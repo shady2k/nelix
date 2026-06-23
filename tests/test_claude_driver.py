@@ -19,6 +19,19 @@ def test_registry_returns_claude_driver():
     assert isinstance(get_driver("claude"), ClaudeDriver)
 
 
+def test_register_decorator_adds_driver():
+    from daemon.drivers import register, DRIVERS, get_driver
+
+    @register("dummy")
+    class Dummy:
+        pass
+
+    try:
+        assert isinstance(get_driver("dummy"), Dummy)
+    finally:
+        DRIVERS.pop("dummy", None)
+
+
 def test_classify_working():
     assert ClaudeDriver().classify(_grid("claude_working.txt"), True) == "working"
 
