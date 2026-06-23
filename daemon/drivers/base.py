@@ -1,0 +1,6 @@
+from typing import Protocol
+
+
+class Driver(Protocol):
+    def is_task_accepted_signal(self, grid: str) -> bool: ...
+    def classify(self, grid: str, task_accepted: bool) -> str: ...
