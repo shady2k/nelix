@@ -1,67 +1,67 @@
 import threading
 import time
 
-from daemon.events import EventQueue
-from daemon.pty_session import PtySession
-
-
-def _default_pty_factory(argv, cwd, cols, rows, env):
-    return PtySession(argv, cwd=cwd, cols=cols, rows=rows, env=env)
+from daemon.hygiene import sanitize_answer
 
 
 class Session:
-    def __init__(self, driver, argv, env, cwd, cols=120, rows=40,
-                 pty_factory=_default_pty_factory):
+    def __init__(self, session_id, executor, driver, launcher, spec, events,
+                 cols=120, rows=40, logger=None):
+        self._id = session_id
+        self._executor = executor
         self._driver = driver
-        self._argv = argv
-        self._env = env
-        self._cwd = cwd
+        self._launcher = launcher
+        self._spec = spec
+        self._events = events
         self._cols = cols
         self._rows = rows
-        self._pty_factory = pty_factory
-        self._pty = None
-        self._events = EventQueue()
+        self._log = logger
+        self._handle = None
         self._task_accepted = False
         self._state = "idle"
         self._last_state = None
-        self._cv = threading.Condition()
         self._thread = None
         self._stop = threading.Event()
 
     def start(self, task):
-        self._pty = self._pty_factory(self._argv, self._cwd, self._cols, self._rows, self._env)
-        self._pty.spawn()
+        self._handle = self._launcher.start(self._spec, self._cols, self._rows)
         self._wait_until_ready()
+        self._ensure_ask_mode()
         self._submit(task)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def _submit(self, text):
-        # The CLI's TUI treats CR (\r), not LF (\n), as Enter. Type the text, let it
-        # render, then send CR to submit.
-        self._pty.write(text)
+        # The TUI treats CR (\r), not LF, as Enter. Type, let it render, then CR.
+        self._handle.write(text)
         time.sleep(0.3)
-        self._pty.write("\r")
+        self._handle.write("\r")
 
     def _wait_until_ready(self, timeout=20.0, stable_for=1.2):
-        # The CLI needs time to draw its TUI before it accepts input. Inject only once
-        # the rendered screen is non-empty AND has stopped changing for `stable_for`.
-        last = None
-        stable_since = None
+        last = None; stable_since = None
         deadline = time.time() + timeout
-        while time.time() < deadline and self._pty.is_alive():
-            self._pty.pump(0.1)
-            grid = self._pty.render()
+        while time.time() < deadline and self._handle.is_alive():
+            self._handle.pump(0.1)
+            grid = self._handle.render()
             if grid != last:
-                last = grid
-                stable_since = time.time()
+                last = grid; stable_since = time.time()
             elif grid.strip() and stable_since is not None and time.time() - stable_since >= stable_for:
                 return
 
+    def _ensure_ask_mode(self, attempts=4):
+        # Cycle Shift+Tab until the driver reports ask-mode (not auto/plan).
+        from daemon.drivers.claude import ASK_MODE_TOGGLE
+        for _ in range(attempts):
+            self._handle.pump(0.1)
+            if self._driver.is_ask_mode(self._handle.render()):
+                return
+            self._handle.write(ASK_MODE_TOGGLE)
+            time.sleep(0.3)
+
     def _loop(self):
-        while not self._stop.is_set() and self._pty.is_alive():
-            self._pty.pump(0.1)
-            grid = self._pty.render()
+        while not self._stop.is_set() and self._handle.is_alive():
+            self._handle.pump(0.1)
+            grid = self._handle.render()
             if not self._task_accepted and self._driver.is_task_accepted_signal(grid):
                 self._task_accepted = True
             state = self._driver.classify(grid, self._task_accepted)
@@ -79,33 +79,26 @@ class Session:
 
     def _emit(self, kind, grid):
         summary = "\n".join(grid.strip().splitlines()[-8:])
-        with self._cv:
-            self._events.publish(kind, summary, self._state)
-            self._cv.notify_all()
-
-    def wait_event(self, after_seq, timeout):
-        deadline = time.time() + timeout
-        with self._cv:
-            while True:
-                evt = self._events.latest_after(after_seq)
-                if evt is not None:
-                    return evt
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    return None
-                self._cv.wait(remaining)
+        evt = self._events.publish(self._id, self._executor, kind, summary, self._state)
+        if self._log is not None:
+            self._log.audit_decision(self._id, self._executor, kind, evt.event_id, grid)
+        # publish() notifies the shared EventQueue condition — no per-session wait here.
 
     def respond(self, event_id, answer):
-        ok = self._events.mark_answered(event_id)
-        if ok and self._pty is not None:
-            self._submit(answer)
+        pending = self._events.pending(self._id)
+        if pending is None or pending.event_id != event_id:
+            return False                      # bind to the current pending decision
+        self._events.mark_answered(event_id)
+        if self._handle is not None:
+            self._submit(sanitize_answer(answer))
             self._last_state = None
-        return ok
+        return True
 
     def snapshot(self):
-        return {"state": self._state, "task_accepted": self._task_accepted}
+        return {"session_id": self._id, "executor": self._executor,
+                "state": self._state, "task_accepted": self._task_accepted}
 
     def stop(self):
         self._stop.set()
-        if self._pty is not None:
-            self._pty.close()
+        if self._handle is not None:
+            self._launcher.stop(self._handle)
