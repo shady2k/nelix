@@ -1,13 +1,13 @@
 import json
-import os
 
 
 def register(ctx):
     def _arm(args, **kwargs):
         secs = int(args.get("seconds", 20))
-        waiter = os.path.join(os.path.dirname(__file__), "waiter.sh")
+        # Self-contained command so it runs in the Dockerized terminal backend with no
+        # host file dependency. On exit, notify_on_complete should wake Hermes with stdout.
         out = ctx.dispatch_tool("terminal", {
-            "command": f"bash {waiter} {secs}",
+            "command": f"sleep {secs}; echo nelix_event spikeA evt-$(date +%s)",
             "background": True,
             "notify_on_complete": True,
         })
