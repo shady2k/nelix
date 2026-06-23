@@ -1,15 +1,13 @@
-import dataclasses
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 
-def make_server(session, token, host="127.0.0.1", port=8765):
+def make_server(manager, token, host="127.0.0.1", port=8765):
     class Handler(BaseHTTPRequestHandler):
         def _auth(self):
             if self.headers.get("X-Nelix-Token") != token:
-                self._send(401, {"error": "unauthorized"})
-                return False
+                self._send(401, {"error": "unauthorized"}); return False
             return True
 
         def _send(self, code, obj):
@@ -17,8 +15,7 @@ def make_server(session, token, host="127.0.0.1", port=8765):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.end_headers(); self.wfile.write(body)
 
         def _read_json(self):
             n = int(self.headers.get("Content-Length", 0))
@@ -30,25 +27,30 @@ def make_server(session, token, host="127.0.0.1", port=8765):
             p = urlparse(self.path)
             if p.path == "/wait":
                 after = int(parse_qs(p.query).get("after_seq", ["0"])[0])
-                evt = session.wait_event(after_seq=after, timeout=25)
-                self._send(200, {"event": dataclasses.asdict(evt) if evt else None})
+                evt = manager._events.wait_event(after_seq=after, timeout=25)
+                self._send(200, {"event": _evt_dict(evt) if evt else None})
             elif p.path == "/status":
-                self._send(200, session.snapshot())
+                sid = parse_qs(p.query).get("session_id", [None])[0]
+                self._send(200, manager.status(sid))
             else:
                 self._send(404, {"error": "not found"})
 
         def do_POST(self):
             if not self._auth():
                 return
-            p = urlparse(self.path)
-            body = self._read_json()
+            p = urlparse(self.path); body = self._read_json()
             if p.path == "/start":
-                session.start(body["task"])
-                self._send(200, {"status": "started"})
+                try:
+                    sid = manager.start(body["executor"], body["task"])
+                except RuntimeError as e:
+                    self._send(409, {"error": str(e)}); return
+                self._send(200, {"session_id": sid})
             elif p.path == "/respond":
-                ok = session.respond(body["event_id"], body["answer"])
+                ok = manager.respond(body["session_id"], body["event_id"], body["answer"])
                 self._send(200 if ok else 409,
-                           {"status": "resumed"} if ok else {"error": "unknown event_id"})
+                           {"status": "resumed"} if ok else {"error": "stale or unknown event_id"})
+            elif p.path == "/stop":
+                self._send(200, {"stopped": manager.stop(body["session_id"])})
             else:
                 self._send(404, {"error": "not found"})
 
@@ -56,3 +58,8 @@ def make_server(session, token, host="127.0.0.1", port=8765):
             pass
 
     return ThreadingHTTPServer((host, port), Handler)
+
+
+def _evt_dict(e):
+    return {"seq": e.seq, "event_id": e.event_id, "session_id": e.session_id,
+            "executor": e.executor, "kind": e.kind, "summary": e.summary, "state": e.state}

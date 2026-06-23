@@ -51,9 +51,6 @@ class SessionManager:
         sess = self._sessions.get(session_id)
         return bool(sess and sess.respond(event_id, answer))
 
-    def wait(self, after_seq, timeout):
-        return self._events.latest_after(after_seq)  # global; long-poll handled by server
-
     def status(self, session_id=None):
         if session_id is not None:
             sess = self._sessions.get(session_id)
