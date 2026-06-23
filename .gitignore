@@ -12,6 +12,7 @@ nelix.toml
 tests/fixtures/
 spikes/frames/
 FEASIBILITY.md
+docs/HANDOFF.md
 
 # Python
 __pycache__/
