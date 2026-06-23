@@ -5,7 +5,7 @@ description: How to delegate a coding/dev task to an agentic CLI executor via th
 
 # Orchestrating a CLI executor with Nelix
 
-Nelix delegates work to an **agentic CLI executor** — an autonomous coding agent (e.g. Claude Code)
+Nelix delegates work to an **agentic CLI executor** — an autonomous coding agent (e.g. OpenCode)
 with its own plan, opinions, and tools. It runs on its own and pauses only at **decision points**
 (permission prompts, choices). You are the orchestrator; the CLI is the executor; the **user decides**.
 Your job is to relay each decision to the user and feed the answer back — not to decide yourself.
