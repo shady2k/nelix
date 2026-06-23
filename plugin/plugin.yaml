@@ -1,0 +1,8 @@
+name: nelix
+version: 0.1.0
+description: "Orchestrate a config-defined agentic CLI over a PTY; relay decision points to the user."
+author: nelix
+hooks: []
+provides:
+  tools: [nelix_start, nelix_status, nelix_respond, nelix_stop]
+  commands: [nelix]
