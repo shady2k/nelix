@@ -1,3 +1,7 @@
+ASK_MODE_TOGGLE = "\x1b[Z"  # Shift+Tab cycles the permission mode in the TUI
+# We are in ask-mode when the mode line is NOT an auto-accept / plan mode.
+_AUTO_MODE_MARKERS = ("accept edits on", "plan mode on", "bypass permissions")
+
 # Markers confirmed against real pyte-rendered frames of Claude Code v2.1.186 (spike P0-B).
 WORKING_MARKERS = ("esc to interrupt",)
 CRASH_MARKERS = ("Traceback (most recent call last)", "command not found",
@@ -27,3 +31,9 @@ class ClaudeDriver:
         if any(m in grid for m in INPUT_BOX_MARKERS):
             return "done_candidate" if task_accepted else "idle"
         return "idle"
+
+    def is_ask_mode(self, grid):
+        # Ask-mode = a known mode line is present but none of the auto markers are.
+        if "shift+tab to cycle" not in grid:
+            return False
+        return not any(m in grid for m in _AUTO_MODE_MARKERS)

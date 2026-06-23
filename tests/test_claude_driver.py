@@ -33,3 +33,13 @@ def test_classify_idle_before_task_is_not_done():
 
 def test_classify_idle_after_task_is_done_candidate():
     assert ClaudeDriver().classify(_grid("claude_idle.txt"), True) == "done_candidate"
+
+
+from daemon.drivers.claude import ClaudeDriver, ASK_MODE_TOGGLE
+
+
+def test_ask_mode_detection():
+    d = ClaudeDriver()
+    assert ASK_MODE_TOGGLE == "\x1b[Z"
+    assert d.is_ask_mode("... ⏵⏵ accept edits on (shift+tab to cycle)") is False
+    assert d.is_ask_mode("... (shift+tab to cycle)  normal mode") is True
