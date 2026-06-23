@@ -10,6 +10,7 @@ class ExecutorSpec:
     env: dict
     cwd: str
     driver: str
+    launcher: str = "auto"
 
     def argv(self):
         return [self.command, *self.args]
@@ -35,5 +36,12 @@ def load_executors(path):
             env=dict(spec.get("env", {})),
             cwd=spec.get("cwd", "."),
             driver=spec.get("driver", "claude"),
+            launcher=spec.get("launcher", "auto"),
         )
     return out
+
+
+def load_concurrency_limit(path, default=1):
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    return int(data.get("concurrency_limit", default))
