@@ -23,12 +23,15 @@ class PtySession:
     def pump(self, timeout=0.1):
         if self._child is None:
             return False
-        r, _, _ = select.select([self._child.fd], [], [], timeout)
+        try:
+            r, _, _ = select.select([self._child.fd], [], [], timeout)
+        except (OSError, ValueError):
+            return False  # fd closed (e.g. child exited or session torn down)
         if not r:
             return False
         try:
             data = self._child.read(65536)
-        except EOFError:
+        except (EOFError, OSError, ValueError):
             return False
         self._stream.feed(data)
         return True

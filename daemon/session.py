@@ -31,13 +31,32 @@ class Session:
     def start(self, task):
         self._pty = self._pty_factory(self._argv, self._cwd, self._cols, self._rows, self._env)
         self._pty.spawn()
-        for _ in range(50):
-            self._pty.pump(0.1)
-            if self._pty.render().strip():
-                break
-        self._pty.write(task + "\n")
+        self._wait_until_ready()
+        self._submit(task)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+
+    def _submit(self, text):
+        # The CLI's TUI treats CR (\r), not LF (\n), as Enter. Type the text, let it
+        # render, then send CR to submit.
+        self._pty.write(text)
+        time.sleep(0.3)
+        self._pty.write("\r")
+
+    def _wait_until_ready(self, timeout=20.0, stable_for=1.2):
+        # The CLI needs time to draw its TUI before it accepts input. Inject only once
+        # the rendered screen is non-empty AND has stopped changing for `stable_for`.
+        last = None
+        stable_since = None
+        deadline = time.time() + timeout
+        while time.time() < deadline and self._pty.is_alive():
+            self._pty.pump(0.1)
+            grid = self._pty.render()
+            if grid != last:
+                last = grid
+                stable_since = time.time()
+            elif grid.strip() and stable_since is not None and time.time() - stable_since >= stable_for:
+                return
 
     def _loop(self):
         while not self._stop.is_set() and self._pty.is_alive():
@@ -46,6 +65,8 @@ class Session:
             if not self._task_accepted and self._driver.is_task_accepted_signal(grid):
                 self._task_accepted = True
             state = self._driver.classify(grid, self._task_accepted)
+            if state in ("working", "waiting_for_user"):
+                self._task_accepted = True
             self._state = state
             if state != self._last_state:
                 self._last_state = state
@@ -77,7 +98,7 @@ class Session:
     def respond(self, event_id, answer):
         ok = self._events.mark_answered(event_id)
         if ok and self._pty is not None:
-            self._pty.write(answer + "\n")
+            self._submit(answer)
             self._last_state = None
         return ok
 

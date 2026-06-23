@@ -53,5 +53,5 @@ def test_session_emits_waiting_then_resumes():
     evt = s.wait_event(0, 3)
     assert evt is not None and evt.kind == "waiting_for_user"
     assert s.respond(evt.event_id, "yes") is True
-    assert "yes\n" in "".join(fake.written)
+    assert "yes" in "".join(fake.written) and "\r" in "".join(fake.written)
     s.stop()
