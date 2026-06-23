@@ -30,12 +30,14 @@ def load_executors(path):
         data = tomllib.load(f)
     out = {}
     for name, spec in data.get("executors", {}).items():
+        if "driver" not in spec:
+            raise ValueError(f"executor {name!r}: 'driver' is required")
         out[name] = ExecutorSpec(
             command=spec["command"],
             args=list(spec.get("args", [])),
             env=dict(spec.get("env", {})),
             cwd=spec.get("cwd", "."),
-            driver=spec.get("driver", "claude"),
+            driver=spec["driver"],
             launcher=spec.get("launcher", "auto"),
         )
     return out

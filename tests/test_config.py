@@ -1,3 +1,5 @@
+import pytest
+
 from daemon.config import load_executors, load_concurrency_limit
 
 
@@ -23,6 +25,13 @@ def test_launcher_defaults_to_auto(tmp_path):
     cfg.write_text('[executors.demo]\ncommand="tool"\ndriver="claude"\n')
     spec = load_executors(str(cfg))["demo"]
     assert spec.launcher == "auto"
+
+
+def test_missing_driver_raises(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.demo]\ncommand="tool"\n')
+    with pytest.raises(ValueError, match="demo"):
+        load_executors(str(cfg))
 
 
 def test_concurrency_limit(tmp_path):
