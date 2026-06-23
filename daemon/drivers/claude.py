@@ -1,9 +1,16 @@
 # Markers confirmed against real pyte-rendered frames of Claude Code v2.1.186 (spike P0-B).
 WORKING_MARKERS = ("esc to interrupt",)
-WAITING_MARKERS = ("Do you want to proceed?",)
 CRASH_MARKERS = ("Traceback (most recent call last)", "command not found",
                  "Invalid API key", "authentication_error")
 INPUT_BOX_MARKERS = ("❯",)
+
+
+def _is_choice_prompt(grid):
+    # When Claude needs a decision (permission for an edit, a bash command, …) it presents
+    # a numbered Yes/…/No selection menu. The Yes+No options are the decision-point signal,
+    # stable across prompt types (the headers differ: "Do you want to proceed?" for bash,
+    # "Create file …?" for edits, etc.).
+    return "1. Yes" in grid and "3. No" in grid
 
 
 class ClaudeDriver:
@@ -13,7 +20,7 @@ class ClaudeDriver:
     def classify(self, grid, task_accepted):
         if any(m in grid for m in CRASH_MARKERS):
             return "crashed"
-        if any(m in grid for m in WAITING_MARKERS):
+        if _is_choice_prompt(grid):
             return "waiting_for_user"
         if any(m in grid for m in WORKING_MARKERS):
             return "working"
