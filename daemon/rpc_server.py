@@ -42,15 +42,24 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
             if p.path == "/start":
                 try:
                     sid = manager.start(body["executor"], body["task"])
-                except RuntimeError as e:
+                except (RuntimeError, ValueError) as e:
                     self._send(409, {"error": str(e)}); return
+                except KeyError as e:
+                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
                 self._send(200, {"session_id": sid})
             elif p.path == "/respond":
-                ok = manager.respond(body["session_id"], body["event_id"], body["answer"])
+                try:
+                    ok = manager.respond(body["session_id"], body["event_id"], body["answer"])
+                except KeyError as e:
+                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
                 self._send(200 if ok else 409,
                            {"status": "resumed"} if ok else {"error": "stale or unknown event_id"})
             elif p.path == "/stop":
-                self._send(200, {"stopped": manager.stop(body["session_id"])})
+                try:
+                    stopped = manager.stop(body["session_id"])
+                except KeyError as e:
+                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
+                self._send(200, {"stopped": stopped})
             else:
                 self._send(404, {"error": "not found"})
 

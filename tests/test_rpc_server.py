@@ -57,3 +57,40 @@ def test_rpc_requires_token():
             assert e.code == 401
     finally:
         srv.shutdown()
+
+
+class FakeManagerRaisesValueError:
+    def __init__(self):
+        self._events = EventQueue()
+    def start(self, executor, task):
+        raise ValueError(f"launcher 'auto' is not implemented (post-MVP); use 'local'")
+    def respond(self, *a): return False
+    def status(self, session_id=None): return {}
+    def stop(self, session_id): return False
+
+
+def test_rpc_start_value_error_returns_409():
+    m = FakeManagerRaisesValueError()
+    srv = make_server(m, token="t", port=8768)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8768/start",
+                     body={"executor": "bad", "task": "hi"})
+        assert st == 409, f"expected 409, got {st}"
+        assert "error" in b
+    finally:
+        srv.shutdown()
+
+
+def test_rpc_start_missing_field_returns_400():
+    m = FakeManager()
+    srv = make_server(m, token="t", port=8769)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        # body missing "task" key
+        st, b = _req("POST", "http://127.0.0.1:8769/start",
+                     body={"executor": "claude_zai"})
+        assert st == 400, f"expected 400, got {st}"
+        assert "missing field" in b.get("error", "")
+    finally:
+        srv.shutdown()

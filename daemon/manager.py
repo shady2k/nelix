@@ -55,7 +55,9 @@ class SessionManager:
         if session_id is not None:
             sess = self._sessions.get(session_id)
             return sess.snapshot() if sess else {"error": "unknown session"}
-        return {"sessions": {sid: s.snapshot() for sid, s in self._sessions.items()},
+        with self._lock:
+            snapshot = dict(self._sessions)
+        return {"sessions": {sid: s.snapshot() for sid, s in snapshot.items()},
                 "limit": self._limit}
 
     def stop(self, session_id):

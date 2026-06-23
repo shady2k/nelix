@@ -6,3 +6,4 @@ args = ["--interactive"]
 env = {}                 # extra env if needed; secrets via your own secret manager
 cwd = "~/work"
 driver = "claude"        # which classifier to use
+launcher = "local"       # MVP: only "local" is implemented ("auto"/"docker" are post-MVP)
