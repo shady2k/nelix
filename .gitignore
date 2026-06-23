@@ -1,0 +1,16 @@
+# Local Claude Code / per-user settings (not shared)
+.claude/settings.local.json
+
+# Superpowers SDD scratch
+.superpowers/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor cruft
+.DS_Store
+*.swp
