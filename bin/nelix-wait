@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""One-shot waiter: long-poll /wait, print the first real event as JSON, exit."""
+import argparse, json, os, sys, urllib.request
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base", default=os.environ.get("NELIX_RPC", "http://127.0.0.1:8765"))
+    ap.add_argument("--after", type=int, default=0)
+    args = ap.parse_args()
+    token = os.environ["NELIX_RPC_TOKEN"]
+    after = args.after
+    while True:
+        req = urllib.request.Request(f"{args.base}/wait?after_seq={after}",
+                                     headers={"X-Nelix-Token": token})
+        with urllib.request.urlopen(req, timeout=40) as r:
+            evt = json.loads(r.read()).get("event")
+        if evt is None:
+            continue                     # timeout tick — re-issue
+        print(json.dumps({"seq": evt["seq"], "session_id": evt["session_id"],
+                          "event_id": evt["event_id"], "executor": evt["executor"],
+                          "kind": evt["kind"], "summary": evt["summary"]}))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
