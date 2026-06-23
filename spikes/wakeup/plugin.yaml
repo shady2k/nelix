@@ -1,0 +1,6 @@
+name: nelix-wakeup-spike
+version: 0.0.1
+description: Throwaway spike — arm a background waiter and observe gateway wake-up
+provides_tools:
+  - nelix_spike_arm
+author: nelix
