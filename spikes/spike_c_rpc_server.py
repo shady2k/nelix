@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN = os.environ["NELIX_RPC_TOKEN"]
 PORT = int(os.environ.get("NELIX_RPC_PORT", "8787"))
+BIND = os.environ.get("NELIX_RPC_BIND", "0.0.0.0")  # container-reachable (host.docker.internal)
 
 
 class H(BaseHTTPRequestHandler):
@@ -24,4 +25,4 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    ThreadingHTTPServer((BIND, PORT), H).serve_forever()

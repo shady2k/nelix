@@ -4,8 +4,9 @@
 # Superpowers SDD scratch
 .superpowers/
 
-# Implementation plans kept local (may name concrete tools / local paths)
+# Implementation plans + design specs kept local (may name concrete tools / local paths)
 docs/superpowers/plans/
+docs/superpowers/specs/
 
 # Real local config + captured env-specific artifacts (never committed)
 nelix.toml
