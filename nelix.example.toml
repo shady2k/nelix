@@ -1,0 +1,8 @@
+# Nelix executor registry. Copy to nelix.toml (gitignored) and fill in real values.
+# Launch is config-driven; per-tool code is only the classifier ("driver").
+[executors.example_cli]
+command = "my-agent-cli"
+args = ["--interactive"]
+env = {}                 # extra env if needed; secrets via your own secret manager
+cwd = "~/work"
+driver = "claude"        # which classifier to use

@@ -4,6 +4,15 @@
 # Superpowers SDD scratch
 .superpowers/
 
+# Implementation plans kept local (may name concrete tools / local paths)
+docs/superpowers/plans/
+
+# Real local config + captured env-specific artifacts (never committed)
+nelix.toml
+tests/fixtures/
+spikes/frames/
+FEASIBILITY.md
+
 # Python
 __pycache__/
 *.py[cod]
