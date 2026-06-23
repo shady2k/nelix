@@ -1,8 +1,9 @@
+# Markers confirmed against real pyte-rendered frames of Claude Code v2.1.186 (spike P0-B).
 WORKING_MARKERS = ("esc to interrupt",)
-WAITING_MARKERS = ("Do you want to proceed", "❯ 1.", "1. Yes")
+WAITING_MARKERS = ("Do you want to proceed?",)
 CRASH_MARKERS = ("Traceback (most recent call last)", "command not found",
                  "Invalid API key", "authentication_error")
-INPUT_BOX_MARKERS = ("│ >", "> ")
+INPUT_BOX_MARKERS = ("❯",)
 
 
 class ClaudeDriver:
