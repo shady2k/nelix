@@ -49,13 +49,12 @@ class Session:
                 return
 
     def _ensure_ask_mode(self, attempts=4):
-        # Cycle Shift+Tab until the driver reports ask-mode (not auto/plan).
-        from daemon.drivers.claude import ASK_MODE_TOGGLE
+        # Cycle the driver's mode toggle until it reports ask-mode (not auto/plan).
         for _ in range(attempts):
             self._handle.pump(0.1)
             if self._driver.is_ask_mode(self._handle.render()):
                 return
-            self._handle.write(ASK_MODE_TOGGLE)
+            self._handle.write(self._driver.ask_mode_toggle)
             time.sleep(0.3)
 
     def _loop(self):

@@ -1,6 +1,6 @@
 from daemon.drivers import register
+from daemon.drivers.base import DriverState
 
-ASK_MODE_TOGGLE = "\x1b[Z"  # Shift+Tab cycles the permission mode in the TUI
 # We are in ask-mode when the mode line is NOT an auto-accept / plan mode.
 _AUTO_MODE_MARKERS = ("accept edits on", "plan mode on", "bypass permissions")
 
@@ -21,10 +21,12 @@ def _is_choice_prompt(grid):
 
 @register("claude")
 class ClaudeDriver:
+    ask_mode_toggle = "\x1b[Z"  # Shift+Tab cycles the permission mode in the TUI
+
     def is_task_accepted_signal(self, grid):
         return any(m in grid for m in WORKING_MARKERS)
 
-    def classify(self, grid, task_accepted):
+    def classify(self, grid, task_accepted) -> "DriverState":
         if any(m in grid for m in CRASH_MARKERS):
             return "crashed"
         if _is_choice_prompt(grid):

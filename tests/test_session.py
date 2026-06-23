@@ -22,6 +22,7 @@ class FakeLauncher:
 
 
 class FakeDriver:
+    ask_mode_toggle = "\x1b[Z"
     def is_task_accepted_signal(self, grid): return "esc to interrupt" in grid
     def is_ask_mode(self, grid): return "ASKMODE" in grid
     def classify(self, grid, task_accepted):
@@ -47,3 +48,12 @@ def test_session_emits_with_session_id_then_resumes():
     joined = "".join(fake.written)
     assert "yes" in joined and "\r" in joined and "/yes" not in joined  # hygiene applied
     s.stop()
+
+
+def test_ensure_ask_mode_writes_driver_toggle():
+    fake = FakePty(); fake.grid = "normal mode, no askmode marker"
+    drv = FakeDriver(); drv.ask_mode_toggle = "\x1bSENTINEL"
+    s = Session("s1", EXECUTOR, drv, FakeLauncher(fake), make_spec(), EventQueue())
+    s._handle = fake
+    s._ensure_ask_mode(attempts=2)
+    assert "\x1bSENTINEL" in "".join(fake.written)
