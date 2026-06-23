@@ -2,9 +2,9 @@ import json
 import os
 from pathlib import Path
 
-from plugin.rpc_client import RpcClient
-from plugin.launcher_resolve import resolve_launcher
-from plugin.wake import arm_waiter
+from .rpc_client import RpcClient
+from .launcher_resolve import resolve_launcher
+from .wake import arm_waiter
 
 _OBJ = {"type": "object", "additionalProperties": False}
 _SKILLS_DIR = Path(__file__).parent / "skills"
@@ -17,8 +17,10 @@ def _client():
 
 def _executor_names():
     try:
-        from daemon.config import load_executors
-        names = sorted(load_executors(os.environ.get("NELIX_CONFIG", "nelix.toml")))
+        import tomllib
+        path = os.path.expanduser(os.environ.get("NELIX_CONFIG", "nelix.toml"))
+        with open(path, "rb") as f:
+            names = sorted(tomllib.load(f).get("executors", {}))
         return ", ".join(names) if names else "the configured CLI"
     except Exception:
         return "the configured CLI"
