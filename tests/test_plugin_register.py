@@ -1,5 +1,6 @@
 import json, threading, textwrap, tempfile, os
 from pathlib import Path
+from conftest import EXECUTOR
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
 import plugin as nelix_plugin
@@ -38,7 +39,7 @@ def test_register_wires_four_tools_and_command(monkeypatch):
         assert set(ctx.tools) == {"nelix_start", "nelix_status", "nelix_respond", "nelix_stop"}
         assert "nelix" in ctx.commands
         # drive nelix_start handler: it should call /start and arm the waiter
-        out = ctx.tools["nelix_start"]["handler"]({"executor": "claude_zai", "task": "go"})
+        out = ctx.tools["nelix_start"]["handler"]({"executor": EXECUTOR, "task": "go"})
         assert json.loads(out)["session_id"] == "s1"
         assert "terminal" in ctx.dispatched
     finally:

@@ -1,7 +1,7 @@
 import pytest
+from conftest import make_spec
 from daemon.launchers import get_launcher
 from daemon.launchers.base import ExecutorCapabilities
-from daemon.config import ExecutorSpec
 
 
 def test_local_launcher_capabilities():
@@ -26,8 +26,7 @@ def test_local_launcher_start_spawns(monkeypatch):
         def close(self): spawned["closed"] = True
 
     monkeypatch.setattr("daemon.launchers.local.PtySession", FakePty)
-    spec = ExecutorSpec(command="tool", args=["-x"], env={}, cwd="/tmp", driver="claude",
-                        launcher="local")
+    spec = make_spec(command="tool", args=["-x"])
     lr = get_launcher("local")
     h = lr.start(spec, cols=100, rows=30)
     assert spawned["spawned"] is True and spawned["argv"] == ["tool", "-x"]

@@ -1,7 +1,7 @@
 import time
+from conftest import EXECUTOR, make_spec
 from daemon.events import EventQueue
 from daemon.session import Session
-from daemon.config import ExecutorSpec
 
 
 class FakePty:
@@ -30,22 +30,17 @@ class FakeDriver:
         return "done_candidate" if task_accepted else "idle"
 
 
-def _spec():
-    return ExecutorSpec(command="x", args=[], env={}, cwd="/tmp", driver="claude",
-                        launcher="local")
-
-
 def test_session_emits_with_session_id_then_resumes():
     fake = FakePty(); fake.grid = "ASKMODE ❯"  # ready + ask-mode so startup proceeds
     q = EventQueue()
-    s = Session("s1", "claude_zai", FakeDriver(), FakeLauncher(fake), _spec(), q)
+    s = Session("s1", EXECUTOR, FakeDriver(), FakeLauncher(fake), make_spec(), q)
     s.start("do the thing")
     assert "do the thing" in "".join(fake.written)
     fake.grid = "esc to interrupt"; time.sleep(0.1)
     fake.grid = "Do you want to proceed"
     evt = q.wait_event(0, 3)        # read via the shared queue (Session has no wait_event)
     assert evt is not None and evt.kind == "waiting_for_user" and evt.session_id == "s1"
-    assert evt.executor == "claude_zai"
+    assert evt.executor == EXECUTOR
     # respond is bound to the current pending event_id
     assert s.respond("evt-bogus", "yes") is False
     assert s.respond(evt.event_id, "/yes\n") is True

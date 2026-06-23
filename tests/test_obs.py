@@ -1,4 +1,5 @@
 import io, json
+from conftest import EXECUTOR
 from daemon.obs import redact, Logger
 
 
@@ -11,7 +12,7 @@ def test_redact_masks_secrets():
 def test_logger_writes_json_line_with_correlation():
     buf = io.StringIO()
     log = Logger(stream=buf)
-    log.event("session", "info", session_id="s1", executor="claude_zai", msg="started")
+    log.event("session", "info", session_id="s1", executor=EXECUTOR, msg="started")
     rec = json.loads(buf.getvalue().strip())
     assert rec["session_id"] == "s1" and rec["component"] == "session" and rec["msg"] == "started"
 
@@ -19,7 +20,7 @@ def test_logger_writes_json_line_with_correlation():
 def test_audit_decision_redacts_grid():
     buf = io.StringIO()
     log = Logger(audit_stream=buf)
-    log.audit_decision("s1", "claude_zai", "waiting_for_user", "evt-1",
+    log.audit_decision("s1", EXECUTOR, "waiting_for_user", "evt-1",
                        "Run: curl -H 'token=abcd1234efgh5678' ...")
     rec = json.loads(buf.getvalue().strip())
     assert rec["event_id"] == "evt-1" and "abcd1234efgh5678" not in rec["grid"]

@@ -1,7 +1,7 @@
 import pytest
+from conftest import EXECUTOR, make_spec
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
-from daemon.config import ExecutorSpec
 
 
 class FakeSession:
@@ -14,7 +14,7 @@ class FakeSession:
 
 
 def _mgr(limit=1):
-    specs = {"claude_zai": ExecutorSpec("x", [], {}, "/tmp", "claude", "local")}
+    specs = {EXECUTOR: make_spec()}
     q = EventQueue()
     captured = []
     def session_factory(sid, executor, spec, events):
@@ -25,10 +25,10 @@ def _mgr(limit=1):
 
 def test_start_returns_id_and_enforces_limit():
     m, captured = _mgr(limit=1)
-    sid = m.start("claude_zai", "task A")
+    sid = m.start(EXECUTOR, "task A")
     assert captured[0].started == "task A" and m.get(sid) is captured[0]
     with pytest.raises(RuntimeError):
-        m.start("claude_zai", "task B")        # limit reached
+        m.start(EXECUTOR, "task B")        # limit reached
 
 
 def test_unknown_executor_raises():
@@ -39,7 +39,7 @@ def test_unknown_executor_raises():
 
 def test_status_lists_all_and_stop():
     m, captured = _mgr(limit=2)
-    sid = m.start("claude_zai", "t")
+    sid = m.start(EXECUTOR, "t")
     all_status = m.status()
     assert sid in all_status["sessions"]
     assert m.stop(sid) is True and captured[0].stopped is True

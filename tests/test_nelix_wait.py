@@ -2,6 +2,8 @@ import json, signal, subprocess, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from conftest import EXECUTOR
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -23,7 +25,7 @@ def _server(port, payloads):
 def test_nelix_wait_reissues_then_prints_event():
     srv = _server(8790, [
         {"event": None},
-        {"event": {"seq": 5, "session_id": "s1", "event_id": "evt-x", "executor": "claude_zai",
+        {"event": {"seq": 5, "session_id": "s1", "event_id": "evt-x", "executor": EXECUTOR,
                    "kind": "waiting_for_user", "summary": "1. Yes / 3. No"}},
     ])
     try:

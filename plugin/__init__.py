@@ -91,7 +91,7 @@ def register(ctx):
     def slash_nelix(raw_args):
         raw = (raw_args or "").strip()
         if not raw:
-            return "Usage: /nelix <executor>: <task>   (e.g. /nelix claude_zai: fix the test)"
+            return "Usage: /nelix <executor>: <task>   (e.g. /nelix example_cli: fix the test)"
         executor, _, task = raw.partition(":")
         if not task.strip():
             return "Usage: /nelix <executor>: <task>"

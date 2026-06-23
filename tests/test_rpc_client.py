@@ -1,4 +1,5 @@
 import threading
+from conftest import EXECUTOR
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
 from plugin.rpc_client import RpcClient
@@ -18,7 +19,7 @@ def test_rpc_client_roundtrip():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         c = RpcClient("http://127.0.0.1:8781", "t")
-        assert c.start("claude_zai", "go")["session_id"] == "s1"
+        assert c.start(EXECUTOR, "go")["session_id"] == "s1"
         ok, _ = c.respond("s1", "evt-1", "yes")
         assert ok is True and ("respond", "s1", "evt-1", "yes") in m.calls
         assert c.stop("s1")["stopped"] is True

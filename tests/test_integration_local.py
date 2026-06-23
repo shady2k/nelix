@@ -19,7 +19,7 @@ def _call(method, path, body=None):
 
 def test_local_task_reaches_decision_and_creates_file(tmp_path):
     sid = _call("POST", "/start",
-                {"executor": "claude_zai",
+                {"executor": os.environ.get("NELIX_EXECUTOR", "demo"),
                  "task": "create test.txt containing the word nelix"})["session_id"]
     after = 0
     deadline = time.time() + 180

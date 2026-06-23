@@ -1,4 +1,5 @@
 import json, threading, urllib.error, urllib.request
+from conftest import EXECUTOR
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
 
@@ -29,9 +30,9 @@ def test_rpc_session_scoped_roundtrip():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:8766"
     try:
-        st, b = _req("POST", base + "/start", body={"executor": "claude_zai", "task": "hi"})
-        assert st == 200 and b["session_id"] == "s1" and m.started == ("claude_zai", "hi")
-        m._events.publish("s1", "claude_zai", "waiting_for_user", "y/n?", "waiting_for_user")
+        st, b = _req("POST", base + "/start", body={"executor": EXECUTOR, "task": "hi"})
+        assert st == 200 and b["session_id"] == "s1" and m.started == (EXECUTOR, "hi")
+        m._events.publish("s1", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
         _, wb = _req("GET", base + "/wait?after_seq=0")
         eid = wb["event"]["event_id"]; assert wb["event"]["session_id"] == "s1"
         st, _ = _req("POST", base + "/respond",
@@ -89,7 +90,7 @@ def test_rpc_start_missing_field_returns_400():
     try:
         # body missing "task" key
         st, b = _req("POST", "http://127.0.0.1:8769/start",
-                     body={"executor": "claude_zai"})
+                     body={"executor": EXECUTOR})
         assert st == 400, f"expected 400, got {st}"
         assert "missing field" in b.get("error", "")
     finally:
