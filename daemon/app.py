@@ -1,35 +1,36 @@
 import os
 
-from daemon.config import load_executors
+from daemon.config import load_executors, load_concurrency_limit
 from daemon.drivers import get_driver
+from daemon.launchers import get_launcher
+from daemon.events import EventQueue
+from daemon.manager import SessionManager
+from daemon.obs import Logger
 from daemon.rpc_server import make_server
-from daemon.session import Session
-
-
-def _pick_executor(execs):
-    name = os.environ.get("NELIX_EXECUTOR")
-    if name:
-        return name
-    if len(execs) == 1:
-        return next(iter(execs))
-    raise SystemExit(f"set NELIX_EXECUTOR (configured: {sorted(execs)})")
 
 
 def main():
-    execs = load_executors(os.environ.get("NELIX_CONFIG", "nelix.toml"))
-    spec = execs[_pick_executor(execs)]
-    cwd = spec.resolved_cwd()
-    os.makedirs(cwd, exist_ok=True)
-    session = Session(get_driver(spec.driver), argv=spec.argv(),
-                      env=spec.resolved_env(), cwd=cwd)
+    cfg_path = os.environ.get("NELIX_CONFIG", "nelix.toml")
+    specs = load_executors(cfg_path)
+    limit = load_concurrency_limit(cfg_path)
+    for name, spec in specs.items():
+        os.makedirs(spec.resolved_cwd(), exist_ok=True)
+    logger = Logger()
+    events = EventQueue()
+    manager = SessionManager(
+        specs, events,
+        launcher_factory=get_launcher, driver_factory=get_driver,
+        concurrency_limit=limit, logger=logger,
+    )
     token = os.environ["NELIX_RPC_TOKEN"]
     port = int(os.environ.get("NELIX_RPC_PORT", "8765"))
-    server = make_server(session, token=token, port=port)
-    print(f"nelix daemon: http://127.0.0.1:{port}  cwd={cwd}")
+    server = make_server(manager, token=token, port=port)
+    logger.event("app", "info", msg=f"nelix daemon on 127.0.0.1:{port}",
+                 executors=sorted(specs), limit=limit)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        session.stop()
+        manager.stop_all()
 
 
 if __name__ == "__main__":
