@@ -12,3 +12,24 @@ def test_render_captures_child_output():
     s.pump(0.1)
     assert "HELLO-NELIX" in s.render()
     s.close()
+
+
+def test_pump_tees_raw_and_commits_scrolled_lines(tmp_path):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from daemon.pty_session import PtySession
+    from daemon.dialog import Dialog
+    d = Dialog(tmp_path / "s", tail_lines=100, spool_max_bytes=1_000_000)
+    # Echo more lines than the 4-row screen so the top scrolls off into history.
+    s = PtySession(["/bin/sh", "-c", "for i in 1 2 3 4 5 6; do echo line$i; done; sleep 0.2"],
+                   cols=40, rows=4, dialog=d)
+    s.spawn()
+    for _ in range(40):
+        s.pump(0.1)
+    s.flush_viewport(d)
+    raw = (tmp_path / "s" / "raw").read_bytes()
+    assert b"line1" in raw and b"line6" in raw            # raw has everything
+    joined = d.turn_text(0)["text"]
+    assert "line1" in joined and "line6" in joined         # transcript preserved beyond the viewport
+    s.close()
