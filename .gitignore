@@ -25,3 +25,5 @@ venv/
 # OS / editor cruft
 .DS_Store
 *.swp
+spikes/_spike_d_raw
+spikes/_spike_d_transcript.txt
