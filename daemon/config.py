@@ -59,3 +59,32 @@ def load_concurrency_limit(path, default=1):
     with open(path, "rb") as f:
         data = tomllib.load(f)
     return int(data.get("concurrency_limit", default))
+
+
+@dataclass
+class RetentionConfig:
+    daemon_log_retain: int = 10
+    session_retain: int = 20
+    session_max_age_days: int = 7
+
+
+def _cfg_int(data, key, default, floor):
+    v = data.get(key, default)
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return default
+    return v if v >= floor else default
+
+
+def load_retention(path):
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        data = {}
+    return RetentionConfig(
+        daemon_log_retain=_cfg_int(data, "daemon_log_retain", 10, floor=1),
+        session_retain=_cfg_int(data, "session_retain", 20, floor=0),
+        session_max_age_days=_cfg_int(data, "session_max_age_days", 7, floor=0),
+    )

@@ -57,3 +57,29 @@ def test_concurrency_limit(tmp_path):
     cfg2 = tmp_path / "n2.toml"
     cfg2.write_text('[executors.demo]\ncommand="t"\n')
     assert load_concurrency_limit(str(cfg2)) == 1
+
+
+def test_load_retention_defaults_when_missing(tmp_path):
+    from daemon.config import load_retention
+    r = load_retention(str(tmp_path / "absent.toml"))
+    assert (r.daemon_log_retain, r.session_retain, r.session_max_age_days) == (10, 20, 7)
+
+
+def test_load_retention_reads_values(tmp_path):
+    from daemon.config import load_retention
+    cfg = tmp_path / "n.toml"
+    cfg.write_text("daemon_log_retain = 3\nsession_retain = 5\nsession_max_age_days = 2\n"
+                   '[executors.demo]\ncommand="t"\ndriver="claude"\n')
+    r = load_retention(str(cfg))
+    assert (r.daemon_log_retain, r.session_retain, r.session_max_age_days) == (3, 5, 2)
+
+
+def test_load_retention_validates(tmp_path):
+    from daemon.config import load_retention
+    cfg = tmp_path / "n.toml"
+    # log retain floor is 1 (0/neg -> default); session rakes allow 0 (disabled); neg/non-int -> default
+    cfg.write_text('daemon_log_retain = 0\nsession_retain = 0\nsession_max_age_days = -4\n')
+    r = load_retention(str(cfg))
+    assert r.daemon_log_retain == 10      # 0 < floor 1 -> default
+    assert r.session_retain == 0          # 0 is valid (disabled)
+    assert r.session_max_age_days == 7    # negative -> default
