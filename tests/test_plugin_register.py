@@ -62,7 +62,7 @@ def test_register_wires_tools_command_skill_hook(monkeypatch, tmp_path):
     ctx = FakeCtx()
     try:
         nelix.register(ctx)
-        assert set(ctx.tools) == {"nelix_start","nelix_status","nelix_respond","nelix_stop"}
+        assert set(ctx.tools) == {"nelix_start","nelix_status","nelix_respond","nelix_stop","nelix_dialog"}
         assert "nelix" in ctx.commands
         assert "nelix-orchestration" in ctx.skills
         # on_session_finalize (NOT on_session_end): the latter fires per run_conversation
@@ -76,6 +76,9 @@ def test_register_wires_tools_command_skill_hook(monkeypatch, tmp_path):
         out = ctx.tools["nelix_start"]["handler"]({"executor":"opencode","task":"go"})
         assert json.loads(out)["session_id"] == "s1"
         assert ctx.dispatched and ctx.dispatched[0][0] == "terminal"
+        # nelix_dialog reaches the daemon (GET /dialog) and returns a JSON object
+        dout = ctx.tools["nelix_dialog"]["handler"]({"session_id": "s1"})
+        assert isinstance(json.loads(dout), dict) and "error" not in json.loads(dout)
     finally:
         nelix.supervisor.teardown()
 
@@ -89,7 +92,7 @@ def test_tool_schemas_are_llm_function_shaped(monkeypatch, tmp_path):
     ctx = FakeCtx()
     try:
         nelix.register(ctx)
-        for tname in ("nelix_start", "nelix_status", "nelix_respond", "nelix_stop"):
+        for tname in ("nelix_start", "nelix_status", "nelix_respond", "nelix_stop", "nelix_dialog"):
             fn = {**ctx.tools[tname]["schema"], "name": tname}  # mirror Hermes' builder
             assert fn.get("description"), f"{tname}: no description in the LLM function spec"
             params = fn.get("parameters")

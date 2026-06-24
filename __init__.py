@@ -46,6 +46,14 @@ def register(ctx):
         base, token = bt
         return json.dumps(RpcClient(base, token).stop(args["session_id"]))
 
+    def nelix_dialog(args, **k):
+        bt = supervisor.base_token()
+        if bt is None:
+            return json.dumps({"error": "no active nelix daemon"})
+        base, token = bt
+        return json.dumps(RpcClient(base, token).dialog(
+            args["session_id"], args.get("turn"), int(args.get("offset", 0)), args.get("limit")))
+
     names = ", ".join(registry.names()) or "the configured CLI"
     # Hermes builds the LLM tool spec as {"type":"function","function":{**schema,"name":name}}
     # (tools/registry.py), so `schema` MUST be the full function schema with `description`
@@ -91,6 +99,16 @@ def register(ctx):
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
                         "required": ["session_id"]}},
         nelix_stop)
+    ctx.register_tool(
+        "nelix_dialog", "nelix",
+        {"description": ("Read an orchestrated executor's dialog transcript: the latest turn by"
+                         " default, or an earlier `turn` index, paginated by `offset`/`limit`. Use"
+                         " to read a long question or review earlier turns the wake-up summarized."),
+         "parameters": {**_OBJ, "properties": {
+             "session_id": {"type": "string"}, "turn": {"type": "integer"},
+             "offset": {"type": "integer"}, "limit": {"type": "integer"}},
+             "required": ["session_id"]}},
+        nelix_dialog)
 
     def slash_nelix(raw_args):
         raw = (raw_args or "").strip()

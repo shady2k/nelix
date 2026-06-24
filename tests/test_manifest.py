@@ -13,7 +13,8 @@ def test_manifest_uses_real_hermes_fields():
     # The parser reads `provides_hooks`, NOT `hooks` (plugins.py PluginManifest).
     # Teardown is on on_session_finalize (true teardown), not on_session_end (per-turn).
     assert "on_session_finalize" in data["provides_hooks"]
-    assert set(data["provides_tools"]) == {"nelix_start", "nelix_status", "nelix_respond", "nelix_stop"}
+    assert set(data["provides_tools"]) == {"nelix_start", "nelix_status", "nelix_respond",
+                                            "nelix_stop", "nelix_dialog"}
     # `pip_dependencies` is a no-op in Hermes — deps are installed venv-scoped by
     # supervisor._ensure_deps(), so the manifest must not pretend otherwise.
     assert "pip_dependencies" not in data
