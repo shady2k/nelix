@@ -192,3 +192,12 @@ def test_prune_keeps_newest_retain_and_spares_symlink(monkeypatch, tmp_path):
     survivors = sorted(p.name for p in root.glob("daemon-*-*.log") if not p.is_symlink())
     assert survivors == [made[3].name, made[4].name]   # newest 2 kept
     assert (root / "daemon-latest.log").is_symlink()    # symlink untouched
+
+
+def test_teardown_logs_to_nelix_logger(monkeypatch, tmp_path, caplog):
+    _use_fake_daemon(monkeypatch, tmp_path)
+    supervisor.ensure_running()
+    with caplog.at_level("INFO", logger="nelix.supervisor"):
+        supervisor.teardown("unit test")
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "unit test" in msgs

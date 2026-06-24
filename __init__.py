@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 
 from .rpc_client import RpcClient
@@ -6,6 +7,7 @@ from .launcher_resolve import resolve_launcher
 from .wake import arm_waiter
 from . import supervisor, registry
 
+_log = logging.getLogger("nelix")
 _OBJ = {"type": "object", "additionalProperties": False}
 _SKILLS_DIR = Path(__file__).parent / "skills"
 
@@ -14,6 +16,7 @@ def register(ctx):
     registry.seed_if_absent()
 
     def nelix_start(args, **k):
+        _log.info("nelix_start executor=%s", args["executor"])
         resolve_launcher("auto")               # isolation parity: fail closed
         base, token = supervisor.ensure_running()
         body = RpcClient(base, token).start(args["executor"], args["task"])
@@ -28,6 +31,7 @@ def register(ctx):
         return json.dumps(RpcClient(base, token).status(args.get("session_id")))
 
     def nelix_respond(args, **k):
+        _log.info("nelix_respond session=%s event=%s", args["session_id"], args.get("event_id"))
         bt = supervisor.base_token()
         if bt is None:
             return json.dumps({"error": "no active nelix daemon"})

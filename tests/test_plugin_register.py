@@ -115,3 +115,18 @@ def test_session_finalize_hook_calls_teardown(monkeypatch, tmp_path):
     assert "on_session_end" not in ctx.hooks
     ctx.hooks["on_session_finalize"]()
     assert called.get("t") is True
+
+
+def test_nelix_start_logs_metadata_not_task_text(monkeypatch, tmp_path, caplog):
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    try:
+        nelix.register(ctx)
+        SECRET_TASK = "delete prod database please"
+        with caplog.at_level("INFO", logger="nelix"):
+            ctx.tools["nelix_start"]["handler"]({"executor": "opencode", "task": SECRET_TASK})
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "opencode" in msgs            # executor metadata logged
+        assert SECRET_TASK not in msgs        # task body must NOT be logged
+    finally:
+        nelix.supervisor.teardown()

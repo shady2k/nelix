@@ -28,6 +28,7 @@ except ImportError:           # loaded as a top-level module (tests), not as a p
 
 PLUGIN_ROOT = Path(__file__).parent
 _HEALTH_TIMEOUT = 10.0
+_log = logging.getLogger("nelix.supervisor")
 
 # Daemon deps live in the Hermes runtime venv (our sys.executable), which does
 # not ship them. No plugin.yaml field installs deps (pip_dependencies is a
@@ -247,6 +248,7 @@ def ensure_running():
     while time.time() < deadline:
         if _healthy(port, token):
             _write_state(proc.pid, port, token)
+            _log.info("nelix daemon started pid=%s port=%s log=%s", proc.pid, port, log_path)
             return f"http://127.0.0.1:{port}", token
         if proc.poll() is not None:
             raise RuntimeError(
@@ -257,6 +259,7 @@ def ensure_running():
 
 
 def teardown(reason: str = "") -> None:
+    _log.info("nelix daemon teardown: %s", reason or "(no reason)")
     st = _read_state()
     if st and _pid_alive(st["pid"]):
         pid = st["pid"]
