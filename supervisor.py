@@ -8,6 +8,7 @@ down; a fresh one is spawned on the next nelix_start.
 import importlib
 import importlib.util
 import json
+import logging
 import os
 import shutil
 import signal
@@ -20,8 +21,10 @@ from pathlib import Path
 
 try:
     from . import paths
+    from .daemon.config import load_retention
 except ImportError:           # loaded as a top-level module (tests), not as a package
     import paths
+    from daemon.config import load_retention
 
 PLUGIN_ROOT = Path(__file__).parent
 _HEALTH_TIMEOUT = 10.0
@@ -177,6 +180,41 @@ def base_token():
     return None
 
 
+def _open_daemon_log(root) -> Path:
+    """Create this spawn's log file, point daemon-latest.log at it, prune old ones.
+    <pid> is the supervisor's own pid (known pre-spawn; the daemon child pid only
+    exists after Popen). Returns the per-spawn path to open for the child's stdio."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    log_path = paths.daemon_log(stamp, os.getpid())
+    log_path.touch()
+    _refresh_latest(root, log_path)
+    retain = load_retention(str(paths.config_path())).daemon_log_retain
+    _prune_daemon_logs(root, retain)
+    return log_path
+
+
+def _refresh_latest(root, target) -> None:
+    link = paths.daemon_latest()
+    tmp = root / "daemon-latest.log.tmp"
+    try:
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        tmp.symlink_to(target.name)        # relative (same dir) target
+        os.replace(tmp, link)              # atomic overwrite of the existing symlink
+    except OSError:
+        pass
+
+
+def _prune_daemon_logs(root, retain) -> None:
+    files = [p for p in root.glob(paths.DAEMON_LOG_GLOB) if not p.is_symlink()]
+    files.sort(key=lambda p: p.stat().st_mtime)            # oldest first
+    for p in files[:max(0, len(files) - retain)]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
 def ensure_running():
     existing = base_token()
     if existing:
@@ -189,7 +227,8 @@ def ensure_running():
     port = _free_port()
     root = _root()
     root.mkdir(parents=True, exist_ok=True)
-    log = open(root / "daemon.log", "ab")
+    log_path = _open_daemon_log(root)
+    log = open(log_path, "ab")
     env = {**os.environ,
            "NELIX_RPC_TOKEN": token,
            "NELIX_RPC_PORT": str(port),
@@ -211,10 +250,10 @@ def ensure_running():
             return f"http://127.0.0.1:{port}", token
         if proc.poll() is not None:
             raise RuntimeError(
-                f"nelix daemon exited early (code {proc.returncode}); see {root/'daemon.log'}")
+                f"nelix daemon exited early (code {proc.returncode}); see {log_path}")
         time.sleep(0.1)
     proc.terminate()
-    raise RuntimeError(f"nelix daemon did not become healthy; see {root/'daemon.log'}")
+    raise RuntimeError(f"nelix daemon did not become healthy; see {log_path}")
 
 
 def teardown(reason: str = "") -> None:

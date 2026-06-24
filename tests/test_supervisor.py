@@ -165,3 +165,30 @@ def test_venv_pip_install_bootstraps_ensurepip_when_pip_missing(monkeypatch):
     ok, _out = supervisor._venv_pip_install(("pyte==0.8.2",))
     assert ok is True
     assert any("ensurepip" in c for c in record)
+
+
+def test_daemon_log_is_per_spawn_named_with_pid(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    root = supervisor._root(); root.mkdir(parents=True)
+    p = supervisor._open_daemon_log(root)
+    assert p.parent == root
+    assert p.name.startswith("daemon-") and p.name.endswith(f"-{os.getpid()}.log")
+    assert (root / "daemon-latest.log").is_symlink()
+    assert (root / "daemon-latest.log").resolve() == p.resolve()
+
+
+def test_prune_keeps_newest_retain_and_spares_symlink(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    root = supervisor._root(); root.mkdir(parents=True)
+    made = []
+    for i in range(5):
+        f = root / f"daemon-2026010{i}-000000-{1000+i}.log"
+        f.write_text("x"); os.utime(f, (i, i))   # ascending mtime
+        made.append(f)
+    (root / "daemon-latest.log").symlink_to(made[-1].name)
+    supervisor._prune_daemon_logs(root, retain=2)
+    survivors = sorted(p.name for p in root.glob("daemon-*-*.log") if not p.is_symlink())
+    assert survivors == [made[3].name, made[4].name]   # newest 2 kept
+    assert (root / "daemon-latest.log").is_symlink()    # symlink untouched
