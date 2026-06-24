@@ -2,7 +2,7 @@ import threading
 from conftest import EXECUTOR
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
-from plugin.rpc_client import RpcClient
+from rpc_client import RpcClient
 
 
 class FakeManager:

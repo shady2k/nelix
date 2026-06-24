@@ -3,7 +3,8 @@ from pathlib import Path
 from conftest import EXECUTOR
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
-import plugin as nelix_plugin
+from plugin_loader import load_plugin
+nelix_plugin = load_plugin()
 
 
 class FakeCtx:

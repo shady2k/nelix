@@ -1,5 +1,5 @@
 import pytest
-from plugin.launcher_resolve import resolve_launcher
+from launcher_resolve import resolve_launcher
 
 
 def test_auto_resolves_local(monkeypatch):
