@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from conftest import EXECUTOR, make_spec
 from daemon.events import EventQueue
@@ -27,6 +29,9 @@ def test_start_returns_id_and_enforces_limit():
     m, captured = _mgr(limit=1)
     sid = m.start(EXECUTOR, "task A")
     assert captured[0].started == "task A" and m.get(sid) is captured[0]
+    # session ids are uuid-based (not a per-daemon sequential counter that resets to
+    # "s1" on restart and collides with stale references); consistent with evt-<hex>.
+    assert re.match(r"^s-[0-9a-f]{8}$", sid), f"non-uuid session id: {sid!r}"
     with pytest.raises(RuntimeError):
         m.start(EXECUTOR, "task B")        # limit reached
 

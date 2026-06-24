@@ -1,5 +1,5 @@
-import itertools
 import threading
+import uuid
 
 from daemon.session import Session
 
@@ -20,7 +20,6 @@ class SessionManager:
         self._limit = concurrency_limit
         self._logger = logger
         self._sessions = {}
-        self._ids = (f"s{n}" for n in itertools.count(1))
         self._lock = threading.Lock()
         if session_factory is not None:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
@@ -38,7 +37,9 @@ class SessionManager:
                 raise RuntimeError(
                     f"concurrency_limit={self._limit} reached "
                     f"(active: {sorted(self._sessions)}); concurrent executors are post-MVP")
-            sid = next(self._ids)
+            # uuid-based (not a per-daemon sequential counter): unique + collision-safe
+            # across daemon restarts, consistent with evt-<hex> event ids.
+            sid = f"s-{uuid.uuid4().hex[:8]}"
             sess = self._make(sid, executor_name, spec)
             self._sessions[sid] = sess
         sess.start(task)

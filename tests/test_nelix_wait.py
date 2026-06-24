@@ -37,6 +37,10 @@ def test_nelix_wait_reissues_then_prints_event():
         srv.shutdown()
     rec = json.loads(out.strip())
     assert rec["event_id"] == "evt-x" and rec["session_id"] == "s1" and rec["seq"] == 5
+    # the waiter must NOT echo the raw TUI `summary` (last-8-grid-lines = box-drawing
+    # chrome) — that floods the notify_on_complete output; the agent reads details via
+    # nelix_status instead.
+    assert "summary" not in rec
 
 
 def test_nelix_wait_reads_token_from_token_file(tmp_path):

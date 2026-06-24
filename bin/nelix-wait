@@ -41,9 +41,12 @@ def main():
                 return 0
             if evt is None:
                 continue                     # timeout tick — re-issue
+            # Deliberately omit the raw TUI `summary` (box-drawing chrome) — it floods the
+            # notify_on_complete output. This line just wakes Hermes; the agent reads the
+            # real state/decision via nelix_status.
             print(json.dumps({"seq": evt["seq"], "session_id": evt["session_id"],
                               "event_id": evt["event_id"], "executor": evt["executor"],
-                              "kind": evt["kind"], "summary": evt["summary"]}))
+                              "kind": evt["kind"]}))
             return 0
     except KeyboardInterrupt:
         print(json.dumps({"kind": "none"}))
