@@ -20,8 +20,9 @@ def test_local_launcher_start_spawns(monkeypatch):
     spawned = {}
 
     class FakePty:
-        def __init__(self, argv, cwd=None, cols=120, rows=40, env=None):
+        def __init__(self, argv, cwd=None, cols=120, rows=40, env=None, dialog=None):
             spawned["argv"] = argv; spawned["cwd"] = cwd; spawned["env"] = env
+            spawned["dialog"] = dialog
         def spawn(self): spawned["spawned"] = True
         def close(self): spawned["closed"] = True
 

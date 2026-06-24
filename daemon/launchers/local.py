@@ -7,9 +7,9 @@ class LocalLauncher:
 
     capabilities = ExecutorCapabilities(isolation_class="host", can_attach=False)
 
-    def start(self, spec, cols=120, rows=40):
+    def start(self, spec, cols=120, rows=40, dialog=None):
         pty = PtySession(spec.argv(), cwd=spec.resolved_cwd(), cols=cols, rows=rows,
-                         env=spec.resolved_env())
+                         env=spec.resolved_env(), dialog=dialog)
         pty.spawn()
         return pty
 
