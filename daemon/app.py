@@ -1,4 +1,5 @@
 import os
+import signal
 
 from daemon.config import load_executors, load_concurrency_limit
 from daemon.drivers import get_driver
@@ -7,6 +8,15 @@ from daemon.events import EventQueue
 from daemon.manager import SessionManager
 from daemon.obs import Logger
 from daemon.rpc_server import make_server
+
+
+def install_shutdown_handler(manager):
+    """SIGTERM -> graceful stop_all() then exit (mirrors the SIGINT path)."""
+    def _handle(signum, frame):
+        manager.stop_all()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _handle)
+    return _handle
 
 
 def main():
@@ -27,6 +37,7 @@ def main():
     server = make_server(manager, token=token, port=port)
     logger.event("app", "info", msg=f"nelix daemon on 127.0.0.1:{port}",
                  executors=sorted(specs), limit=limit)
+    install_shutdown_handler(manager)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

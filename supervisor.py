@@ -79,6 +79,8 @@ def _daemon_argv():
 
 
 def _free_port() -> int:
+    # Bind-to-0, read port, close, then rebind — accepted MVP TOCTOU tradeoff:
+    # loopback only, window is tiny; health-timeout fails loudly if rebind loses.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -146,10 +148,13 @@ def ensure_running():
            "NELIX_CONFIG": str(registry.config_path()),
            "HERMES_HOME": str(registry.hermes_home()),
            "PYTHONPATH": str(PLUGIN_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    proc = subprocess.Popen(
-        _daemon_argv(), cwd=str(PLUGIN_ROOT), env=env,
-        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True, close_fds=True)
+    try:
+        proc = subprocess.Popen(
+            _daemon_argv(), cwd=str(PLUGIN_ROOT), env=env,
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True, close_fds=True)
+    finally:
+        log.close()  # parent's copy; child has its own inherited fd
 
     deadline = time.time() + _HEALTH_TIMEOUT
     while time.time() < deadline:
@@ -171,17 +176,20 @@ def teardown(reason: str = "") -> None:
         try:
             os.kill(pid, signal.SIGTERM)
             for _ in range(20):
-                if not _pid_alive(pid):
+                try:                              # reap if it's OUR child
+                    if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                        break
+                except ChildProcessError:
+                    pass                          # cross-process: not our child
+                if not _pid_alive(pid):           # handles the non-child case
                     break
                 time.sleep(0.5)
             if _pid_alive(pid):
                 os.kill(pid, signal.SIGKILL)
-                time.sleep(0.1)
-            # Reap the zombie so os.kill(pid, 0) raises OSError for callers.
-            try:
-                os.waitpid(pid, 0)
-            except Exception:
-                pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
         except Exception:
             pass
     try:
