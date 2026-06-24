@@ -84,6 +84,8 @@ class SessionManager:
             raise RuntimeError(f"unknown executor: {executor_name!r} "
                                f"(configured: {sorted(self._specs)})")
         cwd = os.path.abspath(os.path.expanduser(cwd))
+        if not os.path.isdir(cwd):          # host-side: fail fast, no session, no auto-mkdir
+            raise ValueError(f"cwd does not exist or is not a directory: {cwd!r}")
         with self._lock:
             if len(self._sessions) >= self._limit:
                 raise RuntimeError(

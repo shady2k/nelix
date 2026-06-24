@@ -28,13 +28,13 @@ def _mgr(limit=1):
 
 def test_start_returns_id_and_enforces_limit():
     m, captured = _mgr(limit=1)
-    sid = m.start(EXECUTOR, "task A", "/repo")
+    sid = m.start(EXECUTOR, "task A", "/tmp")
     assert captured[0].started == "task A" and m.get(sid) is captured[0]
     # session ids are uuid-based (not a per-daemon sequential counter that resets to
     # "s1" on restart and collides with stale references); consistent with evt-<hex>.
     assert re.match(r"^s-[0-9a-f]{8}$", sid), f"non-uuid session id: {sid!r}"
     with pytest.raises(RuntimeError):
-        m.start(EXECUTOR, "task B", "/repo")        # limit reached
+        m.start(EXECUTOR, "task B", "/tmp")        # limit reached
 
 
 def test_unknown_executor_raises():
@@ -43,23 +43,38 @@ def test_unknown_executor_raises():
         m.start("nope", "x", "/repo")
 
 
-def test_start_threads_cwd_to_session():
+def test_start_threads_cwd_to_session(tmp_path):
     m, captured = _mgr()
-    m.start(EXECUTOR, "t", "/work/repo")
-    assert captured[0].started_cwd == "/work/repo"
+    m.start(EXECUTOR, "t", str(tmp_path))
+    assert captured[0].started_cwd == str(tmp_path)
 
 
 def test_start_expands_user_and_makes_cwd_absolute():
     import os
     m, captured = _mgr()
-    m.start(EXECUTOR, "t", "~/proj")
-    assert captured[0].started_cwd == os.path.expanduser("~/proj")
+    m.start(EXECUTOR, "t", "~")                 # home exists -> passes validation
+    assert captured[0].started_cwd == os.path.expanduser("~")
     assert os.path.isabs(captured[0].started_cwd)
+
+
+def test_start_rejects_nonexistent_cwd():
+    m, captured = _mgr()
+    with pytest.raises(ValueError):
+        m.start(EXECUTOR, "t", "/no/such/dir/definitely-not-here")
+    assert captured == []                       # invalid cwd -> no session created
+
+
+def test_start_rejects_cwd_that_is_a_file(tmp_path):
+    m, captured = _mgr()
+    f = tmp_path / "afile"; f.write_text("x")
+    with pytest.raises(ValueError):
+        m.start(EXECUTOR, "t", str(f))
+    assert captured == []
 
 
 def test_status_lists_all_and_stop():
     m, captured = _mgr(limit=2)
-    sid = m.start(EXECUTOR, "t", "/repo")
+    sid = m.start(EXECUTOR, "t", "/tmp")
     all_status = m.status()
     assert sid in all_status["sessions"]
     assert m.stop(sid) is True and captured[0].stopped is True
