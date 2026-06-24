@@ -29,7 +29,21 @@ def test_local_launcher_start_spawns(monkeypatch):
     monkeypatch.setattr("daemon.launchers.local.PtySession", FakePty)
     spec = make_spec(command="tool", args=["-x"])
     lr = get_launcher("local")
-    h = lr.start(spec, cols=100, rows=30)
+    h = lr.start(spec, "/tmp", cols=100, rows=30)
     assert spawned["spawned"] is True and spawned["argv"] == ["tool", "-x"]
     lr.stop(h)
     assert spawned["closed"] is True
+
+
+def test_local_launcher_uses_given_cwd(monkeypatch):
+    seen = {}
+
+    class FakePty:
+        def __init__(self, argv, cwd=None, cols=120, rows=40, env=None, dialog=None):
+            seen["cwd"] = cwd
+        def spawn(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr("daemon.launchers.local.PtySession", FakePty)
+    get_launcher("local").start(make_spec(command="tool"), "/work/repo")
+    assert seen["cwd"] == "/work/repo"

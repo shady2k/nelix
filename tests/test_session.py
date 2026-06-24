@@ -211,6 +211,25 @@ def test_respond_answers_and_advances_turn(monkeypatch, tmp_path):
     assert "\r" in sess._handle.writes and any("1" in w for w in sess._handle.writes)
 
 
+def test_start_passes_cwd_to_launcher(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    seen = {}
+
+    class FakeLauncher:
+        def start(self, spec, cwd, cols, rows, dialog=None):
+            seen["cwd"] = cwd
+            return FakeHandle(["x"])
+
+    sess = Session("s1", "demo", ClaudeDriver(), FakeLauncher(), Spec(), EventQueue())
+    monkeypatch.setattr(sess, "_wait_until_ready", lambda *a, **k: None)
+    monkeypatch.setattr(sess, "_ensure_ask_mode", lambda *a, **k: None)
+    monkeypatch.setattr(sess, "_submit", lambda *a, **k: None)
+    monkeypatch.setattr(sess, "_loop", lambda *a, **k: None)
+    sess.start("do it", cwd="/work/repo")
+    sess._stop.set()
+    assert seen["cwd"] == "/work/repo"
+
+
 def test_ensure_ask_mode_writes_driver_toggle(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     sess, _ = _session(tmp_path, ["normal mode, no askmode marker"])

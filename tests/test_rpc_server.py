@@ -7,7 +7,7 @@ from daemon.rpc_server import make_server
 class FakeManager:
     def __init__(self):
         self._events = EventQueue(); self.started = None; self.responded = []; self.stopped = []
-    def start(self, executor, task): self.started = (executor, task); return "s1"
+    def start(self, executor, task, cwd): self.started = (executor, task, cwd); return "s1"
     def respond(self, session_id, event_id, answer):
         self.responded.append((session_id, event_id, answer)); return event_id == "ok"
     def status(self, session_id=None): return {"sessions": {}} if session_id is None else {"state": "working"}
@@ -30,8 +30,9 @@ def test_rpc_session_scoped_roundtrip():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:8766"
     try:
-        st, b = _req("POST", base + "/start", body={"executor": EXECUTOR, "task": "hi"})
-        assert st == 200 and b["session_id"] == "s1" and m.started == (EXECUTOR, "hi")
+        st, b = _req("POST", base + "/start",
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo"})
+        assert st == 200 and b["session_id"] == "s1" and m.started == (EXECUTOR, "hi", "/repo")
         m._events.publish("s1", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
         _, wb = _req("GET", base + "/wait?after_seq=0")
         eid = wb["event"]["event_id"]; assert wb["event"]["session_id"] == "s1"
@@ -63,7 +64,7 @@ def test_rpc_requires_token():
 class FakeManagerRaisesValueError:
     def __init__(self):
         self._events = EventQueue()
-    def start(self, executor, task):
+    def start(self, executor, task, cwd):
         raise ValueError(f"launcher 'auto' is not implemented (post-MVP); use 'local'")
     def respond(self, *a): return False
     def status(self, session_id=None): return {}
@@ -76,7 +77,7 @@ def test_rpc_start_value_error_returns_409():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", "http://127.0.0.1:8768/start",
-                     body={"executor": "bad", "task": "hi"})
+                     body={"executor": "bad", "task": "hi", "cwd": "/repo"})
         assert st == 409, f"expected 409, got {st}"
         assert "error" in b
     finally:
@@ -140,5 +141,19 @@ def test_rpc_start_missing_field_returns_400():
                      body={"executor": EXECUTOR})
         assert st == 400, f"expected 400, got {st}"
         assert "missing field" in b.get("error", "")
+    finally:
+        srv.shutdown()
+
+
+def test_rpc_start_missing_cwd_returns_400():
+    m = FakeManager()
+    srv = make_server(m, token="t", port=8772)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        # cwd is required: a start without a working dir must be rejected, not defaulted.
+        st, b = _req("POST", "http://127.0.0.1:8772/start",
+                     body={"executor": EXECUTOR, "task": "hi"})
+        assert st == 400, f"expected 400, got {st}"
+        assert "missing field" in b.get("error", "") and "cwd" in b.get("error", "")
     finally:
         srv.shutdown()

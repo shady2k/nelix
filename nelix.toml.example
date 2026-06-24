@@ -4,7 +4,8 @@
 command = "my-agent-cli"
 args = ["--interactive"]
 env = {}                 # extra env if needed; secrets via your own secret manager
-cwd = "~/work"
+# no cwd here: the working dir is per-session — passed to nelix_start (defaults to the
+# orchestrator's own cwd), so one executor entry serves any project.
 driver = "claude"        # which classifier to use
 launcher = "local"       # MVP: only "local" is implemented ("auto"/"docker" are post-MVP)
 

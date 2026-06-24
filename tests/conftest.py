@@ -9,7 +9,6 @@ EXECUTOR = "demo"
 
 
 def make_spec(**overrides):
-    fields = dict(command="x", args=[], env={}, cwd="/tmp",
-                  driver="claude", launcher="local")
+    fields = dict(command="x", args=[], env={}, driver="claude", launcher="local")
     fields.update(overrides)
     return ExecutorSpec(**fields)

@@ -52,7 +52,7 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
             p = urlparse(self.path); body = self._read_json()
             if p.path == "/start":
                 try:
-                    sid = manager.start(body["executor"], body["task"])
+                    sid = manager.start(body["executor"], body["task"], body["cwd"])
                 except (RuntimeError, ValueError) as e:
                     self._send(409, {"error": str(e)}); return
                 except KeyError as e:

@@ -43,11 +43,11 @@ class Session:
         return self._dialog
 
     # ---- lifecycle ----
-    def start(self, task):
+    def start(self, task, cwd):
         self._dialog = Dialog(self._sessions_dir / self._id,
                               tail_lines=self._spec.tail_lines,
                               spool_max_bytes=self._spec.spool_max_bytes)
-        self._handle = self._launcher.start(self._spec, self._cols, self._rows,
+        self._handle = self._launcher.start(self._spec, cwd, self._cols, self._rows,
                                             dialog=self._dialog)
         self._wait_until_ready()
         self._ensure_ask_mode()

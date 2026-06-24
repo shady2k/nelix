@@ -17,7 +17,8 @@ def test_load_executor_spec(tmp_path):
     assert spec.argv() == ["tool", "-x", "--", "~/w.sh"]
     assert spec.driver == "claude"
     assert spec.resolved_env()["FOO"] == "bar"
-    assert not spec.resolved_cwd().startswith("~")
+    # cwd is per-session (a nelix_start arg), not a config field — any config cwd is ignored.
+    assert not hasattr(spec, "cwd")
 
 
 def test_launcher_defaults_to_auto(tmp_path):

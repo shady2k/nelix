@@ -23,8 +23,6 @@ def main():
     cfg_path = os.environ.get("NELIX_CONFIG", "nelix.toml")
     specs = load_executors(cfg_path)
     limit = load_concurrency_limit(cfg_path)
-    for name, spec in specs.items():
-        os.makedirs(spec.resolved_cwd(), exist_ok=True)
     logger = Logger()
     events = EventQueue()
     retention = load_retention(cfg_path)

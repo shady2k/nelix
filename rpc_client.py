@@ -19,8 +19,9 @@ class RpcClient:
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
-    def start(self, executor, task):
-        _, body = self._call("POST", "/start", {"executor": executor, "task": task})
+    def start(self, executor, task, cwd):
+        _, body = self._call("POST", "/start",
+                             {"executor": executor, "task": task, "cwd": cwd})
         return body
 
     def status(self, session_id=None):

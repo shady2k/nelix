@@ -1,3 +1,4 @@
+import os
 import shutil
 import threading
 import time
@@ -77,11 +78,12 @@ class SessionManager:
             self._make = lambda sid, ex, spec: _default_session_factory(
                 sid, ex, spec, events, launcher_factory, driver_factory, logger)
 
-    def start(self, executor_name, task):
+    def start(self, executor_name, task, cwd):
         spec = self._specs.get(executor_name)
         if spec is None:
             raise RuntimeError(f"unknown executor: {executor_name!r} "
                                f"(configured: {sorted(self._specs)})")
+        cwd = os.path.abspath(os.path.expanduser(cwd))
         with self._lock:
             if len(self._sessions) >= self._limit:
                 raise RuntimeError(
@@ -92,7 +94,7 @@ class SessionManager:
             self._sessions[sid] = sess
             keep = set(self._sessions)
         gc_sessions(keep, self._session_retain, self._session_max_age_days, logger=self._logger)
-        sess.start(task)
+        sess.start(task, cwd)
         return sid
 
     def get(self, session_id):

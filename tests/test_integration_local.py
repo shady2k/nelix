@@ -20,7 +20,8 @@ def _call(method, path, body=None):
 def test_local_task_reaches_decision_and_creates_file(tmp_path):
     sid = _call("POST", "/start",
                 {"executor": os.environ.get("NELIX_EXECUTOR", "demo"),
-                 "task": "create test.txt containing the word nelix"})["session_id"]
+                 "task": "create test.txt containing the word nelix",
+                 "cwd": str(tmp_path)})["session_id"]
     after = 0
     deadline = time.time() + 180
     while time.time() < deadline:
@@ -34,7 +35,7 @@ def test_local_task_reaches_decision_and_creates_file(tmp_path):
                   {"session_id": sid, "event_id": evt["event_id"], "answer": "1"})
         elif evt["kind"] in ("done", "crashed"):
             break
-    target = os.path.expanduser("~/tmp/nelix-skeleton/test.txt")
+    target = os.path.join(str(tmp_path), "test.txt")   # lands in the per-session cwd, not a skeleton dir
     assert os.path.exists(target)
     _call("POST", "/stop", {"session_id": sid})
 
@@ -48,7 +49,8 @@ def test_supervisor_spawns_daemon_and_runs(tmp_path, monkeypatch):
     base, token = supervisor.ensure_running()
     try:
         sid = RpcClient(base, token).start(os.environ["NELIX_EXECUTOR"],
-                                           "create test.txt containing the word nelix")["session_id"]
+                                           "create test.txt containing the word nelix",
+                                           str(tmp_path))["session_id"]
         assert sid
     finally:
         supervisor.teardown()

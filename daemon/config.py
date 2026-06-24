@@ -8,7 +8,6 @@ class ExecutorSpec:
     command: str
     args: list
     env: dict
-    cwd: str
     driver: str
     launcher: str = "auto"
     settle_seconds: float = 1.5
@@ -27,9 +26,6 @@ class ExecutorSpec:
             merged[k] = os.path.expanduser(str(v))
         return merged
 
-    def resolved_cwd(self):
-        return os.path.expanduser(self.cwd)
-
 
 def load_executors(path):
     with open(path, "rb") as f:
@@ -42,7 +38,6 @@ def load_executors(path):
             command=spec["command"],
             args=list(spec.get("args", [])),
             env=dict(spec.get("env", {})),
-            cwd=spec.get("cwd", "."),
             driver=spec["driver"],
             launcher=spec.get("launcher", "auto"),
             settle_seconds=float(spec.get("settle_seconds", 1.5)),

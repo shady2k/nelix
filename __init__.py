@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from pathlib import Path
 
 from .rpc_client import RpcClient
@@ -16,10 +17,13 @@ def register(ctx):
     registry.seed_if_absent()
 
     def nelix_start(args, **k):
-        _log.info("nelix_start executor=%s", args["executor"])
+        # cwd is per-session: caller-supplied project dir, else this orchestrator's own
+        # working dir (no static config cwd). The daemon resolves/validates it host-side.
+        cwd = args.get("cwd") or os.getcwd()
+        _log.info("nelix_start executor=%s cwd=%s", args["executor"], cwd)
         resolve_launcher("auto")               # isolation parity: fail closed
         base, token = supervisor.ensure_running()
-        body = RpcClient(base, token).start(args["executor"], args["task"])
+        body = RpcClient(base, token).start(args["executor"], args["task"], cwd)
         arm_waiter(ctx, base, after_seq=0, token_file=supervisor.state_file())
         return json.dumps(body)
 
@@ -71,10 +75,12 @@ def register(ctx):
             " that works on its own and pauses only to ask permission or make a decision. Spawns"
             " the session, returns its session_id, and arms a wake-up for the next decision."
             " 'executor' is a configured name. Use this to hand dev work to the CLI instead of"
-            " doing it yourself. Before orchestrating, you MUST call"
-            " skill_view(\"nelix:nelix-orchestration\") to read the turn-by-turn contract."),
+            " doing it yourself. 'cwd' is the working directory (project/repo) the executor"
+            " runs in; omit it to use your own current working directory. Before orchestrating,"
+            " you MUST call skill_view(\"nelix:nelix-orchestration\") to read the contract."),
          "parameters": {**_OBJ,
-                        "properties": {"executor": {"type": "string"}, "task": {"type": "string"}},
+                        "properties": {"executor": {"type": "string"}, "task": {"type": "string"},
+                                       "cwd": {"type": "string"}},
                         "required": ["executor", "task"]}},
         nelix_start)
     ctx.register_tool(
