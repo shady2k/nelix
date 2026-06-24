@@ -1,8 +1,9 @@
+manifest_version: 1
 name: nelix
 version: 0.1.0
 description: "Orchestrate a config-defined agentic CLI over a PTY; relay decision points to the user."
-author: nelix
-hooks: []
-provides:
-  tools: [nelix_start, nelix_status, nelix_respond, nelix_stop]
-  commands: [nelix]
+author: shady2k
+kind: standalone
+provides_tools: [nelix_start, nelix_status, nelix_respond, nelix_stop]
+provides_hooks:
+  - on_session_end
