@@ -66,11 +66,35 @@ def test_register_wires_tools_command_skill_hook(monkeypatch, tmp_path):
         assert "nelix" in ctx.commands
         assert "nelix-orchestration" in ctx.skills
         assert "on_session_end" in ctx.hooks
-        assert "opencode" in ctx.tools["nelix_start"]["description"]
-        assert "skill_view" in ctx.tools["nelix_start"]["description"]
+        # description lives INSIDE the schema (Hermes' LLM builder reads schema, not the
+        # description= kwarg) — see test_tool_schemas_are_llm_function_shaped.
+        assert "opencode" in ctx.tools["nelix_start"]["schema"]["description"]
+        assert "skill_view" in ctx.tools["nelix_start"]["schema"]["description"]
         out = ctx.tools["nelix_start"]["handler"]({"executor":"opencode","task":"go"})
         assert json.loads(out)["session_id"] == "s1"
         assert ctx.dispatched and ctx.dispatched[0][0] == "terminal"
+    finally:
+        nelix.supervisor.teardown()
+
+
+def test_tool_schemas_are_llm_function_shaped(monkeypatch, tmp_path):
+    """Each tool's schema must be a full function schema (description + parameters),
+    because Hermes builds the LLM tool spec as {**schema, "name": name} (tools/
+    registry.py) — a bare parameters object + description= kwarg is dropped and the
+    model sees an undescribed, paramless tool."""
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    try:
+        nelix.register(ctx)
+        for tname in ("nelix_start", "nelix_status", "nelix_respond", "nelix_stop"):
+            fn = {**ctx.tools[tname]["schema"], "name": tname}  # mirror Hermes' builder
+            assert fn.get("description"), f"{tname}: no description in the LLM function spec"
+            params = fn.get("parameters")
+            assert isinstance(params, dict) and params.get("type") == "object", \
+                f"{tname}: parameters missing/!=object in the LLM function spec"
+        start = ctx.tools["nelix_start"]["schema"]["parameters"]
+        assert {"executor", "task"} <= set(start["properties"])
+        assert start.get("required") == ["executor", "task"]
     finally:
         nelix.supervisor.teardown()
 

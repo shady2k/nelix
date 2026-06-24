@@ -46,41 +46,49 @@ def register(ctx):
         return json.dumps(RpcClient(base, token).stop(args["session_id"]))
 
     names = ", ".join(registry.names()) or "the configured CLI"
+    # Hermes builds the LLM tool spec as {"type":"function","function":{**schema,"name":name}}
+    # (tools/registry.py), so `schema` MUST be the full function schema with `description`
+    # and `parameters` nested — exactly like plugins/google_meet's MEET_JOIN_SCHEMA. A bare
+    # parameters object + a `description=` kwarg is dropped: the LLM sees no description and
+    # no parameters.
     ctx.register_tool(
         "nelix_start", "nelix",
-        {**_OBJ, "properties": {"executor": {"type": "string"}, "task": {"type": "string"}},
-         "required": ["executor", "task"]},
-        nelix_start,
-        description=(
+        {"description": (
             f"Delegate a task to an agentic CLI executor ({names}) — an autonomous coding agent"
             " that works on its own and pauses only to ask permission or make a decision. Spawns"
             " the session, returns its session_id, and arms a wake-up for the next decision."
             " 'executor' is a configured name. Use this to hand dev work to the CLI instead of"
             " doing it yourself. Before orchestrating, you MUST call"
-            " skill_view(\"nelix:nelix-orchestration\") to read the turn-by-turn contract."))
+            " skill_view(\"nelix:nelix-orchestration\") to read the turn-by-turn contract."),
+         "parameters": {**_OBJ,
+                        "properties": {"executor": {"type": "string"}, "task": {"type": "string"}},
+                        "required": ["executor", "task"]}},
+        nelix_start)
     ctx.register_tool(
         "nelix_status", "nelix",
-        {**_OBJ, "properties": {"session_id": {"type": "string"}}},
-        nelix_status,
-        description=(
+        {"description": (
             "Inspect an orchestrated executor: its current state and any decision it is blocked"
             " on awaiting your answer. Omit session_id to list active sessions. Call this every"
-            " turn while a session is active so a missed wake-up is recovered."))
+            " turn while a session is active so a missed wake-up is recovered."),
+         "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}}}},
+        nelix_status)
     ctx.register_tool(
         "nelix_respond", "nelix",
-        {**_OBJ, "properties": {"session_id": {"type": "string"}, "event_id": {"type": "string"},
-                                "answer": {"type": "string"}, "after_seq": {"type": "integer"}},
-         "required": ["session_id", "event_id", "answer"]},
-        nelix_respond,
-        description=(
+        {"description": (
             "Answer the decision a paused executor asked about (e.g. '1' to approve, or free text)"
             " so it resumes. Bound to that decision's exact event_id; pass the last-seen after_seq"
-            " so the next wake-up fires on a new decision, not the one just answered."))
+            " so the next wake-up fires on a new decision, not the one just answered."),
+         "parameters": {**_OBJ,
+                        "properties": {"session_id": {"type": "string"}, "event_id": {"type": "string"},
+                                       "answer": {"type": "string"}, "after_seq": {"type": "integer"}},
+                        "required": ["session_id", "event_id", "answer"]}},
+        nelix_respond)
     ctx.register_tool(
         "nelix_stop", "nelix",
-        {**_OBJ, "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
-        nelix_stop,
-        description="Terminate a running executor session by session_id.")
+        {"description": "Terminate a running executor session by session_id.",
+         "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
+                        "required": ["session_id"]}},
+        nelix_stop)
 
     def slash_nelix(raw_args):
         raw = (raw_args or "").strip()
