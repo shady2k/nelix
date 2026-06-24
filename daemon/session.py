@@ -142,10 +142,11 @@ class Session:
             turn = self._dialog.current_turn()
             start = self._dialog._turn_starts[turn]
             end = self._dialog.line_count()
-            text = self._dialog.range_text(start, end,
-                                           limit=self._spec.status_tail_chars)["text"]
+            page = self._dialog.range_text(start, end, limit=self._spec.status_tail_chars)
+            text = page["text"]
             decision = {"kind": kind, "turn_index": turn, "range": (start, end),
-                        "hint": hint, "hung": hung, "text": text}
+                        "hint": hint, "hung": hung, "text": text,
+                        "total_len": page["total_len"], "truncated": page["truncated"]}
             if kind == "waiting_for_user":
                 self._decision = decision
         # publish OUTSIDE the session lock (lock order: never hold it across a queue publish).
@@ -167,9 +168,9 @@ class Session:
             if self._decision is not None:
                 # serve the FROZEN range, not a mutating "latest turn".
                 s, e = self._decision["range"]
-                snap["decision"] = {**self._decision,
-                                    "text": self._dialog.range_text(
-                                        s, e, limit=self._spec.status_tail_chars)["text"]}
+                page = self._dialog.range_text(s, e, limit=self._spec.status_tail_chars)
+                snap["decision"] = {**self._decision, "text": page["text"],
+                                    "total_len": page["total_len"], "truncated": page["truncated"]}
             return snap
 
     def respond(self, event_id, answer):

@@ -21,6 +21,10 @@ class HangSpec(Spec):
     hang_timeout = 5.0
 
 
+class TruncSpec(Spec):
+    status_tail_chars = 5
+
+
 class FakeHandle:
     """Scripted PTY: render() walks `frames`; process stays alive, the loop is terminated
     by setting `stop` once the last frame is reached (so classify never sees a false exit)."""
@@ -133,6 +137,16 @@ def test_stop_edge_emits_frozen_respondable_event(monkeypatch, tmp_path):
     sess._dialog.add_line("LATE OUTPUT")
     assert sess.snapshot()["decision"]["text"] == frozen
     assert "LATE OUTPUT" not in sess.snapshot()["decision"]["text"]
+
+
+def test_decision_reports_truncation(monkeypatch, tmp_path):
+    box = "Hello answer.\n❯ "
+    sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box], spec=TruncSpec())
+    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
+    sess._loop()
+    dec = sess.snapshot()["decision"]
+    assert dec["truncated"] is True
+    assert dec["total_len"] > len(dec["text"]) and len(dec["text"]) <= 5
 
 
 def test_quiet_working_emits_no_event(monkeypatch, tmp_path):

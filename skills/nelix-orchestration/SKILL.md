@@ -22,9 +22,9 @@ Your job is to relay each decision to the user and feed the answer back — not 
    if several are active). The **user decides** — don't answer it yourself.
    - `decision.hint == "needs_permission"` → a permission menu (the answer is usually a number, e.g. `1`).
      Otherwise it's a free-text question.
-   - `decision.text` is the tail of the turn (capped). To read the **full question or an earlier turn**
-     the wake-up summarized, call `nelix_dialog(session_id)` (latest turn) or
-     `nelix_dialog(session_id, turn=N, offset=M)` to page.
+   - `decision.text` is the turn's text capped to `status_tail_chars`. If `decision.truncated` is
+     true it was cut (`decision.total_len` = full length) — call `nelix_dialog(session_id)` to read
+     the **full question**. Use `nelix_dialog(session_id, turn=N, offset=M)` to review an earlier turn.
    - `decision.hung == true` → the executor made no progress for a long time and nelix nudged it with
      ESC; it may be wedged. Relay that and let the user decide (answer, or `nelix_stop`).
 4. `nelix_respond(session_id, decision.event_id, answer)` with the user's answer; pass the last-seen
