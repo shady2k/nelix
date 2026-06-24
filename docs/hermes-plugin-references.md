@@ -50,3 +50,31 @@ venv** (the venv whose `python` is the plugin's `sys.executable` — here
 Auto-ensure (pattern 1) on first `nelix_start`, inside `supervisor.ensure_running()`,
 honoring the pattern-2 security gate, with a clear manual-`pip` fallback message. Keeps
 zero-config install true.
+
+## End-user install workflow (verified against `hermes_cli/plugins_cmd.py`)
+How a user installs nelix, grounded in the installed Hermes source (more accurate than the
+public guide, which omits some of this):
+
+- **Canonical:** `hermes plugins install shady2k/nelix --enable`
+  - `owner/repo` shorthand → clones `https://github.com/shady2k/nelix.git` into
+    `get_hermes_home()/plugins/nelix` (profile-scoped: the profile you run it from).
+    Also accepts full https/ssh/browser git URLs and an `owner/repo/subdir` form. Because
+    the repo ROOT is the plugin (Task 1 hoist), no subdir is needed.
+  - `--enable` installs + enables; without it, prompts `Enable 'nelix' now? [y/N]` (default N).
+    Manage later via `hermes plugins enable/disable nelix` or `plugins.enabled` in config.yaml.
+  - **GitHub-clone path ⇒ the repo must be pushed** (`git push origin main`); a local `main`
+    that's ahead of `origin/main` won't be what users get.
+- **`requires_env`** is empty in our manifest → install prompts for NO credentials (zero-config).
+- **`after-install.md` IS surfaced** on install (`plugins_cmd.py:6` + `_display_after_install`,
+  ~line 391) — contradicts the public user-guide, which doesn't mention the mechanism. Our
+  `after-install.md` (executor-registry setup + dep note) is shown to the user immediately.
+- **Restart Hermes** after install/enable (plugins load at startup).
+- Discovery order (later overrides earlier): bundled `<repo>/plugins/` → user
+  `get_hermes_home()/plugins/` → project `./.hermes/plugins/` (needs
+  `HERMES_ENABLE_PROJECT_PLUGINS=true`) → pip entry points (`hermes_agent.plugins`).
+- Mgmt: `hermes plugins list` (enabled/disabled/not-enabled), `... info`, `... update nelix`,
+  `... remove nelix`. Local dev: drop/symlink the repo at `get_hermes_home()/plugins/nelix`
+  + enable (no GitHub needed).
+- **Post-install (one-time, operator):** fill `$HERMES_HOME/nelix/nelix.toml` (seeded from
+  `nelix.toml.example`) with an executor; `pyte`/`ptyprocess` auto-install venv-scoped on the
+  first `nelix_start`. Then converse: "code with <executor>: <task>".
