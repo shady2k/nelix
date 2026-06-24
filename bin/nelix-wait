@@ -3,12 +3,28 @@
 import argparse, json, os, sys, urllib.request
 
 
+def _read_token(token_file):
+    """Token from the supervisor state file (--token-file) — the terminal tool
+    that arms this waiter does NOT forward an `env` dict, so the token cannot be
+    relied on in the environment. Falls back to NELIX_RPC_TOKEN for manual runs."""
+    if token_file:
+        with open(token_file) as f:
+            return json.load(f)["token"]
+    tok = os.environ.get("NELIX_RPC_TOKEN")
+    if not tok:
+        print("nelix-wait: no token (pass --token-file or set NELIX_RPC_TOKEN)",
+              file=sys.stderr)
+        sys.exit(2)
+    return tok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default=os.environ.get("NELIX_RPC", "http://127.0.0.1:8765"))
     ap.add_argument("--after", type=int, default=0)
+    ap.add_argument("--token-file", dest="token_file", default=None)
     args = ap.parse_args()
-    token = os.environ["NELIX_RPC_TOKEN"]
+    token = _read_token(args.token_file)
     after = args.after
     try:
         while True:

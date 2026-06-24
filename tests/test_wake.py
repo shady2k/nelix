@@ -12,14 +12,19 @@ class FakeCtx:
         self.dispatched.append((name, args)); return "{}"
 
 
-def test_arm_waiter_uses_bundled_path_and_token():
+def test_arm_waiter_passes_token_file_not_env(tmp_path):
     ctx = FakeCtx()
-    wake.arm_waiter(ctx, "http://127.0.0.1:9000", "secrettok", after_seq=5)
+    tf = tmp_path / ".active.json"
+    wake.arm_waiter(ctx, "http://127.0.0.1:9000", after_seq=5, token_file=tf)
     assert len(ctx.dispatched) == 1
     name, args = ctx.dispatched[0]
     assert name == "terminal"
     assert args["background"] is True and args["notify_on_complete"] is True
-    assert str(Path(wake.__file__).parent / "bin" / "nelix-wait") in args["command"]
-    assert "--after 5" in args["command"]
-    assert args["env"]["NELIX_RPC_TOKEN"] == "secrettok"
-    assert args["env"]["NELIX_RPC"] == "http://127.0.0.1:9000"
+    cmd = args["command"]
+    assert str(Path(wake.__file__).parent / "bin" / "nelix-wait") in cmd
+    assert "--base" in cmd and "http://127.0.0.1:9000" in cmd
+    assert "--after 5" in cmd
+    assert "--token-file" in cmd and str(tf) in cmd
+    # The terminal tool ignores an `env` dict, so the token must NOT travel that way;
+    # and it must NOT be inlined in the command (avoids ps / redact_secrets exposure).
+    assert "env" not in args

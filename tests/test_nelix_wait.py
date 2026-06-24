@@ -39,6 +39,35 @@ def test_nelix_wait_reissues_then_prints_event():
     assert rec["event_id"] == "evt-x" and rec["session_id"] == "s1" and rec["seq"] == 5
 
 
+def test_nelix_wait_reads_token_from_token_file(tmp_path):
+    seen = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["tok"] = self.headers.get("X-Nelix-Token")
+            body = json.dumps({"event": {"seq": 7, "session_id": "s2", "event_id": "evt-y",
+                                         "executor": EXECUTOR, "kind": "done",
+                                         "summary": "done"}}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        def log_message(self, *a): pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 8792), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    tf = tmp_path / ".active.json"
+    tf.write_text(json.dumps({"pid": 1, "port": 8792, "token": "filetok"}))
+    try:
+        out = subprocess.check_output(
+            [sys.executable, str(ROOT / "bin" / "nelix-wait"),
+             "--base", "http://127.0.0.1:8792", "--after", "0", "--token-file", str(tf)],
+            env={"PATH": "/usr/bin:/bin"}, timeout=10, text=True)  # NO NELIX_RPC_TOKEN in env
+    finally:
+        srv.shutdown()
+    assert seen["tok"] == "filetok"   # token read from the file and sent in the header
+    assert json.loads(out.strip())["event_id"] == "evt-y"
+
+
 def test_nelix_wait_graceful_interrupt():
     hit = threading.Event()
     class BlockingHandler(BaseHTTPRequestHandler):

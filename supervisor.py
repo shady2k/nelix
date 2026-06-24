@@ -116,6 +116,12 @@ def _state_file() -> Path:
     return _root() / ".active.json"
 
 
+def state_file() -> Path:
+    """Public path of the 0600 state file holding {pid,port,token}. The wake
+    waiter reads the RPC token from here (see wake.arm_waiter)."""
+    return _state_file()
+
+
 def _daemon_argv():
     return [sys.executable, "-m", "daemon.app"]
 

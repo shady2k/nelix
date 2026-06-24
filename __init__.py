@@ -17,7 +17,7 @@ def register(ctx):
         resolve_launcher("auto")               # isolation parity: fail closed
         base, token = supervisor.ensure_running()
         body = RpcClient(base, token).start(args["executor"], args["task"])
-        arm_waiter(ctx, base, token, after_seq=0)
+        arm_waiter(ctx, base, after_seq=0, token_file=supervisor.state_file())
         return json.dumps(body)
 
     def nelix_status(args, **k):
@@ -35,7 +35,8 @@ def register(ctx):
         ok, body = RpcClient(base, token).respond(
             args["session_id"], args["event_id"], args["answer"])
         if ok:
-            arm_waiter(ctx, base, token, after_seq=int(args.get("after_seq", 0)))
+            arm_waiter(ctx, base, after_seq=int(args.get("after_seq", 0)),
+                       token_file=supervisor.state_file())
         return json.dumps(body)
 
     def nelix_stop(args, **k):
@@ -68,8 +69,9 @@ def register(ctx):
         "nelix_status", "nelix",
         {"description": (
             "Inspect an orchestrated executor: its current state and any decision it is blocked"
-            " on awaiting your answer. Omit session_id to list active sessions. Call this every"
-            " turn while a session is active so a missed wake-up is recovered."),
+            " on awaiting your answer. Omit session_id to list active sessions. Call this ONCE"
+            " each time the wake-up brings you back, to reconcile state — do NOT poll it in a loop"
+            " while the executor runs (that wastes tokens; you sleep between decisions)."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}}}},
         nelix_status)
     ctx.register_tool(
