@@ -28,12 +28,13 @@ def _executor_names():
 
 def register(ctx):
     base = os.environ.get("NELIX_RPC", "http://127.0.0.1:8765")
+    token = os.environ["NELIX_RPC_TOKEN"]
 
     def nelix_start(args, **k):
         # Isolation parity: fail closed before doing anything (raises if weaker/post-MVP).
         resolve_launcher("auto")
         body = _client().start(args["executor"], args["task"])
-        arm_waiter(ctx, base, after_seq=0)
+        arm_waiter(ctx, base, token, after_seq=0)
         return json.dumps(body)
 
     def nelix_status(args, **k):
@@ -43,7 +44,7 @@ def register(ctx):
         ok, body = _client().respond(args["session_id"], args["event_id"], args["answer"])
         # Re-arm the waiter so the next decision wakes us again.
         if ok:
-            arm_waiter(ctx, base, after_seq=int(args.get("after_seq", 0)))
+            arm_waiter(ctx, base, token, after_seq=int(args.get("after_seq", 0)))
         return json.dumps(body)
 
     def nelix_stop(args, **k):
