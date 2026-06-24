@@ -62,7 +62,7 @@ def register(ctx):
         return json.dumps(RpcClient(base, token).dialog(
             args["session_id"], args.get("turn"), int(args.get("offset", 0)), args.get("limit")))
 
-    names = ", ".join(registry.names()) or "the configured CLI"
+    names = ", ".join(registry.names()) or "a configured agent"
     # Hermes builds the LLM tool spec as {"type":"function","function":{**schema,"name":name}}
     # (tools/registry.py), so `schema` MUST be the full function schema with `description`
     # and `parameters` nested — exactly like plugins/google_meet's MEET_JOIN_SCHEMA. A bare
@@ -71,13 +71,11 @@ def register(ctx):
     ctx.register_tool(
         "nelix_start", "nelix",
         {"description": (
-            f"Delegate a task to an agentic CLI executor ({names}) — an autonomous coding agent"
-            " that works on its own and pauses only to ask permission or make a decision. Spawns"
-            " the session, returns its session_id, and arms a wake-up for the next decision."
-            " 'executor' is a configured name. Use this to hand dev work to the CLI instead of"
-            " doing it yourself. 'cwd' is the working directory (project/repo) the executor"
-            " runs in; omit it to use your own current working directory. Before orchestrating,"
-            " you MUST call skill_view(\"nelix:nelix-orchestration\") to read the contract."),
+            f"Hand a coding/dev task to a named agent ({names}); it works on its own and pauses"
+            " only for a decision or when done. Returns at once — you're brought back when it needs"
+            " you or finishes, and spend nothing meanwhile. 'executor' is the agent's configured"
+            " name; 'cwd' is the project dir it runs in (omit = your current dir). Before driving"
+            " it, you MUST call skill_view(\"nelix:nelix-orchestration\")."),
          "parameters": {**_OBJ,
                         "properties": {"executor": {"type": "string"}, "task": {"type": "string"},
                                        "cwd": {"type": "string"}},
@@ -86,18 +84,17 @@ def register(ctx):
     ctx.register_tool(
         "nelix_status", "nelix",
         {"description": (
-            "Inspect an orchestrated executor: its current state and any decision it is blocked"
-            " on awaiting your answer. Omit session_id to list active sessions. Call this ONCE"
-            " each time the wake-up brings you back, to reconcile state — do NOT poll it in a loop"
-            " while the executor runs (that wastes tokens; you sleep between decisions)."),
+            "Check a running agent: its state and any pending decision. Omit session_id to list all"
+            " running agents. Call this ONCE each time you're brought back — never poll it in a loop"
+            " while the agent works."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}}}},
         nelix_status)
     ctx.register_tool(
         "nelix_respond", "nelix",
         {"description": (
-            "Answer the decision a paused executor asked about (e.g. '1' to approve, or free text)"
-            " so it resumes. Bound to that decision's exact event_id; pass the last-seen after_seq"
-            " so the next wake-up fires on a new decision, not the one just answered."),
+            "Send the user's answer to a paused agent (e.g. '1' to approve, or free text) so it"
+            " continues. Bound to that decision's event_id; pass the last-seen after_seq so the next"
+            " return is a NEW decision, not this one."),
          "parameters": {**_OBJ,
                         "properties": {"session_id": {"type": "string"}, "event_id": {"type": "string"},
                                        "answer": {"type": "string"}, "after_seq": {"type": "integer"}},
@@ -105,15 +102,15 @@ def register(ctx):
         nelix_respond)
     ctx.register_tool(
         "nelix_stop", "nelix",
-        {"description": "Terminate a running executor session by session_id.",
+        {"description": "Stop a running agent by session_id.",
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
                         "required": ["session_id"]}},
         nelix_stop)
     ctx.register_tool(
         "nelix_dialog", "nelix",
-        {"description": ("Read an orchestrated executor's dialog transcript: the latest turn by"
-                         " default, or an earlier `turn` index, paginated by `offset`/`limit`. Use"
-                         " to read a long question or review earlier turns the wake-up summarized."),
+        {"description": ("Read an agent's transcript: the latest turn by default, or an earlier `turn`"
+                         " index, paginated by `offset`/`limit`. For a long question or earlier turns —"
+                         " not for polling progress."),
          "parameters": {**_OBJ, "properties": {
              "session_id": {"type": "string"}, "turn": {"type": "integer"},
              "offset": {"type": "integer"}, "limit": {"type": "integer"}},
@@ -123,22 +120,21 @@ def register(ctx):
     def slash_nelix(raw_args):
         raw = (raw_args or "").strip()
         if not raw or ":" not in raw:
-            return "Usage: /nelix <executor>: <task>   (e.g. /nelix opencode: fix the test)"
+            return "Usage: /nelix <agent>: <task>   (e.g. /nelix <agent>: fix the test)"
         executor, _, task = raw.partition(":")
         if not task.strip():
-            return "Usage: /nelix <executor>: <task>"
+            return "Usage: /nelix <agent>: <task>"
         return nelix_start({"executor": executor.strip(), "task": task.strip()})
 
     ctx.register_command(
         "nelix", slash_nelix,
-        description="Delegate a task to an agentic CLI executor and orchestrate it."
-                    " Usage: /nelix <executor>: <task>",
-        args_hint="<executor>: <task>")
+        description="Hand a task to a named coding agent and drive it. Usage: /nelix <agent>: <task>",
+        args_hint="<agent>: <task>")
 
     ctx.register_skill(
         "nelix-orchestration", _SKILLS_DIR / "nelix-orchestration" / "SKILL.md",
-        description=("How to delegate a coding/dev task to an agentic CLI executor via the nelix_*"
-                     " tools — drive it and relay its decisions to the user."))
+        description=("Drive a named coding agent via the nelix_* tools as a companion — hold the"
+                     " goal, recover, and bring real decisions to the user."))
 
     # on_session_finalize, NOT on_session_end: on_session_end fires at the end of every
     # run_conversation (i.e. every turn) + interrupted exits, which would tear the daemon
