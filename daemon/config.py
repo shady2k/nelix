@@ -70,9 +70,8 @@ class RetentionConfig:
 
 def _cfg_int(data, key, default, floor):
     v = data.get(key, default)
-    try:
-        v = int(v)
-    except (TypeError, ValueError):
+    # Strictly int: reject bool (a subclass of int), float (e.g. 1.9), str, etc. -> default.
+    if isinstance(v, bool) or not isinstance(v, int):
         return default
     return v if v >= floor else default
 

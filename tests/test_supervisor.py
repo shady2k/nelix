@@ -201,3 +201,20 @@ def test_teardown_logs_to_nelix_logger(monkeypatch, tmp_path, caplog):
         supervisor.teardown("unit test")
     msgs = " ".join(r.getMessage() for r in caplog.records)
     assert "unit test" in msgs
+
+
+def test_prune_spares_current_file_and_keeps_total_retain(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    root = supervisor._root(); root.mkdir(parents=True)
+    # 3 old files (one FUTURE-dated so it sorts newest) + a "current" file with an OLDER mtime.
+    # current must survive regardless of mtime, and the total must be exactly retain=2.
+    for i, mt in enumerate((100, 5000, 200)):           # index 1 is future-dated
+        f = root / f"daemon-2026010{i}-000000-{900 + i}.log"
+        f.write_text("x"); os.utime(f, (mt, mt))
+    current = root / f"daemon-20260109-000000-{os.getpid()}.log"
+    current.write_text("c"); os.utime(current, (300, 300))   # NOT the newest by mtime
+    supervisor._prune_daemon_logs(root, retain=2, keep=current)
+    remaining = {p.name for p in root.glob("daemon-*-*.log")}
+    assert current.name in remaining                    # current spared despite older mtime
+    assert len(remaining) == 2                            # exactly retain total

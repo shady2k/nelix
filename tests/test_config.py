@@ -83,3 +83,12 @@ def test_load_retention_validates(tmp_path):
     assert r.daemon_log_retain == 10      # 0 < floor 1 -> default
     assert r.session_retain == 0          # 0 is valid (disabled)
     assert r.session_max_age_days == 7    # negative -> default
+
+
+def test_load_retention_rejects_float_and_bool(tmp_path):
+    from daemon.config import load_retention
+    cfg = tmp_path / "n.toml"
+    # non-int TOML values (float, bool) must fall back to the default, not coerce via int().
+    cfg.write_text("daemon_log_retain = 1.9\nsession_retain = true\nsession_max_age_days = 2.0\n")
+    r = load_retention(str(cfg))
+    assert (r.daemon_log_retain, r.session_retain, r.session_max_age_days) == (10, 20, 7)

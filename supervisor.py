@@ -1,7 +1,7 @@
 """Lifecycle of the ephemeral orchestration daemon (one per Hermes gateway).
 
 Modelled on plugins/google_meet/process_manager.py: detached child, single
-state file under $HERMES_HOME/nelix/, SIGTERM->SIGKILL teardown. The daemon is
+state file under $HERMES_HOME/workspace/nelix/, SIGTERM->SIGKILL teardown. The daemon is
 NOT meant to survive a Hermes restart (BR-11 dropped) — on_session_end tears it
 down; a fresh one is spawned on the next nelix_start.
 """
@@ -190,7 +190,7 @@ def _open_daemon_log(root) -> Path:
     log_path.touch()
     _refresh_latest(root, log_path)
     retain = load_retention(str(paths.config_path())).daemon_log_retain
-    _prune_daemon_logs(root, retain)
+    _prune_daemon_logs(root, retain, keep=log_path)
     return log_path
 
 
@@ -206,10 +206,14 @@ def _refresh_latest(root, target) -> None:
         pass
 
 
-def _prune_daemon_logs(root, retain) -> None:
-    files = [p for p in root.glob(paths.DAEMON_LOG_GLOB) if not p.is_symlink()]
+def _prune_daemon_logs(root, retain, keep=None) -> None:
+    # Never a deletion candidate: the daemon-latest.log symlink, and the just-created
+    # file (`keep`) — it must survive regardless of any odd/future mtime on older files.
+    files = [p for p in root.glob(paths.DAEMON_LOG_GLOB)
+             if not p.is_symlink() and (keep is None or p.name != keep.name)]
     files.sort(key=lambda p: p.stat().st_mtime)            # oldest first
-    for p in files[:max(0, len(files) - retain)]:
+    budget = retain - 1 if keep is not None else retain    # `keep` occupies one slot of `retain`
+    for p in files[:max(0, len(files) - max(0, budget))]:
         try:
             p.unlink()
         except OSError:
