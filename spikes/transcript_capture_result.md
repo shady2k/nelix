@@ -45,9 +45,14 @@ long-turn bodies require the deferred structured-output / stream-json driver mod
 
 ## Decision for the build
 
-- **Task 4**: keep `pump()`'s raw tee + `render()`; make `_commit_scrolled` a **no-op**;
-  rely on `flush_viewport` at each stop (Task 7) to snapshot the viewport as the turn's
-  lines. Everything downstream (Dialog, paging, RPC) is unchanged.
+- **Task 4** (as built): keep `pump()`'s raw tee + `render()`. The `pyte.HistoryScreen`
+  scroll-off source (`_commit_scrolled`) is **retained but naturally inert** for this
+  alt-screen TUI — `history.top` stays empty (0 linefeeds), so it commits nothing and
+  cannot produce garbage. The effective line-source for the Claude driver is the per-stop
+  `flush_viewport` snapshot (Task 7). Retaining the scroll-off path (rather than forcing a
+  no-op) keeps capture working for normal-buffer executors (universality) and keeps the
+  plan's Task-4 test valid (it drives a real-scrolling `/bin/sh`). Everything downstream
+  (Dialog, paging, RPC) is unchanged.
 - **Fidelity caveat**: downgraded for the Claude driver — `nelix_dialog` history for long
   turns is best-effort per-stop snapshots, not a full transcript.
 - Fallback chain options (b) driver-level extraction and (c) structured-output mode remain
