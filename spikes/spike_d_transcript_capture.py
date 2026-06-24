@@ -19,6 +19,7 @@ ACCEPTANCE (record the verdict in spikes/transcript_capture_result.md):
            snapshot fallback (screen-height limited); update the spec's fidelity caveat.
 """
 import os
+import select
 import shlex
 import sys
 import time
@@ -49,7 +50,7 @@ def main():
     if cwd:
         os.makedirs(cwd, exist_ok=True)
     task = sys.argv[1] if len(sys.argv) > 1 else "say hello then stop"
-    timeout = float(os.environ.get("NELIX_SPIKE_TIMEOUT", "120"))
+    timeout = float(os.environ.get("NELIX_SPIKE_TIMEOUT", "60"))
 
     screen = pyte.HistoryScreen(COLS, ROWS, history=100000, ratio=0.5)
     stream = pyte.ByteStream(screen)
@@ -59,8 +60,16 @@ def main():
     time.sleep(2.0)                      # let the TUI settle before sending the task
     child.write((task + "\r").encode())
 
+    # select-before-read so idle periods don't block past the deadline (the executor is a
+    # long-running TUI that never exits on its own — the timeout is what stops the spike).
     deadline = time.time() + timeout
     while time.time() < deadline and child.isalive():
+        try:
+            r, _, _ = select.select([child.fd], [], [], 0.5)
+        except (OSError, ValueError):
+            break
+        if not r:
+            continue                     # idle tick — re-check the deadline
         try:
             data = child.read(65536)
         except (EOFError, OSError):
