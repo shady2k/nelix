@@ -161,7 +161,8 @@ class Session:
     # ---- reads / control ----
     def snapshot(self):
         with self._lock:
-            snap = {"state": self._state,
+            snap = {"session_id": self._id, "executor": self._executor,
+                    "state": self._state,
                     "turn_count": self._dialog.turn_count() if self._dialog else 0}
             if self._decision is not None:
                 # serve the FROZEN range, not a mutating "latest turn".

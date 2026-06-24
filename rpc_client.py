@@ -28,6 +28,15 @@ class RpcClient:
         _, body = self._call("GET", "/status" + q)
         return body
 
+    def dialog(self, session_id, turn=None, offset=0, limit=None):
+        q = f"?session_id={session_id}&offset={offset}"
+        if turn is not None:
+            q += f"&turn={turn}"
+        if limit is not None:
+            q += f"&limit={limit}"
+        _, body = self._call("GET", "/dialog" + q)
+        return body
+
     def respond(self, session_id, event_id, answer):
         st, body = self._call("POST", "/respond",
                               {"session_id": session_id, "event_id": event_id, "answer": answer})

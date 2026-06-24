@@ -25,3 +25,33 @@ def test_rpc_client_roundtrip():
         assert c.stop("s1")["stopped"] is True
     finally:
         srv.shutdown()
+
+
+class _Dialog:
+    def turn_count(self): return 3
+    def turn_text(self, turn, offset=0, limit=None):
+        return {"turn_index": turn, "text": f"t{turn}@{offset}", "total_len": 4,
+                "truncated": False, "unavailable": False}
+
+
+class _Sess:
+    dialog = _Dialog()
+
+
+class FakeManagerDialog:
+    def __init__(self): self._events = EventQueue()
+    def status(self, sid=None): return {"sessions": {}}
+    def get(self, sid): return _Sess() if sid == "s1" else None
+
+
+def test_rpc_client_dialog():
+    m = FakeManagerDialog()
+    srv = make_server(m, token="t", port=8782)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        c = RpcClient("http://127.0.0.1:8782", "t")
+        d = c.dialog("s1", turn=1, offset=2)
+        assert d["turn_index"] == 1 and d["text"] == "t1@2"
+        assert c.dialog("s1")["turn_index"] == 2          # default -> latest
+    finally:
+        srv.shutdown()

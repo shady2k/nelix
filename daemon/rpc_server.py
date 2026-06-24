@@ -32,6 +32,17 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
             elif p.path == "/status":
                 sid = parse_qs(p.query).get("session_id", [None])[0]
                 self._send(200, manager.status(sid))
+            elif p.path == "/dialog":
+                qs = parse_qs(p.query)
+                sess = manager.get(qs.get("session_id", [None])[0])
+                if sess is None or sess.dialog is None:
+                    self._send(404, {"error": "unknown session"}); return
+                turn = qs.get("turn", [None])[0]
+                turn = int(turn) if turn is not None else sess.dialog.turn_count() - 1
+                offset = int(qs.get("offset", ["0"])[0])
+                limit = qs.get("limit", [None])[0]
+                self._send(200, sess.dialog.turn_text(
+                    turn, offset, int(limit) if limit is not None else None))
             else:
                 self._send(404, {"error": "not found"})
 

@@ -83,6 +83,53 @@ def test_rpc_start_value_error_returns_409():
         srv.shutdown()
 
 
+class _FakeDialog:
+    def turn_count(self): return 3
+    def turn_text(self, turn, offset=0, limit=None):
+        return {"turn_index": turn, "text": f"turn{turn}@{offset}", "total_len": 5,
+                "truncated": False, "unavailable": False}
+
+
+class _FakeSession:
+    dialog = _FakeDialog()
+
+
+class FakeManagerWithDialog:
+    def __init__(self): self._events = EventQueue()
+    def status(self, sid=None):
+        return {"session_id": "s1", "executor": EXECUTOR, "state": "idle_prompt",
+                "turn_count": 3, "decision": {"kind": "waiting_for_user", "turn_index": 2,
+                "text": "Proceed?", "hint": "needs_permission"}}
+    def get(self, sid): return _FakeSession() if sid == "s1" else None
+
+
+def test_status_includes_decision():
+    m = FakeManagerWithDialog()
+    srv = make_server(m, token="t", port=8770)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("GET", "http://127.0.0.1:8770/status?session_id=s1")
+        assert st == 200 and b["decision"]["kind"] == "waiting_for_user"
+        assert b["decision"]["hint"] == "needs_permission"
+    finally:
+        srv.shutdown()
+
+
+def test_dialog_paginates_turn_and_defaults_to_latest():
+    m = FakeManagerWithDialog()
+    srv = make_server(m, token="t", port=8771)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("GET", "http://127.0.0.1:8771/dialog?session_id=s1&turn=1&offset=2")
+        assert st == 200 and b["turn_index"] == 1 and b["text"] == "turn1@2"
+        _, b = _req("GET", "http://127.0.0.1:8771/dialog?session_id=s1")
+        assert b["turn_index"] == 2                      # default -> latest (turn_count-1)
+        st, _ = _req("GET", "http://127.0.0.1:8771/dialog?session_id=nope")
+        assert st == 404
+    finally:
+        srv.shutdown()
+
+
 def test_rpc_start_missing_field_returns_400():
     m = FakeManager()
     srv = make_server(m, token="t", port=8769)
