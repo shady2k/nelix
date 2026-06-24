@@ -1,7 +1,7 @@
 import os
 import signal
 
-from daemon.config import load_executors, load_concurrency_limit
+from daemon.config import load_executors, load_concurrency_limit, load_retention
 from daemon.drivers import get_driver
 from daemon.launchers import get_launcher
 from daemon.events import EventQueue
@@ -27,10 +27,13 @@ def main():
         os.makedirs(spec.resolved_cwd(), exist_ok=True)
     logger = Logger()
     events = EventQueue()
+    retention = load_retention(cfg_path)
     manager = SessionManager(
         specs, events,
         launcher_factory=get_launcher, driver_factory=get_driver,
         concurrency_limit=limit, logger=logger,
+        session_retain=retention.session_retain,
+        session_max_age_days=retention.session_max_age_days,
     )
     token = os.environ["NELIX_RPC_TOKEN"]
     port = int(os.environ.get("NELIX_RPC_PORT", "8765"))
