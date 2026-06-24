@@ -6,4 +6,4 @@ author: shady2k
 kind: standalone
 provides_tools: [nelix_start, nelix_status, nelix_respond, nelix_stop]
 provides_hooks:
-  - on_session_end
+  - on_session_finalize

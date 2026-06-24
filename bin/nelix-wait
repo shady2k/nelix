@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """One-shot waiter: long-poll /wait, print the first real event as JSON, exit."""
-import argparse, json, os, sys, urllib.request
+import argparse, http.client, json, os, sys, urllib.error, urllib.request
 
 
 def _read_token(token_file):
@@ -30,8 +30,15 @@ def main():
         while True:
             req = urllib.request.Request(f"{args.base}/wait?after_seq={after}",
                                          headers={"X-Nelix-Token": token})
-            with urllib.request.urlopen(req, timeout=40) as r:
-                evt = json.loads(r.read()).get("event")
+            try:
+                with urllib.request.urlopen(req, timeout=40) as r:
+                    evt = json.loads(r.read()).get("event")
+            except (urllib.error.URLError, OSError, http.client.HTTPException):
+                # Daemon gone/unreachable (e.g. torn down, restarting). Don't crash with a
+                # traceback — exit cleanly so notify_on_complete wakes Hermes to reconcile
+                # via nelix_status instead of surfacing a scary background failure.
+                print(json.dumps({"kind": "none"}))
+                return 0
             if evt is None:
                 continue                     # timeout tick — re-issue
             print(json.dumps({"seq": evt["seq"], "session_id": evt["session_id"],

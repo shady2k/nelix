@@ -68,6 +68,19 @@ def test_nelix_wait_reads_token_from_token_file(tmp_path):
     assert json.loads(out.strip())["event_id"] == "evt-y"
 
 
+def test_nelix_wait_exits_cleanly_when_daemon_unreachable(tmp_path):
+    # If the daemon is gone/unreachable, the waiter must NOT crash with a traceback
+    # (exit 1) — it should exit 0 with {"kind":"none"} so Hermes wakes and reconciles
+    # via nelix_status instead of seeing a scary background-process failure.
+    tf = tmp_path / ".active.json"
+    tf.write_text(json.dumps({"pid": 1, "port": 1, "token": "t"}))
+    out = subprocess.check_output(
+        [sys.executable, str(ROOT / "bin" / "nelix-wait"),
+         "--base", "http://127.0.0.1:1", "--after", "0", "--token-file", str(tf)],
+        env={"PATH": "/usr/bin:/bin"}, timeout=10, text=True)
+    assert json.loads(out.strip()) == {"kind": "none"}
+
+
 def test_nelix_wait_graceful_interrupt():
     hit = threading.Event()
     class BlockingHandler(BaseHTTPRequestHandler):

@@ -112,4 +112,10 @@ def register(ctx):
         description=("How to delegate a coding/dev task to an agentic CLI executor via the nelix_*"
                      " tools — drive it and relay its decisions to the user."))
 
-    ctx.register_hook("on_session_end", lambda **kw: supervisor.teardown("session ended"))
+    # on_session_finalize, NOT on_session_end: on_session_end fires at the end of every
+    # run_conversation (i.e. every turn) + interrupted exits, which would tear the daemon
+    # down mid-task the moment the agent correctly yields between decisions. finalize fires
+    # only at true teardown (CLI exit / /new / /reset), so the daemon survives across turns
+    # (required by the wake-between-decisions design). Verified against Hermes cli.py.
+    ctx.register_hook("on_session_finalize",
+                      lambda **kw: supervisor.teardown("session finalized"))

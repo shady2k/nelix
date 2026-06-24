@@ -65,7 +65,10 @@ def test_register_wires_tools_command_skill_hook(monkeypatch, tmp_path):
         assert set(ctx.tools) == {"nelix_start","nelix_status","nelix_respond","nelix_stop"}
         assert "nelix" in ctx.commands
         assert "nelix-orchestration" in ctx.skills
-        assert "on_session_end" in ctx.hooks
+        # on_session_finalize (NOT on_session_end): the latter fires per run_conversation
+        # (every turn) and would tear the daemon down mid-task; finalize fires only at true
+        # teardown (CLI exit / /new / /reset). See test_session_finalize_hook_calls_teardown.
+        assert "on_session_finalize" in ctx.hooks
         # description lives INSIDE the schema (Hermes' LLM builder reads schema, not the
         # description= kwarg) — see test_tool_schemas_are_llm_function_shaped.
         assert "opencode" in ctx.tools["nelix_start"]["schema"]["description"]
@@ -99,11 +102,13 @@ def test_tool_schemas_are_llm_function_shaped(monkeypatch, tmp_path):
         nelix.supervisor.teardown()
 
 
-def test_session_end_hook_calls_teardown(monkeypatch, tmp_path):
+def test_session_finalize_hook_calls_teardown(monkeypatch, tmp_path):
     nelix = _load_with_fake(monkeypatch, tmp_path)
     called = {}
     monkeypatch.setattr(nelix.supervisor, "teardown", lambda *a, **k: called.setdefault("t", True))
     ctx = FakeCtx()
     nelix.register(ctx)
-    ctx.hooks["on_session_end"]()
+    # teardown must be on on_session_finalize (true teardown), NOT on_session_end (per-turn)
+    assert "on_session_end" not in ctx.hooks
+    ctx.hooks["on_session_finalize"]()
     assert called.get("t") is True
