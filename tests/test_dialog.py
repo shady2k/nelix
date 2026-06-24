@@ -1,0 +1,58 @@
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from daemon.dialog import Dialog  # noqa: E402
+
+
+def _mk(tmp_path, **kw):
+    kw.setdefault("tail_lines", 100); kw.setdefault("spool_max_bytes", 1_000_000)
+    return Dialog(tmp_path / "s1", **kw)
+
+
+def test_raw_spool_appends(tmp_path):
+    d = _mk(tmp_path)
+    d.append_raw(b"abc"); d.append_raw(b"def")
+    assert (tmp_path / "s1" / "raw").read_bytes() == b"abcdef"
+
+
+def test_lines_and_turns_indexing(tmp_path):
+    d = _mk(tmp_path)
+    assert d.current_turn() == 0
+    d.add_line("a0"); d.add_line("a1")          # turn 0: lines 0,1
+    d.mark_turn_boundary()                       # -> turn 1
+    d.add_line("b0")                             # turn 1: line 2
+    assert d.turn_count() == 2 and d.line_count() == 3 and d.current_turn() == 1
+    assert d.turn_text(0)["text"] == "a0\na1"
+    assert d.turn_text(1)["text"] == "b0"
+
+
+def test_turn_text_pagination(tmp_path):
+    d = _mk(tmp_path)
+    for i in range(5):
+        d.add_line(f"L{i}")                      # "L0\nL1\nL2\nL3\nL4" (len 14)
+    full = d.turn_text(0)
+    assert full["text"] == "L0\nL1\nL2\nL3\nL4" and full["truncated"] is False
+    page = d.turn_text(0, offset=3, limit=5)
+    assert page["text"] == "L1\nL2" and page["offset"] == 3 and page["truncated"] is True
+
+
+def test_transcript_jsonl_persisted(tmp_path):
+    d = _mk(tmp_path)
+    d.add_line("x"); d.mark_turn_boundary(); d.add_line("y")
+    recs = [json.loads(l) for l in (tmp_path / "s1" / "transcript.jsonl").read_text().splitlines()]
+    assert recs == [{"idx": 0, "turn": 0, "text": "x"}, {"idx": 1, "turn": 1, "text": "y"}]
+
+
+def test_range_text_for_frozen_event(tmp_path):
+    d = _mk(tmp_path)
+    for i in range(4):
+        d.add_line(f"L{i}")
+    assert d.range_text(1, 3)["text"] == "L1\nL2"   # [start, end)
+
+
+def test_raw_cap_drops_oldest_and_marks_base(tmp_path):
+    d = _mk(tmp_path, spool_max_bytes=4)
+    d.append_raw(b"123456")                      # exceeds 4 -> keep last 4
+    assert (tmp_path / "s1" / "raw").read_bytes() == b"3456"
