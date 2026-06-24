@@ -11,6 +11,12 @@ class ExecutorSpec:
     cwd: str
     driver: str
     launcher: str = "auto"
+    settle_seconds: float = 1.5
+    hang_timeout: float = 600.0
+    tail_lines: int = 400
+    status_tail_chars: int = 4000
+    dialog_page_chars: int = 8000
+    spool_max_bytes: int = 8_388_608
 
     def argv(self):
         return [self.command, *self.args]
@@ -39,6 +45,12 @@ def load_executors(path):
             cwd=spec.get("cwd", "."),
             driver=spec["driver"],
             launcher=spec.get("launcher", "auto"),
+            settle_seconds=float(spec.get("settle_seconds", 1.5)),
+            hang_timeout=float(spec.get("hang_timeout", 600.0)),
+            tail_lines=int(spec.get("tail_lines", 400)),
+            status_tail_chars=int(spec.get("status_tail_chars", 4000)),
+            dialog_page_chars=int(spec.get("dialog_page_chars", 8000)),
+            spool_max_bytes=int(spec.get("spool_max_bytes", 8_388_608)),
         )
     return out
 
