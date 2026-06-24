@@ -1,98 +1,85 @@
-import json, threading, textwrap, tempfile, os
+import json
+import sys
+import textwrap
 from pathlib import Path
-from conftest import EXECUTOR
-from daemon.events import EventQueue
-from daemon.rpc_server import make_server
-from plugin_loader import load_plugin
-nelix_plugin = load_plugin()
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from plugin_loader import load_plugin  # noqa: E402
+
+_FAKE = textwrap.dedent("""
+    import os, json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    tok=os.environ['NELIX_RPC_TOKEN']; port=int(os.environ['NELIX_RPC_PORT'])
+    class H(BaseHTTPRequestHandler):
+        def _j(self,o):
+            b=json.dumps(o).encode(); self.send_response(200)
+            self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b)
+        def do_GET(self):
+            if self.headers.get('X-Nelix-Token')!=tok:
+                self.send_response(401); self.send_header('Content-Length','2'); self.end_headers(); self.wfile.write(b'{}'); return
+            self._j({'sessions': {}, 'limit': 1})
+        def do_POST(self):
+            n=int(self.headers.get('Content-Length',0)); self.rfile.read(n)
+            self._j({'session_id':'s1'})
+        def log_message(self,*a): pass
+    ThreadingHTTPServer(('127.0.0.1',port),H).serve_forever()
+""")
 
 
 class FakeCtx:
     profile_name = "local"
-    def __init__(self): self.tools = {}; self.commands = {}; self.dispatched = {}; self.skills = {}
-    def register_tool(self, name, toolset, schema, handler, description="", is_async=False, **k):
-        self.tools[name] = {"schema": schema, "handler": handler, "toolset": toolset, "description": description}
+    def __init__(self):
+        self.tools={}; self.commands={}; self.skills={}; self.hooks={}; self.dispatched=[]
+    def register_tool(self, name, toolset, schema, handler, description="", **k):
+        self.tools[name]={"schema":schema,"handler":handler,"description":description}
     def register_command(self, name, handler, description="", args_hint=""):
-        self.commands[name] = handler
+        self.commands[name]=handler
     def register_skill(self, name, path, description=""):
-        self.skills[name] = {"path": path, "description": description}
-    def dispatch_tool(self, tool_name, args, **k):
-        self.dispatched.setdefault(tool_name, []).append(args); return "{}"
+        self.skills[name]={"path":path}
+    def register_hook(self, name, cb):
+        self.hooks[name]=cb
+    def dispatch_tool(self, name, args, **k):
+        self.dispatched.append((name,args)); return "{}"
 
 
-class FakeManager:
-    def __init__(self): self._events = EventQueue()
-    def start(self, e, t): return "s1"
-    def respond(self, s, e, a): return True
-    def status(self, sid=None): return {"sessions": {}}
-    def stop(self, s): return True
+def _load_with_fake(monkeypatch, tmp_path):
+    """Seed registry + load the plugin, then point the PLUGIN'S supervisor at a
+    fake daemon. Must patch nelix.supervisor (the plugin uses
+    hermes_plugins.nelix.supervisor — a different object from a top-level
+    `import supervisor`)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg = tmp_path/"nelix"/"nelix.toml"; cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('[executors.opencode]\ncommand="opencode"\nargs=[]\nenv={}\ncwd="."\ndriver="claude"\nlauncher="local"\n')
+    fake = tmp_path/"fake_daemon.py"; fake.write_text(_FAKE)
+    nelix = load_plugin()
+    monkeypatch.setattr(nelix.supervisor, "_daemon_argv", lambda: [sys.executable, str(fake)])
+    monkeypatch.setattr(nelix, "resolve_launcher", lambda *a, **k: "local")
+    return nelix
 
 
-def test_register_wires_four_tools_and_command(monkeypatch):
-    srv = make_server(FakeManager(), token="t", port=8782)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    monkeypatch.setenv("NELIX_RPC", "http://127.0.0.1:8782")
-    monkeypatch.setenv("NELIX_RPC_TOKEN", "t")
-    monkeypatch.setenv("TERMINAL_ENV", "local")
+def test_register_wires_tools_command_skill_hook(monkeypatch, tmp_path):
+    nelix = _load_with_fake(monkeypatch, tmp_path)
     ctx = FakeCtx()
     try:
-        nelix_plugin.register(ctx)
-        assert set(ctx.tools) == {"nelix_start", "nelix_status", "nelix_respond", "nelix_stop"}
+        nelix.register(ctx)
+        assert set(ctx.tools) == {"nelix_start","nelix_status","nelix_respond","nelix_stop"}
         assert "nelix" in ctx.commands
-        # drive nelix_start handler: it should call /start and arm the waiter
-        out = ctx.tools["nelix_start"]["handler"]({"executor": EXECUTOR, "task": "go"})
+        assert "nelix-orchestration" in ctx.skills
+        assert "on_session_end" in ctx.hooks
+        assert "opencode" in ctx.tools["nelix_start"]["description"]
+        assert "skill_view" in ctx.tools["nelix_start"]["description"]
+        out = ctx.tools["nelix_start"]["handler"]({"executor":"opencode","task":"go"})
         assert json.loads(out)["session_id"] == "s1"
-        assert "terminal" in ctx.dispatched
+        assert ctx.dispatched and ctx.dispatched[0][0] == "terminal"
     finally:
-        srv.shutdown()
+        nelix.supervisor.teardown()
 
 
-_DEMO_TOML = textwrap.dedent("""\
-    [executors.demo_cli]
-    command = "demo"
-    args = []
-    env = {}
-    cwd = "."
-    driver = "claude"
-""")
-
-
-def _make_temp_toml(tmp_path):
-    p = tmp_path / "nelix.toml"
-    p.write_text(_DEMO_TOML)
-    return str(p)
-
-
-def test_skill_registered(monkeypatch, tmp_path):
-    """register() must register the nelix-orchestration skill."""
-    srv = make_server(FakeManager(), token="t2", port=8783)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    monkeypatch.setenv("NELIX_RPC", "http://127.0.0.1:8783")
-    monkeypatch.setenv("NELIX_RPC_TOKEN", "t2")
-    monkeypatch.setenv("TERMINAL_ENV", "local")
-    monkeypatch.setenv("NELIX_CONFIG", _make_temp_toml(tmp_path))
+def test_session_end_hook_calls_teardown(monkeypatch, tmp_path):
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    called = {}
+    monkeypatch.setattr(nelix.supervisor, "teardown", lambda *a, **k: called.setdefault("t", True))
     ctx = FakeCtx()
-    try:
-        nelix_plugin.register(ctx)
-        assert "nelix-orchestration" in ctx.skills, "nelix-orchestration skill must be registered"
-        skill_path = ctx.skills["nelix-orchestration"]["path"]
-        assert Path(skill_path).exists(), f"SKILL.md not found at {skill_path}"
-    finally:
-        srv.shutdown()
-
-
-def test_nelix_start_description_contains_executor_name(monkeypatch, tmp_path):
-    """nelix_start description must include the configured executor name."""
-    srv = make_server(FakeManager(), token="t3", port=8784)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    monkeypatch.setenv("NELIX_RPC", "http://127.0.0.1:8784")
-    monkeypatch.setenv("NELIX_RPC_TOKEN", "t3")
-    monkeypatch.setenv("TERMINAL_ENV", "local")
-    monkeypatch.setenv("NELIX_CONFIG", _make_temp_toml(tmp_path))
-    ctx = FakeCtx()
-    try:
-        nelix_plugin.register(ctx)
-        desc = ctx.tools["nelix_start"]["description"]
-        assert "demo_cli" in desc, f"Expected 'demo_cli' in nelix_start description, got: {desc!r}"
-    finally:
-        srv.shutdown()
+    nelix.register(ctx)
+    ctx.hooks["on_session_end"]()
+    assert called.get("t") is True

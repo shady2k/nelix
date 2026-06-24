@@ -17,7 +17,10 @@ import time
 import urllib.request
 from pathlib import Path
 
-import registry
+try:
+    from . import registry
+except ImportError:           # loaded as a top-level module (tests), not as a package
+    import registry
 
 PLUGIN_ROOT = Path(__file__).parent
 _HEALTH_TIMEOUT = 10.0
