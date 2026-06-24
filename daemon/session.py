@@ -110,8 +110,8 @@ class Session:
 
     def _on_state(self, state, now):
         running = state in ("working", "quiet_working")
-        # hang backstop: alive + running but no meaningful progress for hang_timeout.
-        if running and now - self._last_progress > self._spec.hang_timeout:
+        # idle backstop: alive + running but no meaningful progress for max_idle_seconds (0 = off).
+        if running and self._spec.max_idle_seconds and now - self._last_progress > self._spec.max_idle_seconds:
             self._handle.write("\x1b")             # ESC to nudge the executor
             self._emit_stop("idle_prompt", hung=True)
             self._last_progress = now              # re-arm; do not ESC-storm

@@ -11,7 +11,7 @@ from daemon.events import EventQueue          # noqa: E402
 
 class Spec:
     settle_seconds = 1.5
-    hang_timeout = 600.0
+    max_idle_seconds = 600.0
     tail_lines = 100
     status_tail_chars = 4000
     dialog_page_chars = 8000
@@ -19,7 +19,7 @@ class Spec:
 
 
 class HangSpec(Spec):
-    hang_timeout = 5.0
+    max_idle_seconds = 5.0
 
 
 class TruncSpec(Spec):

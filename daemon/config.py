@@ -11,7 +11,9 @@ class ExecutorSpec:
     driver: str
     launcher: str = "auto"
     settle_seconds: float = 1.5
-    hang_timeout: float = 600.0
+    max_idle_seconds: float = 600.0      # recovery: no-progress watchdog (daemon); 0 = disabled
+    max_runtime_seconds: float = 0.0     # recovery: total-runtime ceiling (daemon); 0 = disabled
+    max_restarts: int = 3                # recovery: consecutive auto-restarts before escalating (Hermes)
     tail_lines: int = 400
     status_tail_chars: int = 4000
     dialog_page_chars: int = 8000
@@ -25,6 +27,15 @@ class ExecutorSpec:
         for k, v in self.env.items():
             merged[k] = os.path.expanduser(str(v))
         return merged
+
+
+def _spec_num(spec, key, default, *, cast, floor=0):
+    """Per-executor numeric tunable: non-numeric / bool / below-floor -> default
+    (don't crash the daemon load on a hand-edited typo)."""
+    v = spec.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < floor:
+        return default
+    return cast(v)
 
 
 def load_executors(path):
@@ -41,7 +52,9 @@ def load_executors(path):
             driver=spec["driver"],
             launcher=spec.get("launcher", "auto"),
             settle_seconds=float(spec.get("settle_seconds", 1.5)),
-            hang_timeout=float(spec.get("hang_timeout", 600.0)),
+            max_idle_seconds=_spec_num(spec, "max_idle_seconds", 600.0, cast=float),
+            max_runtime_seconds=_spec_num(spec, "max_runtime_seconds", 0.0, cast=float),
+            max_restarts=_spec_num(spec, "max_restarts", 3, cast=int),
             tail_lines=int(spec.get("tail_lines", 400)),
             status_tail_chars=int(spec.get("status_tail_chars", 4000)),
             dialog_page_chars=int(spec.get("dialog_page_chars", 8000)),
