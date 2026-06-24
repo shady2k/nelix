@@ -9,6 +9,7 @@ import importlib
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -46,6 +47,46 @@ def _lazy_installs_allowed() -> bool:
         return True
 
 
+def _venv_pip_install(specs):
+    """Install *specs* into the active venv (sys.executable) via a uv -> pip ->
+    ensurepip ladder, mirroring Hermes' lazy installer (tools/lazy_deps.py) so it
+    also works in a uv-managed venv that ships no pip. Returns (ok, output)."""
+    venv_root = Path(sys.executable).parent.parent
+    env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
+    # Tier 1: uv (fast; does not need pip inside the venv).
+    uv = shutil.which("uv")
+    if uv:
+        try:
+            r = subprocess.run([uv, "pip", "install", *specs], env=env,
+                               capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=300)
+            if r.returncode == 0:
+                return True, (r.stdout or "") + (r.stderr or "")
+        except (OSError, subprocess.SubprocessError):
+            pass  # fall through to pip
+    # Tier 2: python -m pip (bootstrap via ensurepip if pip is absent).
+    pip = [sys.executable, "-m", "pip"]
+    need_bootstrap = False
+    try:
+        probe = subprocess.run(pip + ["--version"], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=30)
+        need_bootstrap = probe.returncode != 0
+    except (OSError, subprocess.SubprocessError):
+        need_bootstrap = True
+    if need_bootstrap:
+        try:
+            subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"pip unavailable and ensurepip bootstrap failed: {e}"
+    try:
+        r = subprocess.run(pip + ["install", *specs], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=300)
+        return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"pip install failed: {e}"
+
+
 def _ensure_deps() -> None:
     """Make pyte/ptyprocess importable in the Hermes runtime venv (sys.executable).
 
@@ -59,14 +100,12 @@ def _ensure_deps() -> None:
             "nelix daemon needs " + " ".join(_DAEMON_DEPS)
             + " but lazy installs are disabled (security.allow_lazy_installs=false). "
             + f"Install manually: {manual}")
-    proc = subprocess.run(
-        [sys.executable, "-m", "pip", "install", *_DAEMON_DEPS],
-        capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    ok, output = _venv_pip_install(_DAEMON_DEPS)
     importlib.invalidate_caches()
-    if proc.returncode != 0 or not _deps_present():
+    if not ok or not _deps_present():
         raise RuntimeError(
             "nelix daemon dependency install failed; install manually: "
-            + manual + "\n" + (proc.stderr or proc.stdout or "")[-1000:].strip())
+            + manual + "\n" + (output or "")[-1000:].strip())
 
 
 def _root() -> Path:

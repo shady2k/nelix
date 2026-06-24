@@ -76,27 +76,16 @@ def test_stale_state_triggers_respawn(monkeypatch, tmp_path):
     supervisor.teardown()
 
 
-def test_ensure_deps_installs_venv_scoped_when_missing(monkeypatch):
+def test_ensure_deps_calls_installer_when_missing(monkeypatch):
     importlib.reload(supervisor)
     calls = []
-    # missing before install, present after (calls is non-empty post-run)
+    # missing before install, present after (calls non-empty post-run)
     monkeypatch.setattr(supervisor, "_deps_present", lambda: bool(calls))
     monkeypatch.setattr(supervisor, "_lazy_installs_allowed", lambda: True)
-
-    def fake_run(cmd, **k):
-        calls.append(cmd)
-        class R:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-        return R()
-
-    monkeypatch.setattr(supervisor.subprocess, "run", fake_run)
+    monkeypatch.setattr(supervisor, "_venv_pip_install",
+                        lambda specs: (calls.append(tuple(specs)) or (True, "")))
     supervisor._ensure_deps()
-    assert calls and calls[0][:3] == [sys.executable, "-m", "pip"]
-    assert "install" in calls[0]
-    for pkg in ("pyte", "ptyprocess"):
-        assert any(pkg in str(a) for a in calls[0])
+    assert calls == [supervisor._DAEMON_DEPS]
 
 
 def test_ensure_deps_raises_when_lazy_installs_disabled(monkeypatch):
@@ -106,3 +95,72 @@ def test_ensure_deps_raises_when_lazy_installs_disabled(monkeypatch):
     import pytest as _pt
     with _pt.raises(RuntimeError):
         supervisor._ensure_deps()
+
+
+def test_ensure_deps_raises_when_install_fails(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_deps_present", lambda: False)  # never becomes present
+    monkeypatch.setattr(supervisor, "_lazy_installs_allowed", lambda: True)
+    monkeypatch.setattr(supervisor, "_venv_pip_install", lambda specs: (False, "boom"))
+    import pytest as _pt
+    with _pt.raises(RuntimeError):
+        supervisor._ensure_deps()
+
+
+def _record_run(record, rc_for):
+    def fake(cmd, **k):
+        record.append(cmd)
+        class R:
+            returncode = rc_for(cmd)
+            stdout = ""
+            stderr = ""
+        return R()
+    return fake
+
+
+def test_venv_pip_install_prefers_uv(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor.shutil, "which",
+                        lambda b: "/usr/bin/uv" if b == "uv" else None)
+    record = []
+    monkeypatch.setattr(supervisor.subprocess, "run", _record_run(record, lambda cmd: 0))
+    ok, _out = supervisor._venv_pip_install(("pyte==0.8.2",))
+    assert ok is True
+    assert record[0][0] == "/usr/bin/uv" and record[0][1:3] == ["pip", "install"]
+    assert len(record) == 1  # uv succeeded -> no pip fallback
+
+
+def test_venv_pip_install_falls_through_to_pip_when_uv_fails(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor.shutil, "which",
+                        lambda b: "/usr/bin/uv" if b == "uv" else None)
+    record = []
+    # uv present but exits non-zero -> must fall through to the pip tier
+    monkeypatch.setattr(supervisor.subprocess, "run",
+                        _record_run(record, lambda cmd: 1 if cmd[0] == "/usr/bin/uv" else 0))
+    ok, _out = supervisor._venv_pip_install(("pyte==0.8.2",))
+    assert ok is True
+    assert record[0][0] == "/usr/bin/uv"  # uv tried first
+    assert any(c[:3] == [sys.executable, "-m", "pip"] and "install" in c for c in record)
+
+
+def test_venv_pip_install_falls_back_to_pip_when_no_uv(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor.shutil, "which", lambda b: None)
+    record = []
+    monkeypatch.setattr(supervisor.subprocess, "run", _record_run(record, lambda cmd: 0))
+    ok, _out = supervisor._venv_pip_install(("pyte==0.8.2",))
+    assert ok is True
+    assert [sys.executable, "-m", "pip", "--version"] in record
+    assert any(c[:3] == [sys.executable, "-m", "pip"] and "install" in c for c in record)
+
+
+def test_venv_pip_install_bootstraps_ensurepip_when_pip_missing(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor.shutil, "which", lambda b: None)
+    record = []
+    monkeypatch.setattr(supervisor.subprocess, "run",
+                        _record_run(record, lambda cmd: 1 if "--version" in cmd else 0))
+    ok, _out = supervisor._venv_pip_install(("pyte==0.8.2",))
+    assert ok is True
+    assert any("ensurepip" in c for c in record)
