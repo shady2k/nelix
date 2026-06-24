@@ -48,7 +48,7 @@ def _load_with_fake(monkeypatch, tmp_path):
     hermes_plugins.nelix.supervisor — a different object from a top-level
     `import supervisor`)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    cfg = tmp_path/"nelix"/"nelix.toml"; cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg = tmp_path / "workspace" / "nelix" / "nelix.toml"; cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text('[executors.opencode]\ncommand="opencode"\nargs=[]\nenv={}\ncwd="."\ndriver="claude"\nlauncher="local"\n')
     fake = tmp_path/"fake_daemon.py"; fake.write_text(_FAKE)
     nelix = load_plugin()

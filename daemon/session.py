@@ -1,16 +1,14 @@
-import os
 import threading
 import time
-from pathlib import Path
 
+import paths
 from daemon.dialog import Dialog
 from daemon.drivers.base import ClassifyCtx
 from daemon.hygiene import sanitize_answer
 
 
 def _sessions_root():
-    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return Path(home) / "nelix" / "sessions"
+    return paths.sessions_root()
 
 
 class Session:

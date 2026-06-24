@@ -2,7 +2,7 @@
 
 Nelix orchestrates an agentic CLI over a PTY and relays its decision points to you.
 
-**One-time setup:** declare your executors in `$HERMES_HOME/nelix/nelix.toml`
+**One-time setup:** declare your executors in `$HERMES_HOME/workspace/nelix/nelix.toml`
 (a starter copy was seeded on first load). Each entry maps a name to a command
 nelix runs verbatim — secret injection or wrappers are entirely yours.
 

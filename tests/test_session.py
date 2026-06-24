@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import paths                                   # noqa: E402
 from daemon.session import Session            # noqa: E402
 from daemon.dialog import Dialog              # noqa: E402
 from daemon.drivers.claude import ClaudeDriver  # noqa: E402
@@ -116,7 +117,7 @@ def _session(tmp_path, frames=(), handle=None, spec=None):
 def test_sessions_dir_resolves_under_hermes_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), EventQueue())
-    assert sess._sessions_dir == tmp_path / "nelix" / "sessions"
+    assert sess._sessions_dir == paths.sessions_root()
 
 
 def test_stop_edge_emits_frozen_respondable_event(monkeypatch, tmp_path):

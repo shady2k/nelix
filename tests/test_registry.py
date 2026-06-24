@@ -4,19 +4,21 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import paths  # noqa: E402
 import registry  # noqa: E402
 
 
 def test_hermes_home_honors_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths)
     importlib.reload(registry)
-    assert registry.hermes_home() == tmp_path
-    assert registry.config_path() == tmp_path / "nelix" / "nelix.toml"
+    assert paths.hermes_home() == tmp_path
+    assert registry.config_path() == tmp_path / "workspace" / "nelix" / "nelix.toml"
 
 
 def test_names_reads_executor_table(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    cfg = tmp_path / "nelix" / "nelix.toml"
+    cfg = paths.config_path()
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
         '[executors.opencode]\ncommand="opencode"\nargs=[]\nenv={}\ncwd="."\n'

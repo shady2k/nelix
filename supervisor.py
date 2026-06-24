@@ -19,9 +19,9 @@ import urllib.request
 from pathlib import Path
 
 try:
-    from . import registry
+    from . import paths
 except ImportError:           # loaded as a top-level module (tests), not as a package
-    import registry
+    import paths
 
 PLUGIN_ROOT = Path(__file__).parent
 _HEALTH_TIMEOUT = 10.0
@@ -109,11 +109,11 @@ def _ensure_deps() -> None:
 
 
 def _root() -> Path:
-    return registry.hermes_home() / "nelix"
+    return paths.nelix_root()
 
 
 def _state_file() -> Path:
-    return _root() / ".active.json"
+    return paths.state_file()
 
 
 def state_file() -> Path:
@@ -193,8 +193,8 @@ def ensure_running():
     env = {**os.environ,
            "NELIX_RPC_TOKEN": token,
            "NELIX_RPC_PORT": str(port),
-           "NELIX_CONFIG": str(registry.config_path()),
-           "HERMES_HOME": str(registry.hermes_home()),
+           "NELIX_CONFIG": str(paths.config_path()),
+           "HERMES_HOME": str(paths.hermes_home()),
            "PYTHONPATH": str(PLUGIN_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")}
     try:
         proc = subprocess.Popen(
