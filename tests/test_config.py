@@ -56,21 +56,22 @@ def test_recovery_thresholds_defaults_and_overrides(tmp_path):
     cfg.write_text(
         '[executors.a]\ncommand="x"\ndriver="claude"\n'
         '[executors.b]\ncommand="y"\ndriver="claude"\n'
-        'max_idle_seconds=120\nmax_runtime_seconds=3600\nmax_restarts=5\n')
+        'max_idle_seconds=120\nmax_restarts=5\n')
     specs = load_executors(str(cfg))
     a, b = specs["a"], specs["b"]
-    assert (a.max_idle_seconds, a.max_runtime_seconds, a.max_restarts) == (600.0, 0.0, 3)
-    assert (b.max_idle_seconds, b.max_runtime_seconds, b.max_restarts) == (120.0, 3600.0, 5)
+    assert (a.max_idle_seconds, a.max_restarts) == (600.0, 3)
+    assert (b.max_idle_seconds, b.max_restarts) == (120.0, 5)
     assert not hasattr(a, "hang_timeout")          # renamed, not kept alongside
+    assert not hasattr(a, "max_runtime_seconds")   # dropped: no time-ceiling logic in the daemon
 
 
 def test_recovery_thresholds_reject_bad_values(tmp_path):
     cfg = tmp_path / "n.toml"
     # non-numeric / negative / bool must fall back to the default, not crash the load.
     cfg.write_text('[executors.a]\ncommand="x"\ndriver="claude"\n'
-                   'max_idle_seconds="oops"\nmax_runtime_seconds=-5\nmax_restarts=true\n')
+                   'max_idle_seconds="oops"\nmax_restarts=true\n')
     a = load_executors(str(cfg))["a"]
-    assert (a.max_idle_seconds, a.max_runtime_seconds, a.max_restarts) == (600.0, 0.0, 3)
+    assert (a.max_idle_seconds, a.max_restarts) == (600.0, 3)
 
 
 def test_concurrency_limit(tmp_path):

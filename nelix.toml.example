@@ -8,11 +8,9 @@ env = {}                 # extra env if needed; secrets via your own secret mana
 # orchestrator's own cwd), so one executor entry serves any project.
 driver = "claude"        # which classifier to use
 launcher = "local"       # MVP: only "local" is implemented ("auto"/"docker" are post-MVP)
-# Recovery thresholds (optional; defaults shown). The daemon watches time, Hermes counts
-# restarts; the prompt/mandate can override per session.
-# max_idle_seconds    = 600   # no-progress watchdog -> escalate to you (0 = off)
-# max_runtime_seconds = 0     # total-runtime ceiling -> escalate to you (0 = off)
-# max_restarts        = 3     # consecutive auto-restarts (no progress) before escalating
+# Recovery thresholds (optional; defaults shown). The prompt/mandate can override per session.
+# max_idle_seconds = 600   # no meaningful progress for this long -> daemon escalates to you (0 = off)
+# max_restarts     = 3     # consecutive auto-restarts (no progress) before Hermes escalates
 
 # Retention (optional; defaults shown). Applied by the daemon/supervisor.
 daemon_log_retain    = 10    # how many daemon-<ts>-<pid>.log files to keep (min 1)

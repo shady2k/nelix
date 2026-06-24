@@ -187,13 +187,13 @@ def test_exit_nonzero_emits_crashed(monkeypatch, tmp_path):
     assert sess.snapshot()["state"] == "crashed"
 
 
-def test_hang_writes_esc_and_emits_hung(monkeypatch, tmp_path):
+def test_no_progress_escalates_hung_without_esc(monkeypatch, tmp_path):
     sess, ev = _session(tmp_path, ["working… esc to interrupt"] * 3, spec=HangSpec())
     monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 10]))
     sess._loop()
-    assert "\x1b" in sess._handle.writes                  # ESC written once
+    assert "\x1b" not in sess._handle.writes              # daemon is a bridge: no ESC nudge / action
     pend = ev.pending("s1")
-    assert pend is not None and pend.hung is True
+    assert pend is not None and pend.hung is True         # no-progress still escalates (wakes Hermes)
 
 
 def test_respond_answers_and_advances_turn(monkeypatch, tmp_path):

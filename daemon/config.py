@@ -12,7 +12,6 @@ class ExecutorSpec:
     launcher: str = "auto"
     settle_seconds: float = 1.5
     max_idle_seconds: float = 600.0      # recovery: no-progress watchdog (daemon); 0 = disabled
-    max_runtime_seconds: float = 0.0     # recovery: total-runtime ceiling (daemon); 0 = disabled
     max_restarts: int = 3                # recovery: consecutive auto-restarts before escalating (Hermes)
     tail_lines: int = 400
     status_tail_chars: int = 4000
@@ -53,7 +52,6 @@ def load_executors(path):
             launcher=spec.get("launcher", "auto"),
             settle_seconds=float(spec.get("settle_seconds", 1.5)),
             max_idle_seconds=_spec_num(spec, "max_idle_seconds", 600.0, cast=float),
-            max_runtime_seconds=_spec_num(spec, "max_runtime_seconds", 0.0, cast=float),
             max_restarts=_spec_num(spec, "max_restarts", 3, cast=int),
             tail_lines=int(spec.get("tail_lines", 400)),
             status_tail_chars=int(spec.get("status_tail_chars", 4000)),

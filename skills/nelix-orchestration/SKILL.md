@@ -25,8 +25,8 @@ Your job is to relay each decision to the user and feed the answer back — not 
    - `decision.text` is the turn's text capped to `status_tail_chars`. If `decision.truncated` is
      true it was cut (`decision.total_len` = full length) — call `nelix_dialog(session_id)` to read
      the **full question**. Use `nelix_dialog(session_id, turn=N, offset=M)` to review an earlier turn.
-   - `decision.hung == true` → the executor made no progress for a long time and nelix nudged it with
-     ESC; it may be wedged. Relay that and let the user decide (answer, or `nelix_stop`).
+   - `decision.hung == true` → the executor made no meaningful progress for a long time (`max_idle_seconds`);
+     it may be stuck or just slow. nelix does NOT nudge it — relay that and let the user decide (wait, or `nelix_stop`).
 4. `nelix_respond(session_id, decision.event_id, answer)` with the user's answer; pass the last-seen
    event `seq` as `after_seq` so the next wake fires on a NEW decision. Then **end your turn again** —
    you'll be woken on the next decision.

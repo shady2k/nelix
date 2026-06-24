@@ -110,11 +110,12 @@ class Session:
 
     def _on_state(self, state, now):
         running = state in ("working", "quiet_working")
-        # idle backstop: alive + running but no meaningful progress for max_idle_seconds (0 = off).
+        # no-progress backstop: running but no meaningful progress for max_idle_seconds (0 = off).
+        # The daemon is a bridge — it reports the fact and wakes Hermes; it does NOT nudge (no ESC)
+        # or act. Hermes decides (relay to the user, stop, restart).
         if running and self._spec.max_idle_seconds and now - self._last_progress > self._spec.max_idle_seconds:
-            self._handle.write("\x1b")             # ESC to nudge the executor
             self._emit_stop("idle_prompt", hung=True)
-            self._last_progress = now              # re-arm; do not ESC-storm
+            self._last_progress = now              # re-arm so it doesn't re-fire every loop
             return
         with self._lock:
             prev = self._last_state
