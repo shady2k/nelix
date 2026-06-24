@@ -15,6 +15,10 @@ class Event:
     summary: str
     state: str
     answered: bool = False
+    turn_index: int = 0
+    range: tuple = (0, 0)
+    hint: str = None
+    hung: bool = False
 
 
 class EventQueue:
@@ -26,10 +30,12 @@ class EventQueue:
         self._seq = itertools.count(1)
         self._cv = threading.Condition()
 
-    def publish(self, session_id, executor, kind, summary, state):
+    def publish(self, session_id, executor, kind, summary, state, *,
+                turn_index=0, range=(0, 0), hint=None, hung=False):
         with self._cv:
             e = Event(next(self._seq), f"evt-{uuid.uuid4().hex[:8]}", session_id, executor,
-                      kind, summary, state)
+                      kind, summary, state, turn_index=turn_index, range=range,
+                      hint=hint, hung=hung)
             self._events.append(e)
             self._cv.notify_all()
             return e
@@ -53,15 +59,17 @@ class EventQueue:
                 self._cv.wait(remaining)
 
     def mark_answered(self, event_id):
-        for e in self._events:
-            if e.event_id == event_id:
-                e.answered = True
-                return True
-        return False
+        with self._cv:
+            for e in self._events:
+                if e.event_id == event_id:
+                    e.answered = True
+                    return True
+            return False
 
     def pending(self, session_id=None):
-        for e in reversed(self._events):
-            if e.kind == "waiting_for_user" and not e.answered:
-                if session_id is None or e.session_id == session_id:
-                    return e
-        return None
+        with self._cv:
+            for e in reversed(self._events):
+                if e.kind == "waiting_for_user" and not e.answered:
+                    if session_id is None or e.session_id == session_id:
+                        return e
+            return None

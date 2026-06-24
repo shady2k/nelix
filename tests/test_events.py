@@ -28,3 +28,15 @@ def test_wait_event_blocks_then_returns():
     threading.Thread(target=producer, daemon=True).start()
     assert q.wait_event(after_seq=0, timeout=2).seq == 1
     assert q.wait_event(after_seq=1, timeout=0.1) is None
+
+
+def test_publish_carries_range_and_hint_under_lock():
+    from daemon.events import EventQueue
+    q = EventQueue()
+    e = q.publish("s1", "demo", "waiting_for_user", "sum", "idle_prompt",
+                  turn_index=2, range=(5, 9), hint="needs_permission", hung=False)
+    assert e.turn_index == 2 and e.range == (5, 9) and e.hint == "needs_permission"
+    pend = q.pending()
+    assert pend is not None and pend.event_id == e.event_id
+    q.mark_answered(e.event_id)
+    assert q.pending() is None
