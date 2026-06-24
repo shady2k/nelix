@@ -37,3 +37,18 @@ def test_local_task_reaches_decision_and_creates_file(tmp_path):
     target = os.path.expanduser("~/tmp/nelix-skeleton/test.txt")
     assert os.path.exists(target)
     _call("POST", "/stop", {"session_id": sid})
+
+
+def test_supervisor_spawns_daemon_and_runs(tmp_path, monkeypatch):
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    import supervisor, registry
+    from rpc_client import RpcClient
+    # operator must point HERMES_HOME at a profile whose nelix.toml has NELIX_EXECUTOR
+    base, token = supervisor.ensure_running()
+    try:
+        sid = RpcClient(base, token).start(os.environ["NELIX_EXECUTOR"],
+                                           "create test.txt containing the word nelix")["session_id"]
+        assert sid
+    finally:
+        supervisor.teardown()
