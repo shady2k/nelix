@@ -40,7 +40,7 @@ def main():
                 # Daemon gone/unreachable (e.g. torn down, restarting). Don't crash with a
                 # traceback — exit cleanly so notify_on_complete wakes Hermes to reconcile
                 # via nelix_status instead of surfacing a scary background failure.
-                print(json.dumps({"kind": "none"}))
+                print(json.dumps({"kind": "none"}, ensure_ascii=False))
                 return 0
             if evt is None:
                 continue                     # timeout tick — re-issue
@@ -49,10 +49,10 @@ def main():
             # (box-drawing chrome) is omitted; screen_excerpt carries the live ground truth.
             fields = ("seq", "event_id", "session_id", "executor", "kind", "hint", "hung",
                       "task_delivery", "requires_response", "screen_excerpt")
-            print(json.dumps({k: evt.get(k) for k in fields}))
+            print(json.dumps({k: evt.get(k) for k in fields}, ensure_ascii=False))
             return 0
     except KeyboardInterrupt:
-        print(json.dumps({"kind": "none"}))
+        print(json.dumps({"kind": "none"}, ensure_ascii=False))
         return 0
 
 

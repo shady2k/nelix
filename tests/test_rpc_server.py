@@ -52,6 +52,25 @@ def test_rpc_session_scoped_roundtrip():
         srv.shutdown()
 
 
+def test_responses_are_utf8_not_ascii_escaped():
+    # screen/transcript text (Cyrillic task echo, ❯) must reach Hermes as real UTF-8,
+    # not \uXXXX escapes (ensure_ascii=False in _send).
+    class CyrManager:
+        def status(self, session_id=None):
+            return {"msg": "вторая строка ❯"}
+    srv = make_server(CyrManager(), token="t", port=8779)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        r = urllib.request.Request("http://127.0.0.1:8779/status?session_id=s1",
+                                   headers={"X-Nelix-Token": "t"})
+        with urllib.request.urlopen(r, timeout=5) as resp:
+            raw = resp.read()
+        assert "вторая строка ❯".encode("utf-8") in raw     # real UTF-8 bytes
+        assert b"\\u" not in raw                              # not \uXXXX escaped
+    finally:
+        srv.shutdown()
+
+
 def test_rpc_requires_token():
     srv = make_server(FakeManager(), token="t", port=8767)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

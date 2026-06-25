@@ -11,7 +11,7 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
             return True
 
         def _send(self, code, obj):
-            body = json.dumps(obj).encode()
+            body = json.dumps(obj, ensure_ascii=False).encode()  # UTF-8 out, not \uXXXX
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

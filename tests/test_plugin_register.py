@@ -119,6 +119,26 @@ def test_session_finalize_hook_calls_teardown(monkeypatch, tmp_path):
     assert called.get("t") is True
 
 
+def test_nelix_start_no_waiter_on_failed_start(monkeypatch, tmp_path):
+    # A failed start (e.g. bad cwd) returns an error body with no session_id; we must NOT arm a
+    # waiter — an unscoped orphan waiter would later wake on an unrelated session's event.
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    try:
+        nelix.register(ctx)
+
+        class FailStart:
+            def __init__(self, *a, **k): pass
+            def start(self, *a, **k):
+                return {"error": "cwd does not exist or is not a directory: '/nope'"}
+        monkeypatch.setattr(nelix, "RpcClient", FailStart)
+        out = ctx.tools["nelix_start"]["handler"]({"executor": "opencode", "task": "go", "cwd": "/nope"})
+        assert "error" in json.loads(out)
+        assert ctx.dispatched == []                  # no orphan waiter armed
+    finally:
+        nelix.supervisor.teardown()
+
+
 def test_nelix_start_logs_metadata_not_task_text(monkeypatch, tmp_path, caplog):
     nelix = _load_with_fake(monkeypatch, tmp_path)
     ctx = FakeCtx()
