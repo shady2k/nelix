@@ -291,6 +291,10 @@ class Session:
             self._log.audit_decision(self._id, self._executor, kind, evt.event_id, text)
 
     # ---- reads / control ----
+    def is_working(self):
+        with self._lock:
+            return self._decision is None and self._state in ("working", "quiet_working")
+
     def snapshot(self):
         with self._lock:
             snap = {"session_id": self._id, "executor": self._executor,
@@ -302,6 +306,12 @@ class Session:
                 page = self._dialog.range_text(s, e, limit=self._spec.status_tail_chars)
                 snap["decision"] = {**self._decision, "text": page["text"],
                                     "total_len": page["total_len"], "truncated": page["truncated"]}
+            # active-working snapshots are deliberately low-information: no progress bait, just
+            # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
+            snap["pending"] = self._decision is not None
+            if self._decision is None and self._state in ("working", "quiet_working"):
+                snap["message"] = ("Agent is still working. End your turn; nelix will wake "
+                                   "you on the next event.")
             return snap
 
     def respond(self, event_id, answer):

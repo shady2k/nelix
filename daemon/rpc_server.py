@@ -49,7 +49,8 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
                 raw = qs.get("raw", ["0"])[0].lower() in ("1", "true")
-                self._send(200, manager.screen(sid, raw=raw))
+                force = qs.get("force", ["0"])[0].lower() in ("1", "true")
+                self._send(200, manager.screen(sid, raw=raw, force=force))
             else:
                 self._send(404, {"error": "not found"})
 

@@ -180,7 +180,7 @@ class FakeManagerWithScreen:
     _FRAME = "╭──────╮\n│ Welcome back! │\n╰──────╯\n❯ "
     def __init__(self):
         self._events = EventQueue()
-    def screen(self, session_id, raw=False):
+    def screen(self, session_id, raw=False, force=False):
         from daemon.session import _clean_screen
         if session_id != "s1":
             return {"error": "unknown session"}
@@ -199,5 +199,31 @@ def test_screen_endpoint_returns_live_viewport():
         assert "│" not in b["screen"] and "Welcome back!" in b["screen"]   # cleaned by default
         st, rb = _req("GET", "http://127.0.0.1:8773/screen?session_id=s1&raw=1")
         assert st == 200 and "│" in rb["screen"]                            # raw is uncleaned
+    finally:
+        srv.shutdown()
+
+
+class FakeManagerWorkingScreen:
+    _FRAME = "doing things esc to interrupt"
+    def __init__(self):
+        self._events = EventQueue()
+    def screen(self, session_id, raw=False, force=False):
+        # mirror the real manager: while working, withhold the screen unless force/raw
+        if not force and not raw:
+            return {"state": "working", "pending": False,
+                    "message": "Agent is still working. End your turn; nelix will wake you ..."}
+        return {"screen": self._FRAME, "cols": 120, "rows": 40}
+
+
+def test_screen_endpoint_withholds_while_working_unless_force():
+    m = FakeManagerWorkingScreen()
+    srv = make_server(m, token="t", port=8774)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("GET", "http://127.0.0.1:8774/screen?session_id=s1")
+        assert st == 200 and "screen" not in b
+        assert b["state"] == "working" and "End your turn" in b["message"]
+        st, fb = _req("GET", "http://127.0.0.1:8774/screen?session_id=s1&force=1")
+        assert st == 200 and fb["screen"] == FakeManagerWorkingScreen._FRAME   # force shows it
     finally:
         srv.shutdown()

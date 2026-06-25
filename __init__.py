@@ -72,7 +72,7 @@ def register(ctx):
             return json.dumps({"error": "no active nelix daemon"})
         base, token = bt
         return json.dumps(RpcClient(base, token).screen(
-            args["session_id"], raw=bool(args.get("raw"))))
+            args["session_id"], raw=bool(args.get("raw")), force=bool(args.get("force"))))
 
     names = ", ".join(registry.names()) or "a configured agent"
     # Hermes builds the LLM tool spec as {"type":"function","function":{**schema,"name":name}}
@@ -134,9 +134,12 @@ def register(ctx):
                          " with borders and framing stripped for readability. Use this whenever a"
                          " wake-up is unclear or the agent looks stuck before your task ran (e.g. a"
                          " trust/setup prompt): read the screen and answer what it actually shows,"
-                         " instead of resending the task. Set raw:true for the unfiltered full screen."),
+                         " instead of resending the task. While the agent is working this returns a"
+                         " brief 'still working' note; pass force:true to see the screen anyway."
+                         " Set raw:true for the unfiltered full screen."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
-                                               "raw": {"type": "boolean"}},
+                                               "raw": {"type": "boolean"},
+                                               "force": {"type": "boolean"}},
                         "required": ["session_id"]}},
         nelix_screen)
 

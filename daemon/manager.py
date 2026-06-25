@@ -103,10 +103,16 @@ class SessionManager:
     def get(self, session_id):
         return self._sessions.get(session_id)
 
-    def screen(self, session_id, raw=False):
+    def screen(self, session_id, raw=False, force=False):
         sess = self._sessions.get(session_id)
         if sess is None:
             return {"error": "unknown session"}
+        # While the agent is actively working, withhold the screen (poll bait) unless explicitly
+        # forced or asked for raw — the wake's screen_excerpt is the ground truth between events.
+        if sess.is_working() and not force and not raw:
+            return {"state": "working", "pending": False,
+                    "message": ("Agent is still working. End your turn; nelix will wake you on the "
+                                "next event. Pass force:true to see the screen anyway.")}
         return {"screen": sess.screen(raw=raw), "cols": sess._cols, "rows": sess._rows}
 
     def respond(self, session_id, event_id, answer):

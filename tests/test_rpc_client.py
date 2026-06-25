@@ -76,3 +76,13 @@ def test_client_screen_raw_appends_raw_query(monkeypatch):
                         lambda m, p, body=None: seen.update(m=m, p=p) or (200, {"screen": "R"}))
     assert c.screen("s-1", raw=True) == {"screen": "R"}
     assert seen == {"m": "GET", "p": "/screen?session_id=s-1&raw=1"}
+
+
+def test_client_screen_force_appends_force_query(monkeypatch):
+    from rpc_client import RpcClient
+    c = RpcClient("http://x", "t")
+    seen = {}
+    monkeypatch.setattr(c, "_call",
+                        lambda m, p, body=None: seen.update(m=m, p=p) or (200, {"screen": "F"}))
+    assert c.screen("s-1", force=True) == {"screen": "F"}
+    assert seen == {"m": "GET", "p": "/screen?session_id=s-1&force=1"}

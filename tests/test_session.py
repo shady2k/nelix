@@ -433,6 +433,18 @@ def test_idle_backstop_re_surfaces_unanswered_blocked(tmp_path):
     sess.stop()
 
 
+def test_snapshot_is_boring_while_working(tmp_path):
+    # While the agent is actively working (no pending decision), the snapshot is deliberately
+    # low-information: no progress bait, just "end your turn". Removes the poll incentive.
+    sess, handle, ev = make_session(tmp_path, frames=["doing things esc to interrupt"])
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sess._state in ("working", "quiet_working") and sess._decision is None)
+    snap = sess.snapshot()
+    assert snap["pending"] is False and "End your turn" in snap["message"]
+    assert sess.is_working() is True
+    sess.stop()
+
+
 # ---- structural screen cleaner --------------------------------------------------
 
 def test_clean_screen_drops_borders_keeps_framed_text():
