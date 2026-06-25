@@ -263,30 +263,52 @@ def ensure_running():
 
 
 def teardown(reason: str = "") -> None:
+    # Runs as Hermes' session-finalize hook on exit. It MUST NOT propagate — Hermes'
+    # quit signal handler raises KeyboardInterrupt (a BaseException), which during our
+    # graceful wait would otherwise escape as a bare traceback. A Ctrl+C here means
+    # "force exit now": cut the graceful wait short and go straight to SIGKILL.
     _log.info("nelix daemon teardown: %s", reason or "(no reason)")
-    st = _read_state()
-    if st and _pid_alive(st["pid"]):
-        pid = st["pid"]
+    try:
+        st = _read_state()
+        if st and _pid_alive(st["pid"]):
+            pid = st["pid"]
+            try:
+                _graceful_wait(pid)
+            except KeyboardInterrupt:
+                pass                              # force exit -> fall through to SIGKILL
+            _force_kill(pid)                      # no-op if it already exited
         try:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(20):
-                try:                              # reap if it's OUR child
-                    if os.waitpid(pid, os.WNOHANG)[0] == pid:
-                        break
-                except ChildProcessError:
-                    pass                          # cross-process: not our child
-                if not _pid_alive(pid):           # handles the non-child case
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
-                try:
-                    os.waitpid(pid, 0)
-                except ChildProcessError:
-                    pass
+            _state_file().unlink()
         except Exception:
             pass
+    except BaseException:                         # finalize hook never crashes the exit
+        pass
+
+
+def _graceful_wait(pid: int) -> None:
+    """SIGTERM, then poll up to ~10s for the pid to exit. May raise KeyboardInterrupt
+    if the wait is interrupted (the caller then force-kills)."""
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(20):
+        try:                                      # reap if it's OUR child
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                return
+        except ChildProcessError:
+            pass                                  # cross-process: not our child
+        if not _pid_alive(pid):                   # handles the non-child case
+            return
+        time.sleep(0.5)
+
+
+def _force_kill(pid: int) -> None:
+    """SIGKILL if still alive; reap if it's our child. Best-effort, never raises."""
+    if not _pid_alive(pid):
+        return
     try:
-        _state_file().unlink()
-    except Exception:
+        os.kill(pid, signal.SIGKILL)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+    except (KeyboardInterrupt, Exception):
         pass

@@ -218,3 +218,28 @@ def test_prune_spares_current_file_and_keeps_total_retain(monkeypatch, tmp_path)
     remaining = {p.name for p in root.glob("daemon-*-*.log")}
     assert current.name in remaining                    # current spared despite older mtime
     assert len(remaining) == 2                            # exactly retain total
+
+
+def test_teardown_survives_ctrl_c_and_force_kills(monkeypatch, tmp_path):
+    # Hermes' quit handler raises KeyboardInterrupt during teardown's graceful wait.
+    # teardown must NOT propagate it, and must escalate to SIGKILL (force exit).
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_read_state",
+                        lambda: {"pid": 4242, "port": 1, "token": "t"})
+    alive = {"v": True}                                   # "process" dies only on SIGKILL
+    monkeypatch.setattr(supervisor, "_pid_alive", lambda pid: alive["v"])
+    signals = []
+
+    def fake_kill(pid, sig):
+        signals.append(sig)
+        if sig == supervisor.signal.SIGKILL:
+            alive["v"] = False
+    monkeypatch.setattr(supervisor.os, "kill", fake_kill)
+    monkeypatch.setattr(supervisor.os, "waitpid", lambda pid, flags=0: (0, 0))
+    monkeypatch.setattr(supervisor.time, "sleep",
+                        lambda _s: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    supervisor.teardown("ctrl-c test")                    # must not raise
+    assert supervisor.signal.SIGTERM in signals           # graceful attempt first
+    assert supervisor.signal.SIGKILL in signals           # then force-killed
