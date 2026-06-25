@@ -83,7 +83,7 @@ class Session:
     def _wait_until_ready(self, timeout=20.0, stable_for=1.2):
         last = None; stable_since = None
         deadline = time.time() + timeout
-        while time.time() < deadline and self._handle.is_alive():
+        while time.time() < deadline and self._handle.is_alive() and not self._stop.is_set():
             self._handle.pump(0.1)
             grid = self._handle.render()
             if grid != last:
@@ -315,6 +315,10 @@ class Session:
 
     def stop(self):
         self._stop.set()
+        # Join the monitor thread before closing the dialog so an in-flight delivery/emit
+        # never writes to a closed transcript (the monitor owns all dialog writes).
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
         if self._handle is not None:
             self._launcher.stop(self._handle)
         if self._dialog is not None:

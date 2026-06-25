@@ -371,3 +371,16 @@ def test_blocked_is_not_respammed_while_screen_unchanged(tmp_path):
     blocked = [e for e in ev._events if e.kind == "blocked"]
     assert len(blocked) == 1                        # one blocked, not per-loop spam
     sess.stop()
+
+
+def test_respond_to_blocked_does_not_mark_turn_boundary(tmp_path):
+    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    sess, handle, _ = make_session(tmp_path, frames=[trust])
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
+    turns_before = sess._dialog.turn_count()
+    ev = sess._decision["event_id"]
+    assert sess.respond(ev, "1") is True
+    assert "1" in "".join(handle.writes) and "\r" in handle.writes   # answer injected
+    assert sess._dialog.turn_count() == turns_before                 # NO task turn boundary
+    sess.stop()
