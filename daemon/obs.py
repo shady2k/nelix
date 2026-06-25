@@ -42,6 +42,12 @@ class Logger:
             "grid": redact(grid),
         })
 
+    def audit_task(self, session_id, executor, task):
+        self._write(self._audit, {
+            "level": "audit", "component": "task_delivered", "session_id": session_id,
+            "executor": executor, "task": redact(task),
+        })
+
 
 def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")

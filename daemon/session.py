@@ -189,6 +189,8 @@ class Session:
                 self._dialog.mark_turn_boundary()    # task turn begins now
                 self._task_delivery = "delivered"
                 self._last_state = None
+                if self._log is not None:
+                    self._log.audit_task(self._id, self._executor, self._task)
                 return
         # Not confirmed within the window (a slow paste should have shown by now): give up — do NOT
         # press Enter, do NOT re-type. Mark failed so the run loop exits, and wake Hermes with a

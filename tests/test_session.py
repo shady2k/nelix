@@ -581,6 +581,21 @@ def test_clean_screen_drops_pure_block_and_corner_lines():
     assert out == ["keep me"]              # block row, corner row, blank row all dropped
 
 
+def test_task_is_audit_logged_at_delivery(tmp_path):
+    calls = []
+    class FakeLog:
+        def audit_task(self, sid, ex, task): calls.append((sid, ex, task))
+        def audit_decision(self, *a, **k): pass
+        def event(self, *a, **k): pass
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box])
+    sess._log = FakeLog()
+    sess.start("create report.md", str(tmp_path))
+    _wait_for(lambda: sess._task_delivery == "delivered")
+    assert calls and calls[0][2] == "create report.md"
+    sess.stop()
+
+
 def test_session_screen_cleans_by_default_and_raw_is_exact(tmp_path):
     raw = "╭──────╮\n│ hi  │\n╰──────╯\n"
     sess, handle, _ = make_session(tmp_path, frames=[raw])

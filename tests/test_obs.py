@@ -48,3 +48,15 @@ def test_redact_no_over_redaction():
     """Ensure normal words are not over-redacted."""
     assert redact("hello world") == "hello world"
     assert redact("this is a test") == "this is a test"
+
+
+def test_audit_task_writes_redacted_record():
+    import io, json
+    from daemon.obs import Logger
+    buf = io.StringIO()
+    log = Logger(stream=buf, audit_stream=buf)
+    log.audit_task("s1", "demo", "do the thing with token=abcdef1234567890ZZ")
+    rec = json.loads(buf.getvalue())
+    assert rec["component"] == "task_delivered" and rec["session_id"] == "s1"
+    assert rec["executor"] == "demo"
+    assert "abcdef1234567890ZZ" not in rec["task"]   # secret-ish token redacted
