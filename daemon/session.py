@@ -102,8 +102,8 @@ class Session:
         self._thread.start()
 
     # ---- low-level PTY ops (split from the old blind _submit) ----
-    def _type_text(self, text, timeout=None):
-        self._handle.write(text, timeout=timeout)
+    def _type_text(self, text, timeout=None, drain_output=False):
+        self._handle.write(text, timeout=timeout, drain_output=drain_output)
 
     def _press_enter(self):
         # Submit with the driver-declared submit key (CR for most TUIs, not LF).
@@ -208,7 +208,13 @@ class Session:
         # would otherwise wedge the monitor forever if the executor stops draining stdin.
         deadline = time.monotonic() + self._spec.delivery_confirm_seconds
         try:
-            self._type_text(self._task, timeout=max(0.0, deadline - time.monotonic()))
+            # drain_output: a CLI that echoes/re-renders a large paste fills the PTY output
+            # buffer and then blocks writing it, which stops it reading our input. The monitor
+            # owns both the write and the read here, so draining during the write breaks that
+            # flow-control deadlock and lets a large task land. (respond()'s write stays
+            # non-draining: it runs on the RPC thread, where draining would race pump().)
+            self._type_text(self._task, timeout=max(0.0, deadline - time.monotonic()),
+                            drain_output=True)
         except PtyWriteTimeout:
             self._fail_delivery("write_unconfirmed")   # executor not reading stdin
             return

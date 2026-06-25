@@ -45,11 +45,16 @@ class PtySession:
             data = self._child.read(65536)
         except (EOFError, OSError, ValueError):
             return False
+        self._feed(data)
+        return True
+
+    def _feed(self, data):
+        # Ingest child output: tee raw to the transcript, advance the screen, commit any
+        # scrolled-off lines. Shared by pump() and by drain-during-write in write().
         if self._dialog is not None:
             self._dialog.append_raw(data)
         self._stream.feed(data)
         self._commit_scrolled()
-        return True
 
     def _commit_scrolled(self):
         # Lines that scrolled off the top of the normal buffer are final — commit each once.
@@ -71,7 +76,7 @@ class PtySession:
     def render(self):
         return "\n".join(self._screen.display)
 
-    def write(self, data, timeout=None):
+    def write(self, data, timeout=None, drain_output=False):
         # Non-blocking, deadline-bounded write. A blocking ptyprocess.write() would wedge
         # the monitor thread forever if the child stops draining its stdin (PTY input
         # buffer full) — and on macOS select-for-write on a PTY master can report writable
@@ -79,6 +84,9 @@ class PtySession:
         # BlockingIOError instead of blocking. With `timeout` set, raise PtyWriteTimeout if
         # `data` is not fully written in time. Only the monitor thread writes, so toggling
         # the fd's blocking mode here (restored in finally) is safe vs the read path.
+        # With drain_output, also consume the child's output while writing (see below) —
+        # opt-in because a concurrent reader (the monitor's pump) must not race the screen;
+        # delivery passes it because there the monitor itself owns both the write and the read.
         if self._child is None:
             return
         b = data.encode()
@@ -104,11 +112,24 @@ class PtySession:
                     pass                    # buffer full: wait (bounded) for space
                 except (OSError, ValueError):
                     return                  # fd closed / child gone
+                # Buffer full: wait (bounded) for the slave to accept more. With drain_output,
+                # also watch for readable output and consume it: a TUI that echoes/re-renders
+                # the input fills the PTY output buffer, then blocks writing it (nobody reads
+                # the master) and so stops reading our input — a flow-control deadlock that
+                # would otherwise eat the whole budget and fail an in-flight large write.
+                # Reading here keeps the child draining so the write can complete.
                 wait = 0.1 if deadline is None else min(0.1, max(0.0, deadline - time.monotonic()))
                 try:
-                    select.select([], [fd], [], wait)
+                    r, _, _ = select.select([fd] if drain_output else [], [fd], [], wait)
                 except (OSError, ValueError):
                     return
+                if r:
+                    try:
+                        chunk = os.read(fd, 65536)
+                    except (BlockingIOError, OSError, ValueError):
+                        chunk = b""
+                    if chunk:
+                        self._feed(chunk)
         finally:
             try:
                 os.set_blocking(fd, old_blocking)

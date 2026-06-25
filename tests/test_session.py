@@ -63,7 +63,7 @@ class FakeHandle:
     def exit_code(self):
         return None
 
-    def write(self, data, timeout=None):
+    def write(self, data, timeout=None, drain_output=False):
         self.writes.append(data)
 
     def flush_viewport(self, dialog):
@@ -103,7 +103,7 @@ class DeadHandle:
     def exit_code(self):
         return self._code
 
-    def write(self, data, timeout=None):
+    def write(self, data, timeout=None, drain_output=False):
         self.writes.append(data)
 
     def flush_viewport(self, dialog):
@@ -333,7 +333,7 @@ class LiveHandle:
     def render(self):
         return self._frames[min(self._i, len(self._frames) - 1)]
 
-    def write(self, data, timeout=None):
+    def write(self, data, timeout=None, drain_output=False):
         self.writes.append(data)
         # simulate echo: typing text makes it visible in the (current) frame
         if data not in ("\r", "\x1b[Z", "\x1b"):
@@ -367,7 +367,7 @@ class LiveHandle:
 
 class PasteCollapseHandle(LiveHandle):
     """Claude collapses a long pasted task into a "[Pasted text #N]" placeholder instead of echoing."""
-    def write(self, data, timeout=None):
+    def write(self, data, timeout=None, drain_output=False):
         self.writes.append(data)
         if data not in ("\r", "\x1b[Z", "\x1b"):
             j = min(self._i, len(self._frames) - 1)
@@ -453,7 +453,7 @@ def test_delivery_timeout_marks_failed_and_wakes(tmp_path):
     # The typed task never confirms (no echo, no placeholder). After the confirm window, delivery is
     # marked failed and a non-respondable delivery_failed event wakes Hermes — nothing is re-typed.
     class NoEchoHandle(LiveHandle):
-        def write(self, data, timeout=None):
+        def write(self, data, timeout=None, drain_output=False):
             self.writes.append(data)            # record but never render evidence -> never confirms
 
     box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
@@ -785,6 +785,70 @@ def test_delivery_does_not_wedge_when_executor_ignores_stdin(tmp_path, monkeypat
     finally:
         # bulletproof cleanup independent of teardown robustness (Fix B): kill the whole
         # process group so a wedged write unblocks immediately, then stop normally.
+        import os as _os, signal as _signal
+        try:
+            _os.killpg(_os.getpgid(sess._handle.leader_pid()), _signal.SIGKILL)
+        except Exception:
+            pass
+        sess.stop()
+
+
+# ---- delivery must drain the executor's output while writing (real PtySession) ----
+
+# An executor that DOES read stdin but echoes every chunk (amplified), so its render output
+# fills the PTY output buffer. If the monitor writes the task without draining that output,
+# the child blocks on its own os.write, stops reading stdin, the input buffer fills, and the
+# bounded write deadlocks -> write_unconfirmed. Mirrors Claude/zai collapsing a large paste.
+_RAW_ECHO_FLOOD_CHILD = (
+    "import sys,os,tty,time\n"
+    "fd=0\n"
+    "try:\n"
+    "    tty.setraw(fd)\n"
+    "except Exception:\n"
+    "    pass\n"
+    "os.write(1,'\\u276f \\r\\n\\u23f5\\u23f5 ask mode (shift+tab to cycle)\\r\\n'.encode())\n"
+    "while True:\n"
+    "    ch=os.read(fd,1024)\n"
+    "    if not ch:\n"
+    "        break\n"
+    "    os.write(1,ch)\n"                          # echo (advances the rendered prompt)
+    "    os.write(1,ch)\n"                          # amplify: fill the output buffer faster than input drains
+    "    if b'\\r' in ch:\n"                        # the submit key (sent only after confirmation)
+    "        break\n"
+    "time.sleep(30)\n"
+)
+
+
+class FloodConfirmSpec(Spec):
+    delivery_confirm_seconds = 5.0      # generous budget: the drained write must finish well inside it
+
+
+def test_delivery_drains_output_so_large_task_reaches_executor(tmp_path, monkeypatch):
+    """A real executor that READS stdin but emits output per chunk (filling the PTY output
+    buffer). Delivering a task larger than the PTY buffers must still reach it (delivered),
+    which is only possible if the monitor DRAINS the child's output while writing — otherwise
+    both sides deadlock and the bounded write fails with write_unconfirmed. FAILS on the
+    pre-fix write() that waits only for writability and never reads during the write."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from daemon.pty_session import PtySession
+
+    child = ["python3", "-c", _RAW_ECHO_FLOOD_CHILD]
+
+    class _Launcher:
+        def start(self, spec, cwd, cols, rows, dialog=None):
+            p = PtySession(child, cols=cols, rows=rows, dialog=dialog)
+            p.spawn()
+            return p
+        def stop(self, h):
+            h.close()
+
+    sess = Session("s1", "dummy", ClaudeDriver(), _Launcher(), FloodConfirmSpec(), EventQueue())
+    sess.start("X" * 65536, str(tmp_path))          # task far larger than the PTY buffers
+    try:
+        assert _wait_for(lambda: sess._task_delivery == "delivered", timeout=12.0), \
+            (f"large task never reached the executor (delivery={sess._task_delivery}); "
+             "the monitor did not drain PTY output during the write -> flow-control deadlock")
+    finally:
         import os as _os, signal as _signal
         try:
             _os.killpg(_os.getpgid(sess._handle.leader_pid()), _signal.SIGKILL)
