@@ -1,3 +1,4 @@
+import os
 import select
 
 import pyte
@@ -78,6 +79,28 @@ class PtySession:
         if self._child is None:
             return None
         return self._child.exitstatus
+
+    def leader_pid(self):
+        return self._child.pid if self._child is not None else None
+
+    def leader_pgid(self):
+        if self._child is None:
+            return None
+        try:
+            return os.getpgid(self._child.pid)
+        except OSError:
+            return None
+
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        if self._child is None:
+            return LeaderStatus(alive=False, exit_code=None, signal=None, status_available=False)
+        alive = self._child.isalive()           # nonblocking reap; populates exit/signal status
+        if alive:
+            return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
+        ec, sig = self._child.exitstatus, self._child.signalstatus
+        return LeaderStatus(alive=False, exit_code=ec, signal=sig,
+                            status_available=(ec is not None or sig is not None))
 
     def close(self):
         if self._child is not None:

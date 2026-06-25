@@ -177,3 +177,45 @@ def test_gc_rmtree_failure_is_skipped(monkeypatch, tmp_path):
                         lambda d: (_ for _ in ()).throw(OSError("locked")))
     manager.gc_sessions(set(), retain=0, max_age_days=7, now=now)   # must not raise
     assert (root / "s-a").exists()
+
+
+def test_session_created_and_stopped_logged(tmp_path, monkeypatch):
+    import io, json
+    from daemon.obs import Logger
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    buf = io.StringIO()
+    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), concurrency_limit=1,
+                         logger=Logger(level="debug", stream=buf),
+                         session_factory=lambda sid, ex, spec, ev: FakeSession(sid, ex))
+    sid, _ = mgr.start(EXECUTOR, "hi", str(tmp_path))      # real dir for the isdir() check
+    mgr.stop(sid)
+    events = [json.loads(l)["event"] for l in buf.getvalue().splitlines() if l.strip()]
+    assert "session_created" in events and "session_stopped" in events
+
+
+def test_unknown_executor_logs_rejected(tmp_path, monkeypatch):
+    import io
+    from daemon.obs import Logger
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    buf = io.StringIO()
+    mgr = SessionManager({}, EventQueue(), logger=Logger(level="debug", stream=buf))
+    try:
+        mgr.start("nope", "t", str(tmp_path))
+    except Exception:
+        pass
+    assert "session_start_rejected" in buf.getvalue()
+
+
+def test_stop_all_uses_shutdown_reason(tmp_path, monkeypatch):
+    import io, json
+    from daemon.obs import Logger
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    buf = io.StringIO()
+    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), concurrency_limit=1,
+                         logger=Logger(level="debug", stream=buf),
+                         session_factory=lambda sid, ex, spec, ev: FakeSession(sid, ex))
+    mgr.start(EXECUTOR, "hi", str(tmp_path))
+    mgr.stop_all()
+    rec = [json.loads(l) for l in buf.getvalue().splitlines()
+           if json.loads(l)["event"] == "session_stopped"][0]
+    assert rec["reason"] == "shutdown"

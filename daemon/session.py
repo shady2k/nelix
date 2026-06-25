@@ -1,8 +1,12 @@
+import hashlib
 import re
+import sys
 import threading
 import time
+import traceback
 
 import paths
+from daemon import lifecycle_log
 from daemon.dialog import Dialog
 from daemon.drivers.base import ClassifyCtx
 from daemon.hygiene import prepare_pty_input
@@ -62,6 +66,10 @@ class Session:
         self._last_byte = None         # ts of last PTY byte
         self._task = None              # held task, delivered once a real input box appears
         self._task_delivery = "pending"  # pending | delivered | failed
+        self._finalized = False        # _finish ran (idempotency guard, under self._lock)
+        self._exc = None               # sys.exc_info() if the monitor body raised
+        self._exc_text = None          # formatted traceback captured at catch time
+        self._spawn_ts = None          # ts the PTY leader was spawned (for alive_for)
         self._blocked_fp = None        # normalized screen of the last emitted blocked event
         self._sessions_dir = _sessions_root()
         driver._settle = spec.settle_seconds   # keep classify a pure (frame, ctx) fn
@@ -85,6 +93,10 @@ class Session:
         self._handle = self._launcher.start(self._spec, cwd, self._cols, self._rows,
                                             dialog=self._dialog)
         self._task_delivery = "pending"
+        self._spawn_ts = time.time()
+        self._log_spawned(self._spec.argv(), type(self._launcher).__name__)
+        if self._log is not None:
+            self._log.debug("session", "monitor_started", session_id=self._id)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -120,6 +132,8 @@ class Session:
                 return
             self._handle.write(self._driver.ask_mode_toggle)
             time.sleep(0.3)
+        if self._log is not None:
+            self._log.warning("session", "ask_mode_failed", session_id=self._id)
 
     # ---- loop ----
     def _ctx(self, now):
@@ -132,44 +146,52 @@ class Session:
 
     def _run(self):
         # Monitor-thread entrypoint: wait for the CLI to settle, deliver the held task
-        # (delivery phase), then fall through to the normal run loop.
-        self._wait_until_ready()
-        self._last_progress = self._last_byte = time.time()
-        while not self._stop.is_set() and self._task_delivery == "pending":
-            advanced = self._handle.pump(0.1)
-            now = time.time()
-            if advanced:
-                self._last_byte = now
-            with self._lock:
-                frame = self._handle.render()
-            norm = self._driver.normalize_frame(frame)
-            if norm != self._norm:
-                self._norm = norm
-                self._norm_since = now
-                self._last_progress = now
-            self._delivery_tick(frame, now)
-            # no-progress backstop while blocked (spec §6): re-surface an unanswered blocked with
-            # hung=True so Hermes is reminded; bypass the fingerprint dedup (call _publish directly).
-            blocked_outstanding = self._decision is not None and self._decision["kind"] == "blocked"
-            if (blocked_outstanding and self._spec.max_idle_seconds
-                    and now - self._last_progress > self._spec.max_idle_seconds):
-                self._publish("blocked", hint="task_not_delivered", hung=True,
-                              requires_response=True, task_delivery="pending")
-                self._last_progress = now              # re-arm so it doesn't re-fire every loop
-            if not self._handle.is_alive():
-                break
-        if self._task_delivery == "delivered" and not self._stop.is_set():
-            self._loop()
+        # (delivery phase), then fall through to the normal run loop. A try/except/finally
+        # guarantees _finish() runs exactly once when the monitor exits, for ANY reason.
+        try:
+            self._wait_until_ready()
+            if self._log is not None:
+                self._log.debug("session",
+                                "cli_ready" if self._handle.is_alive() else "cli_ready_timeout",
+                                session_id=self._id)
+            self._last_progress = self._last_byte = time.time()
+            while not self._stop.is_set() and self._task_delivery == "pending":
+                advanced = self._handle.pump(0.1)
+                now = time.time()
+                if advanced:
+                    self._last_byte = now
+                with self._lock:
+                    frame = self._handle.render()
+                norm = self._driver.normalize_frame(frame)
+                if norm != self._norm:
+                    self._norm = norm
+                    self._norm_since = now
+                    self._last_progress = now
+                self._delivery_tick(frame, now)
+                # no-progress backstop while blocked (spec §6): re-surface an unanswered blocked with
+                # hung=True so Hermes is reminded; bypass the fingerprint dedup (call _publish directly).
+                blocked_outstanding = self._decision is not None and self._decision["kind"] == "blocked"
+                if (blocked_outstanding and self._spec.max_idle_seconds
+                        and now - self._last_progress > self._spec.max_idle_seconds):
+                    self._publish("blocked", hint="task_not_delivered", hung=True,
+                                  requires_response=True, task_delivery="pending")
+                    self._last_progress = now              # re-arm so it doesn't re-fire every loop
+                if not self._handle.is_alive():
+                    break
+            if self._task_delivery == "delivered" and not self._stop.is_set():
+                self._loop()
+        except Exception:
+            self._exc = sys.exc_info()
+            self._exc_text = traceback.format_exc()   # capture NOW; exc context is gone in _finish
+        finally:
+            self._finish()
 
     def _delivery_tick(self, frame, now):
         state = self._driver.classify(frame, self._ctx(now))
         if state in ("working", "quiet_working"):
             return                                   # CLI busy / not settled: keep waiting
         if state in ("crashed", "exited") or not self._handle.is_alive():
-            self._task_delivery = "failed"
-            self._publish("crashed" if state == "crashed" else "done",
-                          hint=None, hung=False, requires_response=False)
-            self._stop.set()
+            self._task_delivery = "failed"            # loop exits -> finally -> _finish
             return
         if self._driver.is_accepting_input(frame):
             self._ensure_ask_mode()
@@ -178,6 +200,8 @@ class Session:
             self._emit_blocked(frame)                # modal / onboarding / unknown
 
     def _deliver_task(self):
+        if self._log is not None:
+            self._log.debug("session", "delivery_attempt", session_id=self._id)
         self._type_text(self._task)
         deadline = time.time() + self._spec.delivery_confirm_seconds
         while time.time() < deadline and not self._stop.is_set():
@@ -191,6 +215,7 @@ class Session:
                 self._last_state = None
                 if self._log is not None:
                     self._log.audit_task(self._id, self._executor, self._task)
+                    self._log.info("session", "delivery_confirmed", session_id=self._id)
                 return
         # Not confirmed within the window (a slow paste should have shown by now): give up — do NOT
         # press Enter, do NOT re-type. Mark failed so the run loop exits, and wake Hermes with a
@@ -199,6 +224,9 @@ class Session:
         self._handle.flush_viewport(self._dialog)
         self._publish("delivery_failed", hint="delivery_unconfirmed", hung=False,
                       requires_response=False, task_delivery="failed")
+        if self._log is not None:
+            self._log.warning("session", "delivery_failed", session_id=self._id,
+                              reason="delivery_unconfirmed")
 
     def _loop(self):
         self._last_progress = self._last_byte = time.time()
@@ -241,10 +269,94 @@ class Session:
             self._emit_stop("idle_prompt", hung=False)
         elif state == "permission_prompt":
             self._emit_stop("permission_prompt", hung=False)
-        elif state == "crashed":
+        # crashed/exited are terminal: _loop breaks and _finish() (run from _run's finally)
+        # owns the single terminal event + state, status-mapped from leader_status().
+
+    def _exit_kind(self, status):
+        # deterministic from leader status (NOT driver classification)
+        if status is None or status.signal is not None:
+            return ("crashed", "crashed")
+        if status.exit_code not in (0, None):
+            return ("crashed", "crashed")
+        if status.exit_code == 0:
+            return ("done", "exited")
+        return ("crashed", "crashed")                # dead but status unavailable
+
+    def _finish(self):
+        with self._lock:
+            if self._finalized:
+                return
+            self._finalized = True
+        status = self._handle.leader_status() if self._handle is not None else None
+        alive = bool(status and status.alive)
+        # 1. monitor itself crashed; leader may still be alive
+        if self._exc is not None:
+            with self._lock:
+                self._state = "crashed"
             self._publish("crashed", hint=None, hung=False, requires_response=False)
-        elif state == "exited":
-            self._publish("done", hint=None, hung=False, requires_response=False)
+            if self._log is not None:
+                self._log.error("session", "monitor_exception", session_id=self._id,
+                                traceback=self._exc_text)
+                if not alive:                          # executor_exited only if it actually exited
+                    self._log_exited("monitor_exception", status)
+                self._log.debug("session", "monitor_exited", session_id=self._id)
+            return
+        # 2. executor genuinely exited -> the ONE terminal exit event, status-mapped
+        if not alive:
+            kind, final_state = self._exit_kind(status)
+            with self._lock:
+                self._state = final_state
+            self._publish("done" if kind == "done" else "crashed",
+                          hint=None, hung=False, requires_response=False)
+            self._log_exited(kind if kind == "done" else "crashed", status)
+            if self._log is not None:
+                self._log.debug("session", "monitor_exited", session_id=self._id)
+            return
+        # 3. operator stopped a LIVE agent -> manager logs session_stopped; no executor_exited
+        if self._stop.is_set():
+            if self._log is not None:
+                self._log.debug("session", "monitor_exited", session_id=self._id)
+            return
+        # 4. delivery already failed AND surfaced -> no bogus crashed, no executor_exited
+        if self._task_delivery == "failed":
+            if self._log is not None:
+                self._log.debug("session", "monitor_exited", session_id=self._id)
+            return
+        # 5. crash banner while leader is still alive
+        with self._lock:
+            self._state = "crashed"
+        self._publish("crashed", hint=None, hung=False, requires_response=False)
+        if self._log is not None:
+            self._log.warning("session", "cli_crashed", session_id=self._id)
+            self._log.debug("session", "monitor_exited", session_id=self._id)
+
+    # ---- lifecycle logging helpers (one-liners over lifecycle_log; all logger-guarded) ----
+    def _screen_fp(self):
+        # a HASH of the normalized screen, never the screen content (spec §1b).
+        if self._handle is None:
+            return None
+        norm = self._driver.normalize_frame(self._handle.render())
+        return hashlib.sha256(norm.encode()).hexdigest()[:16]
+
+    def _log_spawned(self, argv, launcher):
+        if self._log is None:
+            return
+        lifecycle_log.log_executor_spawned(
+            self._log, session_id=self._id, executor=self._executor,
+            leader_pid=self._handle.leader_pid(), leader_pgid=self._handle.leader_pgid(),
+            argv=argv, launcher=launcher)
+
+    def _log_exited(self, reason, status):
+        if self._log is None:
+            return
+        alive_for = (time.time() - self._spawn_ts) if self._spawn_ts else None
+        lifecycle_log.log_executor_exited(
+            self._log, session_id=self._id, reason=reason,
+            leader_exit_code=(status.exit_code if status else None),
+            leader_signal=(status.signal if status else None),
+            status_available=(status.status_available if status else False),
+            alive_for=alive_for, task_delivery=self._task_delivery,
+            screen_fingerprint=self._screen_fp())
 
     def _emit_stop(self, state, hung):
         # commit the final viewport so the turn tail is in the transcript, then freeze the range.

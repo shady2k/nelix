@@ -16,3 +16,7 @@ launcher = "local"       # MVP: only "local" is implemented ("auto"/"docker" are
 daemon_log_retain    = 10    # how many daemon-<ts>-<pid>.log files to keep (min 1)
 session_retain       = 20    # how many session dirs to keep by count (0 = disable this rake)
 session_max_age_days = 7     # also delete session dirs older than this (0 = disable this rake)
+
+# Daemon log verbosity: debug | info | warning | error (default: info).
+# Env NELIX_LOG_LEVEL overrides this. Audit records (decisions, delivered task) are always written.
+log_level = "info"

@@ -95,3 +95,46 @@ def load_retention(path):
         session_retain=_cfg_int(data, "session_retain", 20, floor=0),
         session_max_age_days=_cfg_int(data, "session_max_age_days", 7, floor=0),
     )
+
+
+_VALID_LEVELS = ("debug", "info", "warning", "error")
+
+
+@dataclass
+class LogLevelConfig:
+    level: str
+    invalid_value: "str | None" = None
+    invalid_source: "str | None" = None
+
+
+def _norm_level(s):
+    if isinstance(s, str) and s.strip().lower() in _VALID_LEVELS:
+        return s.strip().lower()
+    return None
+
+
+def _file_log_level_raw(path):
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        return None
+    v = data.get("log_level")
+    return v if isinstance(v, str) else None   # missing / non-str -> treat as unset
+
+
+def load_log_level(path, default="info"):
+    env_raw = os.environ.get("NELIX_LOG_LEVEL")
+    file_raw = _file_log_level_raw(path)
+    file_ok = _norm_level(file_raw)
+    if env_raw is not None:
+        env_ok = _norm_level(env_raw)
+        if env_ok:
+            return LogLevelConfig(level=env_ok)
+        return LogLevelConfig(level=file_ok or default,
+                              invalid_value=env_raw, invalid_source="env")
+    if file_raw is None:
+        return LogLevelConfig(level=default)
+    if file_ok:
+        return LogLevelConfig(level=file_ok)
+    return LogLevelConfig(level=default, invalid_value=file_raw, invalid_source="file")

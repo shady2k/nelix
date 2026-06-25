@@ -19,6 +19,9 @@ class Spec:
     dialog_page_chars = 8000
     spool_max_bytes = 1_000_000
 
+    def argv(self):
+        return ["runner", "--interactive"]   # fictional; mirrors ExecutorSpec.argv()
+
 
 class HangSpec(Spec):
     max_idle_seconds = 5.0
@@ -69,6 +72,14 @@ class FakeHandle:
             if t:
                 dialog.add_line(t)
 
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        if self.is_alive():
+            return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
+        return LeaderStatus(alive=False, exit_code=0, signal=None, status_available=True)
+
     def close(self):
         pass
 
@@ -97,6 +108,13 @@ class DeadHandle:
 
     def flush_viewport(self, dialog):
         pass
+
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=False, exit_code=self._code, signal=None,
+                            status_available=True)
 
     def close(self):
         pass
@@ -181,8 +199,8 @@ def test_permission_prompt_carries_needs_permission_hint(monkeypatch, tmp_path):
 
 def test_exit_zero_emits_done(monkeypatch, tmp_path):
     sess, ev = _session(tmp_path, handle=DeadHandle(0))
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0]))
-    sess._loop()
+    sess._spawn_ts = 0.0
+    sess._run()                                           # finally -> _finish publishes terminal
     assert ev.pending("s1") is None                       # 'done' is not respondable
     last = ev.latest_after(0)
     assert last is not None and last.kind == "done"
@@ -191,8 +209,8 @@ def test_exit_zero_emits_done(monkeypatch, tmp_path):
 
 def test_exit_nonzero_emits_crashed(monkeypatch, tmp_path):
     sess, ev = _session(tmp_path, handle=DeadHandle(2))
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0]))
-    sess._loop()
+    sess._spawn_ts = 0.0
+    sess._run()
     last = ev.latest_after(0)
     assert last is not None and last.kind == "crashed"
     assert sess.snapshot()["state"] == "crashed"
@@ -336,6 +354,12 @@ class LiveHandle:
 
     def advance_to_input_box(self):
         self._i = len(self._frames) - 1
+
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
 
     def close(self):
         pass
@@ -586,7 +610,10 @@ def test_task_is_audit_logged_at_delivery(tmp_path):
     class FakeLog:
         def audit_task(self, sid, ex, task): calls.append((sid, ex, task))
         def audit_decision(self, *a, **k): pass
-        def event(self, *a, **k): pass
+        def debug(self, *a, **k): pass
+        def info(self, *a, **k): pass
+        def warning(self, *a, **k): pass
+        def error(self, *a, **k): pass
     box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
     sess, handle, _ = make_session(tmp_path, frames=[box])
     sess._log = FakeLog()
@@ -604,3 +631,114 @@ def test_session_screen_cleans_by_default_and_raw_is_exact(tmp_path):
     assert sess.screen() == _clean_screen(raw)
     assert sess.screen(raw=True) == raw    # exact untouched render()
     assert "│" in sess.screen(raw=True) and "│" not in sess.screen()
+
+
+# ---- observability: finalization correctness (Task 5) ------------------------
+
+def _bare_session(tmp_path, handle):
+    ev = EventQueue()
+    sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), ev)
+    sess._handle = handle
+    sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
+                          spool_max_bytes=Spec.spool_max_bytes)
+    sess._spawn_ts = 0.0
+    return sess, ev
+
+
+def test_pre_delivery_death_publishes_and_sets_state(tmp_path):
+    """The incident: child dies while delivery is pending -> terminal event + state, not silence."""
+    sess, ev = _bare_session(tmp_path, DeadHandle(0))
+    sess._run()
+    assert sess.snapshot()["state"] == "exited"
+    assert ev.latest_after(0) is not None and ev.latest_after(0).kind == "done"
+
+
+def test_pre_delivery_crash_maps_to_crashed(tmp_path):
+    sess, ev = _bare_session(tmp_path, DeadHandle(2))
+    sess._run()
+    assert sess.snapshot()["state"] == "crashed"
+
+
+def test_finish_is_idempotent(tmp_path):
+    sess, ev = _bare_session(tmp_path, DeadHandle(0))
+    sess._finish()
+    n = ev.latest_seq()
+    sess._finish()                        # second call must be a no-op
+    assert ev.latest_seq() == n
+
+
+# ---- observability: lifecycle logging (Task 6) -------------------------------
+
+def _capture_logger():
+    import io
+    from daemon.obs import Logger
+    buf = io.StringIO()
+    return Logger(level="debug", stream=buf, audit_stream=buf), buf
+
+
+def _events_in(buf):
+    import json
+    return [json.loads(l)["event"] for l in buf.getvalue().splitlines() if l.strip()]
+
+
+def test_executor_spawned_logged_with_leader_fields(tmp_path):
+    import json
+    log, buf = _capture_logger()
+    sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), EventQueue(), logger=log)
+    sess._handle = FakeHandle([], stop=sess._stop)
+    sess._spawn_ts = 0.0
+    sess._log_spawned(["runner", "-secret=kv/app"], "LocalLauncher")
+    rec = [json.loads(l) for l in buf.getvalue().splitlines()
+           if json.loads(l)["event"] == "executor_spawned"][0]
+    assert rec["leader_pid"] == 4242 and rec["process_role"] == "pty_leader"
+    assert "kv/app" not in json.dumps(rec["argv_redacted"])
+
+
+def test_executor_exited_logged_once_on_pre_delivery_death(tmp_path):
+    log, buf = _capture_logger()
+    sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), EventQueue(), logger=log)
+    sess._handle = DeadHandle(2)
+    sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
+                          spool_max_bytes=Spec.spool_max_bytes)
+    sess._spawn_ts = 0.0
+    sess._run()
+    assert _events_in(buf).count("executor_exited") == 1
+
+
+def test_live_stop_logs_no_executor_exited(tmp_path):
+    log, buf = _capture_logger()
+    sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), EventQueue(), logger=log)
+    sess._handle = FakeHandle([], stop=sess._stop)      # stays alive
+    sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
+                          spool_max_bytes=Spec.spool_max_bytes)
+    sess._spawn_ts = 0.0
+    sess._stop.set()                                     # operator stop, leader still alive
+    sess._finish()
+    assert "executor_exited" not in _events_in(buf)
+
+
+def test_executor_exited_logged_exactly_once_under_finalize_race(tmp_path):
+    """Natural exit then a racing finalize (what stop() relies on) -> one executor_exited."""
+    log, buf = _capture_logger()
+    sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), EventQueue(), logger=log)
+    sess._handle = DeadHandle(0)
+    sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
+                          spool_max_bytes=Spec.spool_max_bytes)
+    sess._spawn_ts = 0.0
+    sess._run()                  # monitor finalizes -> one executor_exited
+    sess._finish()               # racing second finalize -> _finalized guard, no second log
+    assert _events_in(buf).count("executor_exited") == 1
+
+
+def test_delivered_run_logs_readiness_and_delivery(tmp_path):
+    """Successful delivery path emits the DEBUG/INFO lifecycle rows."""
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box])
+    log, buf = _capture_logger()
+    sess._log = log
+    sess.start("create report.md", str(tmp_path))
+    _wait_for(lambda: sess._task_delivery == "delivered")
+    sess.stop()
+    evs = _events_in(buf)
+    assert "executor_spawned" in evs and "cli_ready" in evs
+    assert "delivery_attempt" in evs and "delivery_confirmed" in evs

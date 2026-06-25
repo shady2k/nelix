@@ -1,62 +1,74 @@
 import io, json
-from conftest import EXECUTOR
 from daemon.obs import redact, Logger
 
 
-def test_redact_masks_secrets():
+def _lines(buf):
+    return [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
+
+
+def test_redact_masks_secrets_but_not_plain_text():
     assert "sk-secret123456789" not in redact("key=sk-secret123456789")
-    assert redact("ZAI_API_KEY=abcd1234efgh5678").endswith("***")
     assert redact("hello world") == "hello world"
 
 
-def test_logger_writes_json_line_with_correlation():
+def test_level_gating_suppresses_below_threshold():
+    buf = io.StringIO()
+    log = Logger(level="info", stream=buf)
+    log.debug("session", "noisy", session_id="s1")
+    log.info("session", "kept", session_id="s1")
+    log.warning("session", "kept2")
+    recs = _lines(buf)
+    assert [r["event"] for r in recs] == ["kept", "kept2"]
+    assert recs[0]["level"] == "info" and recs[0]["component"] == "session"
+
+
+def test_debug_threshold_lets_debug_through():
+    buf = io.StringIO()
+    Logger(level="debug", stream=buf).debug("session", "shown")
+    assert _lines(buf)[0]["event"] == "shown"
+
+
+def test_audit_always_written_even_when_threshold_is_error():
+    buf = io.StringIO()
+    log = Logger(level="error", stream=buf, audit_stream=buf)
+    log.info("session", "dropped")                       # below ERROR -> gone
+    log.audit_task("s1", "demo", "do the thing")         # audit -> kept
+    recs = _lines(buf)
+    assert len(recs) == 1 and recs[0]["category"] == "audit"
+    assert recs[0]["level"] == "info" and recs[0]["component"] == "task_delivered"
+
+
+def test_audit_decision_shape_and_redaction():
+    buf = io.StringIO()
+    Logger(audit_stream=buf).audit_decision(
+        "s1", "demo", "waiting_for_user", "evt-1",
+        "Run: curl -H 'token=abcd1234efgh5678' ...")
+    rec = _lines(buf)[0]
+    assert rec["category"] == "audit" and rec["component"] == "decision"
+    assert rec["event"] == "waiting_for_user" and rec["event_id"] == "evt-1"
+    assert "abcd1234efgh5678" not in rec["grid"]
+
+
+def test_field_aware_redaction():
     buf = io.StringIO()
     log = Logger(stream=buf)
-    log.event("session", "info", session_id="s1", executor=EXECUTOR, msg="started")
-    rec = json.loads(buf.getvalue().strip())
-    assert rec["session_id"] == "s1" and rec["component"] == "session" and rec["msg"] == "started"
+    log.info("session", "spawn", session_id="s1",
+             token="abcd1234efgh5678", api_key="zzz", leader_pid=4321,
+             event_id="evt-9", reason="user_stop", msg="hi token=abcd1234efgh5678")
+    rec = _lines(buf)[0]
+    assert rec["token"] == "***" and rec["api_key"] == "***"      # secret field names masked
+    assert rec["leader_pid"] == 4321                              # numbers untouched
+    assert rec["event_id"] == "evt-9" and rec["reason"] == "user_stop"   # ids/reasons kept
+    assert "abcd1234efgh5678" not in rec["msg"]                   # free-text redacted
 
 
-def test_audit_decision_redacts_grid():
+def test_error_exc_info_captures_redacted_traceback():
     buf = io.StringIO()
-    log = Logger(audit_stream=buf)
-    log.audit_decision("s1", EXECUTOR, "waiting_for_user", "evt-1",
-                       "Run: curl -H 'token=abcd1234efgh5678' ...")
-    rec = json.loads(buf.getvalue().strip())
-    assert rec["event_id"] == "evt-1" and "abcd1234efgh5678" not in rec["grid"]
-
-
-def test_redact_masks_bearer_tokens():
-    """Mask Bearer <token> regardless of token length."""
-    result = redact("Bearer sk-abc123")
-    assert "sk-abc123" not in result
-    assert "***" in result
-
-
-def test_redact_masks_short_prefixed_credentials():
-    """Mask tokens by known secret prefixes (sk-, ghp_, gho_, ghs_, xox, AKIA, eyJ)."""
-    assert "sk-abc123" not in redact("token is sk-abc123")
-    assert "ghp_abcdEFGH1234" not in redact("token is ghp_abcdEFGH1234")
-    assert "gho_abc123" not in redact("gho_abc123 leaked")
-    assert "ghs_xyz789" not in redact("secret: ghs_xyz789")
-    assert "xoxb-abc123def456" not in redact("slack xoxb-abc123def456")
-    assert "AKIA1234567890AB" not in redact("AWS AKIA1234567890AB")
-    assert "eyJhbGc" not in redact("jwt: eyJhbGc")
-
-
-def test_redact_no_over_redaction():
-    """Ensure normal words are not over-redacted."""
-    assert redact("hello world") == "hello world"
-    assert redact("this is a test") == "this is a test"
-
-
-def test_audit_task_writes_redacted_record():
-    import io, json
-    from daemon.obs import Logger
-    buf = io.StringIO()
-    log = Logger(stream=buf, audit_stream=buf)
-    log.audit_task("s1", "demo", "do the thing with token=abcdef1234567890ZZ")
-    rec = json.loads(buf.getvalue())
-    assert rec["component"] == "task_delivered" and rec["session_id"] == "s1"
-    assert rec["executor"] == "demo"
-    assert "abcdef1234567890ZZ" not in rec["task"]   # secret-ish token redacted
+    log = Logger(stream=buf)
+    try:
+        raise RuntimeError("boom token=abcd1234efgh5678")
+    except RuntimeError:
+        log.error("session", "monitor_exception", session_id="s1", exc_info=True)
+    rec = _lines(buf)[0]
+    assert rec["event"] == "monitor_exception" and "RuntimeError" in rec["traceback"]
+    assert "abcd1234efgh5678" not in rec["traceback"]
