@@ -43,6 +43,30 @@ def test_nelix_wait_reissues_then_prints_event():
     assert "summary" not in rec
 
 
+def test_nelix_wait_prints_full_actionable_event():
+    # The wake payload must be self-sufficient: Hermes acts from it without polling. It carries
+    # the decision fields incl. screen_excerpt, and omits the raw TUI `summary` chrome.
+    srv = _server(8795, [
+        {"event": {"seq": 11, "session_id": "s1", "event_id": "evt-w", "executor": EXECUTOR,
+                   "kind": "blocked", "summary": "box-chrome", "hint": "task_not_delivered",
+                   "hung": False, "task_delivery": "pending", "requires_response": True,
+                   "screen_excerpt": "❯ 1. Yes, I trust this folder"}},
+    ])
+    try:
+        out = subprocess.check_output(
+            [sys.executable, str(ROOT / "bin" / "nelix-wait"),
+             "--base", "http://127.0.0.1:8795", "--after", "0"],
+            env={"NELIX_RPC_TOKEN": "t", "PATH": "/usr/bin:/bin"}, timeout=10, text=True)
+    finally:
+        srv.shutdown()
+    rec = json.loads(out.strip())
+    for k in ("kind", "hint", "hung", "task_delivery", "requires_response", "screen_excerpt"):
+        assert k in rec, f"wake payload missing {k}"
+    assert rec["task_delivery"] == "pending" and rec["requires_response"] is True
+    assert rec["screen_excerpt"] == "❯ 1. Yes, I trust this folder"
+    assert "summary" not in rec                    # raw TUI chrome stays out of the wake
+
+
 def test_nelix_wait_scopes_to_session_id():
     seen = {}
 
