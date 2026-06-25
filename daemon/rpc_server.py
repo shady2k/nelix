@@ -16,10 +16,12 @@ class _BadRequest(Exception):
         self.msg = msg
 
 
-def make_server(manager, token, host="127.0.0.1", port=8765):
+def make_server(manager, token, host="127.0.0.1", port=8765, logger=None):
     class Handler(BaseHTTPRequestHandler):
         def _auth(self):
             if self.headers.get("X-Nelix-Token") != token:
+                if logger is not None:
+                    logger.warning("rpc", "unauthorized", path=self.path, status=401)
                 self._send(401, {"error": "unauthorized"}); return False
             return True
 
@@ -58,7 +60,13 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
             try:
                 self._dispatch_get(urlparse(self.path))
             except _BadRequest as e:
+                if logger is not None:
+                    logger.warning("rpc", "bad_request", path=self.path, status=e.code)
                 self._send(e.code, {"error": e.msg})
+            except Exception:
+                if logger is not None:
+                    logger.error("rpc", "request_exception", path=self.path, exc_info=True)
+                self._send(500, {"error": "internal"})
 
         def _dispatch_get(self, p):
             if p.path == "/wait":
@@ -91,11 +99,19 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
         def do_POST(self):
             if not self._auth():
                 return
-            p = urlparse(self.path)
             try:
-                body = self._read_json()
+                self._dispatch_post(urlparse(self.path))
             except _BadRequest as e:
-                self._send(e.code, {"error": e.msg}); return
+                if logger is not None:
+                    logger.warning("rpc", "bad_request", path=self.path, status=e.code)
+                self._send(e.code, {"error": e.msg})
+            except Exception:
+                if logger is not None:
+                    logger.error("rpc", "request_exception", path=self.path, exc_info=True)
+                self._send(500, {"error": "internal"})
+
+        def _dispatch_post(self, p):
+            body = self._read_json()
             if p.path == "/start":
                 try:
                     sid, base_seq = manager.start(body["executor"], body["task"], body["cwd"])
@@ -114,6 +130,8 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
                 if seq is None:
+                    if logger is not None:
+                        logger.warning("rpc", "stale_event", path=self.path, status=409)
                     self._send(409, {"error": "stale or unknown event_id"})
                 else:
                     self._send(200, {"status": "resumed", "next_after_seq": seq})

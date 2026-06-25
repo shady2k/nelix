@@ -127,3 +127,43 @@ def test_load_retention_rejects_float_and_bool(tmp_path):
     cfg.write_text("daemon_log_retain = 1.9\nsession_retain = true\nsession_max_age_days = 2.0\n")
     r = load_retention(str(cfg))
     assert (r.daemon_log_retain, r.session_retain, r.session_max_age_days) == (10, 20, 7)
+
+
+def test_load_log_level_default_when_missing(tmp_path, monkeypatch):
+    monkeypatch.delenv("NELIX_LOG_LEVEL", raising=False)
+    from daemon.config import load_log_level
+    p = tmp_path / "nelix.toml"; p.write_text("concurrency_limit = 1\n")
+    cfg = load_log_level(str(p))
+    assert cfg.level == "info" and cfg.invalid_value is None
+
+
+def test_load_log_level_from_file_case_insensitive(tmp_path, monkeypatch):
+    monkeypatch.delenv("NELIX_LOG_LEVEL", raising=False)
+    from daemon.config import load_log_level
+    p = tmp_path / "nelix.toml"; p.write_text('log_level = "DEBUG"\n')
+    cfg = load_log_level(str(p))
+    assert cfg.level == "debug" and cfg.invalid_value is None
+
+
+def test_load_log_level_invalid_file_falls_back_and_flags(tmp_path, monkeypatch):
+    monkeypatch.delenv("NELIX_LOG_LEVEL", raising=False)
+    from daemon.config import load_log_level
+    p = tmp_path / "nelix.toml"; p.write_text('log_level = "verbose"\n')
+    cfg = load_log_level(str(p))
+    assert cfg.level == "info" and cfg.invalid_value == "verbose" and cfg.invalid_source == "file"
+
+
+def test_env_overrides_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("NELIX_LOG_LEVEL", "warning")
+    from daemon.config import load_log_level
+    p = tmp_path / "nelix.toml"; p.write_text('log_level = "debug"\n')
+    cfg = load_log_level(str(p))
+    assert cfg.level == "warning" and cfg.invalid_value is None
+
+
+def test_invalid_env_falls_back_to_valid_file_but_flags_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("NELIX_LOG_LEVEL", "loud")
+    from daemon.config import load_log_level
+    p = tmp_path / "nelix.toml"; p.write_text('log_level = "debug"\n')
+    cfg = load_log_level(str(p))
+    assert cfg.level == "debug" and cfg.invalid_value == "loud" and cfg.invalid_source == "env"

@@ -27,7 +27,7 @@ def _rmtree(d, logger):
         shutil.rmtree(d)
     except OSError as e:
         if logger is not None:
-            logger.event("manager", "warning", msg="session gc skip", dir=str(d), err=str(e))
+            logger.warning("manager", "session_gc_skip", dir=str(d), err=str(e))
 
 
 def gc_sessions(keep_ids, retain, max_age_days, now=None, logger=None):
@@ -81,13 +81,22 @@ class SessionManager:
     def start(self, executor_name, task, cwd):
         spec = self._specs.get(executor_name)
         if spec is None:
+            if self._logger is not None:
+                self._logger.warning("manager", "session_start_rejected",
+                                     reason="unknown_executor", executor=executor_name)
             raise RuntimeError(f"unknown executor: {executor_name!r} "
                                f"(configured: {sorted(self._specs)})")
         cwd = os.path.abspath(os.path.expanduser(cwd))
         if not os.path.isdir(cwd):          # host-side: fail fast, no session, no auto-mkdir
+            if self._logger is not None:
+                self._logger.warning("manager", "session_start_rejected",
+                                     reason="bad_cwd", executor=executor_name)
             raise ValueError(f"cwd does not exist or is not a directory: {cwd!r}")
         with self._lock:
             if len(self._sessions) >= self._limit:
+                if self._logger is not None:
+                    self._logger.warning("manager", "session_start_rejected",
+                                         reason="concurrency_limit", executor=executor_name)
                 raise RuntimeError(
                     f"concurrency_limit={self._limit} reached "
                     f"(active: {sorted(self._sessions)}); concurrent executors are post-MVP")
@@ -96,6 +105,10 @@ class SessionManager:
             sess = self._make(sid, executor_name, spec)
             self._sessions[sid] = sess
             keep = set(self._sessions)
+        if self._logger is not None:
+            self._logger.info("manager", "session_created", session_id=sid,
+                              executor=executor_name, cwd=cwd,
+                              slot=f"{len(keep)}/{self._limit}")
         gc_sessions(keep, self._session_retain, self._session_max_age_days, logger=self._logger)
         try:
             sess.start(task, cwd)
@@ -106,6 +119,8 @@ class SessionManager:
                 pass
             with self._lock:                      # don't leak a registered-but-unstarted session
                 self._sessions.pop(sid, None)     # (e.g. a rejected task or a spawn failure)
+            if self._logger is not None:
+                self._logger.error("manager", "session_start_failed", session_id=sid, exc_info=True)
             raise
         return sid, base_seq
 
@@ -138,14 +153,17 @@ class SessionManager:
         return {"sessions": {sid: s.snapshot() for sid, s in snapshot.items()},
                 "limit": self._limit}
 
-    def stop(self, session_id):
+    def stop(self, session_id, reason="user_stop"):
         with self._lock:
             sess = self._sessions.pop(session_id, None)
         if sess is None:
             return False
         sess.stop()
+        if self._logger is not None:
+            self._logger.info("manager", "session_stopped", session_id=session_id,
+                              reason=reason, slot_freed=True)
         return True
 
-    def stop_all(self):
+    def stop_all(self, reason="shutdown"):
         for sid in list(self._sessions):
-            self.stop(sid)
+            self.stop(sid, reason=reason)

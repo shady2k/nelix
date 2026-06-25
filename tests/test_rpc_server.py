@@ -292,3 +292,39 @@ def test_screen_endpoint_withholds_while_working_unless_force():
         assert st == 200 and fb["screen"] == FakeManagerWorkingScreen._FRAME   # force shows it
     finally:
         srv.shutdown()
+
+
+def _serve(manager, buf):
+    from daemon.obs import Logger
+    srv = make_server(manager, token="t", port=0, logger=Logger(level="debug", stream=buf))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _, port = srv.server_address          # ephemeral port chosen by the OS
+    return srv, f"http://127.0.0.1:{port}"
+
+
+def test_unauthorized_is_logged():
+    import io
+    buf = io.StringIO()
+    srv, base = _serve(FakeManager(), buf)
+    try:
+        st, _ = _req("GET", base + "/status", token="WRONG")
+        assert st == 401
+    finally:
+        srv.shutdown()
+    assert "unauthorized" in buf.getvalue()
+
+
+def test_unexpected_exception_returns_json_500_and_logs():
+    import io
+    buf = io.StringIO()
+    m = FakeManager()
+    def _boom(*a, **k):
+        raise RuntimeError("boom")
+    m.status = _boom
+    srv, base = _serve(m, buf)
+    try:
+        st, body = _req("GET", base + "/status")
+        assert st == 500 and body["error"] == "internal"
+    finally:
+        srv.shutdown()
+    assert "request_exception" in buf.getvalue()
