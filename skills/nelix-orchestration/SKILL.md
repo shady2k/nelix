@@ -32,37 +32,37 @@ Then `nelix_start(executor, task, cwd)` and **end your turn** — you spend noth
 
 ## The loop
 
-### When you're brought back, read the screen first
+**After `nelix_start` or a successful `nelix_respond`, call no nelix tools — end your turn.** nelix wakes
+you on the next event; there is nothing to check meanwhile, and nothing to gain by looking.
 
-Every wake-up carries `screen_excerpt` — what is literally on the agent's terminal now. Trust it over
-the transcript. For the full screen, call `nelix_screen(session_id)`.
+### The wake notification IS the artifact
 
-Act on the event's own fields, not just its text:
+When nelix wakes you, the notification already carries the full event: `kind`, `task_delivery`, `hint`,
+`requires_response`, and `screen_excerpt` (what is literally on the agent's terminal). Act from it
+directly — no `nelix_status` to "see what happened".
 
 - `task_delivery: "pending"` or `kind: "blocked"` — your task has NOT started; the agent is stopped at
   a setup/permission screen before the prompt (e.g. "Is this a folder you trust?"). Do NOT resend the
-  task. Read the screen and answer what it actually asks: since you chose this working directory, trust
-  is implied — reply `1` with `nelix_respond` (or relay to the user if your mandate says so). The task
+  task. Answer what the `screen_excerpt` actually shows: since you chose this working directory, trust is
+  implied — reply `1` with `nelix_respond` (or relay to the user if your mandate says so). The task
   delivers itself once the prompt clears (there may be more than one such screen — handle each the same
   way).
-- `kind: "waiting_for_user"` — the agent paused at its prompt. Read the screen: if it asked something,
-  answer or relay per your mandate; if it FINISHED, relay the result to the user and do NOT send a bogus
-  reply back to the agent.
+- `kind: "waiting_for_user"` — the agent paused at its prompt. Read `screen_excerpt`: if it asked
+  something, answer or relay per your mandate (permission/destructive → user, always, unless delegated;
+  `hint=="needs_permission"` → the answer is a number). If it FINISHED, relay the result to the user and
+  do NOT send a bogus reply back to the agent. Then `nelix_respond(session_id, event_id, answer)`.
+- `hung: true` — no real progress for `max_idle_seconds` (a ticking timer or long server wait is fine —
+  this fires only on a real stall). Tell the user, let them decide. If you answered and still nothing
+  reacts → wedged → `nelix_stop` and restart.
+- `kind: "done"` (exited) — verify the goal is met (you hold it). Met → report what was done. Not met →
+  restart to continue, within budget.
+- `kind: "crashed"` — recover yourself: `nelix_stop`, then `nelix_start` (same cwd, re-state the goal).
+  Count restarts that bring no progress; reset on progress; after `max_restarts` in a row, stop and ask
+  the user. Say you're restarting, never silently.
 
-Brought back at each pause/finish → call `nelix_status(session_id)` **once**, then:
-
-- **Agent asks** (`hung=false`): permission/destructive → user, always (unless delegated); else follow the
-  mandate. Relay `decision.text`; if `truncated`, read the full question via `nelix_dialog`.
-  `hint=="needs_permission"` → the answer is a number. Send `nelix_respond(session_id, event_id, answer)`
-  with the last-seen `after_seq`.
-- **No progress** (`hung=true`): no real progress for `max_idle_seconds` (a ticking timer or long server
-  wait is fine — this fires only on a real stall). Tell the user, let them decide. If you answered and
-  still nothing reacts → wedged → `nelix_stop` and restart.
-- **Exited**: verify the goal is met (you hold it). Met → report what was done. Not met → restart to
-  continue, within budget.
-- **Crashed**: recover yourself — `nelix_stop`, then `nelix_start` (same cwd, re-state the goal). Count
-  restarts that bring no progress; reset on progress; after `max_restarts` in a row, stop and ask the user.
-  Say you're restarting, never silently.
+If the `screen_excerpt` isn't enough (a truncated question, reconciliation after a crash, debugging),
+`nelix_status` / `nelix_screen` / `nelix_dialog` are there as **fallback inspection** — never the normal
+loop, never progress polling. While the agent is working they return only a brief "still working" note.
 
 End your turn after each start / respond / restart.
 
@@ -80,8 +80,9 @@ its restarts. Re-state the goal on restart. Confirm the goal is actually met bef
 
 ## Rules
 
-- Still running after start / respond / restart → **end your turn**. Never poll `nelix_status` in a loop;
-  reconcile **once** per return.
+- After start / respond / restart → **end your turn** and call no nelix tools. The wake brings you back
+  with the full event; act from it. Never poll `nelix_status`/`nelix_screen` while the agent works.
 - "Done" = process exited **and** goal met — not a mere idle prompt.
-- `nelix_dialog` reads the transcript or a long question — never to poll progress.
+- `nelix_status` / `nelix_screen` / `nelix_dialog` are fallback inspection (reconciliation, a truncated
+  question, debugging) — never the normal loop, never progress polling.
 - Never show the user ids or jargon.

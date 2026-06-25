@@ -96,9 +96,9 @@ def register(ctx):
     ctx.register_tool(
         "nelix_status", "nelix",
         {"description": (
-            "Check a running agent: its state and any pending decision. Omit session_id to list all"
-            " running agents. Call this ONCE each time you're brought back — never poll it in a loop"
-            " while the agent works."),
+            "Fallback snapshot for reconciliation/recovery: an agent's state and any pending decision."
+            " Omit session_id to list all running agents. The wake already carries the event — do NOT"
+            " poll this; while the agent works it just says 'still working'."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}}}},
         nelix_status)
     ctx.register_tool(
@@ -130,13 +130,10 @@ def register(ctx):
         nelix_dialog)
     ctx.register_tool(
         "nelix_screen", "nelix",
-        {"description": ("See exactly what is on the agent's screen right now — the live terminal,"
-                         " with borders and framing stripped for readability. Use this whenever a"
-                         " wake-up is unclear or the agent looks stuck before your task ran (e.g. a"
-                         " trust/setup prompt): read the screen and answer what it actually shows,"
-                         " instead of resending the task. While the agent is working this returns a"
-                         " brief 'still working' note; pass force:true to see the screen anyway."
-                         " Set raw:true for the unfiltered full screen."),
+        {"description": ("Fallback: the live terminal screen, when the wake's screen_excerpt isn't"
+                         " enough — borders and framing stripped for readability. Not for polling"
+                         " progress. While the agent works it returns a brief 'still working' note"
+                         " unless force:true. Set raw:true for the unfiltered full screen."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
                                                "raw": {"type": "boolean"},
                                                "force": {"type": "boolean"}},
