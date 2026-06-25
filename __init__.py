@@ -62,6 +62,13 @@ def register(ctx):
         return json.dumps(RpcClient(base, token).dialog(
             args["session_id"], args.get("turn"), int(args.get("offset", 0)), args.get("limit")))
 
+    def nelix_screen(args, **k):
+        bt = supervisor.base_token()
+        if bt is None:
+            return json.dumps({"error": "no active nelix daemon"})
+        base, token = bt
+        return json.dumps(RpcClient(base, token).screen(args["session_id"]))
+
     names = ", ".join(registry.names()) or "a configured agent"
     # Hermes builds the LLM tool spec as {"type":"function","function":{**schema,"name":name}}
     # (tools/registry.py), so `schema` MUST be the full function schema with `description`
@@ -116,6 +123,15 @@ def register(ctx):
              "offset": {"type": "integer"}, "limit": {"type": "integer"}},
              "required": ["session_id"]}},
         nelix_dialog)
+    ctx.register_tool(
+        "nelix_screen", "nelix",
+        {"description": ("See exactly what is on the agent's screen right now — the live terminal."
+                         " Use this whenever a wake-up is unclear or the agent looks stuck before"
+                         " your task ran (e.g. a trust/setup prompt): read the screen and answer what"
+                         " it actually shows, instead of resending the task."),
+         "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
+                        "required": ["session_id"]}},
+        nelix_screen)
 
     def slash_nelix(raw_args):
         raw = (raw_args or "").strip()

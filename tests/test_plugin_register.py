@@ -62,7 +62,8 @@ def test_register_wires_tools_command_skill_hook(monkeypatch, tmp_path):
     ctx = FakeCtx()
     try:
         nelix.register(ctx)
-        assert set(ctx.tools) == {"nelix_start","nelix_status","nelix_respond","nelix_stop","nelix_dialog"}
+        assert set(ctx.tools) == {"nelix_start","nelix_status","nelix_respond","nelix_stop",
+                                  "nelix_dialog","nelix_screen"}
         assert "nelix" in ctx.commands
         assert "nelix-orchestration" in ctx.skills
         # on_session_finalize (NOT on_session_end): the latter fires per run_conversation
@@ -92,7 +93,8 @@ def test_tool_schemas_are_llm_function_shaped(monkeypatch, tmp_path):
     ctx = FakeCtx()
     try:
         nelix.register(ctx)
-        for tname in ("nelix_start", "nelix_status", "nelix_respond", "nelix_stop", "nelix_dialog"):
+        for tname in ("nelix_start", "nelix_status", "nelix_respond", "nelix_stop", "nelix_dialog",
+                      "nelix_screen"):
             fn = {**ctx.tools[tname]["schema"], "name": tname}  # mirror Hermes' builder
             assert fn.get("description"), f"{tname}: no description in the LLM function spec"
             params = fn.get("parameters")

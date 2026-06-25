@@ -56,3 +56,13 @@ def test_rpc_client_dialog():
         assert c.dialog("s1")["turn_index"] == 2          # default -> latest
     finally:
         srv.shutdown()
+
+
+def test_client_screen_calls_get_screen(monkeypatch):
+    from rpc_client import RpcClient
+    c = RpcClient("http://x", "t")
+    seen = {}
+    monkeypatch.setattr(c, "_call",
+                        lambda m, p, body=None: seen.update(m=m, p=p) or (200, {"screen": "S"}))
+    assert c.screen("s-1") == {"screen": "S"}
+    assert seen == {"m": "GET", "p": "/screen?session_id=s-1"}
