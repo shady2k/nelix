@@ -16,6 +16,21 @@ def test_unknown_launcher_raises():
         get_launcher("warpdrive")
 
 
+def test_auto_launcher_resolves_to_local(monkeypatch):
+    # the ExecutorSpec default (launcher omitted -> "auto") must spawn, not raise "unknown launcher"
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    lr = get_launcher("auto")
+    assert isinstance(lr.capabilities, ExecutorCapabilities)
+    assert lr.capabilities.isolation_class == "host"
+
+
+def test_auto_launcher_under_docker_fails_closed(monkeypatch):
+    # a non-local backend must still fail closed at the daemon launcher (docker is post-MVP)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    with pytest.raises(NotImplementedError):
+        get_launcher("auto")
+
+
 def test_local_launcher_start_spawns(monkeypatch):
     spawned = {}
 
