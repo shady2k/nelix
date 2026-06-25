@@ -318,3 +318,56 @@ def test_start_is_async_and_delivers_when_input_box_ready(tmp_path):
     assert "\r" in handle.writes                          # then Enter
     assert handle.writes.index("\r") > 0                  # Enter AFTER typing
     sess.stop()
+
+
+def test_blocked_on_trust_menu_types_nothing(tmp_path):
+    trust = ("Quick safety check: Is this a project you created or one you trust?\n"
+             "❯ 1. Yes, I trust this folder\n  2. No, exit\n"
+             "Enter to confirm · Esc to cancel\n")
+    sess, handle, _ = make_session(tmp_path, frames=[trust])
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sess._decision is not None and sess._decision["kind"] == "blocked")
+    assert sess._task_delivery == "pending"
+    # no task text, no Enter — only ask-mode toggles are permitted (none expected on a modal)
+    assert handle.writes == [] or all(w in ("\x1b[Z", "\x1b") for w in handle.writes)
+    sess.stop()
+
+
+def test_held_task_delivers_after_interstitials_clear(tmp_path):
+    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[trust, box])
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
+    handle.advance_to_input_box()                  # simulate the menu being answered
+    _wait_for(lambda: sess._task_delivery == "delivered")
+    assert "do work" in "".join(handle.writes) and "\r" in handle.writes
+    sess.stop()
+
+
+def test_blocked_no_echo_emits_blocked_unknown(tmp_path):
+    # An apparent input box where the typed task never echoes -> blocked(unknown), no Enter.
+    class NoEchoHandle(LiveHandle):
+        def write(self, data):
+            self.writes.append(data)            # record but do NOT echo into the frame
+
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box], handle_cls=NoEchoHandle)
+    sess.start("create report.md", str(tmp_path))
+    _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked"
+              and sess._decision.get("hint") == "unknown", timeout=5)
+    assert sess._decision["hint"] == "unknown"
+    assert sess._task_delivery == "pending"
+    assert "\r" not in handle.writes               # never pressed Enter without echo
+    sess.stop()
+
+
+def test_blocked_is_not_respammed_while_screen_unchanged(tmp_path):
+    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    sess, handle, ev = make_session(tmp_path, frames=[trust])
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
+    time.sleep(0.4)                                # let the monitor loop spin several times
+    blocked = [e for e in ev._events if e.kind == "blocked"]
+    assert len(blocked) == 1                        # one blocked, not per-loop spam
+    sess.stop()
