@@ -157,3 +157,37 @@ def test_rpc_start_missing_cwd_returns_400():
         assert "missing field" in b.get("error", "") and "cwd" in b.get("error", "")
     finally:
         srv.shutdown()
+
+
+def test_evt_dict_includes_new_fields():
+    from daemon.rpc_server import _evt_dict
+    from daemon.events import EventQueue
+    q = EventQueue()
+    e = q.publish("s-1", "agent", "blocked", "trust?", "startup_interstitial",
+                  hint="task_not_delivered", task_delivery="pending",
+                  requires_response=True, screen_excerpt="❯ 1. Yes")
+    d = _evt_dict(e)
+    for k in ("hint", "hung", "task_delivery", "requires_response", "screen_excerpt"):
+        assert k in d
+    assert d["task_delivery"] == "pending" and d["requires_response"] is True
+
+
+class FakeManagerWithScreen:
+    def __init__(self):
+        self._events = EventQueue()
+    def screen(self, session_id):
+        if session_id == "s1":
+            return {"screen": "Welcome back!\n❯ ", "cols": 120, "rows": 40}
+        return {"error": "unknown session"}
+
+
+def test_screen_endpoint_returns_live_viewport():
+    m = FakeManagerWithScreen()
+    srv = make_server(m, token="t", port=8773)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("GET", "http://127.0.0.1:8773/screen?session_id=s1")
+        assert st == 200 and "screen" in b and isinstance(b["screen"], str)
+        assert b["cols"] == 120 and b["rows"] == 40
+    finally:
+        srv.shutdown()

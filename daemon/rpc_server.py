@@ -43,6 +43,9 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
                 limit = qs.get("limit", [None])[0]
                 self._send(200, sess.dialog.turn_text(
                     turn, offset, int(limit) if limit is not None else None))
+            elif p.path == "/screen":
+                sid = parse_qs(p.query).get("session_id", [None])[0]
+                self._send(200, manager.screen(sid))
             else:
                 self._send(404, {"error": "not found"})
 
@@ -82,4 +85,6 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
 
 def _evt_dict(e):
     return {"seq": e.seq, "event_id": e.event_id, "session_id": e.session_id,
-            "executor": e.executor, "kind": e.kind, "summary": e.summary, "state": e.state}
+            "executor": e.executor, "kind": e.kind, "summary": e.summary, "state": e.state,
+            "hint": e.hint, "hung": e.hung, "task_delivery": e.task_delivery,
+            "requires_response": e.requires_response, "screen_excerpt": e.screen_excerpt}
