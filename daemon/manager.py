@@ -102,11 +102,11 @@ class SessionManager:
     def get(self, session_id):
         return self._sessions.get(session_id)
 
-    def screen(self, session_id):
+    def screen(self, session_id, raw=False):
         sess = self._sessions.get(session_id)
         if sess is None:
             return {"error": "unknown session"}
-        return {"screen": sess.screen(), "cols": sess._cols, "rows": sess._rows}
+        return {"screen": sess.screen(raw=raw), "cols": sess._cols, "rows": sess._rows}
 
     def respond(self, session_id, event_id, answer):
         sess = self._sessions.get(session_id)

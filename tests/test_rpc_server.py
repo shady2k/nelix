@@ -173,12 +173,15 @@ def test_evt_dict_includes_new_fields():
 
 
 class FakeManagerWithScreen:
+    _FRAME = "╭──────╮\n│ Welcome back! │\n╰──────╯\n❯ "
     def __init__(self):
         self._events = EventQueue()
-    def screen(self, session_id):
-        if session_id == "s1":
-            return {"screen": "Welcome back!\n❯ ", "cols": 120, "rows": 40}
-        return {"error": "unknown session"}
+    def screen(self, session_id, raw=False):
+        from daemon.session import _clean_screen
+        if session_id != "s1":
+            return {"error": "unknown session"}
+        screen = self._FRAME if raw else _clean_screen(self._FRAME)
+        return {"screen": screen, "cols": 120, "rows": 40}
 
 
 def test_screen_endpoint_returns_live_viewport():
@@ -189,5 +192,8 @@ def test_screen_endpoint_returns_live_viewport():
         st, b = _req("GET", "http://127.0.0.1:8773/screen?session_id=s1")
         assert st == 200 and "screen" in b and isinstance(b["screen"], str)
         assert b["cols"] == 120 and b["rows"] == 40
+        assert "│" not in b["screen"] and "Welcome back!" in b["screen"]   # cleaned by default
+        st, rb = _req("GET", "http://127.0.0.1:8773/screen?session_id=s1&raw=1")
+        assert st == 200 and "│" in rb["screen"]                            # raw is uncleaned
     finally:
         srv.shutdown()

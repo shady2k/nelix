@@ -67,7 +67,8 @@ def register(ctx):
         if bt is None:
             return json.dumps({"error": "no active nelix daemon"})
         base, token = bt
-        return json.dumps(RpcClient(base, token).screen(args["session_id"]))
+        return json.dumps(RpcClient(base, token).screen(
+            args["session_id"], raw=bool(args.get("raw"))))
 
     names = ", ".join(registry.names()) or "a configured agent"
     # Hermes builds the LLM tool spec as {"type":"function","function":{**schema,"name":name}}
@@ -125,11 +126,13 @@ def register(ctx):
         nelix_dialog)
     ctx.register_tool(
         "nelix_screen", "nelix",
-        {"description": ("See exactly what is on the agent's screen right now — the live terminal."
-                         " Use this whenever a wake-up is unclear or the agent looks stuck before"
-                         " your task ran (e.g. a trust/setup prompt): read the screen and answer what"
-                         " it actually shows, instead of resending the task."),
-         "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
+        {"description": ("See exactly what is on the agent's screen right now — the live terminal,"
+                         " with borders and framing stripped for readability. Use this whenever a"
+                         " wake-up is unclear or the agent looks stuck before your task ran (e.g. a"
+                         " trust/setup prompt): read the screen and answer what it actually shows,"
+                         " instead of resending the task. Set raw:true for the unfiltered full screen."),
+         "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
+                                               "raw": {"type": "boolean"}},
                         "required": ["session_id"]}},
         nelix_screen)
 

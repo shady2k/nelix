@@ -1,3 +1,4 @@
+import re
 import threading
 import time
 
@@ -11,11 +12,27 @@ def _sessions_root():
     return paths.sessions_root()
 
 
+# Box-drawing (U+2500–U+257F) + block elements (U+2580–U+259F). Purely structural framing
+# glyphs — content-agnostic, no per-CLI knowledge.
+_FRAME_CLASS = "─-╿▀-▟"
+_FRAME_ONLY = re.compile(rf"^[\s{_FRAME_CLASS}]*$")           # whole line is blank/framing
+_FRAME_EDGE = re.compile(rf"^[\s{_FRAME_CLASS}]+|[\s{_FRAME_CLASS}]+$")  # leading/trailing framing
+
+
+def _clean_screen(screen):
+    """Strip the terminal framing structurally: drop border/separator/blank lines and peel
+    the framing off the edges of kept lines (e.g. '│ Welcome back! │' -> 'Welcome back!').
+    Content glyphs outside the box/block ranges (e.g. '❯', U+276F) are preserved."""
+    out = []
+    for line in screen.split("\n"):
+        if _FRAME_ONLY.match(line):
+            continue                                          # pure border / separator / blank
+        out.append(_FRAME_EDGE.sub("", line))
+    return "\n".join(out)
+
+
 def _excerpt(screen, max_chars):
-    lines = [ln.rstrip() for ln in screen.split("\n")]
-    while lines and not lines[-1]:
-        lines.pop()
-    text = "\n".join(lines)
+    text = _clean_screen(screen)                              # clean structurally THEN cap
     return text[-max_chars:] if max_chars and len(text) > max_chars else text
 
 
@@ -76,9 +93,10 @@ class Session:
         # The TUI treats CR (\r), not LF, as Enter.
         self._handle.write("\r")
 
-    def screen(self):
+    def screen(self, raw=False):
         with self._lock:
-            return self._handle.render() if self._handle is not None else ""
+            frame = self._handle.render() if self._handle is not None else ""
+        return frame if raw else _clean_screen(frame)
 
     def _wait_until_ready(self, timeout=20.0, stable_for=1.2):
         last = None; stable_since = None

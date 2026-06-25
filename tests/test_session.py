@@ -384,3 +384,51 @@ def test_respond_to_blocked_does_not_mark_turn_boundary(tmp_path):
     assert "1" in "".join(handle.writes) and "\r" in handle.writes   # answer injected
     assert sess._dialog.turn_count() == turns_before                 # NO task turn boundary
     sess.stop()
+
+
+# ---- structural screen cleaner --------------------------------------------------
+
+def test_clean_screen_drops_borders_keeps_framed_text():
+    from daemon.session import _clean_screen
+    framed = (
+        "╭───────────────╮\n"
+        "│ Welcome back! │\n"
+        "├───────────────┤\n"
+        "│   doing work  │\n"
+        "╰───────────────╯\n")
+    out = _clean_screen(framed)
+    lines = out.split("\n")
+    assert "Welcome back!" in lines        # framing stripped from kept content
+    assert "doing work" in lines
+    assert all("─" not in ln and "│" not in ln and "╭" not in ln for ln in lines)
+    assert all(ln.strip() for ln in lines)  # no blank/border-only lines remain
+
+
+def test_clean_screen_preserves_input_box_and_options():
+    from daemon.session import _clean_screen
+    screen = ("❯ \n"
+              "─────────────\n"
+              "❯ 1. Yes, I trust this folder\n"
+              "  2. No, exit\n")
+    out = _clean_screen(screen).split("\n")
+    assert "❯" in out                      # bare input-box marker survives (U+276F kept)
+    assert "❯ 1. Yes, I trust this folder" in out
+    assert "2. No, exit" in out
+    assert "─────────────" not in out      # pure separator dropped
+
+
+def test_clean_screen_drops_pure_block_and_corner_lines():
+    from daemon.session import _clean_screen
+    screen = "▀▀▀▀▀\nkeep me\n╰────╯\n   \n"
+    out = _clean_screen(screen).split("\n")
+    assert out == ["keep me"]              # block row, corner row, blank row all dropped
+
+
+def test_session_screen_cleans_by_default_and_raw_is_exact(tmp_path):
+    raw = "╭──────╮\n│ hi  │\n╰──────╯\n"
+    sess, handle, _ = make_session(tmp_path, frames=[raw])
+    sess._handle = handle                  # render() serves the framed frame
+    from daemon.session import _clean_screen
+    assert sess.screen() == _clean_screen(raw)
+    assert sess.screen(raw=True) == raw    # exact untouched render()
+    assert "│" in sess.screen(raw=True) and "│" not in sess.screen()

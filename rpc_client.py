@@ -38,8 +38,11 @@ class RpcClient:
         _, body = self._call("GET", "/dialog" + q)
         return body
 
-    def screen(self, session_id):
-        _, body = self._call("GET", f"/screen?session_id={session_id}")
+    def screen(self, session_id, raw=False):
+        q = f"/screen?session_id={session_id}"
+        if raw:
+            q += "&raw=1"
+        _, body = self._call("GET", q)
         return body
 
     def respond(self, session_id, event_id, answer):
