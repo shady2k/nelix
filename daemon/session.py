@@ -77,7 +77,7 @@ class Session:
         # /start returns once the PTY is spawned, NOT once the task is delivered.
         # Clean the held task FIRST (CLI-agnostic byte hygiene + the driver's command-prefix
         # policy): a rejected task raises before anything is spawned, and the cleaned text is
-        # both what gets typed and what input_echo_present() matches against.
+        # both what gets typed and what input_submission_present() matches against.
         self._task = prepare_pty_input(task, self._driver.command_prefixes)
         self._dialog = Dialog(self._sessions_dir / self._id,
                               tail_lines=self._spec.tail_lines,
@@ -184,7 +184,7 @@ class Session:
             self._handle.pump(0.1)
             with self._lock:
                 frame = self._handle.render()
-            if self._driver.input_echo_present(frame, self._task):
+            if self._driver.input_submission_present(frame, self._task):
                 self._press_enter()
                 self._dialog.mark_turn_boundary()    # task turn begins now
                 self._task_delivery = "delivered"

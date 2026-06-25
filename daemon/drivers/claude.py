@@ -17,6 +17,10 @@ _TOKENS = re.compile(r"\d+\s+tokens?\b")
 _PROMPT_FOOTER = "shift+tab to cycle"     # present at the interactive input prompt (any mode)
 _OPTION = re.compile(r"^\s*[❯>]?\s*\d+\.\s+\S", re.M)        # a numbered menu option line
 _SELECTED_OPTION = re.compile(r"^\s*❯\s*\d+\.\s+\S", re.M)   # the cursor sits ON an option
+# Claude collapses long/multiline input into "[Pasted text #N]" ON the prompt line; the prompt marker
+# (❯) sits immediately before it (Claude renders a NBSP between them). Scoped so the same string echoed
+# elsewhere in OUTPUT does not count as our submission.
+_PASTED_TEXT = re.compile(r"❯[ \t ]*\[Pasted text #\d+\]")
 
 
 def _is_choice_prompt(frame):
@@ -70,7 +74,10 @@ class ClaudeDriver:
             return False
         return ("❯" in frame) and (_PROMPT_FOOTER in frame)
 
-    def input_echo_present(self, frame, text):
-        # The just-typed text is visible in the viewport (whitespace-normalized prefix).
+    def input_submission_present(self, frame, text):
+        # Our submission is in the input box — either the typed text echoes verbatim, or (for a long or
+        # multiline task) Claude collapsed it into a "[Pasted text #N]" placeholder on the prompt line.
         needle = " ".join(text.split())[:40]
-        return bool(needle) and needle in " ".join(frame.split())
+        if needle and needle in " ".join(frame.split()):
+            return True
+        return bool(_PASTED_TEXT.search(frame))

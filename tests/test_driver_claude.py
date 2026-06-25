@@ -80,7 +80,13 @@ def test_is_accepting_input_only_at_real_prompt():
     assert D.is_accepting_input(WORKING) is False
 
 
-def test_input_echo_present_detects_typed_task():
+def test_input_submission_present_detects_typed_or_pasted_task():
     typed = INPUT_BOX.replace("❯ \n", "❯ create report.md with a header\n")
-    assert D.input_echo_present(typed, "create report.md with a header") is True
-    assert D.input_echo_present(INPUT_BOX, "create report.md with a header") is False
+    assert D.input_submission_present(typed, "create report.md with a header") is True
+    assert D.input_submission_present(INPUT_BOX, "create report.md with a header") is False
+    # Claude collapses a long/multiline task into a placeholder ON the prompt line (NBSP after ❯).
+    pasted = INPUT_BOX.replace("❯ \n", "❯ [Pasted text #1]\n")
+    assert D.input_submission_present(pasted, "a long task that claude collapsed") is True
+    # A placeholder echoed in OUTPUT while the prompt is empty must NOT count as our submission.
+    output_only = "log: [Pasted text #1] was mentioned\n" + INPUT_BOX
+    assert D.input_submission_present(output_only, "a long task that claude collapsed") is False

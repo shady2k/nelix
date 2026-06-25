@@ -336,6 +336,15 @@ class LiveHandle:
         pass
 
 
+class PasteCollapseHandle(LiveHandle):
+    """Claude collapses a long pasted task into a "[Pasted text #N]" placeholder instead of echoing."""
+    def write(self, data):
+        self.writes.append(data)
+        if data not in ("\r", "\x1b[Z", "\x1b"):
+            j = min(self._i, len(self._frames) - 1)
+            self._frames[j] = self._frames[j].replace("❯ \n", "❯ [Pasted text #1]\n")
+
+
 def make_session(tmp_path, frames, handle_cls=LiveHandle, spec=None):
     ev = EventQueue()
     handle = handle_cls(list(frames))
@@ -396,6 +405,18 @@ def test_held_task_delivers_after_interstitials_clear(tmp_path):
     handle.advance_to_input_box()                  # simulate the menu being answered
     _wait_for(lambda: sess._task_delivery == "delivered")
     assert "do work" in "".join(handle.writes) and "\r" in handle.writes
+    sess.stop()
+
+
+def test_delivery_confirms_when_claude_collapses_paste(tmp_path):
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box], handle_cls=PasteCollapseHandle)
+    sess.start("a long multi-paragraph task that claude will collapse into a paste", str(tmp_path))
+    _wait_for(lambda: sess._task_delivery == "delivered", timeout=5)
+    assert sess._task_delivery == "delivered"
+    assert "\r" in handle.writes                                          # Enter pressed
+    task_writes = [w for w in handle.writes if "multi-paragraph" in w]
+    assert len(task_writes) == 1                                          # typed exactly once
     sess.stop()
 
 
