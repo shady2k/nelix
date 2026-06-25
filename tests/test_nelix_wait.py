@@ -43,6 +43,32 @@ def test_nelix_wait_reissues_then_prints_event():
     assert "summary" not in rec
 
 
+def test_nelix_wait_scopes_to_session_id():
+    seen = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["path"] = self.path
+            body = json.dumps({"event": {"seq": 9, "session_id": "s-abc", "event_id": "evt-z",
+                                         "executor": EXECUTOR, "kind": "waiting_for_user"}}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body))); self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a): pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 8794), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        out = subprocess.check_output(
+            [sys.executable, str(ROOT / "bin" / "nelix-wait"),
+             "--base", "http://127.0.0.1:8794", "--after", "0", "--session-id", "s-abc"],
+            env={"NELIX_RPC_TOKEN": "t", "PATH": "/usr/bin:/bin"}, timeout=10, text=True)
+    finally:
+        srv.shutdown()
+    assert "session_id=s-abc" in seen["path"]          # waiter scopes /wait to the session
+    assert json.loads(out.strip())["session_id"] == "s-abc"
+
+
 def test_nelix_wait_reads_token_from_token_file(tmp_path):
     seen = {}
 

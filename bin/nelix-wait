@@ -23,13 +23,16 @@ def main():
     ap.add_argument("--base", default=os.environ.get("NELIX_RPC", "http://127.0.0.1:8765"))
     ap.add_argument("--after", type=int, default=0)
     ap.add_argument("--token-file", dest="token_file", default=None)
+    ap.add_argument("--session-id", dest="session_id", default=None)
     args = ap.parse_args()
     token = _read_token(args.token_file)
     after = args.after
     try:
         while True:
-            req = urllib.request.Request(f"{args.base}/wait?after_seq={after}",
-                                         headers={"X-Nelix-Token": token})
+            url = f"{args.base}/wait?after_seq={after}"
+            if args.session_id:
+                url += f"&session_id={args.session_id}"
+            req = urllib.request.Request(url, headers={"X-Nelix-Token": token})
             try:
                 with urllib.request.urlopen(req, timeout=40) as r:
                     evt = json.loads(r.read()).get("event")

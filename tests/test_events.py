@@ -15,9 +15,27 @@ def test_pending_filtered_by_session():
     e1 = q.publish("s1", "claude", "waiting_for_user", "y/n?", "waiting_for_user")
     q.publish("s2", "codex", "waiting_for_user", "y/n?", "waiting_for_user")
     assert q.pending("s1").event_id == e1.event_id
-    assert q.mark_answered(e1.event_id) is True
+    assert q.mark_answered(e1.event_id) == e1.seq        # returns the answered seq, not bool
     assert q.pending("s1") is None
     assert q.pending("s2") is not None
+
+
+def test_mark_answered_returns_seq():
+    q = EventQueue()
+    e = q.publish("s-1", "a", "waiting_for_user", "?", "idle_prompt")
+    assert q.mark_answered(e.event_id) == e.seq
+    assert q.mark_answered("evt-nope") is None
+
+
+def test_latest_seq_and_session_scoped_wait():
+    q = EventQueue()
+    assert q.latest_seq() == 0
+    a = q.publish("s-A", "x", "blocked", "", "startup_interstitial")
+    q.publish("s-B", "x", "blocked", "", "startup_interstitial")
+    assert q.latest_seq() == 2
+    # session-scoped: from before A, only s-A's event is returned for session s-A
+    assert q.latest_after(0, session_id="s-A") is a
+    assert q.latest_after(a.seq, session_id="s-A") is None
 
 
 def test_wait_event_blocks_then_returns():

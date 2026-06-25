@@ -28,8 +28,9 @@ def _mgr(limit=1):
 
 def test_start_returns_id_and_enforces_limit():
     m, captured = _mgr(limit=1)
-    sid = m.start(EXECUTOR, "task A", "/tmp")
+    sid, base_seq = m.start(EXECUTOR, "task A", "/tmp")
     assert captured[0].started == "task A" and m.get(sid) is captured[0]
+    assert base_seq == 0                           # daemon-owned cursor: high-water before start
     # session ids are uuid-based (not a per-daemon sequential counter that resets to
     # "s1" on restart and collides with stale references); consistent with evt-<hex>.
     assert re.match(r"^s-[0-9a-f]{8}$", sid), f"non-uuid session id: {sid!r}"
@@ -74,7 +75,7 @@ def test_start_rejects_cwd_that_is_a_file(tmp_path):
 
 def test_status_lists_all_and_stop():
     m, captured = _mgr(limit=2)
-    sid = m.start(EXECUTOR, "t", "/tmp")
+    sid, _ = m.start(EXECUTOR, "t", "/tmp")
     all_status = m.status()
     assert sid in all_status["sessions"]
     assert m.stop(sid) is True and captured[0].stopped is True

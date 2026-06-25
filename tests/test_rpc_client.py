@@ -7,8 +7,8 @@ from rpc_client import RpcClient
 
 class FakeManager:
     def __init__(self): self._events = EventQueue(); self.calls = []
-    def start(self, e, t, c): self.calls.append(("start", e, t, c)); return "s1"
-    def respond(self, s, e, a): self.calls.append(("respond", s, e, a)); return True
+    def start(self, e, t, c): self.calls.append(("start", e, t, c)); return "s1", 0
+    def respond(self, s, e, a): self.calls.append(("respond", s, e, a)); return 3
     def status(self, sid=None): return {"sessions": {}}
     def stop(self, s): self.calls.append(("stop", s)); return True
 

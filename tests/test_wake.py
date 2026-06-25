@@ -28,3 +28,12 @@ def test_arm_waiter_passes_token_file_not_env(tmp_path):
     # The terminal tool ignores an `env` dict, so the token must NOT travel that way;
     # and it must NOT be inlined in the command (avoids ps / redact_secrets exposure).
     assert "env" not in args
+    assert "--session-id" not in cmd               # omitted when no session_id given
+
+
+def test_arm_waiter_scopes_to_session_when_given(tmp_path):
+    ctx = FakeCtx()
+    tf = tmp_path / ".active.json"
+    wake.arm_waiter(ctx, "http://127.0.0.1:9000", after_seq=5, token_file=tf, session_id="s-abc")
+    cmd = ctx.dispatched[0][1]["command"]
+    assert "--session-id s-abc" in cmd             # scoped so cross-session events don't wake

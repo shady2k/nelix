@@ -26,8 +26,10 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
                 return
             p = urlparse(self.path)
             if p.path == "/wait":
-                after = int(parse_qs(p.query).get("after_seq", ["0"])[0])
-                evt = manager._events.wait_event(after_seq=after, timeout=25)
+                qs = parse_qs(p.query)
+                after = int(qs.get("after_seq", ["0"])[0])
+                sid = qs.get("session_id", [None])[0]
+                evt = manager._events.wait_event(after_seq=after, timeout=25, session_id=sid)
                 self._send(200, {"event": _evt_dict(evt) if evt else None})
             elif p.path == "/status":
                 sid = parse_qs(p.query).get("session_id", [None])[0]
@@ -57,19 +59,21 @@ def make_server(manager, token, host="127.0.0.1", port=8765):
             p = urlparse(self.path); body = self._read_json()
             if p.path == "/start":
                 try:
-                    sid = manager.start(body["executor"], body["task"], body["cwd"])
+                    sid, base_seq = manager.start(body["executor"], body["task"], body["cwd"])
                 except (RuntimeError, ValueError) as e:
                     self._send(409, {"error": str(e)}); return
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
-                self._send(200, {"session_id": sid})
+                self._send(200, {"session_id": sid, "next_after_seq": base_seq})
             elif p.path == "/respond":
                 try:
-                    ok = manager.respond(body["session_id"], body["event_id"], body["answer"])
+                    seq = manager.respond(body["session_id"], body["event_id"], body["answer"])
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
-                self._send(200 if ok else 409,
-                           {"status": "resumed"} if ok else {"error": "stale or unknown event_id"})
+                if seq is None:
+                    self._send(409, {"error": "stale or unknown event_id"})
+                else:
+                    self._send(200, {"status": "resumed", "next_after_seq": seq})
             elif p.path == "/stop":
                 try:
                     stopped = manager.stop(body["session_id"])

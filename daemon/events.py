@@ -47,17 +47,21 @@ class EventQueue:
             self._cv.notify_all()
             return e
 
-    def latest_after(self, after_seq):
+    def latest_seq(self):
+        with self._cv:
+            return self._events[-1].seq if self._events else 0
+
+    def latest_after(self, after_seq, session_id=None):
         for e in self._events:
-            if e.seq > after_seq:
+            if e.seq > after_seq and (session_id is None or e.session_id == session_id):
                 return e
         return None
 
-    def wait_event(self, after_seq, timeout):
+    def wait_event(self, after_seq, timeout, session_id=None):
         deadline = time.time() + timeout
         with self._cv:
             while True:
-                evt = self.latest_after(after_seq)
+                evt = self.latest_after(after_seq, session_id)
                 if evt is not None:
                     return evt
                 remaining = deadline - time.time()
@@ -70,8 +74,8 @@ class EventQueue:
             for e in self._events:
                 if e.event_id == event_id:
                     e.answered = True
-                    return True
-            return False
+                    return e.seq               # the answered event's seq (cursor to arm from)
+            return None
 
     def pending(self, session_id=None):
         with self._cv:

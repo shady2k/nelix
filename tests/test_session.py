@@ -208,9 +208,10 @@ def test_respond_answers_and_advances_turn(monkeypatch, tmp_path):
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
-    eid = sess.snapshot()["decision"]["event_id"]
+    pend = ev.pending("s1")
+    eid = pend.event_id
     assert sess._dialog.current_turn() == 0
-    assert sess.respond(eid, "1") is True
+    assert sess.respond(eid, "1") == pend.seq             # returns the answered event's seq
     assert ev.pending("s1") is None                       # answered
     assert sess._dialog.current_turn() == 1               # new turn boundary
     assert sess.snapshot().get("decision") is None        # cleared
@@ -384,7 +385,7 @@ def test_respond_to_blocked_does_not_mark_turn_boundary(tmp_path):
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
     turns_before = sess._dialog.turn_count()
     ev = sess._decision["event_id"]
-    assert sess.respond(ev, "1") is True
+    assert sess.respond(ev, "1") is not None         # returns the answered seq, not bool
     assert "1" in "".join(handle.writes) and "\r" in handle.writes   # answer injected
     assert sess._dialog.turn_count() == turns_before                 # NO task turn boundary
     sess.stop()
@@ -413,7 +414,7 @@ def test_respond_to_blocked_does_not_re_emit_same_frame(tmp_path):
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
     eid = sess._decision["event_id"]
-    assert sess.respond(eid, "1") is True
+    assert sess.respond(eid, "1") is not None       # returns the answered seq, not bool
     time.sleep(0.3)                                # monitor keeps seeing the same trust frame
     blocked = [e for e in ev._events if e.kind == "blocked"]
     assert len(blocked) == 1                        # no duplicate for the unchanged frame

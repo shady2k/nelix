@@ -307,9 +307,9 @@ class Session:
     def respond(self, event_id, answer):
         pending = self._events.pending(self._id)
         if pending is None or pending.event_id != event_id:
-            return False                              # bind to the current pending decision
+            return None                               # stale/unknown: bind to the current decision
         is_blocked = pending.kind == "blocked"
-        self._events.mark_answered(event_id)
+        seq = self._events.mark_answered(event_id)
         if self._handle is not None:
             if not is_blocked:
                 # only a delivered agent turn gets a boundary; the monitor reads the dialog
@@ -321,7 +321,7 @@ class Session:
             self._last_state = None
         with self._lock:
             self._decision = None
-        return True
+        return seq                                    # cursor for the waiter to arm past
 
     def stop(self):
         self._stop.set()

@@ -92,12 +92,13 @@ class SessionManager:
                     f"concurrency_limit={self._limit} reached "
                     f"(active: {sorted(self._sessions)}); concurrent executors are post-MVP")
             sid = f"s-{uuid.uuid4().hex[:8]}"
+            base_seq = self._events.latest_seq()      # waiter arms past anything already emitted
             sess = self._make(sid, executor_name, spec)
             self._sessions[sid] = sess
             keep = set(self._sessions)
         gc_sessions(keep, self._session_retain, self._session_max_age_days, logger=self._logger)
         sess.start(task, cwd)
-        return sid
+        return sid, base_seq
 
     def get(self, session_id):
         return self._sessions.get(session_id)
@@ -110,7 +111,7 @@ class SessionManager:
 
     def respond(self, session_id, event_id, answer):
         sess = self._sessions.get(session_id)
-        return bool(sess and sess.respond(event_id, answer))
+        return sess.respond(event_id, answer) if sess else None
 
     def status(self, session_id=None):
         if session_id is not None:

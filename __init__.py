@@ -24,7 +24,10 @@ def register(ctx):
         resolve_launcher("auto")               # isolation parity: fail closed
         base, token = supervisor.ensure_running()
         body = RpcClient(base, token).start(args["executor"], args["task"], cwd)
-        arm_waiter(ctx, base, after_seq=0, token_file=supervisor.state_file())
+        # The daemon owns the cursor: arm the wake past anything emitted before this session,
+        # scoped to this session so cross-session events never produce a stale wake.
+        arm_waiter(ctx, base, after_seq=int(body.get("next_after_seq", 0)),
+                   session_id=body.get("session_id"), token_file=supervisor.state_file())
         return json.dumps(body)
 
     def nelix_status(args, **k):
@@ -43,8 +46,9 @@ def register(ctx):
         ok, body = RpcClient(base, token).respond(
             args["session_id"], args["event_id"], args["answer"])
         if ok:
-            arm_waiter(ctx, base, after_seq=int(args.get("after_seq", 0)),
-                       token_file=supervisor.state_file())
+            # The daemon owns the cursor: arm the next wake past the event we just answered.
+            arm_waiter(ctx, base, after_seq=int(body.get("next_after_seq", 0)),
+                       session_id=args["session_id"], token_file=supervisor.state_file())
         return json.dumps(body)
 
     def nelix_stop(args, **k):
@@ -101,11 +105,11 @@ def register(ctx):
         "nelix_respond", "nelix",
         {"description": (
             "Send the user's answer to a paused agent (e.g. '1' to approve, or free text) so it"
-            " continues. Bound to that decision's event_id; pass the last-seen after_seq so the next"
-            " return is a NEW decision, not this one."),
+            " continues. Bound to that decision's event_id. After it succeeds, end your turn — nelix"
+            " wakes you on the next event."),
          "parameters": {**_OBJ,
                         "properties": {"session_id": {"type": "string"}, "event_id": {"type": "string"},
-                                       "answer": {"type": "string"}, "after_seq": {"type": "integer"}},
+                                       "answer": {"type": "string"}},
                         "required": ["session_id", "event_id", "answer"]}},
         nelix_respond)
     ctx.register_tool(
