@@ -1,8 +1,11 @@
 import os
 import select
+import time
 
 import pyte
 import ptyprocess
+
+from daemon.errors import PtyWriteTimeout
 
 
 def _row_text(row):
@@ -68,9 +71,49 @@ class PtySession:
     def render(self):
         return "\n".join(self._screen.display)
 
-    def write(self, data):
-        if self._child is not None:
-            self._child.write(data.encode())
+    def write(self, data, timeout=None):
+        # Non-blocking, deadline-bounded write. A blocking ptyprocess.write() would wedge
+        # the monitor thread forever if the child stops draining its stdin (PTY input
+        # buffer full) — and on macOS select-for-write on a PTY master can report writable
+        # even when the buffer is full, so we set the fd non-blocking: os.write raises
+        # BlockingIOError instead of blocking. With `timeout` set, raise PtyWriteTimeout if
+        # `data` is not fully written in time. Only the monitor thread writes, so toggling
+        # the fd's blocking mode here (restored in finally) is safe vs the read path.
+        if self._child is None:
+            return
+        b = data.encode()
+        fd = self._child.fd
+        mv = memoryview(b)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            old_blocking = os.get_blocking(fd)
+            os.set_blocking(fd, False)
+        except (OSError, ValueError):
+            return                          # fd already closed (e.g. concurrent stop())
+        try:
+            while mv:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise PtyWriteTimeout(len(b) - len(mv), len(b))
+                try:
+                    n = os.write(fd, mv[:65536])
+                    if n <= 0:              # no progress: treat as "would block", wait
+                        raise BlockingIOError()
+                    mv = mv[n:]
+                    continue
+                except BlockingIOError:
+                    pass                    # buffer full: wait (bounded) for space
+                except (OSError, ValueError):
+                    return                  # fd closed / child gone
+                wait = 0.1 if deadline is None else min(0.1, max(0.0, deadline - time.monotonic()))
+                try:
+                    select.select([], [fd], [], wait)
+                except (OSError, ValueError):
+                    return
+        finally:
+            try:
+                os.set_blocking(fd, old_blocking)
+            except OSError:
+                pass
 
     def is_alive(self):
         return self._child is not None and self._child.isalive()
@@ -104,4 +147,7 @@ class PtySession:
 
     def close(self):
         if self._child is not None:
-            self._child.close(force=True)
+            try:
+                self._child.close(force=True)
+            except OSError:
+                pass            # EIO etc. on a torn-down PTY: closing a broken fd is fine
