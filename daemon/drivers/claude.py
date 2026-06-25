@@ -80,4 +80,7 @@ class ClaudeDriver:
         needle = " ".join(text.split())[:40]
         if needle and needle in " ".join(frame.split()):
             return True
-        return bool(_PASTED_TEXT.search(frame))
+        # The placeholder only counts on the active input line (from the last ❯ onward), never in
+        # scrolled-up agent output that happens to contain the same string.
+        tail = frame[frame.rfind("❯"):] if "❯" in frame else ""
+        return bool(_PASTED_TEXT.search(tail))

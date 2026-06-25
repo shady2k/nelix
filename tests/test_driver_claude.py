@@ -93,3 +93,13 @@ def test_input_submission_present_detects_typed_or_pasted_task():
     # A placeholder echoed in OUTPUT while the prompt is empty must NOT count as our submission.
     output_only = "log: [Pasted text #1] was mentioned\n" + INPUT_BOX
     assert D.input_submission_present(output_only, "a long task that claude collapsed") is False
+
+
+def test_pasted_placeholder_only_on_active_input_line():
+    # placeholder on the real (last) input line -> True
+    box = "Welcome back!\n❯ [Pasted text #1]\n⏵⏵ ask mode (shift+tab to cycle)\n"
+    assert D.input_submission_present(box, "a long collapsed task") is True
+    # placeholder ONLY in scrolled agent output, with an empty real prompt below -> False
+    out = ("agent log: ❯ [Pasted text #9] (quoted)\nmore output\n"
+           "❯ \n⏵⏵ ask mode (shift+tab to cycle)\n")
+    assert D.input_submission_present(out, "a long collapsed task") is False
