@@ -12,6 +12,7 @@ from daemon.events import EventQueue          # noqa: E402
 
 class Spec:
     settle_seconds = 1.5
+    delivery_confirm_seconds = 2.0
     max_idle_seconds = 600.0
     tail_lines = 100
     status_tail_chars = 4000
@@ -25,6 +26,10 @@ class HangSpec(Spec):
 
 class BackstopSpec(Spec):
     max_idle_seconds = 0.2          # fast no-progress backstop for real-thread tests
+
+
+class FastConfirmSpec(Spec):
+    delivery_confirm_seconds = 0.3      # fast timeout so the failure path is quick to test
 
 
 class TruncSpec(Spec):
@@ -420,20 +425,26 @@ def test_delivery_confirms_when_claude_collapses_paste(tmp_path):
     sess.stop()
 
 
-def test_blocked_no_echo_emits_blocked_unknown(tmp_path):
-    # An apparent input box where the typed task never echoes -> blocked(unknown), no Enter.
+def test_delivery_timeout_marks_failed_and_wakes(tmp_path):
+    # The typed task never confirms (no echo, no placeholder). After the confirm window, delivery is
+    # marked failed and a non-respondable delivery_failed event wakes Hermes — nothing is re-typed.
     class NoEchoHandle(LiveHandle):
         def write(self, data):
-            self.writes.append(data)            # record but do NOT echo into the frame
+            self.writes.append(data)            # record but never render evidence -> never confirms
 
     box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
-    sess, handle, _ = make_session(tmp_path, frames=[box], handle_cls=NoEchoHandle)
+    sess, handle, ev = make_session(tmp_path, frames=[box], handle_cls=NoEchoHandle,
+                                    spec=FastConfirmSpec())
     sess.start("create report.md", str(tmp_path))
-    _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked"
-              and sess._decision.get("hint") == "unknown", timeout=5)
-    assert sess._decision["hint"] == "unknown"
-    assert sess._task_delivery == "pending"
-    assert "\r" not in handle.writes               # never pressed Enter without echo
+    _wait_for(lambda: sess._task_delivery == "failed", timeout=5)
+    assert sess._task_delivery == "failed"
+    assert "\r" not in handle.writes                                    # never pressed Enter
+    assert len([w for w in handle.writes if "report" in w]) == 1        # typed once, not re-typed
+    last = ev.latest_after(0)
+    assert last.kind == "delivery_failed" and last.hint == "delivery_unconfirmed"
+    assert last.requires_response is False
+    time.sleep(0.3)                                                     # loop has exited
+    assert sess._task_delivery == "failed"                             # stays failed, no re-delivery
     sess.stop()
 
 

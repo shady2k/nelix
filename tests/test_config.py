@@ -83,6 +83,17 @@ def test_concurrency_limit(tmp_path):
     assert load_concurrency_limit(str(cfg2)) == 1
 
 
+def test_delivery_confirm_seconds_loads_with_default(tmp_path):
+    from daemon.config import load_executors
+    p = tmp_path / "nelix.toml"
+    p.write_text(
+        '[executors.a]\ncommand="x"\ndriver="claude"\n'
+        '[executors.b]\ncommand="y"\ndriver="claude"\ndelivery_confirm_seconds=3.5\n')
+    specs = load_executors(str(p))
+    assert specs["a"].delivery_confirm_seconds == 10.0      # default
+    assert specs["b"].delivery_confirm_seconds == 3.5       # overridden
+
+
 def test_load_retention_defaults_when_missing(tmp_path):
     from daemon.config import load_retention
     r = load_retention(str(tmp_path / "absent.toml"))

@@ -179,7 +179,7 @@ class Session:
 
     def _deliver_task(self):
         self._type_text(self._task)
-        deadline = time.time() + max(2.0, self._spec.settle_seconds)
+        deadline = time.time() + self._spec.delivery_confirm_seconds
         while time.time() < deadline and not self._stop.is_set():
             self._handle.pump(0.1)
             with self._lock:
@@ -190,10 +190,13 @@ class Session:
                 self._task_delivery = "delivered"
                 self._last_state = None
                 return
-        # no echo within the window: surface it; do NOT press Enter
-        with self._lock:
-            frame = self._handle.render()
-        self._emit_blocked(frame, hint="unknown")
+        # Not confirmed within the window (a slow paste should have shown by now): give up — do NOT
+        # press Enter, do NOT re-type. Mark failed so the run loop exits, and wake Hermes with a
+        # non-respondable advisory; the human stops + restarts.
+        self._task_delivery = "failed"
+        self._handle.flush_viewport(self._dialog)
+        self._publish("delivery_failed", hint="delivery_unconfirmed", hung=True,
+                      requires_response=False, task_delivery="failed")
 
     def _loop(self):
         self._last_progress = self._last_byte = time.time()
