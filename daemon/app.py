@@ -1,5 +1,7 @@
+import faulthandler
 import os
 import signal
+import sys
 
 from daemon.config import (load_executors, load_concurrency_limit, load_retention,
                            load_log_level)
@@ -9,6 +11,16 @@ from daemon.events import EventQueue
 from daemon.manager import SessionManager
 from daemon.obs import Logger
 from daemon.rpc_server import make_server
+
+
+def install_stack_dump_handler():
+    """`kill -USR1 <pid>` dumps every thread's stack to the daemon log (stderr ->
+    daemon-*.log). For diagnosing a wedged monitor thread without py-spy/sudo.
+    Also dump on fatal signals (segfault etc.)."""
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, file=sys.stderr,
+                              all_threads=True, chain=False)
 
 
 def warn_invalid_log_level(logger, level_cfg):
@@ -52,6 +64,7 @@ def main():
     logger.info("app", "daemon_started", executors=sorted(specs), limit=limit,
                 log_level=level_cfg.level, port=port)
     warn_invalid_log_level(logger, level_cfg)
+    install_stack_dump_handler()
     install_shutdown_handler(manager, logger)
     try:
         server.serve_forever()
