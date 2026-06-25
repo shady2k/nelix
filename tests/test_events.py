@@ -1,4 +1,4 @@
-from daemon.events import EventQueue
+from daemon.events import EventQueue, RESPONDABLE_KINDS
 
 
 def test_global_seq_across_sessions():
@@ -40,3 +40,16 @@ def test_publish_carries_range_and_hint_under_lock():
     assert pend is not None and pend.event_id == e.event_id
     q.mark_answered(e.event_id)
     assert q.pending() is None
+
+
+def test_blocked_event_is_pending_and_carries_fields():
+    q = EventQueue()
+    e = q.publish("s-1", "agent", "blocked", "trust?", "startup_interstitial",
+                  hint="task_not_delivered", task_delivery="pending",
+                  requires_response=True, screen_excerpt="❯ 1. Yes")
+    assert e.task_delivery == "pending" and e.requires_response is True
+    assert e.screen_excerpt == "❯ 1. Yes"
+    assert q.pending("s-1") is e                 # blocked is respondable
+    q.mark_answered(e.event_id)
+    assert q.pending("s-1") is None
+    assert "blocked" in RESPONDABLE_KINDS and "waiting_for_user" in RESPONDABLE_KINDS

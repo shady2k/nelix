@@ -4,6 +4,8 @@ import time
 import uuid
 from dataclasses import dataclass
 
+RESPONDABLE_KINDS = {"waiting_for_user", "blocked"}
+
 
 @dataclass
 class Event:
@@ -19,6 +21,9 @@ class Event:
     range: tuple = (0, 0)
     hint: str = None
     hung: bool = False
+    task_delivery: str = "delivered"
+    requires_response: bool = False
+    screen_excerpt: str = ""
 
 
 class EventQueue:
@@ -31,11 +36,13 @@ class EventQueue:
         self._cv = threading.Condition()
 
     def publish(self, session_id, executor, kind, summary, state, *,
-                turn_index=0, range=(0, 0), hint=None, hung=False):
+                turn_index=0, range=(0, 0), hint=None, hung=False,
+                task_delivery="delivered", requires_response=False, screen_excerpt=""):
         with self._cv:
             e = Event(next(self._seq), f"evt-{uuid.uuid4().hex[:8]}", session_id, executor,
                       kind, summary, state, turn_index=turn_index, range=range,
-                      hint=hint, hung=hung)
+                      hint=hint, hung=hung, task_delivery=task_delivery,
+                      requires_response=requires_response, screen_excerpt=screen_excerpt)
             self._events.append(e)
             self._cv.notify_all()
             return e
@@ -69,7 +76,7 @@ class EventQueue:
     def pending(self, session_id=None):
         with self._cv:
             for e in reversed(self._events):
-                if e.kind == "waiting_for_user" and not e.answered:
+                if e.kind in RESPONDABLE_KINDS and not e.answered:
                     if session_id is None or e.session_id == session_id:
                         return e
             return None
