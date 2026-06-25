@@ -17,3 +17,10 @@ def test_valid_log_level_no_warning():
     buf = io.StringIO()
     warn_invalid_log_level(Logger(stream=buf), LogLevelConfig(level="info"))
     assert buf.getvalue() == ""
+
+
+def test_install_stack_dump_handler_enables_faulthandler():
+    import faulthandler
+    from daemon.app import install_stack_dump_handler
+    install_stack_dump_handler()
+    assert faulthandler.is_enabled()
