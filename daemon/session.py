@@ -145,6 +145,14 @@ class Session:
                 self._norm_since = now
                 self._last_progress = now
             self._delivery_tick(frame, now)
+            # no-progress backstop while blocked (spec §6): re-surface an unanswered blocked with
+            # hung=True so Hermes is reminded; bypass the fingerprint dedup (call _publish directly).
+            blocked_outstanding = self._decision is not None and self._decision["kind"] == "blocked"
+            if (blocked_outstanding and self._spec.max_idle_seconds
+                    and now - self._last_progress > self._spec.max_idle_seconds):
+                self._publish("blocked", hint="task_not_delivered", hung=True,
+                              requires_response=True, task_delivery="pending")
+                self._last_progress = now              # re-arm so it doesn't re-fire every loop
             if not self._handle.is_alive():
                 break
         if self._task_delivery == "delivered" and not self._stop.is_set():
@@ -219,20 +227,16 @@ class Session:
         if state == prev:
             return
         if state == "idle_prompt":
-            kind = "waiting_for_user" if self._has_question() else "attention"
-            self._emit_idle(kind)
+            # The daemon can't reliably tell "asked a question" from "finished" (the real prompt
+            # has a mode footer below the input line). Hermes reads the live screen on every wake,
+            # so defaulting to waiting_for_user is fail-safe — never a silent dead-end.
+            self._emit_stop("idle_prompt", hung=False)
         elif state == "permission_prompt":
             self._emit_stop("permission_prompt", hung=False)
         elif state == "crashed":
             self._publish("crashed", hint=None, hung=False, requires_response=False)
         elif state == "exited":
             self._publish("done", hint=None, hung=False, requires_response=False)
-
-    def _emit_idle(self, kind):
-        # commit the final viewport so the turn tail is in the transcript, then freeze the range.
-        self._handle.flush_viewport(self._dialog)
-        self._publish(kind, hint=None, hung=False,
-                      requires_response=(kind == "waiting_for_user"))
 
     def _emit_stop(self, state, hung):
         # commit the final viewport so the turn tail is in the transcript, then freeze the range.
@@ -242,12 +246,11 @@ class Session:
 
     def _emit_blocked(self, frame, hint="task_not_delivered"):
         # Surface a pre-delivery interstitial (modal / onboarding / unknown). Type/press NOTHING.
-        # Dedup by normalized-screen fingerprint: re-emit only when the screen changes or the
-        # prior blocked event was answered (no per-loop spam).
+        # Dedup by normalized-screen fingerprint alone: emit once per distinct screen. A new
+        # interstitial (different fingerprint) emits a fresh blocked; the same screen never re-spams,
+        # including after the prior one is answered (the answer changes the screen anyway).
         fp = self._driver.normalize_frame(frame)
-        with self._lock:
-            unanswered = self._decision is not None and self._decision["kind"] == "blocked"
-        if unanswered and fp == self._blocked_fp:
+        if fp == self._blocked_fp:
             return
         self._blocked_fp = fp
         self._handle.flush_viewport(self._dialog)
@@ -287,19 +290,6 @@ class Session:
         if self._log is not None:
             self._log.audit_decision(self._id, self._executor, kind, evt.event_id, text)
 
-    def _has_question(self):
-        # Conservative: a question if the live screen (ground truth) ends with '?' or shows a
-        # choice menu. The dialog tail is empty pre-flush for alt-screen TUIs, so read the
-        # screen — which is exactly what the agent is presenting right now. The input-box
-        # marker line ("❯ …") is the prompt itself, not content, so look past it.
-        frame = self._handle.render()
-        if self._driver.is_modal_choice(frame):
-            return True
-        lines = [ln.rstrip() for ln in frame.split("\n")]
-        while lines and (not lines[-1] or lines[-1].lstrip().startswith("❯")):
-            lines.pop()
-        return bool(lines) and lines[-1].endswith("?")
-
     # ---- reads / control ----
     def snapshot(self):
         with self._lock:
@@ -322,13 +312,15 @@ class Session:
         self._events.mark_answered(event_id)
         if self._handle is not None:
             if not is_blocked:
-                self._dialog.mark_turn_boundary()     # only a delivered agent turn gets a boundary
-            self._type_text(sanitize_answer(answer))
+                # only a delivered agent turn gets a boundary; the monitor reads the dialog
+                # under self._lock in _publish, so mutate it under the lock too.
+                with self._lock:
+                    self._dialog.mark_turn_boundary()
+            self._type_text(sanitize_answer(answer))   # PTY writes stay outside the lock
             self._press_enter()
             self._last_state = None
         with self._lock:
             self._decision = None
-        self._blocked_fp = None                       # allow the next blocked screen to re-emit
         return True
 
     def stop(self):

@@ -45,9 +45,9 @@ Act on the event's own fields, not just its text:
   is implied — reply `1` with `nelix_respond` (or relay to the user if your mandate says so). The task
   delivers itself once the prompt clears (there may be more than one such screen — handle each the same
   way).
-- `kind: "waiting_for_user"` — a real question or permission request; relay or answer per your mandate.
-- `kind: "attention"` (`requires_response: false`) — the agent woke you but there is nothing to answer
-  (e.g. it just finished). Do not send a reply into nothing; read the screen and report or move on.
+- `kind: "waiting_for_user"` — the agent paused at its prompt. Read the screen: if it asked something,
+  answer or relay per your mandate; if it FINISHED, relay the result to the user and do NOT send a bogus
+  reply back to the agent.
 
 Brought back at each pause/finish → call `nelix_status(session_id)` **once**, then:
 

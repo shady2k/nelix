@@ -23,6 +23,10 @@ class HangSpec(Spec):
     max_idle_seconds = 5.0
 
 
+class BackstopSpec(Spec):
+    max_idle_seconds = 0.2          # fast no-progress backstop for real-thread tests
+
+
 class TruncSpec(Spec):
     status_tail_chars = 5
 
@@ -383,6 +387,48 @@ def test_respond_to_blocked_does_not_mark_turn_boundary(tmp_path):
     assert sess.respond(ev, "1") is True
     assert "1" in "".join(handle.writes) and "\r" in handle.writes   # answer injected
     assert sess._dialog.turn_count() == turns_before                 # NO task turn boundary
+    sess.stop()
+
+
+def test_idle_prompt_with_footer_below_input_is_waiting_for_user(monkeypatch, tmp_path):
+    # Faithful Claude layout: a question ABOVE the input line, the mode footer BELOW it. The
+    # last content line is the footer, not the question — the old _has_question misread this as
+    # 'attention'. Every post-delivery idle must now be waiting_for_user.
+    box = ("Which database should I use?\n"
+           "❯ \n"
+           "⏵⏵ ask mode · shift+tab to cycle\n")
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
+    sess._loop()
+    dec = sess.snapshot()["decision"]
+    assert dec["kind"] == "waiting_for_user" and dec["requires_response"] is True
+    assert ev.pending("s1") is not None
+
+
+def test_respond_to_blocked_does_not_re_emit_same_frame(tmp_path):
+    # After respond, the SAME interstitial frame must NOT spawn a second blocked event
+    # (fingerprint dedup alone). A genuinely different frame still emits.
+    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    sess, handle, ev = make_session(tmp_path, frames=[trust])
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
+    eid = sess._decision["event_id"]
+    assert sess.respond(eid, "1") is True
+    time.sleep(0.3)                                # monitor keeps seeing the same trust frame
+    blocked = [e for e in ev._events if e.kind == "blocked"]
+    assert len(blocked) == 1                        # no duplicate for the unchanged frame
+    sess.stop()
+
+
+def test_idle_backstop_re_surfaces_unanswered_blocked(tmp_path):
+    # spec §6: while pending and blocked is unanswered, a no-progress backstop re-surfaces the
+    # blocked event with hung=True (bypassing the fingerprint dedup).
+    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    sess, handle, ev = make_session(tmp_path, frames=[trust], spec=BackstopSpec())
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: any(e.kind == "blocked" and e.hung for e in ev._events), timeout=3)
+    hung = [e for e in ev._events if e.kind == "blocked" and e.hung]
+    assert hung, "expected a re-surfaced blocked event with hung=True"
     sess.stop()
 
 
