@@ -32,6 +32,23 @@ Then `nelix_start(executor, task, cwd)` and **end your turn** — you spend noth
 
 ## The loop
 
+### When you're brought back, read the screen first
+
+Every wake-up carries `screen_excerpt` — what is literally on the agent's terminal now. Trust it over
+the transcript. For the full screen, call `nelix_screen(session_id)`.
+
+Act on the event's own fields, not just its text:
+
+- `task_delivery: "pending"` or `kind: "blocked"` — your task has NOT started; the agent is stopped at
+  a setup/permission screen before the prompt (e.g. "Is this a folder you trust?"). Do NOT resend the
+  task. Read the screen and answer what it actually asks: since you chose this working directory, trust
+  is implied — reply `1` with `nelix_respond` (or relay to the user if your mandate says so). The task
+  delivers itself once the prompt clears (there may be more than one such screen — handle each the same
+  way).
+- `kind: "waiting_for_user"` — a real question or permission request; relay or answer per your mandate.
+- `kind: "attention"` (`requires_response: false`) — the agent woke you but there is nothing to answer
+  (e.g. it just finished). Do not send a reply into nothing; read the screen and report or move on.
+
 Brought back at each pause/finish → call `nelix_status(session_id)` **once**, then:
 
 - **Agent asks** (`hung=false`): permission/destructive → user, always (unless delegated); else follow the
