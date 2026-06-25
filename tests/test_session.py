@@ -445,6 +445,23 @@ def test_snapshot_is_boring_while_working(tmp_path):
     sess.stop()
 
 
+def test_manager_screen_withholds_while_working_force_only(tmp_path):
+    # Real manager gate (M4): while the agent works, the screen is withheld; ONLY force bypasses
+    # it. raw controls cleaned-vs-raw formatting but does NOT override withholding.
+    from daemon.manager import SessionManager
+    sess, handle, ev = make_session(tmp_path, frames=["doing things esc to interrupt"])
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sess.is_working())
+    m = SessionManager({}, ev)
+    m._sessions["s1"] = sess
+    withheld = m.screen("s1")
+    assert "screen" not in withheld and "End your turn" in withheld["message"]
+    assert m.screen("s1", raw=True).get("screen", None) is None        # raw is STILL withheld
+    assert "End your turn" in m.screen("s1", raw=True)["message"]
+    assert "screen" in m.screen("s1", force=True)                       # only force shows it
+    sess.stop()
+
+
 # ---- structural screen cleaner --------------------------------------------------
 
 def test_clean_screen_drops_borders_keeps_framed_text():

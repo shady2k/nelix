@@ -44,6 +44,20 @@ def test_unknown_executor_raises():
         m.start("nope", "x", "/repo")
 
 
+def test_base_seq_skips_a_prior_sessions_event():
+    # A prior session left an event in the global queue. A new session's base_seq is the
+    # high-water at start, so a session-scoped wait from there does NOT surface the stale
+    # prior-session event — only this session's future events wake the orchestrator.
+    m, _ = _mgr(limit=2)
+    prior = m._events.publish("s-old", EXECUTOR, "done", "x", "exited")
+    sid, base_seq = m.start(EXECUTOR, "task", "/tmp")
+    assert base_seq == prior.seq                              # high-water before the new session
+    # nothing for the new session yet -> no wake (the prior event is filtered out by session_id)
+    assert m._events.wait_event(after_seq=base_seq, session_id=sid, timeout=0.1) is None
+    mine = m._events.publish(sid, EXECUTOR, "waiting_for_user", "?", "idle_prompt")
+    assert m._events.wait_event(after_seq=base_seq, session_id=sid, timeout=0.1) is mine
+
+
 def test_start_threads_cwd_to_session(tmp_path):
     m, captured = _mgr()
     m.start(EXECUTOR, "t", str(tmp_path))

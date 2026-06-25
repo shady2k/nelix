@@ -38,6 +38,17 @@ def test_latest_seq_and_session_scoped_wait():
     assert q.latest_after(a.seq, session_id="s-A") is None
 
 
+def test_no_stale_wake_after_respond():
+    # The cursor model: after answering A, arming past A.seq must NOT re-return A — only the
+    # NEXT event (B) wakes the orchestrator. This is what kills the stale-wake loop.
+    q = EventQueue()
+    a = q.publish("s1", "claude", "waiting_for_user", "?", "idle_prompt")
+    assert q.mark_answered(a.event_id) == a.seq
+    assert q.wait_event(after_seq=a.seq, timeout=0.1, session_id="s1") is None
+    b = q.publish("s1", "claude", "waiting_for_user", "?2", "idle_prompt")
+    assert q.wait_event(after_seq=a.seq, timeout=0.1, session_id="s1") is b
+
+
 def test_wait_event_blocks_then_returns():
     import threading, time
     q = EventQueue()

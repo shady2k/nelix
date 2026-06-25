@@ -108,8 +108,9 @@ class SessionManager:
         if sess is None:
             return {"error": "unknown session"}
         # While the agent is actively working, withhold the screen (poll bait) unless explicitly
-        # forced or asked for raw — the wake's screen_excerpt is the ground truth between events.
-        if sess.is_working() and not force and not raw:
+        # forced — the wake's screen_excerpt is the ground truth between events. `raw` only selects
+        # cleaned-vs-raw formatting; it must NOT be an escape hatch around withholding (only force is).
+        if sess.is_working() and not force:
             return {"state": "working", "pending": False,
                     "message": ("Agent is still working. End your turn; nelix will wake you on the "
                                 "next event. Pass force:true to see the screen anyway.")}

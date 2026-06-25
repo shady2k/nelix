@@ -132,8 +132,9 @@ def register(ctx):
         "nelix_screen", "nelix",
         {"description": ("Fallback: the live terminal screen, when the wake's screen_excerpt isn't"
                          " enough — borders and framing stripped for readability. Not for polling"
-                         " progress. While the agent works it returns a brief 'still working' note"
-                         " unless force:true. Set raw:true for the unfiltered full screen."),
+                         " progress. While the agent works the screen is withheld with a brief 'still"
+                         " working' note; force:true is the only way to see it anyway. raw:true is just"
+                         " unfiltered formatting (and is still withheld while working unless force)."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
                                                "raw": {"type": "boolean"},
                                                "force": {"type": "boolean"}},

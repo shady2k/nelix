@@ -208,8 +208,9 @@ class FakeManagerWorkingScreen:
     def __init__(self):
         self._events = EventQueue()
     def screen(self, session_id, raw=False, force=False):
-        # mirror the real manager: while working, withhold the screen unless force/raw
-        if not force and not raw:
+        # mirror the real manager (M4): while working, withhold the screen unless force (raw alone
+        # does NOT bypass withholding).
+        if not force:
             return {"state": "working", "pending": False,
                     "message": "Agent is still working. End your turn; nelix will wake you ..."}
         return {"screen": self._FRAME, "cols": 120, "rows": 40}
