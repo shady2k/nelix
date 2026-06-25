@@ -63,7 +63,7 @@ class FakeHandle:
     def exit_code(self):
         return None
 
-    def write(self, data):
+    def write(self, data, timeout=None):
         self.writes.append(data)
 
     def flush_viewport(self, dialog):
@@ -103,7 +103,7 @@ class DeadHandle:
     def exit_code(self):
         return self._code
 
-    def write(self, data):
+    def write(self, data, timeout=None):
         self.writes.append(data)
 
     def flush_viewport(self, dialog):
@@ -333,7 +333,7 @@ class LiveHandle:
     def render(self):
         return self._frames[min(self._i, len(self._frames) - 1)]
 
-    def write(self, data):
+    def write(self, data, timeout=None):
         self.writes.append(data)
         # simulate echo: typing text makes it visible in the (current) frame
         if data not in ("\r", "\x1b[Z", "\x1b"):
@@ -367,7 +367,7 @@ class LiveHandle:
 
 class PasteCollapseHandle(LiveHandle):
     """Claude collapses a long pasted task into a "[Pasted text #N]" placeholder instead of echoing."""
-    def write(self, data):
+    def write(self, data, timeout=None):
         self.writes.append(data)
         if data not in ("\r", "\x1b[Z", "\x1b"):
             j = min(self._i, len(self._frames) - 1)
@@ -453,7 +453,7 @@ def test_delivery_timeout_marks_failed_and_wakes(tmp_path):
     # The typed task never confirms (no echo, no placeholder). After the confirm window, delivery is
     # marked failed and a non-respondable delivery_failed event wakes Hermes — nothing is re-typed.
     class NoEchoHandle(LiveHandle):
-        def write(self, data):
+        def write(self, data, timeout=None):
             self.writes.append(data)            # record but never render evidence -> never confirms
 
     box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
@@ -742,3 +742,52 @@ def test_delivered_run_logs_readiness_and_delivery(tmp_path):
     evs = _events_in(buf)
     assert "executor_spawned" in evs and "cli_ready" in evs
     assert "delivery_attempt" in evs and "delivery_confirmed" in evs
+
+
+# ---- delivery must not wedge on a blocking PTY write (real PtySession) --------
+
+_RAW_IGNORE_STDIN_CHILD = (
+    "import sys,tty,time\n"
+    "try:\n"
+    "    tty.setraw(sys.stdin.fileno())\n"     # raw mode (no echo), like a real TUI
+    "except Exception:\n"
+    "    pass\n"
+    "sys.stdout.write('Welcome\\r\\n\\u276f \\r\\n\\u23f5\\u23f5 ask mode (shift+tab to cycle)\\r\\n')\n"
+    "sys.stdout.flush()\n"
+    "time.sleep(60)\n"                          # NEVER reads stdin -> our write would block
+)
+
+
+def test_delivery_does_not_wedge_when_executor_ignores_stdin(tmp_path, monkeypatch):
+    """Regression for the production hang: a real executor that renders its prompt but
+    never drains stdin. Delivering a task larger than the PTY buffer must NOT block the
+    monitor thread forever in os.write — it must resolve (delivery_failed + finalize)
+    within a bounded time. FAILS on the pre-fix blocking-write code (monitor wedges)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from daemon.pty_session import PtySession
+
+    child = ["python3", "-c", _RAW_IGNORE_STDIN_CHILD]
+
+    class _Launcher:
+        def start(self, spec, cwd, cols, rows, dialog=None):
+            p = PtySession(child, cols=cols, rows=rows, dialog=dialog)
+            p.spawn()
+            return p
+        def stop(self, h):
+            h.close()
+
+    sess = Session("s1", "dummy", ClaudeDriver(), _Launcher(), FastConfirmSpec(), EventQueue())
+    sess.start("X" * 65536, str(tmp_path))      # task far larger than the PTY input buffer
+    try:
+        assert _wait_for(lambda: sess._finalized, timeout=8.0), \
+            "monitor wedged on the blocking PTY write (delivery never resolved)"
+        assert sess._task_delivery == "failed"
+    finally:
+        # bulletproof cleanup independent of teardown robustness (Fix B): kill the whole
+        # process group so a wedged write unblocks immediately, then stop normally.
+        import os as _os, signal as _signal
+        try:
+            _os.killpg(_os.getpgid(sess._handle.leader_pid()), _signal.SIGKILL)
+        except Exception:
+            pass
+        sess.stop()

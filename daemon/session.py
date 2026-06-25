@@ -10,6 +10,7 @@ from daemon import lifecycle_log
 from daemon.dialog import Dialog
 from daemon.drivers.base import ClassifyCtx
 from daemon.hygiene import prepare_pty_input
+from daemon.errors import PtyWriteTimeout
 
 
 def _sessions_root():
@@ -101,8 +102,8 @@ class Session:
         self._thread.start()
 
     # ---- low-level PTY ops (split from the old blind _submit) ----
-    def _type_text(self, text):
-        self._handle.write(text)
+    def _type_text(self, text, timeout=None):
+        self._handle.write(text, timeout=timeout)
 
     def _press_enter(self):
         # Submit with the driver-declared submit key (CR for most TUIs, not LF).
@@ -202,9 +203,16 @@ class Session:
     def _deliver_task(self):
         if self._log is not None:
             self._log.debug("session", "delivery_attempt", session_id=self._id)
-        self._type_text(self._task)
-        deadline = time.time() + self._spec.delivery_confirm_seconds
-        while time.time() < deadline and not self._stop.is_set():
+        # ONE delivery budget covers both the write and the confirmation wait, so a frozen
+        # executor costs at most delivery_confirm_seconds (not 2x). A blocking PTY write
+        # would otherwise wedge the monitor forever if the executor stops draining stdin.
+        deadline = time.monotonic() + self._spec.delivery_confirm_seconds
+        try:
+            self._type_text(self._task, timeout=max(0.0, deadline - time.monotonic()))
+        except PtyWriteTimeout:
+            self._fail_delivery("write_unconfirmed")   # executor not reading stdin
+            return
+        while time.monotonic() < deadline and not self._stop.is_set():
             self._handle.pump(0.1)
             with self._lock:
                 frame = self._handle.render()
@@ -217,16 +225,18 @@ class Session:
                     self._log.audit_task(self._id, self._executor, self._task)
                     self._log.info("session", "delivery_confirmed", session_id=self._id)
                 return
-        # Not confirmed within the window (a slow paste should have shown by now): give up — do NOT
-        # press Enter, do NOT re-type. Mark failed so the run loop exits, and wake Hermes with a
-        # non-respondable advisory; the human stops + restarts.
+        # Not confirmed within the window (a slow paste should have shown by now): give up.
+        self._fail_delivery("delivery_unconfirmed")
+
+    def _fail_delivery(self, reason):
+        # Give up cleanly: do NOT press Enter, do NOT re-type. Mark failed so the run loop
+        # exits, and wake Hermes with a non-respondable advisory; the human stops + restarts.
         self._task_delivery = "failed"
         self._handle.flush_viewport(self._dialog)
-        self._publish("delivery_failed", hint="delivery_unconfirmed", hung=False,
+        self._publish("delivery_failed", hint=reason, hung=False,
                       requires_response=False, task_delivery="failed")
         if self._log is not None:
-            self._log.warning("session", "delivery_failed", session_id=self._id,
-                              reason="delivery_unconfirmed")
+            self._log.warning("session", "delivery_failed", session_id=self._id, reason=reason)
 
     def _loop(self):
         self._last_progress = self._last_byte = time.time()
