@@ -14,6 +14,10 @@ _SPINNER = re.compile(r"[⠀-⣿]")
 _ELAPSED = re.compile(r"\d+(?:\.\d+)?s\b")
 _TOKENS = re.compile(r"\d+\s+tokens?\b")
 
+_PROMPT_FOOTER = "shift+tab to cycle"     # present at the interactive input prompt (any mode)
+_OPTION = re.compile(r"^\s*[❯>]?\s*\d+\.\s+\S", re.M)        # a numbered menu option line
+_SELECTED_OPTION = re.compile(r"^\s*❯\s*\d+\.\s+\S", re.M)   # the cursor sits ON an option
+
 
 def _is_choice_prompt(frame):
     # When Claude needs a decision it presents a numbered Yes/…/No selection menu; the
@@ -51,3 +55,20 @@ class ClaudeDriver:
         if "shift+tab to cycle" not in frame:
             return False
         return not any(m in frame for m in _AUTO_MODE_MARKERS)
+
+    def is_modal_choice(self, frame):
+        # A modal selection menu: the cursor (❯) sits on a numbered option and there
+        # are >=2 numbered options. Distinguishes a menu from the input box (where ❯
+        # sits on a free-text line, not on "N. ...").
+        return bool(_SELECTED_OPTION.search(frame)) and len(_OPTION.findall(frame)) >= 2
+
+    def is_accepting_input(self, frame):
+        # The real free-text prompt is present (any permission mode) and it is NOT a menu.
+        if self.is_modal_choice(frame):
+            return False
+        return ("❯" in frame) and (_PROMPT_FOOTER in frame)
+
+    def input_echo_present(self, frame, text):
+        # The just-typed text is visible in the viewport (whitespace-normalized prefix).
+        needle = " ".join(text.split())[:40]
+        return bool(needle) and needle in " ".join(frame.split())

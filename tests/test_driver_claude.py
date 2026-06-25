@@ -43,3 +43,44 @@ def test_normalize_frame_zeroes_spinner():
     a = D.normalize_frame("⠋ thinking 1.2s · 3 tokens\n❯ ")
     b = D.normalize_frame("⠙ thinking 4.8s · 9 tokens\n❯ ")
     assert a == b   # spinner/clock/counter differences erased -> semantically stable
+
+
+TRUST = (
+    "╭─ Claude Code ─╮\n"
+    "Quick safety check: Is this a project you created or one you trust?\n"
+    "❯ 1. Yes, I trust this folder\n"
+    "  2. No, exit\n"
+    "Enter to confirm · Esc to cancel\n")
+
+PERMISSION = (
+    "Do you want to make this edit?\n"
+    "❯ 1. Yes\n"
+    "  2. Yes, and don't ask again\n"
+    "  3. No\n")
+
+INPUT_BOX = (
+    "Welcome back!\n"
+    "❯ \n"
+    "⏵⏵ auto mode on (shift+tab to cycle)\n")
+
+WORKING = "doing things… esc to interrupt\n"
+
+
+def test_is_modal_choice_matches_two_and_three_option_menus():
+    assert D.is_modal_choice(TRUST) is True
+    assert D.is_modal_choice(PERMISSION) is True
+    assert D.is_modal_choice(INPUT_BOX) is False
+    assert D.is_modal_choice(WORKING) is False
+
+
+def test_is_accepting_input_only_at_real_prompt():
+    assert D.is_accepting_input(INPUT_BOX) is True
+    assert D.is_accepting_input(TRUST) is False       # menu, not input
+    assert D.is_accepting_input(PERMISSION) is False
+    assert D.is_accepting_input(WORKING) is False
+
+
+def test_input_echo_present_detects_typed_task():
+    typed = INPUT_BOX.replace("❯ \n", "❯ create report.md with a header\n")
+    assert D.input_echo_present(typed, "create report.md with a header") is True
+    assert D.input_echo_present(INPUT_BOX, "create report.md with a header") is False
