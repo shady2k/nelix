@@ -87,6 +87,33 @@ def test_start_rejects_cwd_that_is_a_file(tmp_path):
     assert captured == []
 
 
+def test_start_failure_does_not_leak_session():
+    # If session.start() raises (rejected task / spawn failure), the manager must not leave a
+    # registered-but-unstarted session behind, and the concurrency slot must be freed.
+    specs = {EXECUTOR: make_spec()}
+    q = EventQueue()
+    calls = {"n": 0}
+    made = []
+
+    class MaybeBoom(FakeSession):
+        def start(self, task, cwd):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValueError("rejected")       # first start fails
+            super().start(task, cwd)               # later starts behave normally
+
+    def factory(sid, ex, spec, ev):
+        s = MaybeBoom(sid, ex); made.append(s); return s
+
+    m = SessionManager(specs, q, session_factory=factory, concurrency_limit=1)
+    with pytest.raises(ValueError):
+        m.start(EXECUTOR, "task", "/tmp")
+    assert m.status()["sessions"] == {}            # no leaked session
+    assert made[0].stopped is True                 # partially-started session was torn down
+    sid, _ = m.start(EXECUTOR, "task2", "/tmp")    # slot freed: a fresh start still works
+    assert sid is not None and m.status()["sessions"][sid]["state"] == "working"
+
+
 def test_status_lists_all_and_stop():
     m, captured = _mgr(limit=2)
     sid, _ = m.start(EXECUTOR, "t", "/tmp")

@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -9,6 +10,15 @@ from daemon.dialog import Dialog  # noqa: E402
 def _mk(tmp_path, **kw):
     kw.setdefault("tail_lines", 100); kw.setdefault("spool_max_bytes", 1_000_000)
     return Dialog(tmp_path / "s1", **kw)
+
+
+def test_session_dir_and_files_are_private(tmp_path):
+    d = _mk(tmp_path)
+    d.append_raw(b"secret-bearing output"); d.add_line("line")
+    sdir = tmp_path / "s1"
+    assert oct(sdir.stat().st_mode & 0o777) == "0o700"                       # 0700 session dir
+    assert oct((sdir / "raw").stat().st_mode & 0o777) == "0o600"             # 0600 raw spool
+    assert oct((sdir / "transcript.jsonl").stat().st_mode & 0o777) == "0o600"
 
 
 def test_raw_spool_appends(tmp_path):

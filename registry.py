@@ -8,9 +8,9 @@ import tomllib
 from pathlib import Path
 
 try:
-    from .paths import config_path
+    from .paths import config_path, ensure_private_dir
 except ImportError:           # loaded as a top-level module (tests/standalone)
-    from paths import config_path
+    from paths import config_path, ensure_private_dir
 
 _EXAMPLE = Path(__file__).parent / "nelix.toml.example"
 
@@ -25,8 +25,8 @@ def names() -> list:
 
 def seed_if_absent() -> bool:
     dest = config_path()
+    ensure_private_dir(dest.parent)              # tighten the nelix dir even if the config already exists
     if dest.exists():
         return False
-    dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(_EXAMPLE, dest)
     return True

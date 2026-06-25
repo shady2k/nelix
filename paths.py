@@ -35,13 +35,45 @@ def sessions_root() -> Path:
     return nelix_root() / "sessions"
 
 
+def logs_dir() -> Path:
+    return nelix_root() / "logs"
+
+
 def daemon_log(stamp: str, pid: int) -> Path:
-    return nelix_root() / f"daemon-{stamp}-{pid}.log"
+    return logs_dir() / f"daemon-{stamp}-{pid}.log"
 
 
 def daemon_latest() -> Path:
-    return nelix_root() / "daemon-latest.log"
+    return logs_dir() / "daemon-latest.log"
 
 
 # Per-spawn files only. Two wildcards ⇒ never matches single-dash daemon-latest.log.
 DAEMON_LOG_GLOB = "daemon-*-*.log"
+
+
+def ensure_private_dir(path) -> Path:
+    """Create `path` (with parents) and tighten it and every ancestor down to nelix_root to
+    0700, so no nelix-owned directory is group/world-readable — transcripts and the token
+    state file can hold secrets. Idempotent, and corrects a directory created earlier under
+    a looser umask. (mkdir(parents=True) makes intermediate dirs with the umask, so each
+    level is chmod-ed explicitly; ancestors ABOVE nelix_root, e.g. a shared HERMES_HOME, are
+    left untouched.)"""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    root = nelix_root()
+    p = path
+    while True:
+        try:
+            os.chmod(p, 0o700)
+        except OSError:
+            pass
+        if p == root or root not in p.parents:
+            break
+        p = p.parent
+    return path
+
+
+def private_opener(path, flags):
+    """Use as `open(..., opener=private_opener)` so a freshly created file is 0600 with no
+    chmod race. Existing files keep their mode, but they live in a 0700 dir so stay private."""
+    return os.open(path, flags, 0o600)

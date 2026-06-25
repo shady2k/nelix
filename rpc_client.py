@@ -1,5 +1,6 @@
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -25,26 +26,26 @@ class RpcClient:
         return body
 
     def status(self, session_id=None):
-        q = f"?session_id={session_id}" if session_id else ""
+        q = "?" + urllib.parse.urlencode({"session_id": session_id}) if session_id else ""
         _, body = self._call("GET", "/status" + q)
         return body
 
     def dialog(self, session_id, turn=None, offset=0, limit=None):
-        q = f"?session_id={session_id}&offset={offset}"
+        params = {"session_id": session_id, "offset": offset}
         if turn is not None:
-            q += f"&turn={turn}"
+            params["turn"] = turn
         if limit is not None:
-            q += f"&limit={limit}"
-        _, body = self._call("GET", "/dialog" + q)
+            params["limit"] = limit
+        _, body = self._call("GET", "/dialog?" + urllib.parse.urlencode(params))
         return body
 
     def screen(self, session_id, raw=False, force=False):
-        q = f"/screen?session_id={session_id}"
+        params = {"session_id": session_id}
         if raw:
-            q += "&raw=1"
+            params["raw"] = 1
         if force:
-            q += "&force=1"
-        _, body = self._call("GET", q)
+            params["force"] = 1
+        _, body = self._call("GET", "/screen?" + urllib.parse.urlencode(params))
         return body
 
     def respond(self, session_id, event_id, answer):

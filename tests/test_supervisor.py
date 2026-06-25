@@ -77,16 +77,43 @@ def test_stale_state_triggers_respawn(monkeypatch, tmp_path):
     supervisor.teardown()
 
 
-def test_ensure_deps_calls_installer_when_missing(monkeypatch):
+def test_ensure_deps_installs_from_hash_lock_when_missing(monkeypatch):
     importlib.reload(supervisor)
     calls = []
     # missing before install, present after (calls non-empty post-run)
     monkeypatch.setattr(supervisor, "_deps_present", lambda: bool(calls))
     monkeypatch.setattr(supervisor, "_lazy_installs_allowed", lambda: True)
     monkeypatch.setattr(supervisor, "_venv_pip_install",
-                        lambda specs: (calls.append(tuple(specs)) or (True, "")))
+                        lambda req: (calls.append(req) or (True, "")))
     supervisor._ensure_deps()
-    assert calls == [supervisor._DAEMON_DEPS]
+    assert calls == [supervisor._DAEMON_LOCK]      # installs from the hash-pinned lock, not bare specs
+
+
+def test_deps_present_requires_exact_version(monkeypatch):
+    importlib.reload(supervisor)
+    versions = {"pyte": "0.8.2", "ptyprocess": "0.7.0"}
+    monkeypatch.setattr(supervisor.importlib.metadata, "version", lambda n: versions[n])
+    assert supervisor._deps_present() is True
+    versions["pyte"] = "0.8.1"                     # a wrong version present must NOT count as ok
+    assert supervisor._deps_present() is False
+
+
+def test_deps_present_false_when_distribution_missing(monkeypatch):
+    importlib.reload(supervisor)
+
+    def boom(name):
+        raise supervisor.importlib.metadata.PackageNotFoundError(name)
+    monkeypatch.setattr(supervisor.importlib.metadata, "version", boom)
+    assert supervisor._deps_present() is False
+
+
+def test_deps_present_false_when_module_files_gone(monkeypatch):
+    # exact metadata present but the module is not importable (corrupted install) -> reinstall
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor.importlib.metadata, "version",
+                        lambda n: {"pyte": "0.8.2", "ptyprocess": "0.7.0"}[n])
+    monkeypatch.setattr(supervisor.importlib.util, "find_spec", lambda m: None)
+    assert supervisor._deps_present() is False
 
 
 def test_ensure_deps_raises_when_lazy_installs_disabled(monkeypatch):
@@ -119,15 +146,16 @@ def _record_run(record, rc_for):
     return fake
 
 
-def test_venv_pip_install_prefers_uv(monkeypatch):
+def test_venv_pip_install_prefers_uv_with_require_hashes(monkeypatch):
     importlib.reload(supervisor)
     monkeypatch.setattr(supervisor.shutil, "which",
                         lambda b: "/usr/bin/uv" if b == "uv" else None)
     record = []
     monkeypatch.setattr(supervisor.subprocess, "run", _record_run(record, lambda cmd: 0))
-    ok, _out = supervisor._venv_pip_install(("pyte==0.8.2",))
+    ok, _out = supervisor._venv_pip_install("/lock")
     assert ok is True
     assert record[0][0] == "/usr/bin/uv" and record[0][1:3] == ["pip", "install"]
+    assert "--require-hashes" in record[0] and record[0][-2:] == ["-r", "/lock"]
     assert len(record) == 1  # uv succeeded -> no pip fallback
 
 
@@ -139,10 +167,10 @@ def test_venv_pip_install_falls_through_to_pip_when_uv_fails(monkeypatch):
     # uv present but exits non-zero -> must fall through to the pip tier
     monkeypatch.setattr(supervisor.subprocess, "run",
                         _record_run(record, lambda cmd: 1 if cmd[0] == "/usr/bin/uv" else 0))
-    ok, _out = supervisor._venv_pip_install(("pyte==0.8.2",))
+    ok, _out = supervisor._venv_pip_install("/lock")
     assert ok is True
     assert record[0][0] == "/usr/bin/uv"  # uv tried first
-    assert any(c[:3] == [sys.executable, "-m", "pip"] and "install" in c for c in record)
+    assert any(c[:3] == [sys.executable, "-m", "pip"] and "--require-hashes" in c for c in record)
 
 
 def test_venv_pip_install_falls_back_to_pip_when_no_uv(monkeypatch):
@@ -150,10 +178,10 @@ def test_venv_pip_install_falls_back_to_pip_when_no_uv(monkeypatch):
     monkeypatch.setattr(supervisor.shutil, "which", lambda b: None)
     record = []
     monkeypatch.setattr(supervisor.subprocess, "run", _record_run(record, lambda cmd: 0))
-    ok, _out = supervisor._venv_pip_install(("pyte==0.8.2",))
+    ok, _out = supervisor._venv_pip_install("/lock")
     assert ok is True
     assert [sys.executable, "-m", "pip", "--version"] in record
-    assert any(c[:3] == [sys.executable, "-m", "pip"] and "install" in c for c in record)
+    assert any(c[:3] == [sys.executable, "-m", "pip"] and "--require-hashes" in c for c in record)
 
 
 def test_venv_pip_install_bootstraps_ensurepip_when_pip_missing(monkeypatch):
@@ -162,20 +190,50 @@ def test_venv_pip_install_bootstraps_ensurepip_when_pip_missing(monkeypatch):
     record = []
     monkeypatch.setattr(supervisor.subprocess, "run",
                         _record_run(record, lambda cmd: 1 if "--version" in cmd else 0))
-    ok, _out = supervisor._venv_pip_install(("pyte==0.8.2",))
+    ok, _out = supervisor._venv_pip_install("/lock")
     assert ok is True
     assert any("ensurepip" in c for c in record)
 
 
-def test_daemon_log_is_per_spawn_named_with_pid(monkeypatch, tmp_path):
+def test_disable_uv_env_forces_pip_tier(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setenv("NELIX_DISABLE_UV", "1")
+    monkeypatch.setattr(supervisor.shutil, "which",
+                        lambda b: "/usr/bin/uv" if b == "uv" else None)
+    record = []
+    monkeypatch.setattr(supervisor.subprocess, "run", _record_run(record, lambda cmd: 0))
+    ok, _out = supervisor._venv_pip_install("/lock")
+    assert ok is True
+    assert all(c[0] != "/usr/bin/uv" for c in record)   # uv skipped despite being on PATH
+    assert any(c[:3] == [sys.executable, "-m", "pip"] for c in record)
+
+
+def test_daemon_log_is_per_spawn_named_under_logs_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     importlib.reload(supervisor)
     root = supervisor._root(); root.mkdir(parents=True)
     p = supervisor._open_daemon_log(root)
-    assert p.parent == root
+    logs = paths.logs_dir()
+    assert p.parent == logs                                   # logs now live under logs/, not root
     assert p.name.startswith("daemon-") and p.name.endswith(f"-{os.getpid()}.log")
-    assert (root / "daemon-latest.log").is_symlink()
-    assert (root / "daemon-latest.log").resolve() == p.resolve()
+    assert oct(p.stat().st_mode & 0o777) == "0o600"           # log file is private
+    assert oct(logs.stat().st_mode & 0o777) == "0o700"        # logs dir is private
+    assert (logs / "daemon-latest.log").is_symlink()
+    assert (logs / "daemon-latest.log").resolve() == p.resolve()
+
+
+def test_open_daemon_log_migrates_legacy_root_logs(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    root = supervisor._root(); root.mkdir(parents=True)
+    old = root / "daemon-20250101-000000-111.log"; old.write_text("old")   # legacy root layout
+    (root / "daemon-latest.log").symlink_to(old.name)
+    p = supervisor._open_daemon_log(root)
+    logs = paths.logs_dir()
+    assert (logs / old.name).read_text() == "old"             # legacy per-spawn log moved into logs/
+    assert not old.exists()                                   # ... and removed from root
+    assert not (root / "daemon-latest.log").exists()          # stale root symlink dropped
+    assert p.parent == logs and (logs / "daemon-latest.log").is_symlink()
 
 
 def test_prune_keeps_newest_retain_and_spares_symlink(monkeypatch, tmp_path):

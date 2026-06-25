@@ -15,6 +15,8 @@ class ClassifyCtx:
 
 class Driver(Protocol):
     ask_mode_toggle: str
+    command_prefixes: tuple      # leading tokens the CLI reads as a command, not a prompt
+    submit_key: str              # the key that submits a line (CR for most TUIs)
 
     def normalize_frame(self, frame: str) -> str: ...
     def classify(self, frame: str, ctx: ClassifyCtx) -> DriverState: ...

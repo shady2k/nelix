@@ -6,17 +6,19 @@ return paginated cleaned text; raw is never paginated to Hermes.
 import json
 from pathlib import Path
 
+import paths
+
 
 class Dialog:
     def __init__(self, dir_path, tail_lines, spool_max_bytes):
         self._dir = Path(dir_path)
-        self._dir.mkdir(parents=True, exist_ok=True)
+        paths.ensure_private_dir(self._dir)         # 0700 session dir (holds secret-bearing output)
         self._raw_path = self._dir / "raw"
         self._jsonl_path = self._dir / "transcript.jsonl"
         self._tail_lines = int(tail_lines)
         self._spool_max = int(spool_max_bytes)
-        self._raw = open(self._raw_path, "ab")
-        self._jsonl = open(self._jsonl_path, "a")
+        self._raw = open(self._raw_path, "ab", opener=paths.private_opener)      # 0600 raw spool
+        self._jsonl = open(self._jsonl_path, "a", opener=paths.private_opener)   # 0600 transcript
         self._raw_len = self._raw_path.stat().st_size if self._raw_path.exists() else 0
         self._lines = []          # in-memory full index for the session lifetime: list[(turn, text)]
         self._turn = 0
@@ -32,7 +34,7 @@ class Dialog:
             data = self._raw_path.read_bytes()[-self._spool_max:]
             self._raw_path.write_bytes(data)
             self._raw_len = len(data)
-            self._raw = open(self._raw_path, "ab")
+            self._raw = open(self._raw_path, "ab", opener=paths.private_opener)
 
     def add_line(self, text):
         idx = len(self._lines)

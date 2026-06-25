@@ -1,0 +1,13 @@
+# Hash-pinned daemon deps for the nelix PTY daemon (pyte/ptyprocess + transitive wcwidth).
+# Consumed by supervisor.py: `pip|uv pip install --require-hashes -r requirements-daemon.lock`.
+# Regenerate after bumping requirements-daemon.in:
+#   uv pip compile requirements-daemon.in --generate-hashes --no-header -o requirements-daemon.lock
+ptyprocess==0.7.0 \
+    --hash=sha256:4b41f3967fce3af57cc7e94b888626c18bf37a083e3651ca8feeb66d492fef35 \
+    --hash=sha256:5c5d0a3b48ceee0b48485e0c26037c0acd7d29765ca3fbb5cb3831d347423220
+pyte==0.8.2 \
+    --hash=sha256:5af970e843fa96a97149d64e170c984721f20e52227a2f57f0a54207f08f083f \
+    --hash=sha256:85db42a35798a5aafa96ac4d8da78b090b2c933248819157fc0e6f78876a0135
+wcwidth==0.8.1 \
+    --hash=sha256:f453740b1e4a4f3291faa37944c555d71056c4da08d59809b307ef4feba695c8 \
+    --hash=sha256:faf5b4a5366a72dc49cad48cdf21f52bdf63bdda995178e483ba247ff79089b9

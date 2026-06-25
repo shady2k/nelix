@@ -5,7 +5,7 @@ import time
 import paths
 from daemon.dialog import Dialog
 from daemon.drivers.base import ClassifyCtx
-from daemon.hygiene import sanitize_answer
+from daemon.hygiene import prepare_pty_input
 
 
 def _sessions_root():
@@ -75,12 +75,15 @@ class Session:
         # Non-blocking: spawn the PTY, hold the task, and let the monitor thread own
         # both delivery (deliver only into a verified input box) and the run loop.
         # /start returns once the PTY is spawned, NOT once the task is delivered.
+        # Clean the held task FIRST (CLI-agnostic byte hygiene + the driver's command-prefix
+        # policy): a rejected task raises before anything is spawned, and the cleaned text is
+        # both what gets typed and what input_echo_present() matches against.
+        self._task = prepare_pty_input(task, self._driver.command_prefixes)
         self._dialog = Dialog(self._sessions_dir / self._id,
                               tail_lines=self._spec.tail_lines,
                               spool_max_bytes=self._spec.spool_max_bytes)
         self._handle = self._launcher.start(self._spec, cwd, self._cols, self._rows,
                                             dialog=self._dialog)
-        self._task = task
         self._task_delivery = "pending"
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -90,8 +93,8 @@ class Session:
         self._handle.write(text)
 
     def _press_enter(self):
-        # The TUI treats CR (\r), not LF, as Enter.
-        self._handle.write("\r")
+        # Submit with the driver-declared submit key (CR for most TUIs, not LF).
+        self._handle.write(self._driver.submit_key)
 
     def screen(self, raw=False):
         with self._lock:
@@ -318,6 +321,9 @@ class Session:
         pending = self._events.pending(self._id)
         if pending is None or pending.event_id != event_id:
             return None                               # stale/unknown: bind to the current decision
+        # Clean the answer BEFORE any mutation: a rejected answer (command prefix / empty after
+        # sanitization) leaves the decision pending and nothing typed, so the caller can retry.
+        clean = prepare_pty_input(answer, self._driver.command_prefixes)
         is_blocked = pending.kind == "blocked"
         seq = self._events.mark_answered(event_id)
         if self._handle is not None:
@@ -326,7 +332,7 @@ class Session:
                 # under self._lock in _publish, so mutate it under the lock too.
                 with self._lock:
                     self._dialog.mark_turn_boundary()
-            self._type_text(sanitize_answer(answer))   # PTY writes stay outside the lock
+            self._type_text(clean)                     # PTY writes stay outside the lock
             self._press_enter()
             self._last_state = None
         with self._lock:

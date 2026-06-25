@@ -97,7 +97,16 @@ class SessionManager:
             self._sessions[sid] = sess
             keep = set(self._sessions)
         gc_sessions(keep, self._session_retain, self._session_max_age_days, logger=self._logger)
-        sess.start(task, cwd)
+        try:
+            sess.start(task, cwd)
+        except Exception:
+            try:
+                sess.stop()                       # tear down any partially-spawned PTY / open dialog
+            except Exception:
+                pass
+            with self._lock:                      # don't leak a registered-but-unstarted session
+                self._sessions.pop(sid, None)     # (e.g. a rejected task or a spawn failure)
+            raise
         return sid, base_seq
 
     def get(self, session_id):

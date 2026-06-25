@@ -234,6 +234,55 @@ def test_start_passes_cwd_to_launcher(monkeypatch, tmp_path):
     assert seen["cwd"] == "/work/repo"
 
 
+def test_start_rejects_command_prefix_task_without_spawning(tmp_path):
+    import pytest
+    from daemon.hygiene import PtyInputRejected
+    spawned = {"v": False}
+
+    class _Launcher:
+        def start(self, *a, **k):
+            spawned["v"] = True
+            return FakeHandle(["x"])
+
+        def stop(self, h):
+            pass
+
+    sess = Session("s1", "demo", ClaudeDriver(), _Launcher(), Spec(), EventQueue())
+    with pytest.raises(PtyInputRejected):
+        sess.start("/exit", str(tmp_path))           # leading '/' -> rejected
+    assert spawned["v"] is False                     # rejected BEFORE any PTY spawn
+    assert sess._handle is None and sess._dialog is None
+
+
+def test_start_strips_control_bytes_from_task(tmp_path):
+    # A task carrying an embedded mode-toggle keystroke (\x1b[Z) is neutralized before it is
+    # typed — the ask-mode permission control cannot be flipped via task content.
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box])
+    sess.start("do the\x1b[Z work", str(tmp_path))
+    _wait_for(lambda: sess._task_delivery == "delivered")
+    assert "\x1b" not in "".join(handle.writes)      # no escape/keystroke ever reached the PTY
+    assert "do the work" in "".join(handle.writes)   # cleaned text delivered
+    sess.stop()
+
+
+def test_respond_rejects_command_prefix_answer_keeps_pending(tmp_path):
+    import pytest
+    from daemon.hygiene import PtyInputRejected
+    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    sess, handle, ev = make_session(tmp_path, frames=[trust])
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
+    eid = sess._decision["event_id"]
+    writes_before = list(handle.writes)
+    with pytest.raises(PtyInputRejected):
+        sess.respond(eid, "/etc/passwd")             # leading '/' -> rejected
+    assert ev.pending("s1") is not None              # NOT marked answered: still pending
+    assert sess._decision is not None                # decision not cleared
+    assert handle.writes == writes_before            # nothing typed
+    sess.stop()
+
+
 def test_ensure_ask_mode_writes_driver_toggle(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     sess, _ = _session(tmp_path, ["normal mode, no askmode marker"])

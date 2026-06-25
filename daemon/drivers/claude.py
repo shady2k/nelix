@@ -28,6 +28,8 @@ def _is_choice_prompt(frame):
 @register("claude")
 class ClaudeDriver:
     ask_mode_toggle = "\x1b[Z"  # Shift+Tab cycles the permission mode in the TUI
+    command_prefixes = ("/",)   # a leading '/' opens a TUI slash-command, not a prompt
+    submit_key = "\r"           # the TUI treats CR (not LF) as Enter
 
     def normalize_frame(self, frame):
         f = _SPINNER.sub("", frame)
