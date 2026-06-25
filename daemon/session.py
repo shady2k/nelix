@@ -11,6 +11,14 @@ def _sessions_root():
     return paths.sessions_root()
 
 
+def _excerpt(screen, max_chars):
+    lines = [ln.rstrip() for ln in screen.split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    text = "\n".join(lines)
+    return text[-max_chars:] if max_chars and len(text) > max_chars else text
+
+
 class Session:
     def __init__(self, session_id, executor, driver, launcher, spec, events,
                  cols=120, rows=40, logger=None):
@@ -35,6 +43,9 @@ class Session:
         self._norm_since = None        # ts the normalized frame became stable
         self._last_progress = None     # ts of last meaningful (normalized) change (for hang)
         self._last_byte = None         # ts of last PTY byte
+        self._task = None              # held task, delivered once a real input box appears
+        self._task_delivery = "pending"  # pending | delivered | failed
+        self._blocked_fp = None        # normalized screen of the last emitted blocked event
         self._sessions_dir = _sessions_root()
         driver._settle = spec.settle_seconds   # keep classify a pure (frame, ctx) fn
 
@@ -44,22 +55,30 @@ class Session:
 
     # ---- lifecycle ----
     def start(self, task, cwd):
+        # Non-blocking: spawn the PTY, hold the task, and let the monitor thread own
+        # both delivery (deliver only into a verified input box) and the run loop.
+        # /start returns once the PTY is spawned, NOT once the task is delivered.
         self._dialog = Dialog(self._sessions_dir / self._id,
                               tail_lines=self._spec.tail_lines,
                               spool_max_bytes=self._spec.spool_max_bytes)
         self._handle = self._launcher.start(self._spec, cwd, self._cols, self._rows,
                                             dialog=self._dialog)
-        self._wait_until_ready()
-        self._ensure_ask_mode()
-        self._submit(task)
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._task = task
+        self._task_delivery = "pending"
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def _submit(self, text):
-        # The TUI treats CR (\r), not LF, as Enter. Type, let it render, then CR.
+    # ---- low-level PTY ops (split from the old blind _submit) ----
+    def _type_text(self, text):
         self._handle.write(text)
-        time.sleep(0.3)
+
+    def _press_enter(self):
+        # The TUI treats CR (\r), not LF, as Enter.
         self._handle.write("\r")
+
+    def screen(self):
+        with self._lock:
+            return self._handle.render() if self._handle is not None else ""
 
     def _wait_until_ready(self, timeout=20.0, stable_for=1.2):
         last = None; stable_since = None
@@ -90,6 +109,63 @@ class Session:
             exit_code=self._handle.exit_code(),
         )
 
+    def _run(self):
+        # Monitor-thread entrypoint: wait for the CLI to settle, deliver the held task
+        # (delivery phase), then fall through to the normal run loop.
+        self._wait_until_ready()
+        self._last_progress = self._last_byte = time.time()
+        while not self._stop.is_set() and self._task_delivery == "pending":
+            advanced = self._handle.pump(0.1)
+            now = time.time()
+            if advanced:
+                self._last_byte = now
+            with self._lock:
+                frame = self._handle.render()
+            norm = self._driver.normalize_frame(frame)
+            if norm != self._norm:
+                self._norm = norm
+                self._norm_since = now
+                self._last_progress = now
+            self._delivery_tick(frame, now)
+            if not self._handle.is_alive():
+                break
+        if self._task_delivery == "delivered" and not self._stop.is_set():
+            self._loop()
+
+    def _delivery_tick(self, frame, now):
+        state = self._driver.classify(frame, self._ctx(now))
+        if state in ("working", "quiet_working"):
+            return                                   # CLI busy / not settled: keep waiting
+        if state in ("crashed", "exited") or not self._handle.is_alive():
+            self._task_delivery = "failed"
+            self._publish("crashed" if state == "crashed" else "done",
+                          hint=None, hung=False, requires_response=False)
+            self._stop.set()
+            return
+        if self._driver.is_accepting_input(frame):
+            self._ensure_ask_mode()
+            self._deliver_task()
+        else:
+            self._emit_blocked(frame)                # modal / onboarding / unknown
+
+    def _deliver_task(self):
+        self._type_text(self._task)
+        deadline = time.time() + max(2.0, self._spec.settle_seconds)
+        while time.time() < deadline and not self._stop.is_set():
+            self._handle.pump(0.1)
+            with self._lock:
+                frame = self._handle.render()
+            if self._driver.input_echo_present(frame, self._task):
+                self._press_enter()
+                self._dialog.mark_turn_boundary()    # task turn begins now
+                self._task_delivery = "delivered"
+                self._last_state = None
+                return
+        # no echo within the window: surface it; do NOT press Enter
+        with self._lock:
+            frame = self._handle.render()
+        self._emit_blocked(frame, hint="unknown")
+
     def _loop(self):
         self._last_progress = self._last_byte = time.time()
         while not self._stop.is_set():
@@ -97,7 +173,8 @@ class Session:
             now = time.time()
             if advanced:
                 self._last_byte = now
-            frame = self._handle.render()
+            with self._lock:
+                frame = self._handle.render()
             norm = self._driver.normalize_frame(frame)
             if norm != self._norm:
                 self._norm = norm
@@ -123,40 +200,87 @@ class Session:
             self._last_state = state
         if state == prev:
             return
-        if state in ("idle_prompt", "permission_prompt"):
-            self._emit_stop(state, hung=False)
+        if state == "idle_prompt":
+            kind = "waiting_for_user" if self._has_question() else "attention"
+            self._emit_idle(kind)
+        elif state == "permission_prompt":
+            self._emit_stop("permission_prompt", hung=False)
         elif state == "crashed":
-            self._publish("crashed", hint=None, hung=False)
+            self._publish("crashed", hint=None, hung=False, requires_response=False)
         elif state == "exited":
-            self._publish("done", hint=None, hung=False)
+            self._publish("done", hint=None, hung=False, requires_response=False)
+
+    def _emit_idle(self, kind):
+        # commit the final viewport so the turn tail is in the transcript, then freeze the range.
+        self._handle.flush_viewport(self._dialog)
+        self._publish(kind, hint=None, hung=False,
+                      requires_response=(kind == "waiting_for_user"))
 
     def _emit_stop(self, state, hung):
         # commit the final viewport so the turn tail is in the transcript, then freeze the range.
         self._handle.flush_viewport(self._dialog)
         hint = "needs_permission" if state == "permission_prompt" else None
-        self._publish("waiting_for_user", hint=hint, hung=hung)
+        self._publish("waiting_for_user", hint=hint, hung=hung, requires_response=True)
 
-    def _publish(self, kind, hint, hung):
+    def _emit_blocked(self, frame, hint="task_not_delivered"):
+        # Surface a pre-delivery interstitial (modal / onboarding / unknown). Type/press NOTHING.
+        # Dedup by normalized-screen fingerprint: re-emit only when the screen changes or the
+        # prior blocked event was answered (no per-loop spam).
+        fp = self._driver.normalize_frame(frame)
+        with self._lock:
+            unanswered = self._decision is not None and self._decision["kind"] == "blocked"
+        if unanswered and fp == self._blocked_fp:
+            return
+        self._blocked_fp = fp
+        self._handle.flush_viewport(self._dialog)
+        self._publish("blocked", hint=hint, hung=False, requires_response=True,
+                      task_delivery="pending")
+
+    def _publish(self, kind, hint, hung, requires_response=None, task_delivery=None):
+        from daemon.events import RESPONDABLE_KINDS
         with self._lock:
             turn = self._dialog.current_turn()
             start = self._dialog._turn_starts[turn]
             end = self._dialog.line_count()
             page = self._dialog.range_text(start, end, limit=self._spec.status_tail_chars)
             text = page["text"]
+            # render() directly (NOT self.screen(), which also takes self._lock -> deadlock).
+            screen = _excerpt(self._handle.render() if self._handle is not None else "",
+                              self._spec.status_tail_chars)
+            if requires_response is None:
+                requires_response = kind in RESPONDABLE_KINDS
+            if task_delivery is None:
+                task_delivery = self._task_delivery
             decision = {"kind": kind, "turn_index": turn, "range": (start, end),
                         "hint": hint, "hung": hung, "text": text,
+                        "task_delivery": task_delivery, "requires_response": requires_response,
+                        "screen_excerpt": screen,
                         "total_len": page["total_len"], "truncated": page["truncated"]}
-            if kind == "waiting_for_user":
+            if kind in RESPONDABLE_KINDS:
                 self._decision = decision
         # publish OUTSIDE the session lock (lock order: never hold it across a queue publish).
         evt = self._events.publish(self._id, self._executor, kind, text[:200], self._state,
                                    turn_index=decision["turn_index"], range=decision["range"],
-                                   hint=hint, hung=hung)
-        if kind == "waiting_for_user":
+                                   hint=hint, hung=hung, task_delivery=task_delivery,
+                                   requires_response=requires_response, screen_excerpt=screen)
+        if kind in RESPONDABLE_KINDS:
             with self._lock:
                 self._decision["event_id"] = evt.event_id
         if self._log is not None:
             self._log.audit_decision(self._id, self._executor, kind, evt.event_id, text)
+
+    def _has_question(self):
+        # Conservative: a question if the live screen (ground truth) ends with '?' or shows a
+        # choice menu. The dialog tail is empty pre-flush for alt-screen TUIs, so read the
+        # screen — which is exactly what the agent is presenting right now. The input-box
+        # marker line ("❯ …") is the prompt itself, not content, so look past it.
+        frame = self._handle.render()
+        if self._driver.is_modal_choice(frame):
+            return True
+        lines = [ln.rstrip() for ln in frame.split("\n")]
+        while lines and (not lines[-1] or lines[-1].lstrip().startswith("❯")):
+            lines.pop()
+        return bool(lines) and lines[-1].endswith("?")
 
     # ---- reads / control ----
     def snapshot(self):
@@ -175,14 +299,18 @@ class Session:
     def respond(self, event_id, answer):
         pending = self._events.pending(self._id)
         if pending is None or pending.event_id != event_id:
-            return False                      # bind to the current pending decision
+            return False                              # bind to the current pending decision
+        is_blocked = pending.kind == "blocked"
         self._events.mark_answered(event_id)
         if self._handle is not None:
-            self._dialog.mark_turn_boundary()
-            self._submit(sanitize_answer(answer))
+            if not is_blocked:
+                self._dialog.mark_turn_boundary()     # only a delivered agent turn gets a boundary
+            self._type_text(sanitize_answer(answer))
+            self._press_enter()
             self._last_state = None
         with self._lock:
             self._decision = None
+        self._blocked_fp = None                       # allow the next blocked screen to re-emit
         return True
 
     def stop(self):

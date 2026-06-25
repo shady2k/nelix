@@ -1,4 +1,5 @@
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -111,6 +112,7 @@ def _session(tmp_path, frames=(), handle=None, spec=None):
     sess._handle = handle if handle is not None else FakeHandle(list(frames), stop=sess._stop)
     sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
                           spool_max_bytes=Spec.spool_max_bytes)
+    sess._task_delivery = "delivered"     # these tests drive the post-delivery run loop directly
     return sess, ev
 
 
@@ -121,8 +123,8 @@ def test_sessions_dir_resolves_under_hermes_home(monkeypatch, tmp_path):
 
 
 def test_stop_edge_emits_frozen_respondable_event(monkeypatch, tmp_path):
-    frames = ["thinking… esc to interrupt", "Here is my answer.\n❯ ",
-              "Here is my answer.\n❯ ", "Here is my answer.\n❯ "]
+    frames = ["thinking… esc to interrupt", "Here is my answer. Which next?\n❯ ",
+              "Here is my answer. Which next?\n❯ ", "Here is my answer. Which next?\n❯ "]
     sess, ev = _session(tmp_path, frames)
     monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
@@ -141,7 +143,7 @@ def test_stop_edge_emits_frozen_respondable_event(monkeypatch, tmp_path):
 
 
 def test_decision_reports_truncation(monkeypatch, tmp_path):
-    box = "Hello answer.\n❯ "
+    box = "Hello, what now?\n❯ "
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box], spec=TruncSpec())
     monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
@@ -198,7 +200,7 @@ def test_no_progress_escalates_hung_without_esc(monkeypatch, tmp_path):
 
 def test_respond_answers_and_advances_turn(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
-    box = "answer\n❯ "
+    box = "Ready — what next?\n❯ "
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
@@ -221,10 +223,7 @@ def test_start_passes_cwd_to_launcher(monkeypatch, tmp_path):
             return FakeHandle(["x"])
 
     sess = Session("s1", "demo", ClaudeDriver(), FakeLauncher(), Spec(), EventQueue())
-    monkeypatch.setattr(sess, "_wait_until_ready", lambda *a, **k: None)
-    monkeypatch.setattr(sess, "_ensure_ask_mode", lambda *a, **k: None)
-    monkeypatch.setattr(sess, "_submit", lambda *a, **k: None)
-    monkeypatch.setattr(sess, "_loop", lambda *a, **k: None)
+    monkeypatch.setattr(sess, "_run", lambda *a, **k: None)   # monitor thread is a no-op here
     sess.start("do it", cwd="/work/repo")
     sess._stop.set()
     assert seen["cwd"] == "/work/repo"
@@ -235,3 +234,87 @@ def test_ensure_ask_mode_writes_driver_toggle(monkeypatch, tmp_path):
     sess, _ = _session(tmp_path, ["normal mode, no askmode marker"])
     sess._ensure_ask_mode(attempts=2)
     assert sess._driver.ask_mode_toggle in "".join(sess._handle.writes)
+
+
+# ---- live (real-thread) start/delivery harness -------------------------------
+# Drives Session through the real monitor thread (Session.start spawns it). The
+# handle below records writes and simulates echo so delivery/blocked can be observed.
+
+class LiveHandle:
+    def __init__(self, frames, dialog=None):
+        self._frames = list(frames)      # list[str]; last one repeats
+        self._i = 0
+        self.writes = []
+        self._dialog = dialog
+
+    def pump(self, timeout=0.1):
+        if self._i < len(self._frames) - 1:
+            self._i += 1
+        time.sleep(0.005)                # yield so real-time polling can observe steps
+        return True
+
+    def render(self):
+        return self._frames[min(self._i, len(self._frames) - 1)]
+
+    def write(self, data):
+        self.writes.append(data)
+        # simulate echo: typing text makes it visible in the (current) frame
+        if data not in ("\r", "\x1b[Z", "\x1b"):
+            j = min(self._i, len(self._frames) - 1)
+            self._frames[j] = self._frames[j].replace("❯ \n", f"❯ {data}\n")
+
+    def is_alive(self):
+        return True
+
+    def exit_code(self):
+        return None
+
+    def flush_viewport(self, dialog):
+        for ln in self.render().splitlines():
+            t = ln.rstrip()
+            if t:
+                dialog.add_line(t)
+
+    def advance_to_input_box(self):
+        self._i = len(self._frames) - 1
+
+    def close(self):
+        pass
+
+
+def make_session(tmp_path, frames, handle_cls=LiveHandle, spec=None):
+    ev = EventQueue()
+    handle = handle_cls(list(frames))
+
+    class _Launcher:
+        def start(self, spec, cwd, cols, rows, dialog=None):
+            handle._dialog = dialog
+            return handle
+
+        def stop(self, h):
+            pass
+
+    sess = Session("s1", "demo", ClaudeDriver(), _Launcher(), spec or Spec(), ev)
+    return sess, handle, ev
+
+
+def _wait_for(pred, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+def test_start_is_async_and_delivers_when_input_box_ready(tmp_path):
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box])
+    sess.start("create report.md", str(tmp_path))   # must return immediately
+    assert sess._task_delivery in ("pending", "delivered")   # did not block on delivery
+    _wait_for(lambda: sess._task_delivery == "delivered")
+    assert sess._task_delivery == "delivered"
+    assert "create report.md" in "".join(handle.writes)   # typed
+    assert "\r" in handle.writes                          # then Enter
+    assert handle.writes.index("\r") > 0                  # Enter AFTER typing
+    sess.stop()
