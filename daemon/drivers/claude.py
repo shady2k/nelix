@@ -18,9 +18,9 @@ _PROMPT_FOOTER = "shift+tab to cycle"     # present at the interactive input pro
 _OPTION = re.compile(r"^\s*[❯>]?\s*\d+\.\s+\S", re.M)        # a numbered menu option line
 _SELECTED_OPTION = re.compile(r"^\s*❯\s*\d+\.\s+\S", re.M)   # the cursor sits ON an option
 # Claude collapses long/multiline input into "[Pasted text #N]" ON the prompt line; the prompt marker
-# (❯) sits immediately before it (Claude renders a NBSP between them). Scoped so the same string echoed
-# elsewhere in OUTPUT does not count as our submission.
-_PASTED_TEXT = re.compile(r"❯[ \t ]*\[Pasted text #\d+\]")
+# (❯) sits immediately before it (Claude renders a NBSP between them). The character class matches
+# space, tab, or NBSP (U+00A0) — note: " " must be in a non-raw string; it is NOT a raw string.
+_PASTED_TEXT = re.compile("❯[ \t ]*" + r"\[Pasted text #\d+\]")
 
 
 def _is_choice_prompt(frame):

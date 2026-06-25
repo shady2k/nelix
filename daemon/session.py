@@ -195,7 +195,7 @@ class Session:
         # non-respondable advisory; the human stops + restarts.
         self._task_delivery = "failed"
         self._handle.flush_viewport(self._dialog)
-        self._publish("delivery_failed", hint="delivery_unconfirmed", hung=True,
+        self._publish("delivery_failed", hint="delivery_unconfirmed", hung=False,
                       requires_response=False, task_delivery="failed")
 
     def _loop(self):
