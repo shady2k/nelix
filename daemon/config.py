@@ -91,7 +91,7 @@ def load_executors(path):
     for name, spec in execs.items():
         try:
             specs[name] = _build_spec(name, spec)
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, ArithmeticError) as e:
             errors.append({"name": name, "problem": str(e)})
     return ExecutorLoad(specs, errors, None)
 

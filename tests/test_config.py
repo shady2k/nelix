@@ -232,3 +232,14 @@ def test_concurrency_limit_bad_type_defaults(tmp_path):
 
 def test_concurrency_limit_missing_file_defaults(tmp_path):
     assert load_concurrency_limit(str(tmp_path / "absent.toml")) == 1
+
+
+def test_non_finite_int_field_collected_not_raised(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.good]\ncommand="g"\ndriver="claude"\n'
+                   '[executors.bigtail]\ncommand="x"\ndriver="claude"\ntail_lines=inf\n'
+                   '[executors.bigrestart]\ncommand="y"\ndriver="claude"\nmax_restarts=inf\n')
+    load = load_executors(str(cfg))           # must NOT raise
+    assert set(load.specs) == {"good"}        # both inf executors skipped
+    assert load.parse_error is None
+    assert {e["name"] for e in load.executor_errors} == {"bigtail", "bigrestart"}
