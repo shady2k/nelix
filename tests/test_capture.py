@@ -57,6 +57,17 @@ def test_capture_reads_dims_from_session_meta(tmp_path):
     assert "80x10" in r.stderr                            # dims discovered from meta.json
 
 
+def test_capture_malformed_meta_falls_back_to_defaults(tmp_path):
+    # a hand-broken meta.json (null/non-numeric dims) must not crash the tool — fall back to 120x40.
+    sd = tmp_path / "s-bad"
+    sd.mkdir()
+    (sd / "raw").write_bytes(b"abc\r\n")
+    (sd / "meta.json").write_text('{"cols": null, "rows": "oops"}')
+    r = _run(str(sd), "--final")
+    assert r.returncode == 0 and "abc" in r.stdout
+    assert "120x40" in r.stderr
+
+
 def test_capture_dims_override_and_default(tmp_path):
     raw = tmp_path / "raw"
     raw.write_bytes(b"hi\r\n")

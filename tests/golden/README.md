@@ -1,7 +1,8 @@
 # Golden frames — driver-conformance harness
 
-Faithful CLI screen captures + their expected `classify()` result. The directory name under
-`claude/` IS the expected result: `claude/<expected-classify>/<name>.txt`. `tests/test_driver_
+Curated rendered CLI frames (excerpts — trimmed to the lines `classify()` keys on) + their expected
+`classify()` result. The directory name under `claude/` IS the expected result:
+`claude/<expected-classify>/<name>.txt`. `tests/test_driver_
 conformance.py` asserts `ClaudeDriver().classify(frame, settled_ctx) == <dir name>` for every file.
 
 When Claude Code changes how it draws the screen (a new spinner footer, a renamed marker), the driver

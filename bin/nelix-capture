@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import paths                                                  # noqa: E402
 from daemon.pty_session import make_pyte_screen, render_raw   # noqa: E402
 from daemon.drivers.claude import ClaudeDriver                # noqa: E402
 import pyte                                                   # noqa: E402
@@ -31,12 +32,12 @@ def _resolve(path, cols_arg, rows_arg):
     cols, rows = 120, 40
     if p.is_dir():
         raw = p / "raw"
-        meta = p / "meta.json"
+        meta = paths.session_meta(p)
         if meta.exists():
             try:
                 m = json.loads(meta.read_text())
                 cols, rows = int(m.get("cols", cols)), int(m.get("rows", rows))
-            except (OSError, ValueError):
+            except (OSError, ValueError, TypeError):     # malformed/null dims -> keep defaults
                 pass
     else:
         raw = p
@@ -77,8 +78,8 @@ def _all(data, cols, rows, limit, out_dir):
         seen.add(key)
         candidates.append(frame)
         if len(candidates) >= limit:
-            print(f"nelix-capture: --limit {limit} reached; more distinct candidates exist "
-                  f"(raise --limit to see them)", file=sys.stderr)
+            print(f"nelix-capture: --limit {limit} reached; raise --limit if you need more",
+                  file=sys.stderr)
             break
     if out_dir:
         d = Path(out_dir)
