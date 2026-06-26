@@ -6,6 +6,7 @@ import os
 import signal as _signal
 import subprocess
 import sys
+import time
 
 import paths
 
@@ -131,3 +132,19 @@ def forget_child(session_dir) -> None:
         pass
     except OSError:
         pass
+
+
+def kill_group(inspector, killer, leader_pid, pgid, grace, poll=0.1) -> bool:
+    """SIGTERM the group, wait up to `grace` for the leader to die, then SIGKILL. Never
+    falls back to killing by pid when pgid is missing (could hit a reused pgid) -> no-op."""
+    if pgid is None:
+        return False
+    killer.killpg(pgid, _signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if not inspector.is_alive(leader_pid):
+            return True
+        time.sleep(poll)
+    if inspector.is_alive(leader_pid):
+        killer.killpg(pgid, _signal.SIGKILL)
+    return True
