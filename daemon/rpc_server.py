@@ -87,7 +87,10 @@ def make_server(manager, token, host="127.0.0.1", port=8765, logger=None):
                 turn = self._int(qs.get("turn", [None])[0], sess.dialog.turn_count() - 1)
                 offset = self._int(qs.get("offset", ["0"])[0], 0)
                 limit = self._int(qs.get("limit", [None])[0], None)
-                self._send(200, sess.dialog.turn_text(turn, offset, limit))
+                page = sess.dialog.turn_text(turn, offset, limit)
+                # transcript text is captured executor output -> carry the trust fence with it.
+                page["external_output_policy"] = EXTERNAL_OUTPUT_POLICY
+                self._send(200, page)
             elif p.path == "/screen":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]

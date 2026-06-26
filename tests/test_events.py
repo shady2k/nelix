@@ -71,6 +71,44 @@ def test_publish_carries_range_and_hint_under_lock():
     assert q.pending() is None
 
 
+def test_mark_session_answered_clears_all_reemits_of_a_decision():
+    # A pause can span several events (a no-progress backstop re-emit). Answering the decision must
+    # clear ALL of them so pending() never surfaces a stale earlier event for the resolved decision.
+    q = EventQueue()
+    q.publish("s1", "x", "blocked", "trust?", "startup_interstitial", requires_response=True)
+    b = q.publish("s1", "x", "blocked", "trust?", "startup_interstitial",
+                  requires_response=True, hung=True)
+    q.publish("s2", "x", "waiting_for_user", "?", "idle_prompt", requires_response=True)
+    assert q.mark_session_answered("s1") == b.seq      # highest answered seq (cursor to arm past)
+    assert q.pending("s1") is None                     # both s1 re-emits cleared
+    assert q.pending("s2") is not None                 # other session untouched
+    assert q.mark_session_answered("s1") is None       # nothing left to answer
+
+
+def test_publish_on_publish_runs_before_waiters_are_notified():
+    # Install-before-notify: the on_publish hook (where the session installs its decision) runs
+    # while the event is reserved but BEFORE waiters wake — so a woken status pull never observes
+    # an event without its decision.
+    import threading, time as _t
+    q = EventQueue()
+    order = []
+    started = threading.Event()
+
+    def waiter():
+        started.set()
+        evt = q.wait_event(after_seq=0, timeout=2, session_id="s1")
+        order.append(("woke", evt.event_id if evt else None))
+
+    t = threading.Thread(target=waiter, daemon=True); t.start()
+    assert started.wait(1)
+    _t.sleep(0.05)                                      # let the waiter block on the condition
+    e = q.publish("s1", "x", "waiting_for_user", "?", "idle_prompt",
+                  on_publish=lambda ev: order.append(("installed", ev.event_id)))
+    t.join(2)
+    assert order[0] == ("installed", e.event_id)        # install BEFORE the waiter wakes
+    assert order[1] == ("woke", e.event_id)
+
+
 def test_blocked_event_is_pending_and_carries_fields():
     q = EventQueue()
     e = q.publish("s-1", "agent", "blocked", "trust?", "startup_interstitial",

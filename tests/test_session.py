@@ -251,6 +251,32 @@ def test_respond_with_no_pending_decision_is_rejected(tmp_path):
     assert not sess._handle.writes
 
 
+def test_respond_claims_decision_atomically_no_double_type(monkeypatch, tmp_path):
+    # respond claims the decision before typing, so a second respond finds nothing pending and does
+    # NOT type again (PTY input is non-idempotent — a duplicate would inject a stray line).
+    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
+    box = "Ready — what next?\n❯ "
+    sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
+    sess._loop()
+    assert sess.respond("1").status == "resumed"
+    writes_after_first = list(sess._handle.writes)
+    assert sess.respond("2").status == "no_pending"       # already claimed
+    assert sess._handle.writes == writes_after_first      # nothing typed the second time
+
+
+def test_answering_reemitted_blocked_clears_pending(tmp_path):
+    # Answering a decision the backstop re-emitted must clear pending() for ALL its events, not just
+    # the latest — otherwise pending() surfaces a stale earlier event for the resolved decision.
+    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    sess, handle, ev = make_session(tmp_path, frames=[trust], spec=BackstopSpec())
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sum(1 for e in ev._events if e.kind == "blocked") >= 2, timeout=3)
+    assert sess.respond("1").status == "resumed"
+    assert ev.pending("s1") is None                       # every re-emit answered
+    sess.stop()
+
+
 def test_respond_with_stale_decision_id_is_rejected_and_returns_current(monkeypatch, tmp_path):
     # decision_id is an OPTIONAL guard from the status pull, not a required identity. A mismatch
     # is rejected as stale and the response carries the current pending decision for reconcile;
