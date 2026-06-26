@@ -151,6 +151,8 @@ def make_server(manager, token, host="127.0.0.1", port=8765, logger=None):
                         logger.warning("rpc", "respond_write_timeout", session_id=sid, status=503)
                     self._send(503, {"error": "write_timeout",
                                      "detail": "executor did not accept input (stdin wedged); stop and restart"})
+                elif outcome.status == "terminal":
+                    self._send(409, {"error": "session_terminal"})
                 elif outcome.status == "stale":
                     # rich, self-contained diagnosis: who, what was sent, what is actually pending.
                     if logger is not None:

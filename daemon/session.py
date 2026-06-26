@@ -171,6 +171,8 @@ class Session:
 
     def screen(self, raw=False):
         with self._lock:
+            if self._closing:
+                return ""
             frame = self._handle.render() if self._handle is not None else ""
         return frame if raw else _clean_screen(frame)
 
@@ -582,6 +584,8 @@ class Session:
         # Bind to the session's CURRENT pending decision (server owns identity). decision_id is an
         # OPTIONAL staleness guard sourced from the status pull, never required from the wake.
         with self._lock:
+            if self._closing:
+                return RespondOutcome("terminal")
             decision = self._decision
             if decision is None or "event_id" not in decision:
                 return RespondOutcome("no_pending")

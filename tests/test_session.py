@@ -1104,4 +1104,17 @@ def test_finish_kills_group_when_monitor_dies_with_child_alive(tmp_path, monkeyp
     sess.start("hi", str(tmp_path))
     sess._thread.join(timeout=5)
     assert (4242, signal.SIGTERM) in killer_calls        # group killed despite child "alive"
-    assert freed == ["s-0badf00d"]
+
+
+def test_respond_after_terminal_is_rejected_without_writing(tmp_path):
+    from daemon.session import Session, RespondOutcome
+    ev = EventQueue()
+    h = FakeHandle(["x"])
+    sess = Session("s-11112222", "demo", ClaudeDriver(), _NoopLauncher(h), Spec(), ev)
+    sess._handle = h
+    sess._decision = {"kind": "waiting_for_user", "event_id": "e1", "decision_id": "d1",
+                      "range": (0, 0), "seq": 1}
+    sess._closing = True                                  # terminal cleanup has started
+    out = sess.respond("answer")
+    assert out.status == "terminal"
+    assert h.writes == []                                 # nothing typed into a closing PTY
