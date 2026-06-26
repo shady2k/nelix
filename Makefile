@@ -1,0 +1,48 @@
+# Nelix — common dev commands. Run `make` (or `make help`) for the list.
+# Python project: a virtualenv plus requirements.txt. (The out-of-process daemon installs its own
+# hash-pinned deps from requirements-daemon.lock at runtime; this venv is for tests + tooling.)
+
+VENV ?= .venv
+PY   := $(VENV)/bin/python
+PIP  := $(VENV)/bin/pip
+
+# Installed-plugin checkout used by `deploy` / `reinstall-plugin`. Override for another profile:
+#   make reinstall-plugin PLUGIN_DIR=/path/to/plugins/nelix
+PLUGIN_DIR ?= $(HOME)/.hermes/profiles/local/plugins/nelix
+
+.DEFAULT_GOAL := help
+
+.PHONY: help
+help:  ## List the available commands
+	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
+		| awk -F':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+
+.PHONY: venv
+venv:  ## Create the virtualenv if it is missing
+	@test -d $(VENV) || python3 -m venv $(VENV)
+
+.PHONY: install
+install: venv  ## Create the venv and install dependencies
+	$(PIP) install -r requirements.txt
+
+.PHONY: test
+test:  ## Run the test suite
+	$(PY) -m pytest -q
+
+.PHONY: clean
+clean:  ## Remove Python caches (keeps the venv)
+	find . -type d -name __pycache__ -prune -exec rm -rf {} +
+	rm -rf .pytest_cache
+
+.PHONY: reinstall-plugin
+reinstall-plugin:  ## Reset the installed plugin checkout to origin/main (override PLUGIN_DIR)
+	@test -d "$(PLUGIN_DIR)/.git" || { echo "no plugin checkout at $(PLUGIN_DIR)"; exit 1; }
+	git -C "$(PLUGIN_DIR)" fetch origin
+	git -C "$(PLUGIN_DIR)" reset --hard origin/main
+	git -C "$(PLUGIN_DIR)" log --oneline -1
+
+.PHONY: deploy
+deploy:  ## Push main, then reset the installed plugin to it
+	git push origin main
+	$(MAKE) reinstall-plugin
+	@echo "Deployed. Restart the Hermes 'local' session (/new) so the daemon reloads the new code."
