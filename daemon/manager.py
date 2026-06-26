@@ -64,13 +64,14 @@ class SessionManager:
 
     def __init__(self, specs, events, launcher_factory=None, driver_factory=None,
                  concurrency_limit=1, logger=None, session_factory=None,
-                 session_retain=20, session_max_age_days=7):
+                 session_retain=20, session_max_age_days=7, reaper_ctx=None):
         self._specs = specs
         self._events = events
         self._limit = concurrency_limit
         self._logger = logger
         self._session_retain = session_retain
         self._session_max_age_days = session_max_age_days
+        self._reaper_ctx = reaper_ctx
         self._sessions = {}
         self._lock = threading.Lock()
         if session_factory is not None:
@@ -104,6 +105,8 @@ class SessionManager:
             sid = f"s-{uuid.uuid4().hex[:8]}"
             base_seq = self._events.latest_seq()      # waiter arms past anything already emitted
             sess = self._make(sid, executor_name, spec)
+            sess.on_terminal = self._free_slot
+            sess.reaper_ctx = self._reaper_ctx
             self._sessions[sid] = sess
             keep = set(self._sessions)
         if self._logger is not None:
@@ -125,11 +128,19 @@ class SessionManager:
             raise
         return sid, base_seq
 
+    def _free_slot(self, session_id):
+        with self._lock:
+            existed = self._sessions.pop(session_id, None) is not None
+        if existed and self._logger is not None:
+            self._logger.info("manager", "slot_freed", session_id=session_id)
+
     def get(self, session_id):
-        return self._sessions.get(session_id)
+        with self._lock:
+            return self._sessions.get(session_id)
 
     def screen(self, session_id, raw=False, force=False):
-        sess = self._sessions.get(session_id)
+        with self._lock:
+            sess = self._sessions.get(session_id)
         if sess is None:
             return {"error": "unknown session"}
         # While the agent is actively working, withhold the screen (poll bait) unless explicitly
@@ -144,14 +155,16 @@ class SessionManager:
                 "external_output_policy": EXTERNAL_OUTPUT_POLICY}
 
     def respond(self, session_id, answer, decision_id=None):
-        sess = self._sessions.get(session_id)
+        with self._lock:
+            sess = self._sessions.get(session_id)
         if sess is None:
             return RespondOutcome("unknown_session")
         return sess.respond(answer, decision_id=decision_id)
 
     def status(self, session_id=None):
         if session_id is not None:
-            sess = self._sessions.get(session_id)
+            with self._lock:
+                sess = self._sessions.get(session_id)
             return sess.snapshot() if sess else {"error": "unknown session"}
         with self._lock:
             snapshot = dict(self._sessions)
@@ -170,5 +183,7 @@ class SessionManager:
         return True
 
     def stop_all(self, reason="shutdown"):
-        for sid in list(self._sessions):
+        with self._lock:
+            sids = list(self._sessions)
+        for sid in sids:
             self.stop(sid, reason=reason)

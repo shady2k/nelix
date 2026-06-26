@@ -167,3 +167,14 @@ def test_invalid_env_falls_back_to_valid_file_but_flags_env(tmp_path, monkeypatc
     p = tmp_path / "nelix.toml"; p.write_text('log_level = "debug"\n')
     cfg = load_log_level(str(p))
     assert cfg.level == "debug" and cfg.invalid_value == "loud" and cfg.invalid_source == "env"
+
+
+def test_load_kill_grace_seconds(tmp_path):
+    from daemon.config import load_kill_grace_seconds
+    p = tmp_path / "nelix.toml"
+    p.write_text('kill_grace_seconds = 2.5\n')
+    assert load_kill_grace_seconds(str(p)) == 2.5
+    p.write_text('concurrency_limit = 1\n')           # key absent -> default
+    assert load_kill_grace_seconds(str(p)) == 5.0
+    p.write_text('kill_grace_seconds = "nope"\n')      # bad type -> default
+    assert load_kill_grace_seconds(str(p)) == 5.0

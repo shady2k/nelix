@@ -49,7 +49,8 @@ class FakeManagerDialog:
     def get(self, sid): return _Sess() if sid == "s1" else None
 
 
-def test_rpc_client_dialog():
+def test_rpc_client_dialog(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerDialog()
     srv = make_server(m, token="t", port=8782)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

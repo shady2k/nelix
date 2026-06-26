@@ -76,6 +76,10 @@ class FakeHandle:
 
     def leader_pid(self): return 4242
     def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self):
+        pid, pgid = self.leader_pid(), self.leader_pgid()
+        if pid is None or pid != pgid:
+            raise RuntimeError(f"pty leader {pid} is not its own group leader (pgid={pgid})")
     def leader_status(self):
         from daemon.launchers.base import LeaderStatus
         if self.is_alive():
@@ -113,6 +117,10 @@ class DeadHandle:
 
     def leader_pid(self): return 4242
     def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self):
+        pid, pgid = self.leader_pid(), self.leader_pgid()
+        if pid is None or pid != pgid:
+            raise RuntimeError(f"pty leader {pid} is not its own group leader (pgid={pgid})")
     def leader_status(self):
         from daemon.launchers.base import LeaderStatus
         return LeaderStatus(alive=False, exit_code=self._code, signal=None,
@@ -120,6 +128,12 @@ class DeadHandle:
 
     def close(self):
         pass
+
+
+class _NoopLauncher:
+    def __init__(self, handle): self._handle = handle
+    def start(self, spec, cwd, cols, rows, dialog=None): return self._handle
+    def stop(self, handle): handle.close()
 
 
 def _clock(values):
@@ -450,6 +464,10 @@ class LiveHandle:
 
     def leader_pid(self): return 4242
     def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self):
+        pid, pgid = self.leader_pid(), self.leader_pgid()
+        if pid is None or pid != pgid:
+            raise RuntimeError(f"pty leader {pid} is not its own group leader (pgid={pgid})")
     def leader_status(self):
         from daemon.launchers.base import LeaderStatus
         return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
@@ -1014,3 +1032,126 @@ def test_delivery_drains_output_so_large_task_reaches_executor(tmp_path, monkeyp
         except Exception:
             pass
         sess.stop()
+
+
+def test_start_writes_child_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, paths
+    importlib.reload(paths)
+    from daemon import reaper
+    from daemon.session import Session
+
+    class _Insp:
+        def start_fingerprint(self, pid): return f"fp-{pid}"
+        def is_alive(self, pid): return False   # needed by kill_group in _finish_cleanup
+    class _Killer:
+        def killpg(self, pgid, sig): pass
+
+    # _finish_cleanup now calls forget_child after start(); patch it to a no-op so the
+    # assertion below doesn't race with the monitor thread deleting the record.
+    monkeypatch.setattr(reaper, "forget_child", lambda p: None)
+
+    ev = EventQueue()
+    sess = Session("s-deadbeef", "demo", ClaudeDriver(), _NoopLauncher(FakeHandle(["ready"])),
+                   Spec(), ev)
+    sess.reaper_ctx = reaper.ReaperContext(daemon_pid=10, daemon_fingerprint="d1", grace=0.05,
+                                           inspector=_Insp(), killer=_Killer())
+    sess._stop.set()                                   # don't run the monitor loop in this test
+    sess.start("hello", str(tmp_path))
+    rec = reaper.read_child(paths.sessions_root() / "s-deadbeef")
+    assert rec["sid"] == "s-deadbeef"
+    assert rec["pid"] == 4242 and rec["pgid"] == 4242
+    assert rec["daemon_pid"] == 10 and rec["daemon_fingerprint"] == "d1"
+    assert rec["child_fingerprint"] == "fp-4242"
+    sess.stop()
+
+
+def test_finish_frees_slot_and_forgets_record_on_clean_exit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, paths
+    importlib.reload(paths)
+    from daemon import reaper
+    from daemon.session import Session
+
+    class _Insp:
+        def start_fingerprint(self, pid): return f"fp-{pid}"
+        def is_alive(self, pid): return False
+    class _Killer:
+        def __init__(self): self.calls = []
+        def killpg(self, pgid, sig): self.calls.append((pgid, sig))
+
+    freed = []
+    ev = EventQueue()
+    sess = Session("s-cafef00d", "demo", ClaudeDriver(), _NoopLauncher(DeadHandle(0)), Spec(), ev)
+    sess.on_terminal = freed.append
+    sess.reaper_ctx = reaper.ReaperContext(10, "d1", 0.05, _Insp(), _Killer())
+    sess.start("hi", str(tmp_path))
+    sess._thread.join(timeout=5)
+    assert freed == ["s-cafef00d"]                       # slot freed
+    assert reaper.read_child(paths.sessions_root() / "s-cafef00d") is None   # record forgotten
+
+
+def test_finish_kills_group_when_monitor_dies_with_child_alive(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, paths, signal
+    importlib.reload(paths)
+    from daemon import reaper
+    from daemon.session import Session
+
+    class _Insp:
+        def start_fingerprint(self, pid): return f"fp-{pid}"
+        def is_alive(self, pid): return True            # child stays alive
+    killer_calls = []
+    class _Killer:
+        def killpg(self, pgid, sig): killer_calls.append((pgid, sig))
+
+    freed = []
+    ev = EventQueue()
+    sess = Session("s-0badf00d", "demo", ClaudeDriver(), _NoopLauncher(FakeHandle(["x"])), Spec(), ev)
+    sess.on_terminal = freed.append
+    sess.reaper_ctx = reaper.ReaperContext(10, "d1", 0.02, _Insp(), _Killer())
+    # force the monitor body to raise so _finish hits the monitor-dead branch with child alive
+    monkeypatch.setattr(sess, "_wait_until_ready",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    sess.start("hi", str(tmp_path))
+    sess._thread.join(timeout=5)
+    assert (4242, signal.SIGTERM) in killer_calls        # group killed despite child "alive"
+    assert freed == ["s-0badf00d"]
+
+
+def test_respond_after_terminal_is_rejected_without_writing(tmp_path):
+    from daemon.session import Session, RespondOutcome
+    ev = EventQueue()
+    h = FakeHandle(["x"])
+    sess = Session("s-11112222", "demo", ClaudeDriver(), _NoopLauncher(h), Spec(), ev)
+    sess._handle = h
+    sess._decision = {"kind": "waiting_for_user", "event_id": "e1", "decision_id": "d1",
+                      "range": (0, 0), "seq": 1}
+    sess._closing = True                                  # terminal cleanup has started
+    out = sess.respond("answer")
+    assert out.status == "terminal"
+    assert h.writes == []                                 # nothing typed into a closing PTY
+
+
+def test_start_asserts_group_leader_when_reaping(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, paths, pytest
+    importlib.reload(paths)
+    from daemon import reaper
+    from daemon.session import Session
+
+    class _BadHandle(FakeHandle):
+        def leader_pid(self): return 100
+        def leader_pgid(self): return 200     # pid != pgid -> not its own group leader
+
+    class _Insp:
+        def start_fingerprint(self, pid): return "fp"
+    class _Killer:
+        def killpg(self, pgid, sig): pass
+
+    ev = EventQueue()
+    sess = Session("s-badleader", "demo", ClaudeDriver(), _NoopLauncher(_BadHandle(["x"])), Spec(), ev)
+    sess.reaper_ctx = reaper.ReaperContext(10, "d1", 0.05, _Insp(), _Killer())
+    sess._stop.set()
+    with pytest.raises(RuntimeError):
+        sess.start("hi", str(tmp_path))

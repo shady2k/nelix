@@ -198,7 +198,8 @@ def test_status_includes_decision():
         srv.shutdown()
 
 
-def test_dialog_paginates_turn_and_defaults_to_latest():
+def test_dialog_paginates_turn_and_defaults_to_latest(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerWithDialog()
     srv = make_server(m, token="t", port=8771)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -372,6 +373,31 @@ def test_unauthorized_is_logged():
     finally:
         srv.shutdown()
     assert "unauthorized" in buf.getvalue()
+
+
+def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, json, threading, urllib.request, paths
+    importlib.reload(paths)
+    from daemon.dialog import Dialog
+    from daemon.rpc_server import make_server
+
+    d = Dialog(paths.sessions_root() / "s-fin", tail_lines=10, spool_max_bytes=10000)
+    d.add_line("finished output"); d.close()
+
+    class _Mgr:                                   # session no longer live in the registry
+        def get(self, sid): return None
+    srv = make_server(_Mgr(), token="t", port=0)
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    host, port = srv.server_address
+    try:
+        req = urllib.request.Request(f"http://{host}:{port}/dialog?session_id=s-fin",
+                                     headers={"X-Nelix-Token": "t"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            page = json.loads(r.read())
+        assert page["text"] == "finished output" and page["unavailable"] is False
+    finally:
+        srv.server_close()
 
 
 def test_unexpected_exception_returns_json_500_and_logs():

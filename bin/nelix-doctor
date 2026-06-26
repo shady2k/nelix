@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Read-only nelix operator status: daemon health, singleton-lock holder, live sessions,
+and detected strays (recorded children whose owner daemon is gone but child is alive)."""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import paths                                   # noqa: E402
+import supervisor                              # noqa: E402
+from daemon import reaper, singleton           # noqa: E402
+
+
+def _scan_strays(inspector):
+    strays = []
+    try:
+        dirs = [d for d in paths.sessions_root().iterdir() if d.is_dir()]
+    except (FileNotFoundError, NotADirectoryError):
+        return strays
+    for sd in dirs:
+        rec = reaper.read_child(sd)
+        if rec is None or rec.get("sid") != sd.name:
+            continue
+        pid = rec.get("pid")
+        owner_dead = (not inspector.is_alive(rec.get("daemon_pid"))) or \
+            inspector.start_fingerprint(rec.get("daemon_pid")) != rec.get("daemon_fingerprint")
+        if owner_dead and pid is not None and inspector.is_alive(pid) \
+                and inspector.start_fingerprint(pid) == rec.get("child_fingerprint"):
+            strays.append({"sid": rec["sid"], "pid": pid, "pgid": rec.get("pgid"),
+                           "ppid": inspector.ppid(pid)})
+    return strays
+
+
+def collect(inspector=None):
+    inspector = inspector or reaper.ProcessInspector()
+    base = supervisor.base_token()
+    holder = singleton.read_holder(paths.daemon_lock())
+    sessions = []
+    if base:
+        import urllib.request
+        url, token = base
+        try:
+            req = urllib.request.Request(url + "/status", headers={"X-Nelix-Token": token})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                sessions = list(json.loads(r.read()).get("sessions", {}).keys())
+        except Exception:
+            pass
+    return {"daemon": {"alive": base is not None, "base": base[0] if base else None},
+            "lock_holder": holder, "sessions": sessions,
+            "strays": _scan_strays(inspector)}
+
+
+def main():
+    print(json.dumps(collect(), indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -2,6 +2,8 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import paths
+from daemon.dialog import DialogReader
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hygiene import PtyInputRejected
 
@@ -81,14 +83,20 @@ def make_server(manager, token, host="127.0.0.1", port=8765, logger=None):
                 self._send(200, manager.status(sid))
             elif p.path == "/dialog":
                 qs = parse_qs(p.query)
-                sess = manager.get(qs.get("session_id", [None])[0])
-                if sess is None or sess.dialog is None:
-                    self._send(404, {"error": "unknown session"}); return
-                turn = self._int(qs.get("turn", [None])[0], sess.dialog.turn_count() - 1)
+                sid = qs.get("session_id", [None])[0]
+                if not sid:
+                    self._send(400, {"error": "missing session_id"}); return
+                reader = DialogReader(paths.sessions_root() / sid)
+                if reader.turn_count() == 0:
+                    # No transcript on disk — fall back to live session if present
+                    sess = manager.get(sid)
+                    if sess is None or sess.dialog is None:
+                        self._send(404, {"error": "unknown session"}); return
+                    reader = sess.dialog   # duck-typed: same turn_count/turn_text interface
+                turn = self._int(qs.get("turn", [None])[0], reader.turn_count() - 1)
                 offset = self._int(qs.get("offset", ["0"])[0], 0)
                 limit = self._int(qs.get("limit", [None])[0], None)
-                page = sess.dialog.turn_text(turn, offset, limit)
-                # transcript text is captured executor output -> carry the trust fence with it.
+                page = reader.turn_text(turn, offset, limit)
                 page["external_output_policy"] = EXTERNAL_OUTPUT_POLICY
                 self._send(200, page)
             elif p.path == "/screen":
@@ -151,6 +159,8 @@ def make_server(manager, token, host="127.0.0.1", port=8765, logger=None):
                         logger.warning("rpc", "respond_write_timeout", session_id=sid, status=503)
                     self._send(503, {"error": "write_timeout",
                                      "detail": "executor did not accept input (stdin wedged); stop and restart"})
+                elif outcome.status == "terminal":
+                    self._send(409, {"error": "session_terminal"})
                 elif outcome.status == "stale":
                     # rich, self-contained diagnosis: who, what was sent, what is actually pending.
                     if logger is not None:

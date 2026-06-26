@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import paths
 from daemon import lifecycle_log
+from daemon import reaper
 from daemon.dialog import Dialog
 from daemon.drivers.base import ClassifyCtx
 from daemon.events import EXTERNAL_OUTPUT_POLICY, RESPONDABLE_KINDS
@@ -94,6 +95,9 @@ class Session:
         self._spawn_ts = None          # ts the PTY leader was spawned (for alive_for)
         self._blocked_fp = None        # normalized screen of the last emitted blocked event
         self._sessions_dir = _sessions_root()
+        self.on_terminal = None        # manager-set: free the slot on terminal state
+        self.reaper_ctx = None         # daemon-set reaper.ReaperContext (None => no reaping)
+        self._closing = False          # terminal cleanup started: respond/screen must not write
         driver._settle = spec.settle_seconds   # keep classify a pure (frame, ctx) fn
 
     @property
@@ -118,6 +122,7 @@ class Session:
         self._task_delivery = "pending"
         self._spawn_ts = time.time()
         self._log_spawned(self._spec.argv(), type(self._launcher).__name__)
+        self._record_child()
         if self._log is not None:
             self._log.debug("session", "monitor_started", session_id=self._id)
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -136,6 +141,29 @@ class Session:
         except OSError:
             pass
 
+    def _record_child(self):
+        # Publish the reaping record AFTER spawn (pid/pgid known) and BEFORE the monitor
+        # thread runs, so a crash from here on leaves a reapable record.
+        ctx = self.reaper_ctx
+        if ctx is None or self._handle is None:
+            return
+        # The reaper kills by process GROUP; that only reaps the whole subtree if the PTY
+        # child is its own group leader (setsid -> pid == pgid). Enforce it before recording.
+        self._handle.assert_leader_is_group_leader()
+        pid, pgid = self._handle.leader_pid(), self._handle.leader_pgid()
+        record = {"sid": self._id, "daemon_pid": ctx.daemon_pid,
+                  "daemon_fingerprint": ctx.daemon_fingerprint, "pid": pid,
+                  "child_fingerprint": ctx.inspector.start_fingerprint(pid),
+                  "pgid": pgid, "argv": lifecycle_log.redact_argv(self._spec.argv())}
+        try:
+            reaper.record_child(self._sessions_dir / self._id, record)
+            if self._log is not None:
+                self._log.info("session", "child_recorded", session_id=self._id,
+                               pid=pid, pgid=pgid)
+        except OSError:
+            if self._log is not None:
+                self._log.warning("session", "child_record_failed", session_id=self._id)
+
     # ---- low-level PTY ops (split from the old blind _submit) ----
     def _type_text(self, text, timeout=None, drain_output=False):
         self._handle.write(text, timeout=timeout, drain_output=drain_output)
@@ -146,6 +174,8 @@ class Session:
 
     def screen(self, raw=False):
         with self._lock:
+            if self._closing:
+                return ""
             frame = self._handle.render() if self._handle is not None else ""
         return frame if raw else _clean_screen(frame)
 
@@ -341,6 +371,12 @@ class Session:
             self._finalized = True
         status = self._handle.leader_status() if self._handle is not None else None
         alive = bool(status and status.alive)
+        try:
+            self._finish_publish(status, alive)
+        finally:
+            self._finish_cleanup(alive)
+
+    def _finish_publish(self, status, alive):
         # 1. monitor itself crashed; leader may still be alive
         if self._exc is not None:
             with self._lock:
@@ -381,6 +417,26 @@ class Session:
         if self._log is not None:
             self._log.warning("session", "cli_crashed", session_id=self._id)
             self._log.debug("session", "monitor_exited", session_id=self._id)
+
+    def _finish_cleanup(self, alive):
+        # Terminal cleanup for ANY exit reason: reap survivors (monitor-dead-child-alive, or
+        # stragglers in the group), forget the durable record, free the concurrency slot.
+        with self._lock:
+            self._closing = True
+        ctx = self.reaper_ctx
+        if ctx is not None and self._handle is not None:
+            pid, pgid = self._handle.leader_pid(), self._handle.leader_pgid()
+            if alive and pid is not None and pgid is not None:
+                reaper.kill_group(ctx.inspector, ctx.killer, pid, pgid, ctx.grace)
+            reaper.forget_child(self._sessions_dir / self._id)
+        cb = self.on_terminal
+        if cb is not None:
+            try:
+                cb(self._id)
+            except Exception:
+                if self._log is not None:
+                    self._log.error("session", "on_terminal_error", session_id=self._id,
+                                    exc_info=True)
 
     # ---- lifecycle logging helpers (one-liners over lifecycle_log; all logger-guarded) ----
     def _screen_fp(self):
@@ -531,6 +587,8 @@ class Session:
         # Bind to the session's CURRENT pending decision (server owns identity). decision_id is an
         # OPTIONAL staleness guard sourced from the status pull, never required from the wake.
         with self._lock:
+            if self._closing:
+                return RespondOutcome("terminal")
             decision = self._decision
             if decision is None or "event_id" not in decision:
                 return RespondOutcome("no_pending")

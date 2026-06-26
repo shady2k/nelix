@@ -97,3 +97,14 @@ def test_leader_pgid_matches_setsid_leader():
     s.spawn()
     assert s.leader_pgid() == os.getpgid(s.leader_pid())
     s.close()
+
+
+def test_real_spawn_leader_is_group_leader():
+    from daemon.pty_session import PtySession
+    p = PtySession(["/bin/sh", "-c", "sleep 5"], cwd="/tmp", cols=80, rows=24)
+    p.spawn()
+    try:
+        p.assert_leader_is_group_leader()             # must not raise: pid == pgid (setsid)
+        assert p.leader_pid() == p.leader_pgid()
+    finally:
+        p.close()
