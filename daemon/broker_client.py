@@ -51,10 +51,13 @@ class BrokerClient:
                 self._restart_locked()                 # one transparent retry after a mid-call death
                 send_msg(self._sock, req)
                 resp, master = recv_msg(self._sock)
+        if resp.get("status") == "ok" and master is None:
+            raise BrokerSpawnError("missing_fd", None)     # protocol violation: ok but no master
         if resp.get("status") != "ok":
             if master is not None:
                 os.close(master)
             raise BrokerSpawnError(resp.get("stage"), resp.get("errno"))
+        os.set_inheritable(master, False)                  # SCM_RIGHTS fds aren't CLOEXEC by default
         return master, resp["pid"], resp["pgid"]
 
     def _restart_locked(self):

@@ -1,8 +1,10 @@
 import os
+import signal
 import subprocess
 import sys
 import time
 
+import daemon.pty_broker as pty_broker
 from daemon.broker_proto import send_msg, recv_msg, make_socketpair
 
 
@@ -57,3 +59,49 @@ def test_broker_exits_on_socketpair_eof():
     sock.close()                                            # daemon end gone -> broker should exit
     proc.wait(timeout=5)
     assert proc.returncode == 0
+
+
+def test_child_has_controlling_tty(tmp_path):
+    # Prove login_tty handed the child the slave as its controlling terminal: the foreground
+    # process group of the master's terminal must be the child's own (setsid) group == pid.
+    proc, sock = _start_broker()
+    try:
+        send_msg(sock, {"v": 1, "argv": ["cat"], "cwd": str(tmp_path),
+                        "env": dict(os.environ), "cols": 80, "rows": 24})
+        resp, master = recv_msg(sock)
+        assert resp["status"] == "ok"
+        pid = resp["pid"]
+        assert os.tcgetpgrp(master) == pid                  # child is the tty's foreground group
+        os.close(master)
+        os.kill(pid, 9)
+    finally:
+        sock.close(); proc.terminate(); proc.wait(timeout=5)
+
+
+def test_spawn_timeout_kills_by_pid_not_group(monkeypatch):
+    # On a spawn_timeout the grandchild F is still pre-exec and may not have run setsid(), so
+    # its pgid is not guaranteed to equal pid: the broker must os.kill(pid) the single process,
+    # never os.killpg(pid) (which could SIGKILL an unrelated process group).
+    victim = subprocess.Popen(["sleep", "30"])              # a live pid we fully control
+    real_kill = pty_broker.os.kill
+    killed = {"kill": [], "killpg": []}
+    monkeypatch.setattr(pty_broker.os, "kill",
+                        lambda pid, sig: killed["kill"].append((pid, sig)))
+    monkeypatch.setattr(pty_broker.os, "killpg",
+                        lambda pgid, sig: killed["killpg"].append((pgid, sig)))
+    monkeypatch.setattr(pty_broker, "_read_pid", lambda pid_r: victim.pid)
+    monkeypatch.setattr(pty_broker, "_read_err",
+                        lambda err_r: {"stage": "spawn_timeout", "errno": None})
+    try:
+        resp, master = pty_broker.handle_spawn(
+            {"v": 1, "argv": ["true"], "cwd": None, "env": {}, "cols": 80, "rows": 24})
+        assert master is None
+        assert resp["status"] == "spawn_failed" and resp["stage"] == "spawn_timeout"
+        assert killed["killpg"] == []                       # must NOT target a process group
+        assert (victim.pid, signal.SIGKILL) in killed["kill"]
+    finally:
+        try:
+            real_kill(victim.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        victim.wait()

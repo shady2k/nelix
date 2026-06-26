@@ -142,8 +142,11 @@ def handle_spawn(req):
     if err is not None:
         os.close(master)
         if err.get("stage") == "spawn_timeout":
+            # On timeout F is still pre-exec: it may not have reached setsid() yet, so its pgid
+            # is not guaranteed to equal `pid` and killpg(pid) could hit an unrelated group.
+            # Pre-exec F has no child subtree, so kill the single process by pid, not its group.
             try:
-                os.killpg(pid, signal.SIGKILL)     # F known but never exec'd: don't leak it
+                os.kill(pid, signal.SIGKILL)       # F known but never exec'd: don't leak it
             except OSError:
                 pass
         return {"v": 1, "status": "spawn_failed", **err}, None
@@ -165,6 +168,8 @@ def main():
             continue
         except EOFError:
             return                                     # daemon closed its end -> clean exit
+        except ValueError:                            # malformed/oversized datagram (incl.
+            continue                                   # JSONDecodeError): drop it, keep serving
         except OSError:
             return
         resp, master = handle_spawn(req)
