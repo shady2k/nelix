@@ -24,3 +24,30 @@ def test_install_stack_dump_handler_enables_faulthandler():
     from daemon.app import install_stack_dump_handler
     install_stack_dump_handler()
     assert faulthandler.is_enabled()
+
+
+def test_acquire_singleton_second_call_conflicts(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, io, json, paths
+    importlib.reload(paths)
+    from daemon import app, singleton
+    from daemon.obs import Logger
+    buf = io.StringIO()
+    fd = app.acquire_singleton(Logger(level="info", stream=buf))
+    assert fd is not None
+    holder = singleton.read_holder(paths.daemon_lock())
+    assert holder["pid"] == __import__("os").getpid()
+    buf2 = io.StringIO()
+    assert app.acquire_singleton(Logger(level="info", stream=buf2)) is None
+    assert "daemon_lock_conflict" in buf2.getvalue()
+    __import__("os").close(fd)
+
+
+def test_build_reaper_ctx_has_identity(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from daemon import app
+    import os
+    ctx = app.build_reaper_ctx(grace=3.0)
+    assert ctx.daemon_pid == os.getpid()
+    assert isinstance(ctx.daemon_fingerprint, str) and ctx.daemon_fingerprint
+    assert ctx.grace == 3.0

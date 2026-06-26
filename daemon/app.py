@@ -3,14 +3,36 @@ import os
 import signal
 import sys
 
+import paths
+from daemon import reaper, singleton
 from daemon.config import (load_executors, load_concurrency_limit, load_retention,
-                           load_log_level)
+                           load_log_level, load_kill_grace_seconds)
 from daemon.drivers import get_driver
 from daemon.launchers import get_launcher
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
 from daemon.obs import Logger
 from daemon.rpc_server import make_server
+
+_LOCK_FD = None   # held for the daemon's lifetime: closing it releases the singleton flock
+
+
+def build_reaper_ctx(grace):
+    insp = reaper.ProcessInspector()
+    pid = os.getpid()
+    return reaper.ReaperContext(daemon_pid=pid, daemon_fingerprint=insp.start_fingerprint(pid),
+                                grace=grace, inspector=insp, killer=reaper.ProcessKiller())
+
+
+def acquire_singleton(logger, port=None):
+    insp = reaper.ProcessInspector()
+    pid = os.getpid()
+    meta = {"pid": pid, "start_fingerprint": insp.start_fingerprint(pid), "port": port}
+    fd = singleton.acquire(paths.daemon_lock(), meta)
+    if fd is None and logger is not None:
+        holder = singleton.read_holder(paths.daemon_lock())
+        logger.warning("app", "daemon_lock_conflict", holder=holder)
+    return fd
 
 
 def install_stack_dump_handler():
@@ -44,11 +66,19 @@ def install_shutdown_handler(manager, logger=None):
 
 
 def main():
+    global _LOCK_FD
     cfg_path = os.environ.get("NELIX_CONFIG", "nelix.toml")
     specs = load_executors(cfg_path)
     limit = load_concurrency_limit(cfg_path)
     level_cfg = load_log_level(cfg_path)
     logger = Logger(level=level_cfg.level)
+    token = os.environ["NELIX_RPC_TOKEN"]
+    port = int(os.environ.get("NELIX_RPC_PORT", "8765"))
+    _LOCK_FD = acquire_singleton(logger, port=port)
+    if _LOCK_FD is None:
+        raise SystemExit(3)               # another daemon owns this nelix_root
+    grace = load_kill_grace_seconds(cfg_path)
+    reaper_ctx = build_reaper_ctx(grace)
     events = EventQueue()
     retention = load_retention(cfg_path)
     manager = SessionManager(
@@ -57,9 +87,11 @@ def main():
         concurrency_limit=limit, logger=logger,
         session_retain=retention.session_retain,
         session_max_age_days=retention.session_max_age_days,
+        reaper_ctx=reaper_ctx,
     )
-    token = os.environ["NELIX_RPC_TOKEN"]
-    port = int(os.environ.get("NELIX_RPC_PORT", "8765"))
+    reaper.reconcile_orphans(paths.sessions_root(), reaper_ctx.daemon_pid,
+                             reaper_ctx.daemon_fingerprint, grace,
+                             reaper_ctx.inspector, reaper_ctx.killer, logger=logger)
     server = make_server(manager, token=token, port=port, logger=logger)
     logger.info("app", "daemon_started", executors=sorted(specs), limit=limit,
                 log_level=level_cfg.level, port=port)
