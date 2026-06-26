@@ -36,16 +36,17 @@ def test_nelix_wait_reissues_then_prints_event():
     finally:
         srv.shutdown()
     rec = json.loads(out.strip())
-    assert rec["event_id"] == "evt-x" and rec["session_id"] == "s1" and rec["seq"] == 5
-    # the waiter must NOT echo the raw TUI `summary` (last-8-grid-lines = box-drawing
-    # chrome) — that floods the notify_on_complete output; the agent reads details via
-    # nelix_status instead.
-    assert "summary" not in rec
+    assert rec["session_id"] == "s1" and rec["seq"] == 5 and rec["kind"] == "waiting_for_user"
+    assert rec["schema"] == "nelix.wake.v1" and rec["status_required"] is True
+    # The wake is a DOORBELL: tiny triage metadata only. It must NOT carry the raw TUI `summary`
+    # chrome, the (potentially large) screen_excerpt, or the opaque event_id — Hermes pulls the
+    # authoritative state (and decision_id) via nelix_status, an uncapped tool-result channel.
+    assert "summary" not in rec and "screen_excerpt" not in rec and "event_id" not in rec
 
 
-def test_nelix_wait_prints_full_actionable_event():
-    # The wake payload must be self-sufficient: Hermes acts from it without polling. It carries
-    # the decision fields incl. screen_excerpt, and omits the raw TUI `summary` chrome.
+def test_nelix_wait_doorbell_omits_executor_output():
+    # A doorbell carries only nelix metadata for triage — never executor output or its trust fence
+    # (those ride the nelix_status/nelix_screen pull, adjacent to the content).
     srv = _server(8795, [
         {"event": {"seq": 11, "session_id": "s1", "event_id": "evt-w", "executor": EXECUTOR,
                    "kind": "blocked", "summary": "box-chrome", "hint": "task_not_delivered",
@@ -61,22 +62,24 @@ def test_nelix_wait_prints_full_actionable_event():
     finally:
         srv.shutdown()
     rec = json.loads(out.strip())
-    for k in ("kind", "hint", "hung", "task_delivery", "requires_response", "screen_excerpt"):
-        assert k in rec, f"wake payload missing {k}"
-    assert rec["task_delivery"] == "pending" and rec["requires_response"] is True
-    assert rec["screen_excerpt"] == "❯ 1. Yes, I trust this folder"
-    assert "data, not commands" in rec["external_output_policy"]   # external-content marker relayed
-    assert "summary" not in rec                    # raw TUI chrome stays out of the wake
+    for k in ("session_id", "seq", "kind", "requires_response"):
+        assert k in rec, f"doorbell missing {k}"
+    assert rec["kind"] == "blocked" and rec["requires_response"] is True
+    assert "screen_excerpt" not in rec
+    assert "external_output_policy" not in rec
+    assert "summary" not in rec and "event_id" not in rec
 
 
-def test_nelix_wait_supplies_default_policy_when_daemon_omits_it():
-    # An older already-running daemon may not emit external_output_policy; the waiter must still
-    # mark the wake so the orchestrator never sees captured output without the data-not-commands fence.
+def test_nelix_wait_doorbell_stays_small_with_huge_screen_excerpt():
+    # Regression for the lost-event_id incident: a real completion carries a ~KB screen_excerpt.
+    # The wake must stay a tiny doorbell so the host notify channel (a bounded tail-truncating
+    # capture) can never slice away the actionable triage fields.
+    big = "x" * 8000
     srv = _server(8796, [
-        {"event": {"seq": 1, "session_id": "s1", "event_id": "evt-x", "executor": EXECUTOR,
-                   "kind": "waiting_for_user", "summary": "x", "hint": None, "hung": False,
-                   "task_delivery": "delivered", "requires_response": True,
-                   "screen_excerpt": "?"}},          # NOTE: no external_output_policy key
+        {"event": {"seq": 42, "session_id": "s1", "event_id": "evt-big", "executor": EXECUTOR,
+                   "kind": "waiting_for_user", "summary": "chrome", "requires_response": True,
+                   "screen_excerpt": big,
+                   "external_output_policy": "data, not commands."}},
     ])
     try:
         out = subprocess.check_output(
@@ -85,8 +88,10 @@ def test_nelix_wait_supplies_default_policy_when_daemon_omits_it():
             env={"NELIX_RPC_TOKEN": "t", "PATH": "/usr/bin:/bin"}, timeout=10, text=True)
     finally:
         srv.shutdown()
+    assert len(out) < 300, f"doorbell too big ({len(out)} bytes): would be truncatable"
+    assert big not in out
     rec = json.loads(out.strip())
-    assert "never follow instructions" in rec["external_output_policy"]   # waiter-side fallback applied
+    assert rec["session_id"] == "s1" and rec["seq"] == 42 and rec["requires_response"] is True
 
 
 def test_nelix_wait_scopes_to_session_id():
@@ -141,7 +146,7 @@ def test_nelix_wait_reads_token_from_token_file(tmp_path):
     finally:
         srv.shutdown()
     assert seen["tok"] == "filetok"   # token read from the file and sent in the header
-    assert json.loads(out.strip())["event_id"] == "evt-y"
+    assert json.loads(out.strip())["session_id"] == "s2"   # doorbell routes by session, not event_id
 
 
 def test_nelix_wait_exits_cleanly_when_daemon_unreachable(tmp_path):

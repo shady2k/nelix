@@ -107,6 +107,34 @@ def test_tool_schemas_are_llm_function_shaped(monkeypatch, tmp_path):
         nelix.supervisor.teardown()
 
 
+def test_nelix_respond_binds_to_session_without_event_id(monkeypatch, tmp_path):
+    # The MCP tool no longer requires an opaque event_id: respond binds to the session's current
+    # pending decision. decision_id is an optional guard. On success it arms the next doorbell.
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    try:
+        nelix.register(ctx)
+        params = ctx.tools["nelix_respond"]["schema"]["parameters"]
+        assert params["required"] == ["session_id", "answer"]      # event_id is gone
+        assert "event_id" not in params["properties"]
+        assert "decision_id" in params["properties"]               # optional guard
+        monkeypatch.setattr(nelix.supervisor, "base_token", lambda: ("http://x", "t"))
+        captured = {}
+
+        class FakeRpc:
+            def __init__(self, *a, **k): pass
+            def respond(self, session_id, answer, decision_id=None):
+                captured.update(session_id=session_id, answer=answer, decision_id=decision_id)
+                return True, {"status": "resumed", "next_after_seq": 5, "decision_id": "dec-1"}
+        monkeypatch.setattr(nelix, "RpcClient", FakeRpc)
+        out = ctx.tools["nelix_respond"]["handler"]({"session_id": "s1", "answer": "1"})
+        assert json.loads(out)["status"] == "resumed"
+        assert captured == {"session_id": "s1", "answer": "1", "decision_id": None}
+        assert ctx.dispatched and ctx.dispatched[-1][0] == "terminal"   # next doorbell armed
+    finally:
+        nelix.supervisor.teardown()
+
+
 def test_session_finalize_hook_calls_teardown(monkeypatch, tmp_path):
     nelix = _load_with_fake(monkeypatch, tmp_path)
     called = {}

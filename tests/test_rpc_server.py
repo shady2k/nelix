@@ -2,16 +2,20 @@ import json, threading, urllib.error, urllib.request
 from conftest import EXECUTOR
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
+from daemon.session import RespondOutcome
 
 
 class FakeManager:
     def __init__(self):
         self._events = EventQueue(); self.started = None; self.responded = []; self.stopped = []
     def start(self, executor, task, cwd): self.started = (executor, task, cwd); return "s1", 0
-    def respond(self, session_id, event_id, answer):
-        # daemon owns the cursor: returns the answered seq, or None on stale/unknown
-        self.responded.append((session_id, event_id, answer))
-        return 7 if event_id == "ok" else None
+    def respond(self, session_id, answer, decision_id=None):
+        # respond binds to the session's CURRENT pending decision; decision_id is an optional
+        # guard. No decision_id -> resumed; a mismatched guard -> stale (carries current meta).
+        self.responded.append((session_id, answer, decision_id))
+        if decision_id is None:
+            return RespondOutcome("resumed", seq=7, decision_id="dec-1")
+        return RespondOutcome("stale", pending={"decision_id": "dec-1", "kind": "waiting_for_user"})
     def status(self, session_id=None): return {"sessions": {}} if session_id is None else {"state": "working"}
     def stop(self, session_id): self.stopped.append(session_id); return True
 
@@ -38,18 +42,53 @@ def test_rpc_session_scoped_roundtrip():
         assert b["next_after_seq"] == 0          # daemon-owned start cursor (high-water before start)
         m._events.publish("s1", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
         _, wb = _req("GET", base + "/wait?after_seq=0")
-        eid = wb["event"]["event_id"]; assert wb["event"]["session_id"] == "s1"
+        assert wb["event"]["session_id"] == "s1"
         st, rb = _req("POST", base + "/respond",
-                      body={"session_id": "s1", "event_id": "ok", "answer": "yes"})
-        assert st == 200 and m.responded == [("s1", "ok", "yes")]
-        assert rb == {"status": "resumed", "next_after_seq": 7}    # daemon-owned respond cursor
-        st, _ = _req("POST", base + "/respond",
-                     body={"session_id": "s1", "event_id": "stale", "answer": "yes"})
-        assert st == 409
+                      body={"session_id": "s1", "answer": "yes"})       # no event_id needed
+        assert st == 200 and m.responded[-1] == ("s1", "yes", None)
+        assert rb == {"status": "resumed", "next_after_seq": 7, "decision_id": "dec-1"}
+        st, sb = _req("POST", base + "/respond",
+                      body={"session_id": "s1", "answer": "yes", "decision_id": "dec-stale"})
+        assert st == 409 and sb["error"] == "stale_decision"
+        assert sb["pending"]["decision_id"] == "dec-1"               # current decision for reconcile
         st, _ = _req("POST", base + "/stop", body={"session_id": "s1"})
         assert st == 200 and m.stopped == ["s1"]
     finally:
         srv.shutdown()
+
+
+def test_respond_missing_answer_is_400():
+    srv = make_server(FakeManager(), token="t", port=8786)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8786/respond", body={"session_id": "s1"})
+        assert st == 400 and "missing field" in b.get("error", "") and "answer" in b["error"]
+    finally:
+        srv.shutdown()
+
+
+class _NoPendingManager:
+    def __init__(self): self._events = EventQueue()
+    def respond(self, session_id, answer, decision_id=None):
+        return RespondOutcome("no_pending")
+
+
+def test_respond_no_pending_is_409_and_logs_session_id():
+    # Regression: the stale/no-pending 409 must log the request's session_id (was null) and the
+    # provided decision_id, so this class of failure is a one-line diagnosis from the daemon log.
+    import io
+    buf = io.StringIO()
+    srv, base = _serve(_NoPendingManager(), buf)
+    try:
+        st, b = _req("POST", base + "/respond",
+                     body={"session_id": "s-xyz", "answer": "1", "decision_id": "dec-9"})
+        assert st == 409 and b["error"] == "no_pending_decision"
+    finally:
+        srv.shutdown()
+    rec = [json.loads(l) for l in buf.getvalue().splitlines()
+           if json.loads(l)["event"] == "respond_no_pending"][0]
+    assert rec["session_id"] == "s-xyz"                  # NOT null
+    assert rec["provided_decision_id"] == "dec-9" and rec["status"] == 409
 
 
 def test_responses_are_utf8_not_ascii_escaped():

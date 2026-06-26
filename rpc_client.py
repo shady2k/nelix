@@ -48,9 +48,11 @@ class RpcClient:
         _, body = self._call("GET", "/screen?" + urllib.parse.urlencode(params))
         return body
 
-    def respond(self, session_id, event_id, answer):
-        st, body = self._call("POST", "/respond",
-                              {"session_id": session_id, "event_id": event_id, "answer": answer})
+    def respond(self, session_id, answer, decision_id=None):
+        payload = {"session_id": session_id, "answer": answer}
+        if decision_id is not None:
+            payload["decision_id"] = decision_id
+        st, body = self._call("POST", "/respond", payload)
         return st == 200, body
 
     def stop(self, session_id):
