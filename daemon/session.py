@@ -442,27 +442,40 @@ class Session:
                         "task_delivery": task_delivery, "requires_response": requires_response,
                         "screen_excerpt": screen, "external_output_policy": EXTERNAL_OUTPUT_POLICY,
                         "total_len": page["total_len"], "truncated": page["truncated"]}
+            is_reemit = False
             if respondable:
                 # decision identity: REUSE the current decision's id when this is a re-emit of the
                 # same pause (same decision_key), else mint a fresh one. event_id (below) is the
                 # NOTIFICATION identity and changes every emit; decision_id is stable across re-emits
                 # so a held answer never self-invalidates.
                 cur = self._decision
-                if cur is not None and cur.get("decision_key") == decision_key:
-                    decision_id = cur["decision_id"]
-                else:
-                    decision_id = f"dec-{uuid.uuid4().hex[:8]}"
+                is_reemit = cur is not None and cur.get("decision_key") == decision_key
+                decision_id = cur["decision_id"] if is_reemit else f"dec-{uuid.uuid4().hex[:8]}"
                 decision["decision_key"] = decision_key
                 decision["decision_id"] = decision_id
 
         def _install(evt):
             # Runs under the EventQueue lock, AFTER the event is reserved but BEFORE waiters are
             # notified: a woken status pull therefore always observes the installed decision (no
-            # event-without-decision window). Fully populated here, incl. event_id/seq.
+            # event-without-decision window). The branches are race-safe against a concurrent
+            # respond() that may have CLAIMED the decision between build and publish:
             with self._lock:
-                decision["event_id"] = evt.event_id
-                decision["seq"] = evt.seq
-                self._decision = decision
+                cur = self._decision
+                if cur is not None and cur.get("decision_id") == decision_id:
+                    # same logical decision still pending -> refresh notification identity + hung
+                    # IN PLACE (never swap the object: keeps respond()'s claim identity stable).
+                    cur["event_id"] = evt.event_id
+                    cur["seq"] = evt.seq
+                    cur["hung"] = hung
+                elif not is_reemit:
+                    # a genuinely new pause -> install it (supersedes any prior pending decision).
+                    decision["event_id"] = evt.event_id
+                    decision["seq"] = evt.seq
+                    self._decision = decision
+                else:
+                    # a re-emit whose decision was answered/superseded between build and publish:
+                    # obsolete -> mark the event answered so pending() never resurrects it.
+                    evt.answered = True
 
         # publish OUTSIDE the session lock (lock order: never hold it across a queue publish).
         evt = self._events.publish(self._id, self._executor, kind, text[:200], self._state,

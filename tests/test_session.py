@@ -523,7 +523,9 @@ def test_delivery_timeout_marks_failed_and_wakes(tmp_path):
     sess, handle, ev = make_session(tmp_path, frames=[box], handle_cls=NoEchoHandle,
                                     spec=FastConfirmSpec())
     sess.start("create report.md", str(tmp_path))
-    _wait_for(lambda: sess._task_delivery == "failed", timeout=5)
+    # wait for the EVENT, not just the flag: _fail_delivery flips _task_delivery before it publishes,
+    # so gating on the flag alone races the publish.
+    _wait_for(lambda: any(e.kind == "delivery_failed" for e in ev._events), timeout=5)
     assert sess._task_delivery == "failed"
     assert "\r" not in handle.writes                                    # never pressed Enter
     assert len([w for w in handle.writes if "report" in w]) == 1        # typed once, not re-typed
@@ -607,12 +609,41 @@ def test_backstop_reemit_preserves_decision_id(tmp_path):
     sess, handle, ev = make_session(tmp_path, frames=[trust], spec=BackstopSpec())
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
+    first_obj = sess._decision
     first_did = sess._decision["decision_id"]
     _wait_for(lambda: any(e.kind == "blocked" and e.hung for e in ev._events), timeout=3)
     assert sess._decision["decision_id"] == first_did                 # stable across re-emit
+    assert sess._decision is first_obj                                # updated IN PLACE, not swapped
+    assert sess._decision["hung"] is True                             # hung refreshed on re-emit
     eids = {e.event_id for e in ev._events if e.kind == "blocked"}
     assert len(eids) >= 2                                             # distinct notification ids
     sess.stop()
+
+
+def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeypatch, tmp_path):
+    # The race Codex flagged: a re-emit is BUILT while the decision is pending, but its install hook
+    # runs AFTER a concurrent respond() claimed/answered it. The hook must NOT resurrect the answered
+    # decision, and must mark the now-obsolete re-emit event answered (so pending() stays clean).
+    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
+    box = "Ready — what next?\n❯ "
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
+    sess._loop()
+    key = sess._decision["decision_key"]
+    real_publish = ev.publish
+    deferred = {}
+
+    def defer(*a, **k):
+        deferred["a"], deferred["k"] = a, k        # capture the re-emit; do NOT publish yet
+        return None
+    monkeypatch.setattr(ev, "publish", defer)
+    sess._publish("waiting_for_user", hint=None, hung=True, requires_response=True, decision_key=key)
+    monkeypatch.setattr(ev, "publish", real_publish)
+    assert sess.respond("1").status == "resumed"   # claim+answer BEFORE the re-emit is published
+    assert sess._decision is None
+    real_publish(*deferred["a"], **deferred["k"])   # now run the deferred re-emit + its install hook
+    assert sess._decision is None                   # NOT resurrected
+    assert ev.pending("s1") is None                 # obsolete re-emit event marked answered
 
 
 def test_snapshot_is_boring_while_working(tmp_path):
