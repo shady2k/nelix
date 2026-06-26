@@ -3,6 +3,13 @@ import re
 from daemon.drivers import register
 
 WORKING_MARKERS = ("esc to interrupt",)
+# Positive working signal for builds that DON'T keep "esc to interrupt" on screen (CLI drift):
+# Claude's live status line is a spinner glyph at line-start + a status word + an ellipsis, e.g.
+# "✽ Cultivating…" or "·Recombobulating… (1m 58s · ↓ 4.0k tokens)". The (elapsed·tokens) telemetry
+# is OPTIONAL (most frames omit it). Anchored at line-start with a Capitalised word so a stray glyph
+# or a "…" inside ordinary output (e.g. a truncated warning) can't trip it — a false "working" would
+# hang the orchestrator (never woken for the real prompt), so this stays tight.
+_WORKING_STATUS = re.compile(r"(?m)^[ \t]*[·✢✳✶✻✽✺✦][ \t]*[A-Z][A-Za-z]+.*?(?:…|\.\.\.)")
 CRASH_MARKERS = ("Traceback (most recent call last)", "command not found",
                  "Invalid API key", "authentication_error")
 INPUT_BOX_MARKERS = ("❯",)
@@ -46,7 +53,9 @@ class ClaudeDriver:
             return "exited" if (ctx.exit_code or 0) == 0 else "crashed"
         if any(m in frame for m in CRASH_MARKERS):
             return "crashed"
-        if any(m in frame for m in WORKING_MARKERS):
+        # Positive working detection BEFORE the input-box/settle idle path: the ❯ box stays visible
+        # while the agent works, so "stable + ❯" alone is not idle. Legacy marker OR the spinner line.
+        if any(m in frame for m in WORKING_MARKERS) or _WORKING_STATUS.search(frame):
             return "working"
         at_input = any(m in frame for m in INPUT_BOX_MARKERS)
         if at_input and ctx.stable_for >= self._settle:

@@ -66,6 +66,53 @@ INPUT_BOX = (
 WORKING = "doing things… esc to interrupt\n"
 
 
+# Real frames from session s-d719f7b9: this Claude Code build (v2.1.191 / glm) renders its working
+# spinner WITHOUT "esc to interrupt" — an actively-working agent was misread as idle_prompt.
+WORKING_SPINNER_STARTUP = (
+    "...internal/engine/engine.go:813.\n"
+    "✽ Cultivating…\n"
+    "  ⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY takes precedence ove…\n"
+    "❯ \n"
+    "⏵⏵ auto mode on (shift+tab to cycle)\n")
+
+WORKING_SPINNER_COUNTER = (
+    "✽ Recombobulating… (1m 58s · ↓ 4.0k tokens)\n"
+    "❯ Начинай реализацию. Читай спеку целиком.\n"
+    "⏵⏵ auto mode on (shift+tab to cycle)\n")
+
+WORKING_SPINNER_MIDDOT = (
+    "·Recombobulating… still thinking with xhigh effort\n"
+    "❯ \n"
+    "⏵⏵ auto mode on (shift+tab to cycle)\n")
+
+
+def test_working_spinner_without_interrupt_marker_is_working():
+    # CLI drift: the spinner line carries no "esc to interrupt". A STABLE spinner frame with the ❯
+    # box visible must classify working, NOT idle_prompt — that misread was the false-waiting_for_user
+    # bug that made the orchestrator nudge a working agent.
+    assert D.classify(WORKING_SPINNER_STARTUP, Ctx(stable_for=9.9)) == "working"
+    assert D.classify(WORKING_SPINNER_COUNTER, Ctx(stable_for=9.9)) == "working"
+    assert D.classify(WORKING_SPINNER_MIDDOT, Ctx(stable_for=9.9)) == "working"
+
+
+def test_idle_and_menu_not_swallowed_by_working_marker():
+    # The new positive working marker must NOT misread a genuine prompt as working.
+    assert D.classify(INPUT_BOX, Ctx(stable_for=2.0)) == "idle_prompt"
+    assert D.classify(PERMISSION, Ctx(stable_for=2.0)) == "permission_prompt"
+
+
+def test_output_ellipsis_or_stray_glyph_is_not_working():
+    # A genuine idle frame whose visible output merely ENDS with "…" (a truncated warning) or contains
+    # a stray sparkle mid-line must stay idle_prompt. A false "working" here would HANG the orchestrator
+    # (it would never be woken for the real prompt).
+    warn_then_idle = (
+        "  ⚠ claude.ai connectors are disabled because KEY takes precedence ove…\n"
+        "❯ \n⏵⏵ auto mode on (shift+tab to cycle)\n")
+    assert D.classify(warn_then_idle, Ctx(stable_for=2.0)) == "idle_prompt"
+    stray_glyph = "  ✓ wrote file, ✻ done\n❯ \n⏵⏵ auto mode on (shift+tab to cycle)\n"
+    assert D.classify(stray_glyph, Ctx(stable_for=2.0)) == "idle_prompt"
+
+
 def test_is_modal_choice_matches_two_and_three_option_menus():
     assert D.is_modal_choice(TRUST) is True
     assert D.is_modal_choice(PERMISSION) is True
