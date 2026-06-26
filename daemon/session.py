@@ -125,9 +125,9 @@ class Session:
     def _type_text(self, text, timeout=None, drain_output=False):
         self._handle.write(text, timeout=timeout, drain_output=drain_output)
 
-    def _press_enter(self):
+    def _press_enter(self, timeout=None):
         # Submit with the driver-declared submit key (CR for most TUIs, not LF).
-        self._handle.write(self._driver.submit_key)
+        self._handle.write(self._driver.submit_key, timeout=timeout)
 
     def screen(self, raw=False):
         with self._lock:
@@ -535,13 +535,24 @@ class Session:
         # so pending() stays honest and the next waiter arms past the whole resolved decision.
         seq = self._events.mark_session_answered(self._id) or decision.get("seq")
         if self._handle is not None:
+            # Bound the PTY write (this runs on the RPC thread): a wedged executor that stopped
+            # draining its stdin must NOT hang respond forever. ONE deadline covers the answer text +
+            # the submit key; on timeout the answer did not land (executor wedged) -> report it, don't
+            # re-type. Non-draining (the monitor owns pump(); draining here would race it).
+            deadline = time.monotonic() + self._spec.respond_write_seconds
+            try:
+                self._type_text(clean, timeout=max(0.0, deadline - time.monotonic()))
+                self._press_enter(timeout=max(0.0, deadline - time.monotonic()))
+            except PtyWriteTimeout:
+                if self._log is not None:
+                    self._log.warning("session", "respond_write_timeout", session_id=self._id)
+                return RespondOutcome("write_timeout", decision_id=decision.get("decision_id"))
             if not is_blocked:
-                # only a delivered agent turn gets a boundary; the monitor reads the dialog
-                # under self._lock in _publish, so mutate it under the lock too.
+                # only a delivered agent turn gets a boundary, and ONLY after the answer actually
+                # submitted — a write_timeout must not advance the transcript past an undelivered turn.
+                # (the monitor reads the dialog under self._lock in _publish, so mutate it under it.)
                 with self._lock:
                     self._dialog.mark_turn_boundary()
-            self._type_text(clean)                     # PTY writes stay outside the lock
-            self._press_enter()
             self._last_state = None
         return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"))
 

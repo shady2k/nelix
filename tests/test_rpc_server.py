@@ -73,6 +73,26 @@ class _NoPendingManager:
         return RespondOutcome("no_pending")
 
 
+class _WedgedManager:
+    def __init__(self): self._events = EventQueue()
+    def respond(self, session_id, answer, decision_id=None):
+        return RespondOutcome("write_timeout")
+
+
+def test_respond_write_timeout_is_503():
+    # A bounded respond write that times out (executor not draining stdin) surfaces as 503 so the
+    # MCP layer does NOT arm a waiter and the orchestrator is told to stop+restart.
+    import io
+    buf = io.StringIO()
+    srv, base = _serve(_WedgedManager(), buf)
+    try:
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-w", "answer": "1"})
+        assert st == 503 and b["error"] == "write_timeout" and "stdin" in b["detail"]
+    finally:
+        srv.shutdown()
+    assert "respond_write_timeout" in buf.getvalue()
+
+
 def test_respond_no_pending_is_409_and_logs_session_id():
     # Regression: the stale/no-pending 409 must log the request's session_id (was null) and the
     # provided decision_id, so this class of failure is a one-line diagnosis from the daemon log.
