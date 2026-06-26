@@ -212,11 +212,11 @@ def reconcile_orphans(sessions_root, daemon_pid, daemon_fingerprint, grace,
             if _should_reap(inspector, rec, daemon_pid, daemon_fingerprint):
                 kill_group(inspector, killer, rec["pid"], rec.get("pgid"), grace)
                 reaped.append(rec["sid"])
+                forget_child(sd)
                 if logger is not None:
                     logger.info("reaper", "orphan_reaped", session_id=rec["sid"],
                                 pid=rec.get("pid"), pgid=rec.get("pgid"),
                                 ppid=inspector.ppid(rec["pid"]))
-                forget_child(sd)
             elif rec.get("pid") is not None and not inspector.is_alive(rec["pid"]):
                 forget_child(sd)                    # stale record for a dead child: clean up
                 if logger is not None:

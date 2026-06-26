@@ -179,3 +179,16 @@ def test_reconcile_is_per_record_isolated(tmp_path):
     killer = _RecKiller()
     reaped = reaper.reconcile_orphans(tmp_path, 77, "d-new", 0.05, insp, killer)
     assert reaped == ["s-0000000a"]
+
+
+def test_reconcile_skips_pgid_mismatch(tmp_path):
+    # child alive + owner dead + child fingerprint matches, but its current pgid no longer
+    # matches the recorded pgid (cond 5) -> must NOT kill (avoid hitting a reused pgid).
+    _seed_record(tmp_path, "s-00000005", pid=999, pgid=999, child_fingerprint="c1")
+    insp = _FakeInspector({
+        10:  {"alive": False},
+        999: {"alive": True, "ppid": 1, "pgid": 12345, "fp": "c1"},   # pgid != recorded 999
+    })
+    killer = _RecKiller()
+    assert reaper.reconcile_orphans(tmp_path, 77, "d-new", 0.05, insp, killer) == []
+    assert killer.calls == []
