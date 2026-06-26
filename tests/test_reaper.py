@@ -20,12 +20,18 @@ def test_inspector_reads_live_process_facts():
 
 def test_killer_signals_a_real_group():
     # spawn a child in its own session/group, then killpg it via the real killer.
+    r, w = os.pipe()
     pid = os.fork()
     if pid == 0:                                          # child
+        os.close(r)
         os.setsid()
+        os.close(w)                                      # signal parent: setsid done
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         while True:
             signal.pause()
+    os.close(w)
+    os.read(r, 1)                                        # block until child closed w (post-setsid)
+    os.close(r)
     insp, killer = reaper.ProcessInspector(), reaper.ProcessKiller()
     pgid = insp.pgid(pid)
     killer.killpg(pgid, signal.SIGKILL)
