@@ -39,30 +39,61 @@ def _spec_num(spec, key, default, *, cast, floor=0):
     return cast(v)
 
 
+@dataclass
+class ExecutorLoad:
+    specs: dict                  # name -> ExecutorSpec (valid only)
+    executor_errors: list        # [{"name": str, "problem": str}]
+    parse_error: "str | None"    # whole-file TOML/IO error, else None
+
+
+def _build_spec(name, spec):
+    """Build one ExecutorSpec or raise (KeyError/TypeError/ValueError) with a clear,
+    user-relayable message. The caller collects the raise as a per-executor error."""
+    if not isinstance(spec, dict):
+        raise ValueError(f"executor {name!r}: must be an [executors.{name}] table")
+    if "command" not in spec:
+        raise ValueError(f"executor {name!r}: 'command' is required")
+    if "driver" not in spec:
+        raise ValueError(f"executor {name!r}: 'driver' is required")
+    return ExecutorSpec(
+        command=spec["command"],
+        args=list(spec.get("args", [])),
+        env=dict(spec.get("env", {})),
+        driver=spec["driver"],
+        launcher=spec.get("launcher", "auto"),
+        settle_seconds=float(spec.get("settle_seconds", 1.5)),
+        delivery_confirm_seconds=_spec_num(spec, "delivery_confirm_seconds", 10.0, cast=float),
+        respond_write_seconds=_spec_num(spec, "respond_write_seconds", 5.0, cast=float),
+        max_idle_seconds=_spec_num(spec, "max_idle_seconds", 600.0, cast=float),
+        max_restarts=_spec_num(spec, "max_restarts", 3, cast=int),
+        tail_lines=int(spec.get("tail_lines", 400)),
+        status_tail_chars=int(spec.get("status_tail_chars", 4000)),
+        dialog_page_chars=int(spec.get("dialog_page_chars", 8000)),
+        spool_max_bytes=int(spec.get("spool_max_bytes", 8_388_608)),
+    )
+
+
 def load_executors(path):
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
-    out = {}
-    for name, spec in data.get("executors", {}).items():
-        if "driver" not in spec:
-            raise ValueError(f"executor {name!r}: 'driver' is required")
-        out[name] = ExecutorSpec(
-            command=spec["command"],
-            args=list(spec.get("args", [])),
-            env=dict(spec.get("env", {})),
-            driver=spec["driver"],
-            launcher=spec.get("launcher", "auto"),
-            settle_seconds=float(spec.get("settle_seconds", 1.5)),
-            delivery_confirm_seconds=_spec_num(spec, "delivery_confirm_seconds", 10.0, cast=float),
-            respond_write_seconds=_spec_num(spec, "respond_write_seconds", 5.0, cast=float),
-            max_idle_seconds=_spec_num(spec, "max_idle_seconds", 600.0, cast=float),
-            max_restarts=_spec_num(spec, "max_restarts", 3, cast=int),
-            tail_lines=int(spec.get("tail_lines", 400)),
-            status_tail_chars=int(spec.get("status_tail_chars", 4000)),
-            dialog_page_chars=int(spec.get("dialog_page_chars", 8000)),
-            spool_max_bytes=int(spec.get("spool_max_bytes", 8_388_608)),
-        )
-    return out
+    """Resilient per-executor load: skip malformed entries (collecting a structured error),
+    keep the valid ones, and NEVER raise. A whole-file TOML/IO error yields zero specs plus
+    a single parse_error. Single source of validation for both the daemon and the plugin."""
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        return ExecutorLoad({}, [], f"config file not found: {path}")
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return ExecutorLoad({}, [], f"could not parse {path}: {e}")
+    execs = data.get("executors", {})
+    if not isinstance(execs, dict):
+        return ExecutorLoad({}, [], "'executors' must be a table")
+    specs, errors = {}, []
+    for name, spec in execs.items():
+        try:
+            specs[name] = _build_spec(name, spec)
+        except (KeyError, TypeError, ValueError) as e:
+            errors.append({"name": name, "problem": str(e)})
+    return ExecutorLoad(specs, errors, None)
 
 
 def load_concurrency_limit(path, default=1):

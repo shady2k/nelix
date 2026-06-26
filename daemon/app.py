@@ -68,7 +68,7 @@ def install_shutdown_handler(manager, logger=None):
 def main():
     global _LOCK_FD
     cfg_path = os.environ.get("NELIX_CONFIG", "nelix.toml")
-    specs = load_executors(cfg_path)
+    specs = load_executors(cfg_path).specs
     limit = load_concurrency_limit(cfg_path)
     level_cfg = load_log_level(cfg_path)
     logger = Logger(level=level_cfg.level)
