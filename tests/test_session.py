@@ -286,10 +286,12 @@ def test_respond_write_is_bounded_and_reports_timeout(monkeypatch, tmp_path):
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
     monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
+    turn_before = sess._dialog.current_turn()
     sess._handle = WedgedWriteHandle()              # executor stops draining stdin
     out = sess.respond("1")
     assert out.status == "write_timeout"            # bounded, not a hung RPC thread
     assert sess._decision is None                   # decision was claimed, not left half-pending
+    assert sess._dialog.current_turn() == turn_before   # transcript NOT advanced past an undelivered turn
 
 
 def test_answering_reemitted_blocked_clears_pending(tmp_path):

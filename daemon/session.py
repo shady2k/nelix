@@ -535,11 +535,6 @@ class Session:
         # so pending() stays honest and the next waiter arms past the whole resolved decision.
         seq = self._events.mark_session_answered(self._id) or decision.get("seq")
         if self._handle is not None:
-            if not is_blocked:
-                # only a delivered agent turn gets a boundary; the monitor reads the dialog
-                # under self._lock in _publish, so mutate it under the lock too.
-                with self._lock:
-                    self._dialog.mark_turn_boundary()
             # Bound the PTY write (this runs on the RPC thread): a wedged executor that stopped
             # draining its stdin must NOT hang respond forever. ONE deadline covers the answer text +
             # the submit key; on timeout the answer did not land (executor wedged) -> report it, don't
@@ -552,6 +547,12 @@ class Session:
                 if self._log is not None:
                     self._log.warning("session", "respond_write_timeout", session_id=self._id)
                 return RespondOutcome("write_timeout", decision_id=decision.get("decision_id"))
+            if not is_blocked:
+                # only a delivered agent turn gets a boundary, and ONLY after the answer actually
+                # submitted — a write_timeout must not advance the transcript past an undelivered turn.
+                # (the monitor reads the dialog under self._lock in _publish, so mutate it under it.)
+                with self._lock:
+                    self._dialog.mark_turn_boundary()
             self._last_state = None
         return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"))
 
