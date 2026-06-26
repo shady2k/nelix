@@ -362,7 +362,9 @@ class Session:
             return ("crashed", "crashed")
         if status.exit_code == 0:
             return ("done", "exited")
-        return ("crashed", "crashed")                # dead but status unavailable
+        # dead but no waitpid status (broker-backed sessions, always): we cannot tell a
+        # clean exit from a crash, so report a NEUTRAL terminal kind, not "crashed".
+        return ("done", "exited")
 
     def _finish(self):
         with self._lock:
