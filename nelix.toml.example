@@ -17,6 +17,10 @@ daemon_log_retain    = 10    # how many daemon-<ts>-<pid>.log files to keep (min
 session_retain       = 20    # how many session dirs to keep by count (0 = disable this rake)
 session_max_age_days = 7     # also delete session dirs older than this (0 = disable this rake)
 
+# Reaping: seconds between SIGTERM and SIGKILL when killing a stuck/orphaned executor
+# process group (the daemon's own group-kill and startup orphan reconcile). Default 5.
+kill_grace_seconds = 5
+
 # Daemon log verbosity: debug | info | warning | error (default: info).
 # Env NELIX_LOG_LEVEL overrides this. Audit records (decisions, delivered task) are always written.
 log_level = "info"
