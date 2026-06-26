@@ -97,9 +97,17 @@ def load_executors(path):
 
 
 def load_concurrency_limit(path, default=1):
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
-    return int(data.get("concurrency_limit", default))
+    """Top-level concurrency cap. Malformed TOML/IO or a non-int / bool / below-1 value
+    falls back to `default` (mirrors load_retention's _cfg_int) — never crash the load."""
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        return default
+    v = data.get("concurrency_limit", default)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return default
+    return v
 
 
 def load_kill_grace_seconds(path, default=5.0):

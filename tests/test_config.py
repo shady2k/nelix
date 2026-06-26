@@ -212,3 +212,23 @@ def test_non_table_executor_collected(tmp_path):
 def test_missing_file_is_parse_error_not_raise(tmp_path):
     load = load_executors(str(tmp_path / "absent.toml"))
     assert load.specs == {} and load.parse_error
+
+
+def test_concurrency_limit_malformed_toml_defaults(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[oops')
+    assert load_concurrency_limit(str(cfg)) == 1
+
+
+def test_concurrency_limit_bad_type_defaults(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('concurrency_limit = "two"\n')
+    assert load_concurrency_limit(str(cfg)) == 1
+    cfg.write_text('concurrency_limit = true\n')           # bool is not a valid int here
+    assert load_concurrency_limit(str(cfg)) == 1
+    cfg.write_text('concurrency_limit = 0\n')              # floor is 1
+    assert load_concurrency_limit(str(cfg)) == 1
+
+
+def test_concurrency_limit_missing_file_defaults(tmp_path):
+    assert load_concurrency_limit(str(tmp_path / "absent.toml")) == 1
