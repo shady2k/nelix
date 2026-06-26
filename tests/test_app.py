@@ -51,3 +51,30 @@ def test_build_reaper_ctx_has_identity(monkeypatch, tmp_path):
     assert ctx.daemon_pid == os.getpid()
     assert isinstance(ctx.daemon_fingerprint, str) and ctx.daemon_fingerprint
     assert ctx.grace == 3.0
+
+
+def test_load_specs_skips_bad_keeps_good_and_logs(tmp_path):
+    import io, json
+    from daemon.app import load_specs
+    from daemon.obs import Logger
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.good]\ncommand="g"\ndriver="claude"\n'
+                   '[executors.bad]\ncommand="b"\n')          # missing driver
+    buf = io.StringIO()
+    specs = load_specs(str(cfg), Logger(level="info", stream=buf))
+    assert set(specs) == {"good"}
+    recs = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
+    assert any(r["event"] == "executor_skipped" and r.get("executor") == "bad" for r in recs)
+
+
+def test_load_specs_parse_error_returns_empty_and_logs(tmp_path):
+    import io, json
+    from daemon.app import load_specs
+    from daemon.obs import Logger
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[oops')
+    buf = io.StringIO()
+    specs = load_specs(str(cfg), Logger(level="info", stream=buf))
+    assert specs == {}
+    recs = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
+    assert any(r["event"] == "config_parse_error" for r in recs)

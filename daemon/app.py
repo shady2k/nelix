@@ -65,13 +65,25 @@ def install_shutdown_handler(manager, logger=None):
     return _handle
 
 
+def load_specs(cfg_path, logger):
+    """Resilient executor load for the daemon: serve the valid executors, log every skip and
+    any whole-file parse error as a warning. Never raises — a bad config must not crash the daemon."""
+    loaded = load_executors(cfg_path)
+    if loaded.parse_error and logger is not None:
+        logger.warning("app", "config_parse_error", error=loaded.parse_error)
+    for e in loaded.executor_errors:
+        if logger is not None:
+            logger.warning("app", "executor_skipped", executor=e["name"], problem=e["problem"])
+    return loaded.specs
+
+
 def main():
     global _LOCK_FD
     cfg_path = os.environ.get("NELIX_CONFIG", "nelix.toml")
-    specs = load_executors(cfg_path).specs
-    limit = load_concurrency_limit(cfg_path)
     level_cfg = load_log_level(cfg_path)
     logger = Logger(level=level_cfg.level)
+    specs = load_specs(cfg_path, logger)
+    limit = load_concurrency_limit(cfg_path)
     token = os.environ["NELIX_RPC_TOKEN"]
     port = int(os.environ.get("NELIX_RPC_PORT", "8765"))
     _LOCK_FD = acquire_singleton(logger, port=port)
