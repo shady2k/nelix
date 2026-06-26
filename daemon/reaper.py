@@ -19,13 +19,22 @@ class ProcessInspector:
     def is_alive(self, pid) -> bool:
         try:
             os.kill(pid, 0)
-            return True
         except ProcessLookupError:
             return False
         except PermissionError:
             return True               # exists, not ours to signal
         except OSError:
             return False
+        if sys.platform == "linux":   # a zombie passes kill(pid,0) but is effectively dead
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    data = f.read()
+                state = data[data.rindex(")") + 2:].split()[0]   # field 3 = state
+                if state == "Z":
+                    return False
+            except (OSError, ValueError):
+                return False           # gone between kill and read
+        return True
 
     def pgid(self, pid):
         try:

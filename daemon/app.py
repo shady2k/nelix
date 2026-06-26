@@ -5,6 +5,7 @@ import sys
 
 import paths
 from daemon import reaper, singleton
+from daemon.broker_client import BrokerClient, set_broker, get_broker
 from daemon.config import (load_executors, load_concurrency_limit, load_retention,
                            load_log_level, load_kill_grace_seconds)
 from daemon.drivers import get_driver
@@ -58,6 +59,10 @@ def install_shutdown_handler(manager, logger=None):
         if logger is not None:
             logger.info("app", "shutdown_requested", signal=signum)
         manager.stop_all()
+        try:
+            get_broker().close()
+        except Exception:
+            pass
         if logger is not None:
             logger.info("app", "shutdown_complete", signal=signum)
         raise SystemExit(0)
@@ -89,6 +94,7 @@ def main():
     _LOCK_FD = acquire_singleton(logger, port=port)
     if _LOCK_FD is None:
         raise SystemExit(3)               # another daemon owns this nelix_root
+    set_broker(BrokerClient())            # spawn the broker BEFORE any threads exist
     grace = load_kill_grace_seconds(cfg_path)
     reaper_ctx = build_reaper_ctx(grace)
     events = EventQueue()
@@ -114,6 +120,11 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         manager.stop_all()
+    finally:
+        try:
+            get_broker().close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

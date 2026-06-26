@@ -3,7 +3,6 @@ import select
 import time
 
 import pyte
-import ptyprocess
 
 from daemon.errors import PtyWriteTimeout
 
@@ -33,34 +32,37 @@ def render_raw(data, cols=120, rows=40):
 
 
 class PtySession:
-    def __init__(self, argv, cwd=None, cols=120, rows=40, env=None, dialog=None):
-        self._argv = argv
-        self._cwd = cwd
+    def __init__(self, master_fd, pid, pgid, cols=120, rows=40, dialog=None):
+        self._fd = master_fd
+        self._pid = pid
+        self._pgid = pgid
         self._cols = cols
         self._rows = rows
-        self._env = env
-        self._child = None
         self._dialog = dialog
+        self._eof_seen = False
         self._screen = make_pyte_screen(cols, rows)
         self._stream = pyte.ByteStream(self._screen)
         self._history_committed = 0   # how many top-history lines already added to the dialog
 
-    def spawn(self):
-        self._child = ptyprocess.PtyProcess.spawn(
-            self._argv, dimensions=(self._rows, self._cols), cwd=self._cwd, env=self._env)
-
     def pump(self, timeout=0.1):
-        if self._child is None:
+        if self._fd is None or self._eof_seen:
             return False
         try:
-            r, _, _ = select.select([self._child.fd], [], [], timeout)
+            r, _, _ = select.select([self._fd], [], [], timeout)
         except (OSError, ValueError):
-            return False  # fd closed (e.g. child exited or session torn down)
+            self._eof_seen = True
+            return False
         if not r:
             return False
         try:
-            data = self._child.read(65536)
-        except (EOFError, OSError, ValueError):
+            data = os.read(self._fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:                 # EIO on slave hangup, or fd torn down
+            self._eof_seen = True
+            return False
+        if not data:                    # EOF: all slave writers closed (child gone)
+            self._eof_seen = True
             return False
         self._feed(data)
         return True
@@ -104,10 +106,10 @@ class PtySession:
         # With drain_output, also consume the child's output while writing (see below) —
         # opt-in because a concurrent reader (the monitor's pump) must not race the screen;
         # delivery passes it because there the monitor itself owns both the write and the read.
-        if self._child is None:
+        if self._fd is None or self._eof_seen:
             return
         b = data.encode()
-        fd = self._child.fd
+        fd = self._fd
         mv = memoryview(b)
         deadline = None if timeout is None else time.monotonic() + timeout
         try:
@@ -147,6 +149,9 @@ class PtySession:
                         chunk = b""
                     if chunk:
                         self._feed(chunk)
+                    else:
+                        self._eof_seen = True
+                        return
         finally:
             try:
                 os.set_blocking(fd, old_blocking)
@@ -154,45 +159,47 @@ class PtySession:
                 pass
 
     def is_alive(self):
-        return self._child is not None and self._child.isalive()
+        if self._fd is None or self._eof_seen:
+            return False
+        try:
+            os.kill(self._pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass
+        try:
+            return os.getpgid(self._pid) == self._pgid
+        except OSError:
+            return False
 
     def exit_code(self):
-        if self._child is None:
-            return None
-        return self._child.exitstatus
+        return None                     # no waitpid for a non-child; status unavailable
 
     def leader_pid(self):
-        return self._child.pid if self._child is not None else None
+        return self._pid
 
     def leader_pgid(self):
-        if self._child is None:
-            return None
         try:
-            return os.getpgid(self._child.pid)
+            return os.getpgid(self._pid)
         except OSError:
             return None
 
     def assert_leader_is_group_leader(self):
         """The reaper kills by process GROUP; that only reaps the whole subtree if the PTY
-        child is its own group leader (ptyprocess setsid -> pid == pgid). Fail loudly if not."""
+        child is its own group leader (setsid -> pid == pgid). Fail loudly if not."""
         pid, pgid = self.leader_pid(), self.leader_pgid()
         if pid is None or pid != pgid:
             raise RuntimeError(f"pty leader {pid} is not its own group leader (pgid={pgid})")
 
     def leader_status(self):
         from daemon.launchers.base import LeaderStatus
-        if self._child is None:
-            return LeaderStatus(alive=False, exit_code=None, signal=None, status_available=False)
-        alive = self._child.isalive()           # nonblocking reap; populates exit/signal status
-        if alive:
-            return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
-        ec, sig = self._child.exitstatus, self._child.signalstatus
-        return LeaderStatus(alive=False, exit_code=ec, signal=sig,
-                            status_available=(ec is not None or sig is not None))
+        return LeaderStatus(alive=self.is_alive(), exit_code=None, signal=None,
+                            status_available=False)
 
     def close(self):
-        if self._child is not None:
+        if self._fd is not None:
             try:
-                self._child.close(force=True)
+                os.close(self._fd)
             except OSError:
-                pass            # EIO etc. on a torn-down PTY: closing a broken fd is fine
+                pass
+            self._fd = None
