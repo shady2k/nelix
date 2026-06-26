@@ -71,6 +71,20 @@ def load_concurrency_limit(path, default=1):
     return int(data.get("concurrency_limit", default))
 
 
+def load_kill_grace_seconds(path, default=5.0):
+    """Seconds between SIGTERM and SIGKILL when reaping a process group. Top-level (not
+    per-executor): startup reconcile has only a child.json record, not an ExecutorSpec."""
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        return default
+    v = data.get("kill_grace_seconds", default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+        return default
+    return float(v)
+
+
 @dataclass
 class RetentionConfig:
     daemon_log_retain: int = 10

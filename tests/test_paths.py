@@ -46,3 +46,11 @@ def test_private_opener_creates_0600(tmp_path):
     with open(f, "w", opener=paths.private_opener) as fh:
         fh.write("x")
     assert oct(f.stat().st_mode & 0o777) == "0o600"
+
+
+def test_daemon_lock_and_child_record(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths)
+    assert paths.daemon_lock() == paths.nelix_root() / "daemon.lock"
+    sd = paths.sessions_root() / "s-12345678"
+    assert paths.child_record(sd) == sd / "child.json"

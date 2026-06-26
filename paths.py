@@ -41,6 +41,17 @@ def session_meta(session_dir) -> Path:
     return Path(session_dir) / "meta.json"
 
 
+def child_record(session_dir) -> Path:
+    """Per-session reaping record (pid/pgid + fingerprints + owning daemon). Lives in the
+    session dir so it shares the session's lifetime; never in a separate top-level folder."""
+    return Path(session_dir) / "child.json"
+
+
+def daemon_lock() -> Path:
+    """Advisory single-daemon lock for this nelix_root (one daemon per profile)."""
+    return nelix_root() / "daemon.lock"
+
+
 def logs_dir() -> Path:
     return nelix_root() / "logs"
 
