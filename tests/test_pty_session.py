@@ -1,6 +1,46 @@
+import os
 import time
 
 from daemon.pty_session import PtySession
+
+
+def _spawn(argv, cwd=None, cols=80, rows=24):
+    """Build a live PTY pair + child the way the broker does (setsid -> own group leader,
+    pgid == pid), but with a single-threaded openpty()+fork() that is safe inside a test.
+    Returns (master_fd, pid, pgid)."""
+    master, slave = os.openpty()
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()
+        if cwd:
+            try:
+                os.chdir(cwd)
+            except OSError:
+                pass
+        os.dup2(slave, 0); os.dup2(slave, 1); os.dup2(slave, 2)
+        os.close(master); os.close(slave)
+        os.execvpe(argv[0], argv, os.environ.copy())
+        os._exit(127)
+    os.close(slave)
+    # setsid races a plain fork(); wait (best-effort) until it takes effect so is_alive()'s
+    # getpgid(pid) == pgid check is reliable. pgid == pid by the setsid contract (what the
+    # broker reports), so return pid directly -- a fast-exiting child may already be gone.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            if os.getpgid(pid) == pid:
+                break
+        except OSError:
+            break
+        time.sleep(0.005)
+    return master, pid, pid
+
+
+def _reap(pid):
+    try:
+        os.kill(pid, 9); os.waitpid(pid, 0)
+    except OSError:
+        pass
 
 
 def test_render_raw_matches_pty_session_render():
@@ -8,7 +48,7 @@ def test_render_raw_matches_pty_session_render():
     # bytes must produce exactly what PtySession.render() yields, with no live child.
     from daemon.pty_session import render_raw
     data = b"hello\r\nworld\r\n\x1b[1mbold\x1b[0m"
-    p = PtySession([], cols=80, rows=24)
+    p = PtySession(None, 0, 0, cols=80, rows=24)    # pure: no fd, just feed bytes
     p._feed(data)                                   # pure: no spawn, no dialog
     assert render_raw(data, cols=80, rows=24) == p.render()
     assert "hello" in render_raw(data, 80, 24) and "world" in render_raw(data, 80, 24)
@@ -23,88 +63,103 @@ def test_render_raw_defaults_match_session_dims():
 
 
 def test_render_captures_child_output():
-    s = PtySession(["printf", "HELLO-NELIX\\n"], cols=40, rows=10)
-    s.spawn()
-    deadline = time.time() + 5
-    while time.time() < deadline and s.is_alive():
+    master, pid, pgid = _spawn(["printf", "HELLO-NELIX\\n"], cols=40, rows=10)
+    s = PtySession(master, pid, pgid, cols=40, rows=10)
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and s.is_alive():
+            s.pump(0.1)
         s.pump(0.1)
-    s.pump(0.1)
-    assert "HELLO-NELIX" in s.render()
-    s.close()
+        assert "HELLO-NELIX" in s.render()
+    finally:
+        s.close()
+        _reap(pid)
 
 
 def test_pump_tees_raw_and_commits_scrolled_lines(tmp_path):
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from daemon.pty_session import PtySession
     from daemon.dialog import Dialog
     d = Dialog(tmp_path / "s", tail_lines=100, spool_max_bytes=1_000_000)
     # Echo more lines than the 4-row screen so the top scrolls off into history.
-    s = PtySession(["/bin/sh", "-c", "for i in 1 2 3 4 5 6; do echo line$i; done; sleep 0.2"],
-                   cols=40, rows=4, dialog=d)
-    s.spawn()
-    for _ in range(40):
-        s.pump(0.1)
-    s.flush_viewport(d)
-    raw = (tmp_path / "s" / "raw").read_bytes()
-    assert b"line1" in raw and b"line6" in raw            # raw has everything
-    joined = d.turn_text(0)["text"]
-    assert "line1" in joined and "line6" in joined         # transcript preserved beyond the viewport
-    s.close()
+    master, pid, pgid = _spawn(
+        ["/bin/sh", "-c", "for i in 1 2 3 4 5 6; do echo line$i; done; sleep 0.2"],
+        cols=40, rows=4)
+    s = PtySession(master, pid, pgid, cols=40, rows=4, dialog=d)
+    try:
+        for _ in range(40):
+            s.pump(0.1)
+        s.flush_viewport(d)
+        raw = (tmp_path / "s" / "raw").read_bytes()
+        assert b"line1" in raw and b"line6" in raw            # raw has everything
+        joined = d.turn_text(0)["text"]
+        assert "line1" in joined and "line6" in joined         # transcript preserved beyond viewport
+    finally:
+        s.close()
+        _reap(pid)
 
 
 def test_leader_status_clean_exit():
-    s = PtySession(["true"])           # exits 0 immediately
-    s.spawn()
-    while s.is_alive():
-        s.pump(0.05)
-    st = s.leader_status()
-    assert st.alive is False and st.exit_code == 0 and st.status_available is True
-    s.close()
+    # fd-backed sessions have NO waitpid status: a clean exit is reported as dead-without-status
+    # (status_available is False, exit_code/signal None). Exit-code/signal classification of
+    # _exit_kind is covered separately in test_session_exit_kind.py with status_available=True.
+    master, pid, pgid = _spawn(["true"])           # exits 0 immediately
+    s = PtySession(master, pid, pgid)
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and s.is_alive():
+            s.pump(0.05)
+        st = s.leader_status()
+        assert st.alive is False and st.exit_code is None
+        assert st.signal is None and st.status_available is False
+    finally:
+        s.close()
+        _reap(pid)
 
 
 def test_leader_status_signal_death():
-    import os, signal
-    s = PtySession(["sleep", "30"])
-    s.spawn()
-    os.kill(s.leader_pid(), signal.SIGKILL)
-    time.sleep(0.2)
-    st = s.leader_status()
-    assert st.alive is False and st.signal == signal.SIGKILL and st.status_available is True
-    s.close()
+    import signal
+    master, pid, pgid = _spawn(["sleep", "30"])
+    s = PtySession(master, pid, pgid)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)                          # reap so kill(pid,0) fails -> dead
+        deadline = time.time() + 5
+        while time.time() < deadline and s.is_alive():
+            s.pump(0.1)
+        st = s.leader_status()
+        # No waitpid in the fd model -> a signal death is reported dead-without-status (not signal=9).
+        assert st.alive is False and st.signal is None and st.status_available is False
+    finally:
+        s.close()
 
 
 def test_leader_status_defensive_when_status_unavailable():
     from daemon.launchers.base import LeaderStatus
-
-    class _StubChild:
-        pid = 12345
-        exitstatus = None
-        signalstatus = None
-        def isalive(self):
-            return False
-
-    s = PtySession(["true"])
-    s._child = _StubChild()            # dead but no status populated after isalive()
+    # fd-backed sessions NEVER expose waitpid status: status_available is always False.
+    s = PtySession(None, 0, 0)                      # no fd -> is_alive() False
     st = s.leader_status()
     assert st == LeaderStatus(alive=False, exit_code=None, signal=None, status_available=False)
 
 
 def test_leader_pgid_matches_setsid_leader():
-    import os
-    s = PtySession(["sleep", "5"])
-    s.spawn()
-    assert s.leader_pgid() == os.getpgid(s.leader_pid())
-    s.close()
+    master, pid, pgid = _spawn(["sleep", "5"])
+    s = PtySession(master, pid, pgid)
+    try:
+        assert s.leader_pid() == s.leader_pgid()   # setsid -> own group leader (pid == pgid)
+        assert s.leader_pgid() == os.getpgid(s.leader_pid())
+    finally:
+        s.close()
+        _reap(pid)
 
 
 def test_real_spawn_leader_is_group_leader():
-    from daemon.pty_session import PtySession
-    p = PtySession(["/bin/sh", "-c", "sleep 5"], cwd="/tmp", cols=80, rows=24)
-    p.spawn()
+    master, pid, pgid = _spawn(["/bin/sh", "-c", "sleep 5"], cwd="/tmp", cols=80, rows=24)
+    p = PtySession(master, pid, pgid, cols=80, rows=24)
     try:
         p.assert_leader_is_group_leader()             # must not raise: pid == pgid (setsid)
         assert p.leader_pid() == p.leader_pgid()
     finally:
         p.close()
+        _reap(pid)

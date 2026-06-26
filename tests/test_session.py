@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 from pathlib import Path
@@ -942,14 +943,15 @@ def test_delivery_does_not_wedge_when_executor_ignores_stdin(tmp_path, monkeypat
     within a bounded time. FAILS on the pre-fix blocking-write code (monitor wedges)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from daemon.pty_session import PtySession
+    from daemon.broker_client import BrokerClient
 
     child = ["python3", "-c", _RAW_IGNORE_STDIN_CHILD]
+    broker = BrokerClient()                          # real spawn path: PTY fork happens in the broker
 
     class _Launcher:
         def start(self, spec, cwd, cols, rows, dialog=None):
-            p = PtySession(child, cols=cols, rows=rows, dialog=dialog)
-            p.spawn()
-            return p
+            master, pid, pgid = broker.spawn(child, cwd, dict(os.environ), cols, rows)
+            return PtySession(master, pid, pgid, cols=cols, rows=rows, dialog=dialog)
         def stop(self, h):
             h.close()
 
@@ -968,6 +970,7 @@ def test_delivery_does_not_wedge_when_executor_ignores_stdin(tmp_path, monkeypat
         except Exception:
             pass
         sess.stop()
+        broker.close()
 
 
 # ---- delivery must drain the executor's output while writing (real PtySession) ----
@@ -1008,14 +1011,15 @@ def test_delivery_drains_output_so_large_task_reaches_executor(tmp_path, monkeyp
     pre-fix write() that waits only for writability and never reads during the write."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from daemon.pty_session import PtySession
+    from daemon.broker_client import BrokerClient
 
     child = ["python3", "-c", _RAW_ECHO_FLOOD_CHILD]
+    broker = BrokerClient()                          # real spawn path: PTY fork happens in the broker
 
     class _Launcher:
         def start(self, spec, cwd, cols, rows, dialog=None):
-            p = PtySession(child, cols=cols, rows=rows, dialog=dialog)
-            p.spawn()
-            return p
+            master, pid, pgid = broker.spawn(child, cwd, dict(os.environ), cols, rows)
+            return PtySession(master, pid, pgid, cols=cols, rows=rows, dialog=dialog)
         def stop(self, h):
             h.close()
 
@@ -1032,6 +1036,7 @@ def test_delivery_drains_output_so_large_task_reaches_executor(tmp_path, monkeyp
         except Exception:
             pass
         sess.stop()
+        broker.close()
 
 
 def test_start_writes_child_record(tmp_path, monkeypatch):
