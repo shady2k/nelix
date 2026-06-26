@@ -318,6 +318,10 @@ def ensure_running():
             _log.info("nelix daemon started pid=%s port=%s log=%s", proc.pid, port, log_path)
             return f"http://127.0.0.1:{port}", token
         if proc.poll() is not None:
+            existing = base_token()                  # we may have lost a singleton-lock race
+            if existing:
+                _log.info("nelix daemon: lost startup race, reusing pid-holder")
+                return existing
             raise RuntimeError(
                 f"nelix daemon exited early (code {proc.returncode}); see {log_path}")
         time.sleep(0.1)

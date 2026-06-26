@@ -278,6 +278,31 @@ def test_prune_spares_current_file_and_keeps_total_retain(monkeypatch, tmp_path)
     assert len(remaining) == 2                            # exactly retain total
 
 
+def test_ensure_running_reuses_race_winner(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, supervisor
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_ensure_deps", lambda: None)
+    monkeypatch.setattr(supervisor, "_free_port", lambda: 9999)
+    monkeypatch.setattr(supervisor, "_open_daemon_log", lambda root: tmp_path / "d.log")
+
+    # base_token: first call (top of ensure_running) None; later (after our spawn "loses") -> winner
+    calls = {"n": 0}
+    def fake_base_token():
+        calls["n"] += 1
+        return ("http://127.0.0.1:8765", "winner-token") if calls["n"] >= 2 else None
+    monkeypatch.setattr(supervisor, "base_token", fake_base_token)
+
+    class _Proc:
+        pid = 4321; returncode = 3
+        def poll(self): return 3                      # our spawned daemon already exited (lost lock)
+    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *a, **k: _Proc())
+    monkeypatch.setattr(supervisor, "_healthy", lambda port, token: False)
+
+    base, token = supervisor.ensure_running()
+    assert (base, token) == ("http://127.0.0.1:8765", "winner-token")
+
+
 def test_teardown_survives_ctrl_c_and_force_kills(monkeypatch, tmp_path):
     # Hermes' quit handler raises KeyboardInterrupt during teardown's graceful wait.
     # teardown must NOT propagate it, and must escalate to SIGKILL (force exit).
