@@ -366,6 +366,12 @@ class Session:
             self._finalized = True
         status = self._handle.leader_status() if self._handle is not None else None
         alive = bool(status and status.alive)
+        try:
+            self._finish_publish(status, alive)
+        finally:
+            self._finish_cleanup(alive)
+
+    def _finish_publish(self, status, alive):
         # 1. monitor itself crashed; leader may still be alive
         if self._exc is not None:
             with self._lock:
@@ -374,7 +380,7 @@ class Session:
             if self._log is not None:
                 self._log.error("session", "monitor_exception", session_id=self._id,
                                 traceback=self._exc_text)
-                if not alive:                          # executor_exited only if it actually exited
+                if not alive:
                     self._log_exited("monitor_exception", status)
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return
@@ -406,6 +412,26 @@ class Session:
         if self._log is not None:
             self._log.warning("session", "cli_crashed", session_id=self._id)
             self._log.debug("session", "monitor_exited", session_id=self._id)
+
+    def _finish_cleanup(self, alive):
+        # Terminal cleanup for ANY exit reason: reap survivors (monitor-dead-child-alive, or
+        # stragglers in the group), forget the durable record, free the concurrency slot.
+        with self._lock:
+            self._closing = True
+        ctx = self.reaper_ctx
+        if ctx is not None and self._handle is not None:
+            pid, pgid = self._handle.leader_pid(), self._handle.leader_pgid()
+            if alive and pid is not None and pgid is not None:
+                reaper.kill_group(ctx.inspector, ctx.killer, pid, pgid, ctx.grace)
+            reaper.forget_child(self._sessions_dir / self._id)
+        cb = self.on_terminal
+        if cb is not None:
+            try:
+                cb(self._id)
+            except Exception:
+                if self._log is not None:
+                    self._log.error("session", "on_terminal_error", session_id=self._id,
+                                    exc_info=True)
 
     # ---- lifecycle logging helpers (one-liners over lifecycle_log; all logger-guarded) ----
     def _screen_fp(self):

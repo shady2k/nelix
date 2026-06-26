@@ -1031,8 +1031,13 @@ def test_start_writes_child_record(tmp_path, monkeypatch):
 
     class _Insp:
         def start_fingerprint(self, pid): return f"fp-{pid}"
+        def is_alive(self, pid): return False   # needed by kill_group in _finish_cleanup
     class _Killer:
         def killpg(self, pgid, sig): pass
+
+    # _finish_cleanup now calls forget_child after start(); patch it to a no-op so the
+    # assertion below doesn't race with the monitor thread deleting the record.
+    monkeypatch.setattr(reaper, "forget_child", lambda p: None)
 
     ev = EventQueue()
     sess = Session("s-deadbeef", "demo", ClaudeDriver(), _NoopLauncher(FakeHandle(["ready"])),
@@ -1047,3 +1052,56 @@ def test_start_writes_child_record(tmp_path, monkeypatch):
     assert rec["daemon_pid"] == 10 and rec["daemon_fingerprint"] == "d1"
     assert rec["child_fingerprint"] == "fp-4242"
     sess.stop()
+
+
+def test_finish_frees_slot_and_forgets_record_on_clean_exit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, paths
+    importlib.reload(paths)
+    from daemon import reaper
+    from daemon.session import Session
+
+    class _Insp:
+        def start_fingerprint(self, pid): return f"fp-{pid}"
+        def is_alive(self, pid): return False
+    class _Killer:
+        def __init__(self): self.calls = []
+        def killpg(self, pgid, sig): self.calls.append((pgid, sig))
+
+    freed = []
+    ev = EventQueue()
+    sess = Session("s-cafef00d", "demo", ClaudeDriver(), _NoopLauncher(DeadHandle(0)), Spec(), ev)
+    sess.on_terminal = freed.append
+    sess.reaper_ctx = reaper.ReaperContext(10, "d1", 0.05, _Insp(), _Killer())
+    sess.start("hi", str(tmp_path))
+    sess._thread.join(timeout=5)
+    assert freed == ["s-cafef00d"]                       # slot freed
+    assert reaper.read_child(paths.sessions_root() / "s-cafef00d") is None   # record forgotten
+
+
+def test_finish_kills_group_when_monitor_dies_with_child_alive(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, paths, signal
+    importlib.reload(paths)
+    from daemon import reaper
+    from daemon.session import Session
+
+    class _Insp:
+        def start_fingerprint(self, pid): return f"fp-{pid}"
+        def is_alive(self, pid): return True            # child stays alive
+    killer_calls = []
+    class _Killer:
+        def killpg(self, pgid, sig): killer_calls.append((pgid, sig))
+
+    freed = []
+    ev = EventQueue()
+    sess = Session("s-0badf00d", "demo", ClaudeDriver(), _NoopLauncher(FakeHandle(["x"])), Spec(), ev)
+    sess.on_terminal = freed.append
+    sess.reaper_ctx = reaper.ReaperContext(10, "d1", 0.02, _Insp(), _Killer())
+    # force the monitor body to raise so _finish hits the monitor-dead branch with child alive
+    monkeypatch.setattr(sess, "_wait_until_ready",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    sess.start("hi", str(tmp_path))
+    sess._thread.join(timeout=5)
+    assert (4242, signal.SIGTERM) in killer_calls        # group killed despite child "alive"
+    assert freed == ["s-0badf00d"]
