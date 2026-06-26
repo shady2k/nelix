@@ -18,6 +18,9 @@ import termios
 from daemon.broker_proto import send_msg, recv_msg
 
 _READ_TIMEOUT = 10.0          # bound every pipe read; a stuck child must not wedge the broker
+_MAIN_POLL = 0.5              # socket-recv wake interval: poll parent liveness + detect peer
+                              # close (macOS: closing a SOCK_DGRAM peer does NOT wake a blocked
+                              # recvmsg/select, so we re-check on each timeout instead)
 
 
 def _set_winsize(fd, rows, cols):
@@ -149,11 +152,17 @@ def handle_spawn(req):
 
 def main():
     sock = socket.fromfd(int(sys.argv[1]), socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.settimeout(_MAIN_POLL)                       # wake periodically (see _MAIN_POLL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)     # do not inherit daemon handlers
     signal.signal(signal.SIGINT, signal.SIG_DFL)
+    daemon_pid = os.getppid()                         # the daemon that spawned us (direct parent)
     while True:
         try:
             req, _fd = recv_msg(sock)
+        except TimeoutError:                          # idle wake: peer-close (re-checked next loop)
+            if os.getppid() != daemon_pid:            # daemon gone (reparented) -> exit, no leak
+                return
+            continue
         except EOFError:
             return                                     # daemon closed its end -> clean exit
         except OSError:
