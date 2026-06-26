@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import paths
 from daemon import lifecycle_log
+from daemon import reaper
 from daemon.dialog import Dialog
 from daemon.drivers.base import ClassifyCtx
 from daemon.events import EXTERNAL_OUTPUT_POLICY, RESPONDABLE_KINDS
@@ -94,6 +95,9 @@ class Session:
         self._spawn_ts = None          # ts the PTY leader was spawned (for alive_for)
         self._blocked_fp = None        # normalized screen of the last emitted blocked event
         self._sessions_dir = _sessions_root()
+        self.on_terminal = None        # manager-set: free the slot on terminal state
+        self.reaper_ctx = None         # daemon-set reaper.ReaperContext (None => no reaping)
+        self._closing = False          # terminal cleanup started: respond/screen must not write
         driver._settle = spec.settle_seconds   # keep classify a pure (frame, ctx) fn
 
     @property
@@ -118,6 +122,7 @@ class Session:
         self._task_delivery = "pending"
         self._spawn_ts = time.time()
         self._log_spawned(self._spec.argv(), type(self._launcher).__name__)
+        self._record_child()
         if self._log is not None:
             self._log.debug("session", "monitor_started", session_id=self._id)
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -135,6 +140,26 @@ class Session:
                 json.dump(meta, f)
         except OSError:
             pass
+
+    def _record_child(self):
+        # Publish the reaping record AFTER spawn (pid/pgid known) and BEFORE the monitor
+        # thread runs, so a crash from here on leaves a reapable record.
+        ctx = self.reaper_ctx
+        if ctx is None or self._handle is None:
+            return
+        pid, pgid = self._handle.leader_pid(), self._handle.leader_pgid()
+        record = {"sid": self._id, "daemon_pid": ctx.daemon_pid,
+                  "daemon_fingerprint": ctx.daemon_fingerprint, "pid": pid,
+                  "child_fingerprint": ctx.inspector.start_fingerprint(pid),
+                  "pgid": pgid, "argv": list(self._spec.argv())}
+        try:
+            reaper.record_child(self._sessions_dir / self._id, record)
+            if self._log is not None:
+                self._log.info("session", "child_recorded", session_id=self._id,
+                               pid=pid, pgid=pgid)
+        except OSError:
+            if self._log is not None:
+                self._log.warning("session", "child_record_failed", session_id=self._id)
 
     # ---- low-level PTY ops (split from the old blind _submit) ----
     def _type_text(self, text, timeout=None, drain_output=False):

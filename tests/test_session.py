@@ -122,6 +122,12 @@ class DeadHandle:
         pass
 
 
+class _NoopLauncher:
+    def __init__(self, handle): self._handle = handle
+    def start(self, spec, cwd, cols, rows, dialog=None): return self._handle
+    def stop(self, handle): handle.close()
+
+
 def _clock(values):
     it = iter(values)
     last = [0.0]
@@ -1014,3 +1020,30 @@ def test_delivery_drains_output_so_large_task_reaches_executor(tmp_path, monkeyp
         except Exception:
             pass
         sess.stop()
+
+
+def test_start_writes_child_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, paths
+    importlib.reload(paths)
+    from daemon import reaper
+    from daemon.session import Session
+
+    class _Insp:
+        def start_fingerprint(self, pid): return f"fp-{pid}"
+    class _Killer:
+        def killpg(self, pgid, sig): pass
+
+    ev = EventQueue()
+    sess = Session("s-deadbeef", "demo", ClaudeDriver(), _NoopLauncher(FakeHandle(["ready"])),
+                   Spec(), ev)
+    sess.reaper_ctx = reaper.ReaperContext(daemon_pid=10, daemon_fingerprint="d1", grace=0.05,
+                                           inspector=_Insp(), killer=_Killer())
+    sess._stop.set()                                   # don't run the monitor loop in this test
+    sess.start("hello", str(tmp_path))
+    rec = reaper.read_child(paths.sessions_root() / "s-deadbeef")
+    assert rec["sid"] == "s-deadbeef"
+    assert rec["pid"] == 4242 and rec["pgid"] == 4242
+    assert rec["daemon_pid"] == 10 and rec["daemon_fingerprint"] == "d1"
+    assert rec["child_fingerprint"] == "fp-4242"
+    sess.stop()
