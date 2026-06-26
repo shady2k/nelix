@@ -11,6 +11,7 @@ from daemon.events import EventQueue          # noqa: E402
 
 
 class Spec:
+    driver = "claude"
     settle_seconds = 1.5
     respond_write_seconds = 5.0
     delivery_confirm_seconds = 2.0
@@ -501,6 +502,24 @@ def test_start_is_async_and_delivers_when_input_box_ready(tmp_path):
     assert "create report.md" in "".join(handle.writes)   # typed
     assert "\r" in handle.writes                          # then Enter
     assert handle.writes.index("\r") > 0                  # Enter AFTER typing
+    sess.stop()
+
+
+def test_session_start_writes_meta_json(monkeypatch, tmp_path):
+    # nelix-capture needs the exact cols/rows the raw was captured at (replaying at the wrong size
+    # reflows differently) -> persist them (+ executor/driver) at session start, with private perms.
+    import json
+    import stat
+    import paths
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sess, _, _ = make_session(tmp_path, frames=["Welcome\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"])
+    sess.start("do work", str(tmp_path))
+    meta_path = paths.sessions_root() / "s1" / "meta.json"
+    assert meta_path.exists()
+    meta = json.loads(meta_path.read_text())
+    assert meta["cols"] == 120 and meta["rows"] == 40
+    assert meta["executor"] == "demo" and meta["driver"] == "claude"
+    assert stat.S_IMODE(meta_path.stat().st_mode) == 0o600   # same discipline as transcript/raw
     sess.stop()
 
 

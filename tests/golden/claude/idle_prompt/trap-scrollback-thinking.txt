@@ -1,0 +1,4 @@
+  Thinking for 12s, reading 2 files…
+  Done — here is the summary you asked for.
+❯
+⏵⏵ auto mode on (shift+tab to cycle)

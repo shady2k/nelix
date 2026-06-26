@@ -1,0 +1,4 @@
+Claude wants to run a command: npm install
+❯ 1. Yes
+  2. Yes, and don't ask again for npm commands
+  3. No, and tell Claude what to do differently

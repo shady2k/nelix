@@ -15,6 +15,23 @@ def _row_text(row):
     return "".join(row[c].data for c in sorted(row)).rstrip()
 
 
+def make_pyte_screen(cols, rows):
+    """The single source of the pyte screen construction. PtySession and the offline frame
+    renderer both build their screen HERE, so the captured/golden frames can never drift from
+    what the live daemon renders."""
+    return pyte.HistoryScreen(cols, rows, history=100000, ratio=0.5)
+
+
+def render_raw(data, cols=120, rows=40):
+    """Replay raw PTY bytes through a fresh screen and return what the daemon's render() would show
+    — `"\\n".join(screen.display)`. Pure: no child, no dialog. Defaults mirror Session's cols/rows so
+    a session's persisted `raw` replays at the size it was captured. The conformance harness and the
+    nelix-capture tool use this for faithful, live-process-free golden frames."""
+    screen = make_pyte_screen(cols, rows)
+    pyte.ByteStream(screen).feed(data)
+    return "\n".join(screen.display)
+
+
 class PtySession:
     def __init__(self, argv, cwd=None, cols=120, rows=40, env=None, dialog=None):
         self._argv = argv
@@ -24,7 +41,7 @@ class PtySession:
         self._env = env
         self._child = None
         self._dialog = dialog
-        self._screen = pyte.HistoryScreen(cols, rows, history=100000, ratio=0.5)
+        self._screen = make_pyte_screen(cols, rows)
         self._stream = pyte.ByteStream(self._screen)
         self._history_committed = 0   # how many top-history lines already added to the dialog
 
