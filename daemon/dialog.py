@@ -93,3 +93,51 @@ class Dialog:
                 f.close()
             except Exception:
                 pass
+
+
+class DialogReader:
+    """Read-only transcript paging from disk by session dir, for a session no longer live
+    in the manager. Reconstructs turns from transcript.jsonl ({idx, turn, text} records)."""
+
+    def __init__(self, session_dir):
+        self._lines = []           # list[(turn, text)]
+        self._turn_starts = [0]
+        path = Path(session_dir) / "transcript.jsonl"
+        try:
+            with open(path) as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    rec = json.loads(raw)
+                    turn, text = rec.get("turn", 0), rec.get("text", "")
+                    while len(self._turn_starts) <= turn:
+                        self._turn_starts.append(len(self._lines))
+                    self._lines.append((turn, text))
+            self._available = True
+        except (OSError, ValueError):
+            self._available = False
+        self._max_turn = self._lines[-1][0] if self._lines else -1
+
+    def turn_count(self):
+        return self._max_turn + 1 if self._available else 0
+
+    def _slice(self, start, end):
+        return "\n".join(t for (_t, t) in self._lines[start:end])
+
+    def turn_text(self, turn_index, offset=0, limit=None):
+        if not self._available or turn_index < 0 or turn_index > self._max_turn:
+            return {"text": "", "offset": offset, "total_len": 0, "truncated": False,
+                    "unavailable": True}
+        start = self._turn_starts[turn_index]
+        end = self._turn_starts[turn_index + 1] if turn_index + 1 < len(self._turn_starts) \
+            else len(self._lines)
+        text = self._slice(start, end)
+        total = len(text)
+        if offset:
+            text = text[offset:]
+        truncated = False
+        if limit is not None and len(text) > limit:
+            text = text[:limit]; truncated = True
+        return {"text": text, "offset": offset, "total_len": total, "truncated": truncated,
+                "unavailable": False}

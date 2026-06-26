@@ -66,3 +66,24 @@ def test_raw_cap_drops_oldest_and_marks_base(tmp_path):
     d = _mk(tmp_path, spool_max_bytes=4)
     d.append_raw(b"123456")                      # exceeds 4 -> keep last 4
     assert (tmp_path / "s1" / "raw").read_bytes() == b"3456"
+
+
+def test_dialog_reader_reads_finished_transcript(tmp_path):
+    from daemon.dialog import Dialog, DialogReader
+    d = Dialog(tmp_path / "s-x", tail_lines=10, spool_max_bytes=10000)
+    d.add_line("turn0 line0")
+    d.mark_turn_boundary()
+    d.add_line("turn1 line0")
+    d.add_line("turn1 line1")
+    d.close()
+    r = DialogReader(tmp_path / "s-x")
+    assert r.turn_count() == 2
+    assert r.turn_text(0)["text"] == "turn0 line0"
+    assert r.turn_text(1)["text"] == "turn1 line0\nturn1 line1"
+
+
+def test_dialog_reader_missing_is_unavailable(tmp_path):
+    from daemon.dialog import DialogReader
+    r = DialogReader(tmp_path / "nope")
+    assert r.turn_count() == 0
+    assert r.turn_text(0)["unavailable"] is True
