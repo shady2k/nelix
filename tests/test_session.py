@@ -1104,6 +1104,7 @@ def test_finish_kills_group_when_monitor_dies_with_child_alive(tmp_path, monkeyp
     sess.start("hi", str(tmp_path))
     sess._thread.join(timeout=5)
     assert (4242, signal.SIGTERM) in killer_calls        # group killed despite child "alive"
+    assert freed == ["s-0badf00d"]
 
 
 def test_respond_after_terminal_is_rejected_without_writing(tmp_path):
