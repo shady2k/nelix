@@ -7,6 +7,7 @@ import signal as _signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 import paths
 
@@ -148,3 +149,81 @@ def kill_group(inspector, killer, leader_pid, pgid, grace, poll=0.1) -> bool:
     if inspector.is_alive(leader_pid):
         killer.killpg(pgid, _signal.SIGKILL)
     return True
+
+
+@dataclass
+class ReaperContext:
+    """Daemon-wide reaping dependencies handed to each Session (write/forget records, kill
+    survivors). Built once at daemon startup."""
+    daemon_pid: int
+    daemon_fingerprint: str
+    grace: float
+    inspector: ProcessInspector
+    killer: ProcessKiller
+
+
+def _is_owner_dead(inspector, rec):
+    dpid = rec.get("daemon_pid")
+    if dpid is None or not inspector.is_alive(dpid):
+        return True
+    return inspector.start_fingerprint(dpid) != rec.get("daemon_fingerprint")
+
+
+def _should_reap(inspector, rec, daemon_pid, daemon_fingerprint):
+    # (1) not the current daemon's own record
+    if rec.get("daemon_pid") == daemon_pid and rec.get("daemon_fingerprint") == daemon_fingerprint:
+        return False
+    # (2) owner daemon dead
+    if not _is_owner_dead(inspector, rec):
+        return False
+    pid = rec.get("pid")
+    # (3) child alive
+    if pid is None or not inspector.is_alive(pid):
+        return False
+    # (4) child fingerprint matches (anti pid-reuse)
+    if inspector.start_fingerprint(pid) != rec.get("child_fingerprint"):
+        return False
+    # (5) pgid still matches (narrows blast radius)
+    if inspector.pgid(pid) != rec.get("pgid"):
+        return False
+    return True
+
+
+def reconcile_orphans(sessions_root, daemon_pid, daemon_fingerprint, grace,
+                      inspector, killer, logger=None):
+    """Reap orphaned child groups recorded under sessions_root/*/child.json. Returns reaped
+    sids. Per-record isolation: a failure on one record never aborts the scan."""
+    reaped = []
+    try:
+        dirs = [d for d in sessions_root.iterdir() if d.is_dir()]
+    except (FileNotFoundError, NotADirectoryError):
+        return reaped
+    for sd in dirs:
+        try:
+            rec = read_child(sd)
+            if rec is None:
+                continue
+            if rec.get("sid") != sd.name:           # tampered/mismatched -> quarantine, skip
+                try:
+                    os.replace(paths.child_record(sd), str(paths.child_record(sd)) + ".bad")
+                except OSError:
+                    pass
+                continue
+            if _should_reap(inspector, rec, daemon_pid, daemon_fingerprint):
+                kill_group(inspector, killer, rec["pid"], rec.get("pgid"), grace)
+                reaped.append(rec["sid"])
+                if logger is not None:
+                    logger.info("reaper", "orphan_reaped", session_id=rec["sid"],
+                                pid=rec.get("pid"), pgid=rec.get("pgid"),
+                                ppid=inspector.ppid(rec["pid"]))
+                forget_child(sd)
+            elif rec.get("pid") is not None and not inspector.is_alive(rec["pid"]):
+                forget_child(sd)                    # stale record for a dead child: clean up
+                if logger is not None:
+                    logger.info("reaper", "orphan_record_dropped", session_id=rec.get("sid"))
+            elif logger is not None:
+                logger.info("reaper", "orphan_skipped", session_id=rec.get("sid"))
+        except Exception:
+            if logger is not None:
+                logger.error("reaper", "reconcile_record_error", session_id=sd.name, exc_info=True)
+    return reaped
