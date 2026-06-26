@@ -145,6 +145,12 @@ def make_server(manager, token, host="127.0.0.1", port=8765, logger=None):
                     if logger is not None:
                         logger.warning("rpc", "respond_unknown_session", session_id=sid, status=404)
                     self._send(404, {"error": "unknown session"})
+                elif outcome.status == "write_timeout":
+                    # executor stopped draining stdin: the answer did not land and was not re-typed.
+                    if logger is not None:
+                        logger.warning("rpc", "respond_write_timeout", session_id=sid, status=503)
+                    self._send(503, {"error": "write_timeout",
+                                     "detail": "executor did not accept input (stdin wedged); stop and restart"})
                 elif outcome.status == "stale":
                     # rich, self-contained diagnosis: who, what was sent, what is actually pending.
                     if logger is not None:

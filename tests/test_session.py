@@ -12,6 +12,7 @@ from daemon.events import EventQueue          # noqa: E402
 
 class Spec:
     settle_seconds = 1.5
+    respond_write_seconds = 5.0
     delivery_confirm_seconds = 2.0
     max_idle_seconds = 600.0
     tail_lines = 100
@@ -263,6 +264,32 @@ def test_respond_claims_decision_atomically_no_double_type(monkeypatch, tmp_path
     writes_after_first = list(sess._handle.writes)
     assert sess.respond("2").status == "no_pending"       # already claimed
     assert sess._handle.writes == writes_after_first      # nothing typed the second time
+
+
+class WedgedWriteHandle:
+    """A handle whose BOUNDED write times out — models an executor that stopped draining its
+    stdin (the PTY input buffer filled). An unbounded write (timeout=None) would block forever."""
+    def __init__(self):
+        self.writes = []
+
+    def write(self, data, timeout=None, drain_output=False):
+        from daemon.errors import PtyWriteTimeout
+        if timeout is not None:
+            raise PtyWriteTimeout(0, len(data.encode()))
+        self.writes.append(data)
+
+
+def test_respond_write_is_bounded_and_reports_timeout(monkeypatch, tmp_path):
+    # respond's PTY write runs on the RPC thread and was unbounded: a wedged executor (not draining
+    # stdin) would hang the call forever. It must be deadline-bounded -> a 'write_timeout' outcome.
+    box = "Ready — what next?\n❯ "
+    sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
+    sess._loop()
+    sess._handle = WedgedWriteHandle()              # executor stops draining stdin
+    out = sess.respond("1")
+    assert out.status == "write_timeout"            # bounded, not a hung RPC thread
+    assert sess._decision is None                   # decision was claimed, not left half-pending
 
 
 def test_answering_reemitted_blocked_clears_pending(tmp_path):
