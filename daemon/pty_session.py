@@ -172,6 +172,13 @@ class PtySession:
         except OSError:
             return None
 
+    def assert_leader_is_group_leader(self):
+        """The reaper kills by process GROUP; that only reaps the whole subtree if the PTY
+        child is its own group leader (ptyprocess setsid -> pid == pgid). Fail loudly if not."""
+        pid, pgid = self.leader_pid(), self.leader_pgid()
+        if pid is None or pid != pgid:
+            raise RuntimeError(f"pty leader {pid} is not its own group leader (pgid={pgid})")
+
     def leader_status(self):
         from daemon.launchers.base import LeaderStatus
         if self._child is None:
