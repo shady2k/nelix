@@ -30,6 +30,8 @@ honest about who did what.
 
 Then `nelix_start(executor, task, cwd)` and **end your turn** — you spend nothing while it works.
 
+- If a `nelix_start` result contains `config_errors`, the executor's `nelix.toml` is misconfigured: relay the `error` message to the user verbatim and stop — do not retry until they fix the config.
+
 ## The loop
 
 **After `nelix_start` or a successful `nelix_respond`, call no nelix tools — end your turn.** nelix wakes
