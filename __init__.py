@@ -48,15 +48,18 @@ def register(ctx):
         return _j(RpcClient(base, token).status(args.get("session_id")))
 
     def nelix_respond(args, **k):
-        _log.info("nelix_respond session=%s event=%s", args["session_id"], args.get("event_id"))
+        _log.info("nelix_respond session=%s decision=%s", args["session_id"],
+                  args.get("decision_id"))
         bt = supervisor.base_token()
         if bt is None:
             return _j({"error": "no active nelix daemon"})
         base, token = bt
+        # No event_id: the daemon binds the answer to the session's current pending decision.
+        # decision_id (if the model carries it from a status pull) is an optional staleness guard.
         ok, body = RpcClient(base, token).respond(
-            args["session_id"], args["event_id"], args["answer"])
+            args["session_id"], args["answer"], decision_id=args.get("decision_id"))
         if ok:
-            # The daemon owns the cursor: arm the next wake past the event we just answered.
+            # The daemon owns the cursor: arm the next doorbell past the decision we just answered.
             arm_waiter(ctx, base, after_seq=int(body.get("next_after_seq", 0)),
                        session_id=args["session_id"], token_file=supervisor.state_file())
         return _j(body)
@@ -106,21 +109,23 @@ def register(ctx):
     ctx.register_tool(
         "nelix_status", "nelix",
         {"description": (
-            "Fallback snapshot for reconciliation/recovery: an agent's state and any pending decision."
-            " Omit session_id to list all running agents. The wake already carries the event — do NOT"
-            " poll this; while the agent works it just says 'still working'."),
+            "Read an agent's current state and any pending decision (incl. its decision_id and the"
+            " live screen). The wake is only a doorbell — on each wake call this ONCE to see what the"
+            " agent needs, then act. Do NOT poll it in a loop: while the agent works it just says"
+            " 'still working' and nelix wakes you on the next event. Omit session_id to list all."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}}}},
         nelix_status)
     ctx.register_tool(
         "nelix_respond", "nelix",
         {"description": (
             "Send the user's answer to a paused agent (e.g. '1' to approve, or free text) so it"
-            " continues. Bound to that decision's event_id. After it succeeds, end your turn — nelix"
-            " wakes you on the next event."),
+            " continues. It is delivered to the agent's CURRENT pending decision — you do NOT need"
+            " an event id. (Optional: pass decision_id from a nelix_status read as a staleness"
+            " guard.) After it succeeds, end your turn — nelix wakes you on the next event."),
          "parameters": {**_OBJ,
-                        "properties": {"session_id": {"type": "string"}, "event_id": {"type": "string"},
-                                       "answer": {"type": "string"}},
-                        "required": ["session_id", "event_id", "answer"]}},
+                        "properties": {"session_id": {"type": "string"}, "answer": {"type": "string"},
+                                       "decision_id": {"type": "string"}},
+                        "required": ["session_id", "answer"]}},
         nelix_respond)
     ctx.register_tool(
         "nelix_stop", "nelix",

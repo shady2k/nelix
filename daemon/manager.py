@@ -5,7 +5,8 @@ import time
 import uuid
 
 import paths
-from daemon.session import Session
+from daemon.events import EXTERNAL_OUTPUT_POLICY
+from daemon.session import RespondOutcome, Session
 
 
 def _session_activity(d):
@@ -138,11 +139,15 @@ class SessionManager:
             return {"state": "working", "pending": False,
                     "message": ("Agent is still working. End your turn; nelix will wake you on the "
                                 "next event. Pass force:true to see the screen anyway.")}
-        return {"screen": sess.screen(raw=raw), "cols": sess._cols, "rows": sess._rows}
+        # the external-output trust fence rides WITH the captured screen content (not the doorbell).
+        return {"screen": sess.screen(raw=raw), "cols": sess._cols, "rows": sess._rows,
+                "external_output_policy": EXTERNAL_OUTPUT_POLICY}
 
-    def respond(self, session_id, event_id, answer):
+    def respond(self, session_id, answer, decision_id=None):
         sess = self._sessions.get(session_id)
-        return sess.respond(event_id, answer) if sess else None
+        if sess is None:
+            return RespondOutcome("unknown_session")
+        return sess.respond(answer, decision_id=decision_id)
 
     def status(self, session_id=None):
         if session_id is not None:

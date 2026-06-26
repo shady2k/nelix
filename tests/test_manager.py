@@ -11,7 +11,9 @@ class FakeSession:
         self.sid = sid; self.executor = executor; self.started = None
         self.started_cwd = None; self.stopped = False
     def start(self, task, cwd): self.started = task; self.started_cwd = cwd
-    def respond(self, event_id, answer): return event_id == "ok"
+    def respond(self, answer, decision_id=None):
+        from daemon.session import RespondOutcome
+        return RespondOutcome("resumed", seq=1, decision_id="dec-1")
     def snapshot(self): return {"session_id": self.sid, "executor": self.executor, "state": "working"}
     def stop(self): self.stopped = True
 

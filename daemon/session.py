@@ -4,13 +4,33 @@ import sys
 import threading
 import time
 import traceback
+import uuid
+from dataclasses import dataclass
 
 import paths
 from daemon import lifecycle_log
 from daemon.dialog import Dialog
 from daemon.drivers.base import ClassifyCtx
+from daemon.events import EXTERNAL_OUTPUT_POLICY, RESPONDABLE_KINDS
 from daemon.hygiene import prepare_pty_input
 from daemon.errors import PtyWriteTimeout
+
+
+@dataclass
+class RespondOutcome:
+    """Result of binding an answer to a session's current pending decision. `status` is one of
+    'resumed' | 'no_pending' | 'stale' | 'unknown_session'; `pending` carries the current
+    decision metadata when an optional decision_id guard mismatches (so the caller can reconcile)."""
+    status: str
+    seq: int = None
+    decision_id: str = None
+    pending: dict = None
+
+
+def _pending_meta(decision):
+    return {"decision_id": decision.get("decision_id"), "kind": decision["kind"],
+            "requires_response": decision.get("requires_response", True),
+            "hint": decision.get("hint"), "hung": decision.get("hung", False)}
 
 
 def _sessions_root():
@@ -175,7 +195,8 @@ class Session:
                 if (blocked_outstanding and self._spec.max_idle_seconds
                         and now - self._last_progress > self._spec.max_idle_seconds):
                     self._publish("blocked", hint="task_not_delivered", hung=True,
-                                  requires_response=True, task_delivery="pending")
+                                  requires_response=True, task_delivery="pending",
+                                  decision_key=self._blocked_fp)   # same pause -> reuse decision_id
                     self._last_progress = now              # re-arm so it doesn't re-fire every loop
                 if not self._handle.is_alive():
                     break
@@ -378,7 +399,12 @@ class Session:
         # commit the final viewport so the turn tail is in the transcript, then freeze the range.
         self._handle.flush_viewport(self._dialog)
         hint = "needs_permission" if state == "permission_prompt" else None
-        self._publish("waiting_for_user", hint=hint, hung=hung, requires_response=True)
+        # decision_key identifies the pause by what is ON SCREEN, not just the classifier label:
+        # the same stalled/idle screen reuses its decision_id (a hung re-emit), a different screen
+        # (a genuinely different question) starts a new decision. Mirrors blocked's fingerprint key.
+        fp = self._driver.normalize_frame(self._handle.render()) if self._handle is not None else ""
+        self._publish("waiting_for_user", hint=hint, hung=hung, requires_response=True,
+                      decision_key=f"stop:{state}:{fp}")
 
     def _emit_blocked(self, frame, hint="task_not_delivered"):
         # Surface a pre-delivery interstitial (modal / onboarding / unknown). Type/press NOTHING.
@@ -390,11 +416,14 @@ class Session:
             return
         self._blocked_fp = fp
         self._handle.flush_viewport(self._dialog)
+        # decision_key = the normalized-frame fingerprint: a new interstitial (different fp) is a
+        # new decision; the no-progress backstop re-emits the SAME fp and reuses the decision_id.
         self._publish("blocked", hint=hint, hung=False, requires_response=True,
-                      task_delivery="pending")
+                      task_delivery="pending", decision_key=fp)
 
-    def _publish(self, kind, hint, hung, requires_response=None, task_delivery=None):
-        from daemon.events import RESPONDABLE_KINDS
+    def _publish(self, kind, hint, hung, requires_response=None, task_delivery=None,
+                 decision_key=None):
+        respondable = kind in RESPONDABLE_KINDS
         with self._lock:
             turn = self._dialog.current_turn()
             start = self._dialog._turn_starts[turn]
@@ -405,24 +434,55 @@ class Session:
             screen = _excerpt(self._handle.render() if self._handle is not None else "",
                               self._spec.status_tail_chars)
             if requires_response is None:
-                requires_response = kind in RESPONDABLE_KINDS
+                requires_response = respondable
             if task_delivery is None:
                 task_delivery = self._task_delivery
             decision = {"kind": kind, "turn_index": turn, "range": (start, end),
                         "hint": hint, "hung": hung, "text": text,
                         "task_delivery": task_delivery, "requires_response": requires_response,
-                        "screen_excerpt": screen,
+                        "screen_excerpt": screen, "external_output_policy": EXTERNAL_OUTPUT_POLICY,
                         "total_len": page["total_len"], "truncated": page["truncated"]}
-            if kind in RESPONDABLE_KINDS:
-                self._decision = decision
+            is_reemit = False
+            if respondable:
+                # decision identity: REUSE the current decision's id when this is a re-emit of the
+                # same pause (same decision_key), else mint a fresh one. event_id (below) is the
+                # NOTIFICATION identity and changes every emit; decision_id is stable across re-emits
+                # so a held answer never self-invalidates.
+                cur = self._decision
+                is_reemit = cur is not None and cur.get("decision_key") == decision_key
+                decision_id = cur["decision_id"] if is_reemit else f"dec-{uuid.uuid4().hex[:8]}"
+                decision["decision_key"] = decision_key
+                decision["decision_id"] = decision_id
+
+        def _install(evt):
+            # Runs under the EventQueue lock, AFTER the event is reserved but BEFORE waiters are
+            # notified: a woken status pull therefore always observes the installed decision (no
+            # event-without-decision window). The branches are race-safe against a concurrent
+            # respond() that may have CLAIMED the decision between build and publish:
+            with self._lock:
+                cur = self._decision
+                if cur is not None and cur.get("decision_id") == decision_id:
+                    # same logical decision still pending -> refresh notification identity + hung
+                    # IN PLACE (never swap the object: keeps respond()'s claim identity stable).
+                    cur["event_id"] = evt.event_id
+                    cur["seq"] = evt.seq
+                    cur["hung"] = hung
+                elif not is_reemit:
+                    # a genuinely new pause -> install it (supersedes any prior pending decision).
+                    decision["event_id"] = evt.event_id
+                    decision["seq"] = evt.seq
+                    self._decision = decision
+                else:
+                    # a re-emit whose decision was answered/superseded between build and publish:
+                    # obsolete -> mark the event answered so pending() never resurrects it.
+                    evt.answered = True
+
         # publish OUTSIDE the session lock (lock order: never hold it across a queue publish).
         evt = self._events.publish(self._id, self._executor, kind, text[:200], self._state,
                                    turn_index=decision["turn_index"], range=decision["range"],
                                    hint=hint, hung=hung, task_delivery=task_delivery,
-                                   requires_response=requires_response, screen_excerpt=screen)
-        if kind in RESPONDABLE_KINDS:
-            with self._lock:
-                self._decision["event_id"] = evt.event_id
+                                   requires_response=requires_response, screen_excerpt=screen,
+                                   on_publish=_install if respondable else None)
         if self._log is not None:
             self._log.audit_decision(self._id, self._executor, kind, evt.event_id, text)
 
@@ -437,10 +497,12 @@ class Session:
                     "state": self._state,
                     "turn_count": self._dialog.turn_count() if self._dialog else 0}
             if self._decision is not None:
-                # serve the FROZEN range, not a mutating "latest turn".
+                # serve the FROZEN range, not a mutating "latest turn". decision_key is internal
+                # decision identity (never exposed); decision_id is the public guard token.
                 s, e = self._decision["range"]
                 page = self._dialog.range_text(s, e, limit=self._spec.status_tail_chars)
-                snap["decision"] = {**self._decision, "text": page["text"],
+                dec = {k: v for k, v in self._decision.items() if k != "decision_key"}
+                snap["decision"] = {**dec, "text": page["text"],
                                     "total_len": page["total_len"], "truncated": page["truncated"]}
             # active-working snapshots are deliberately low-information: no progress bait, just
             # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
@@ -450,15 +512,28 @@ class Session:
                                    "you on the next event.")
             return snap
 
-    def respond(self, event_id, answer):
-        pending = self._events.pending(self._id)
-        if pending is None or pending.event_id != event_id:
-            return None                               # stale/unknown: bind to the current decision
-        # Clean the answer BEFORE any mutation: a rejected answer (command prefix / empty after
+    def respond(self, answer, decision_id=None):
+        # Bind to the session's CURRENT pending decision (server owns identity). decision_id is an
+        # OPTIONAL staleness guard sourced from the status pull, never required from the wake.
+        with self._lock:
+            decision = self._decision
+            if decision is None or "event_id" not in decision:
+                return RespondOutcome("no_pending")
+            if decision_id is not None and decision.get("decision_id") != decision_id:
+                return RespondOutcome("stale", pending=_pending_meta(decision))
+        # Clean the answer BEFORE claiming: a rejected answer (command prefix / empty after
         # sanitization) leaves the decision pending and nothing typed, so the caller can retry.
         clean = prepare_pty_input(answer, self._driver.command_prefixes)
-        is_blocked = pending.kind == "blocked"
-        seq = self._events.mark_answered(event_id)
+        # Atomically CLAIM the decision: exactly one responder clears it and goes on to type, so
+        # concurrent duplicate responds can never both write to the PTY (which is non-idempotent).
+        with self._lock:
+            if self._decision is not decision:
+                return RespondOutcome("no_pending")    # already claimed, or superseded by a new pause
+            self._decision = None
+        is_blocked = decision["kind"] == "blocked"
+        # one logical decision may span several notification events (backstop re-emits) -> answer all,
+        # so pending() stays honest and the next waiter arms past the whole resolved decision.
+        seq = self._events.mark_session_answered(self._id) or decision.get("seq")
         if self._handle is not None:
             if not is_blocked:
                 # only a delivered agent turn gets a boundary; the monitor reads the dialog
@@ -468,9 +543,7 @@ class Session:
             self._type_text(clean)                     # PTY writes stay outside the lock
             self._press_enter()
             self._last_state = None
-        with self._lock:
-            self._decision = None
-        return seq                                    # cursor for the waiter to arm past
+        return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"))
 
     def stop(self):
         self._stop.set()

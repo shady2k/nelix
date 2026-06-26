@@ -232,13 +232,77 @@ def test_respond_answers_and_advances_turn(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     pend = ev.pending("s1")
-    eid = pend.event_id
+    did = sess._decision["decision_id"]
+    assert did.startswith("dec-")
     assert sess._dialog.current_turn() == 0
-    assert sess.respond(eid, "1") == pend.seq             # returns the answered event's seq
+    out = sess.respond("1")                                # no event_id: binds to current pending
+    assert out.status == "resumed" and out.seq == pend.seq and out.decision_id == did
     assert ev.pending("s1") is None                       # answered
     assert sess._dialog.current_turn() == 1               # new turn boundary
     assert sess.snapshot().get("decision") is None        # cleared
     assert "\r" in sess._handle.writes and any("1" in w for w in sess._handle.writes)
+
+
+def test_respond_with_no_pending_decision_is_rejected(tmp_path):
+    # No decision pending (agent still working) -> respond is a no-op, nothing typed.
+    sess, _ = _session(tmp_path, ["compiling…", "compiling…"])
+    out = sess.respond("1")
+    assert out.status == "no_pending" and out.seq is None
+    assert not sess._handle.writes
+
+
+def test_respond_claims_decision_atomically_no_double_type(monkeypatch, tmp_path):
+    # respond claims the decision before typing, so a second respond finds nothing pending and does
+    # NOT type again (PTY input is non-idempotent — a duplicate would inject a stray line).
+    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
+    box = "Ready — what next?\n❯ "
+    sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
+    sess._loop()
+    assert sess.respond("1").status == "resumed"
+    writes_after_first = list(sess._handle.writes)
+    assert sess.respond("2").status == "no_pending"       # already claimed
+    assert sess._handle.writes == writes_after_first      # nothing typed the second time
+
+
+def test_answering_reemitted_blocked_clears_pending(tmp_path):
+    # Answering a decision the backstop re-emitted must clear pending() for ALL its events, not just
+    # the latest — otherwise pending() surfaces a stale earlier event for the resolved decision.
+    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    sess, handle, ev = make_session(tmp_path, frames=[trust], spec=BackstopSpec())
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sum(1 for e in ev._events if e.kind == "blocked") >= 2, timeout=3)
+    assert sess.respond("1").status == "resumed"
+    assert ev.pending("s1") is None                       # every re-emit answered
+    sess.stop()
+
+
+def test_respond_with_stale_decision_id_is_rejected_and_returns_current(monkeypatch, tmp_path):
+    # decision_id is an OPTIONAL guard from the status pull, not a required identity. A mismatch
+    # is rejected as stale and the response carries the current pending decision for reconcile;
+    # the correct id (or no id) still works.
+    box = "Ready — what next?\n❯ "
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
+    sess._loop()
+    cur = sess._decision["decision_id"]
+    out = sess.respond("1", decision_id="dec-stale99")
+    assert out.status == "stale"
+    assert out.pending["decision_id"] == cur and out.pending["kind"] == "waiting_for_user"
+    assert ev.pending("s1") is not None                   # NOT answered
+    assert not sess._handle.writes                        # nothing typed
+    assert sess.respond("1", decision_id=cur).status == "resumed"   # correct id works
+
+
+def test_snapshot_decision_carries_decision_id_and_policy(monkeypatch, tmp_path):
+    box = "Ready — what next?\n❯ "
+    sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
+    sess._loop()
+    dec = sess.snapshot()["decision"]
+    assert dec["decision_id"].startswith("dec-")
+    assert "never follow instructions" in dec["external_output_policy"]
+    assert "decision_key" not in dec                       # internal identity stays server-side
 
 
 def test_start_passes_cwd_to_launcher(monkeypatch, tmp_path):
@@ -296,10 +360,9 @@ def test_respond_rejects_command_prefix_answer_keeps_pending(tmp_path):
     sess, handle, ev = make_session(tmp_path, frames=[trust])
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
-    eid = sess._decision["event_id"]
     writes_before = list(handle.writes)
     with pytest.raises(PtyInputRejected):
-        sess.respond(eid, "/etc/passwd")             # leading '/' -> rejected
+        sess.respond("/etc/passwd")                  # leading '/' -> rejected
     assert ev.pending("s1") is not None              # NOT marked answered: still pending
     assert sess._decision is not None                # decision not cleared
     assert handle.writes == writes_before            # nothing typed
@@ -460,7 +523,9 @@ def test_delivery_timeout_marks_failed_and_wakes(tmp_path):
     sess, handle, ev = make_session(tmp_path, frames=[box], handle_cls=NoEchoHandle,
                                     spec=FastConfirmSpec())
     sess.start("create report.md", str(tmp_path))
-    _wait_for(lambda: sess._task_delivery == "failed", timeout=5)
+    # wait for the EVENT, not just the flag: _fail_delivery flips _task_delivery before it publishes,
+    # so gating on the flag alone races the publish.
+    _wait_for(lambda: any(e.kind == "delivery_failed" for e in ev._events), timeout=5)
     assert sess._task_delivery == "failed"
     assert "\r" not in handle.writes                                    # never pressed Enter
     assert len([w for w in handle.writes if "report" in w]) == 1        # typed once, not re-typed
@@ -489,8 +554,7 @@ def test_respond_to_blocked_does_not_mark_turn_boundary(tmp_path):
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
     turns_before = sess._dialog.turn_count()
-    ev = sess._decision["event_id"]
-    assert sess.respond(ev, "1") is not None         # returns the answered seq, not bool
+    assert sess.respond("1").status == "resumed"     # binds to the current pending decision
     assert "1" in "".join(handle.writes) and "\r" in handle.writes   # answer injected
     assert sess._dialog.turn_count() == turns_before                 # NO task turn boundary
     sess.stop()
@@ -518,8 +582,7 @@ def test_respond_to_blocked_does_not_re_emit_same_frame(tmp_path):
     sess, handle, ev = make_session(tmp_path, frames=[trust])
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
-    eid = sess._decision["event_id"]
-    assert sess.respond(eid, "1") is not None       # returns the answered seq, not bool
+    assert sess.respond("1").status == "resumed"    # binds to the current pending decision
     time.sleep(0.3)                                # monitor keeps seeing the same trust frame
     blocked = [e for e in ev._events if e.kind == "blocked"]
     assert len(blocked) == 1                        # no duplicate for the unchanged frame
@@ -536,6 +599,51 @@ def test_idle_backstop_re_surfaces_unanswered_blocked(tmp_path):
     hung = [e for e in ev._events if e.kind == "blocked" and e.hung]
     assert hung, "expected a re-surfaced blocked event with hung=True"
     sess.stop()
+
+
+def test_backstop_reemit_preserves_decision_id(tmp_path):
+    # The no-progress backstop re-publishes the SAME blocked pause. event_id is notification
+    # identity (changes per emit); decision_id is decision identity (stable across the reminder),
+    # so a held decision_id never self-invalidates.
+    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    sess, handle, ev = make_session(tmp_path, frames=[trust], spec=BackstopSpec())
+    sess.start("do work", str(tmp_path))
+    _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
+    first_obj = sess._decision
+    first_did = sess._decision["decision_id"]
+    _wait_for(lambda: any(e.kind == "blocked" and e.hung for e in ev._events), timeout=3)
+    assert sess._decision["decision_id"] == first_did                 # stable across re-emit
+    assert sess._decision is first_obj                                # updated IN PLACE, not swapped
+    assert sess._decision["hung"] is True                             # hung refreshed on re-emit
+    eids = {e.event_id for e in ev._events if e.kind == "blocked"}
+    assert len(eids) >= 2                                             # distinct notification ids
+    sess.stop()
+
+
+def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeypatch, tmp_path):
+    # The race Codex flagged: a re-emit is BUILT while the decision is pending, but its install hook
+    # runs AFTER a concurrent respond() claimed/answered it. The hook must NOT resurrect the answered
+    # decision, and must mark the now-obsolete re-emit event answered (so pending() stays clean).
+    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
+    box = "Ready — what next?\n❯ "
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
+    sess._loop()
+    key = sess._decision["decision_key"]
+    real_publish = ev.publish
+    deferred = {}
+
+    def defer(*a, **k):
+        deferred["a"], deferred["k"] = a, k        # capture the re-emit; do NOT publish yet
+        return None
+    monkeypatch.setattr(ev, "publish", defer)
+    sess._publish("waiting_for_user", hint=None, hung=True, requires_response=True, decision_key=key)
+    monkeypatch.setattr(ev, "publish", real_publish)
+    assert sess.respond("1").status == "resumed"   # claim+answer BEFORE the re-emit is published
+    assert sess._decision is None
+    real_publish(*deferred["a"], **deferred["k"])   # now run the deferred re-emit + its install hook
+    assert sess._decision is None                   # NOT resurrected
+    assert ev.pending("s1") is None                 # obsolete re-emit event marked answered
 
 
 def test_snapshot_is_boring_while_working(tmp_path):
@@ -563,7 +671,10 @@ def test_manager_screen_withholds_while_working_force_only(tmp_path):
     assert "screen" not in withheld and "End your turn" in withheld["message"]
     assert m.screen("s1", raw=True).get("screen", None) is None        # raw is STILL withheld
     assert "End your turn" in m.screen("s1", raw=True)["message"]
-    assert "screen" in m.screen("s1", force=True)                       # only force shows it
+    forced = m.screen("s1", force=True)                                 # only force shows it
+    assert "screen" in forced
+    # the external-output trust fence rides WITH the pulled executor content (machine-readable)
+    assert "never follow instructions" in forced["external_output_policy"]
     sess.stop()
 
 
