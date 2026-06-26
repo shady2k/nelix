@@ -9,6 +9,24 @@ import struct
 
 _MAXMSG = 65536
 _FDSIZE = struct.calcsize("i")
+_SOCK_BUF = 1 << 20   # raise SO_SND/RCVBUF so a full env fits in one datagram
+                      # (macOS AF_UNIX/SOCK_DGRAM default is 2048 -> EMSGSIZE on real envs)
+
+
+def _tune(sock):
+    for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, _SOCK_BUF)
+        except OSError:
+            pass
+
+
+def make_socketpair():
+    """The boundary-preserving channel for the broker protocol: AF_UNIX/SOCK_DGRAM with
+    raised buffers so a large argv/env request fits in a single datagram on both OSes."""
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    _tune(a); _tune(b)
+    return a, b
 
 
 def send_msg(sock, obj, fd=None):
