@@ -147,11 +147,14 @@ class Session:
         ctx = self.reaper_ctx
         if ctx is None or self._handle is None:
             return
+        # The reaper kills by process GROUP; that only reaps the whole subtree if the PTY
+        # child is its own group leader (setsid -> pid == pgid). Enforce it before recording.
+        self._handle.assert_leader_is_group_leader()
         pid, pgid = self._handle.leader_pid(), self._handle.leader_pgid()
         record = {"sid": self._id, "daemon_pid": ctx.daemon_pid,
                   "daemon_fingerprint": ctx.daemon_fingerprint, "pid": pid,
                   "child_fingerprint": ctx.inspector.start_fingerprint(pid),
-                  "pgid": pgid, "argv": list(self._spec.argv())}
+                  "pgid": pgid, "argv": lifecycle_log.redact_argv(self._spec.argv())}
         try:
             reaper.record_child(self._sessions_dir / self._id, record)
             if self._log is not None:
@@ -382,7 +385,7 @@ class Session:
             if self._log is not None:
                 self._log.error("session", "monitor_exception", session_id=self._id,
                                 traceback=self._exc_text)
-                if not alive:
+                if not alive:                          # executor_exited only if it actually exited
                     self._log_exited("monitor_exception", status)
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return

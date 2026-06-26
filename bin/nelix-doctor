@@ -2,7 +2,6 @@
 """Read-only nelix operator status: daemon health, singleton-lock holder, live sessions,
 and detected strays (recorded children whose owner daemon is gone but child is alive)."""
 import json
-import os
 import sys
 from pathlib import Path
 

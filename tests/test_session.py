@@ -76,6 +76,10 @@ class FakeHandle:
 
     def leader_pid(self): return 4242
     def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self):
+        pid, pgid = self.leader_pid(), self.leader_pgid()
+        if pid is None or pid != pgid:
+            raise RuntimeError(f"pty leader {pid} is not its own group leader (pgid={pgid})")
     def leader_status(self):
         from daemon.launchers.base import LeaderStatus
         if self.is_alive():
@@ -113,6 +117,10 @@ class DeadHandle:
 
     def leader_pid(self): return 4242
     def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self):
+        pid, pgid = self.leader_pid(), self.leader_pgid()
+        if pid is None or pid != pgid:
+            raise RuntimeError(f"pty leader {pid} is not its own group leader (pgid={pgid})")
     def leader_status(self):
         from daemon.launchers.base import LeaderStatus
         return LeaderStatus(alive=False, exit_code=self._code, signal=None,
@@ -456,6 +464,10 @@ class LiveHandle:
 
     def leader_pid(self): return 4242
     def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self):
+        pid, pgid = self.leader_pid(), self.leader_pgid()
+        if pid is None or pid != pgid:
+            raise RuntimeError(f"pty leader {pid} is not its own group leader (pgid={pgid})")
     def leader_status(self):
         from daemon.launchers.base import LeaderStatus
         return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
@@ -1119,3 +1131,27 @@ def test_respond_after_terminal_is_rejected_without_writing(tmp_path):
     out = sess.respond("answer")
     assert out.status == "terminal"
     assert h.writes == []                                 # nothing typed into a closing PTY
+
+
+def test_start_asserts_group_leader_when_reaping(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, paths, pytest
+    importlib.reload(paths)
+    from daemon import reaper
+    from daemon.session import Session
+
+    class _BadHandle(FakeHandle):
+        def leader_pid(self): return 100
+        def leader_pgid(self): return 200     # pid != pgid -> not its own group leader
+
+    class _Insp:
+        def start_fingerprint(self, pid): return "fp"
+    class _Killer:
+        def killpg(self, pgid, sig): pass
+
+    ev = EventQueue()
+    sess = Session("s-badleader", "demo", ClaudeDriver(), _NoopLauncher(_BadHandle(["x"])), Spec(), ev)
+    sess.reaper_ctx = reaper.ReaperContext(10, "d1", 0.05, _Insp(), _Killer())
+    sess._stop.set()
+    with pytest.raises(RuntimeError):
+        sess.start("hi", str(tmp_path))

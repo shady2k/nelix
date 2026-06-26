@@ -143,10 +143,14 @@ class SessionManager:
             sess = self._sessions.get(session_id)
         if sess is None:
             return {"error": "unknown session"}
+        # While the agent is actively working, withhold the screen (poll bait) unless explicitly
+        # forced — the wake's screen_excerpt is the ground truth between events. `raw` only selects
+        # cleaned-vs-raw formatting; it must NOT be an escape hatch around withholding (only force is).
         if sess.is_working() and not force:
             return {"state": "working", "pending": False,
                     "message": ("Agent is still working. End your turn; nelix will wake you on the "
                                 "next event. Pass force:true to see the screen anyway.")}
+        # the external-output trust fence rides WITH the captured screen content (not the doorbell).
         return {"screen": sess.screen(raw=raw), "cols": sess._cols, "rows": sess._rows,
                 "external_output_policy": EXTERNAL_OUTPUT_POLICY}
 
