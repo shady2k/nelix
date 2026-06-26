@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 import sys
 import threading
@@ -111,6 +112,7 @@ class Session:
         self._dialog = Dialog(self._sessions_dir / self._id,
                               tail_lines=self._spec.tail_lines,
                               spool_max_bytes=self._spec.spool_max_bytes)
+        self._write_meta()
         self._handle = self._launcher.start(self._spec, cwd, self._cols, self._rows,
                                             dialog=self._dialog)
         self._task_delivery = "pending"
@@ -120,6 +122,19 @@ class Session:
             self._log.debug("session", "monitor_started", session_id=self._id)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def _write_meta(self):
+        # Persist the dims (+ executor/driver) the raw is captured at, so nelix-capture can replay
+        # sessions/<id>/raw at the right size. Private (0600) — same discipline as the raw. Best-effort:
+        # never fail a session start over the capture sidecar.
+        meta = {"cols": self._cols, "rows": self._rows, "executor": self._executor,
+                "driver": getattr(self._spec, "driver", None)}
+        try:
+            with open(paths.session_meta(self._sessions_dir / self._id), "w",
+                      opener=paths.private_opener) as f:
+                json.dump(meta, f)
+        except OSError:
+            pass
 
     # ---- low-level PTY ops (split from the old blind _submit) ----
     def _type_text(self, text, timeout=None, drain_output=False):

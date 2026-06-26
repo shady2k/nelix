@@ -34,6 +34,10 @@ clean:  ## Remove Python caches (keeps the venv)
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
 	rm -rf .pytest_cache
 
+.PHONY: capture
+capture:  ## Replay a session raw into golden frame(s): make capture ARGS="<session-dir> --all"
+	$(PY) bin/nelix-capture $(ARGS)
+
 .PHONY: reinstall-plugin
 reinstall-plugin:  ## Reset the installed plugin checkout to origin/main (override PLUGIN_DIR)
 	@test -d "$(PLUGIN_DIR)/.git" || { echo "no plugin checkout at $(PLUGIN_DIR)"; exit 1; }

@@ -35,6 +35,12 @@ def sessions_root() -> Path:
     return nelix_root() / "sessions"
 
 
+def session_meta(session_dir) -> Path:
+    """Per-session metadata sidecar (cols/rows/executor/driver). Single source of the filename so
+    the daemon (writer) and the nelix-capture tool (reader) agree."""
+    return Path(session_dir) / "meta.json"
+
+
 def logs_dir() -> Path:
     return nelix_root() / "logs"
 

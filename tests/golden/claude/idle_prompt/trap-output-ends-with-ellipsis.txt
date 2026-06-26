@@ -1,0 +1,3 @@
+  ⚠ a long advisory line that the terminal truncated with an ellipsis at the edge ove…
+❯
+⏵⏵ auto mode on (shift+tab to cycle)

@@ -3,6 +3,25 @@ import time
 from daemon.pty_session import PtySession
 
 
+def test_render_raw_matches_pty_session_render():
+    # render_raw is the SHARED renderer (capture tool + daemon must never drift): feeding the same
+    # bytes must produce exactly what PtySession.render() yields, with no live child.
+    from daemon.pty_session import render_raw
+    data = b"hello\r\nworld\r\n\x1b[1mbold\x1b[0m"
+    p = PtySession([], cols=80, rows=24)
+    p._feed(data)                                   # pure: no spawn, no dialog
+    assert render_raw(data, cols=80, rows=24) == p.render()
+    assert "hello" in render_raw(data, 80, 24) and "world" in render_raw(data, 80, 24)
+
+
+def test_render_raw_defaults_match_session_dims():
+    # default 120x40 mirrors Session's defaults, so a session's raw replays at the right size.
+    from daemon.pty_session import render_raw
+    out = render_raw(b"line-a\r\nline-b")
+    assert "line-a" in out and "line-b" in out
+    assert len(out.split("\n")) == 40              # rows=40 viewport
+
+
 def test_render_captures_child_output():
     s = PtySession(["printf", "HELLO-NELIX\\n"], cols=40, rows=10)
     s.spawn()

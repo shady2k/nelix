@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Replay a session's raw PTY bytes through the daemon's renderer and print golden frame(s) for the
+driver-conformance harness — no live process needed.
+
+Input is a session dir (reads `meta.json` for the cols/rows the raw was captured at — replaying at
+the wrong size reflows differently and yields bogus frames) or a bare `raw` file (`--cols/--rows`,
+default 120x40). Faithfulness: only `--final` is fully faithful (pyte state after ALL bytes, exactly
+what the daemon's render() shows at end-of-stream). `--at-marker`/`--all` snapshot pyte state at byte
+PREFIXES — plausible screens a human still curates, not provably ones the daemon classified at that
+instant (raw preserves bytes, not pump() chunk boundaries or inter-byte timing).
+
+Usage:
+  nelix-capture <session-dir|raw-file> [--cols N --rows M] [--final | --at-marker SUBSTR | --all]
+                [--limit N] [--out-dir DIR]
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from daemon.pty_session import make_pyte_screen, render_raw   # noqa: E402
+from daemon.drivers.claude import ClaudeDriver                # noqa: E402
+import pyte                                                   # noqa: E402
+
+_CHUNK = 64   # replay granularity for --at-marker/--all (small enough to catch transient frames)
+
+
+def _resolve(path, cols_arg, rows_arg):
+    p = Path(path)
+    cols, rows = 120, 40
+    if p.is_dir():
+        raw = p / "raw"
+        meta = p / "meta.json"
+        if meta.exists():
+            try:
+                m = json.loads(meta.read_text())
+                cols, rows = int(m.get("cols", cols)), int(m.get("rows", rows))
+            except (OSError, ValueError):
+                pass
+    else:
+        raw = p
+    if cols_arg is not None:
+        cols = cols_arg
+    if rows_arg is not None:
+        rows = rows_arg
+    return raw, cols, rows
+
+
+def _frames(data, cols, rows):
+    # yield render() after each chunk fed — pyte state at byte-prefixes (parser state carries across
+    # feeds, so splitting mid-escape-sequence is fine).
+    screen = make_pyte_screen(cols, rows)
+    stream = pyte.ByteStream(screen)
+    for i in range(0, len(data), _CHUNK):
+        stream.feed(data[i:i + _CHUNK])
+        yield "\n".join(screen.display)
+
+
+def _at_marker(data, cols, rows, marker):
+    for frame in _frames(data, cols, rows):
+        if marker in frame:
+            print(frame)
+            return 0
+    print(f"nelix-capture: marker {marker!r} not found in {len(data)} bytes "
+          f"(the raw may have been truncated at the front by spool_max_bytes)", file=sys.stderr)
+    return 1
+
+
+def _all(data, cols, rows, limit, out_dir):
+    driver = ClaudeDriver()
+    seen, candidates = set(), []
+    for frame in _frames(data, cols, rows):
+        key = driver.normalize_frame(frame)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(frame)
+        if len(candidates) >= limit:
+            print(f"nelix-capture: --limit {limit} reached; more distinct candidates exist "
+                  f"(raise --limit to see them)", file=sys.stderr)
+            break
+    if out_dir:
+        d = Path(out_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        for i, frame in enumerate(candidates):
+            (d / f"candidate-{i:03d}.txt").write_text(frame)
+        print(f"nelix-capture: wrote {len(candidates)} candidate(s) to {out_dir}", file=sys.stderr)
+    else:
+        for i, frame in enumerate(candidates):
+            print(f"===== candidate {i} =====")
+            print(frame)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Replay session raw -> rendered golden frame(s).")
+    ap.add_argument("path", help="a session dir (reads meta.json) or a raw file")
+    ap.add_argument("--cols", type=int, default=None)
+    ap.add_argument("--rows", type=int, default=None)
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--final", action="store_true", help="render after all bytes (default)")
+    mode.add_argument("--at-marker", dest="at_marker", default=None,
+                      help="print the first frame containing SUBSTR")
+    mode.add_argument("--all", action="store_true",
+                      help="print each distinct normalized candidate frame")
+    ap.add_argument("--limit", type=int, default=50, help="max candidates for --all (default 50)")
+    ap.add_argument("--out-dir", default=None, help="write --all candidates as files here")
+    args = ap.parse_args()
+
+    raw_path, cols, rows = _resolve(args.path, args.cols, args.rows)
+    try:
+        data = raw_path.read_bytes()
+    except OSError as e:
+        print(f"nelix-capture: cannot read {raw_path}: {e}", file=sys.stderr)
+        return 2
+    print(f"nelix-capture: {raw_path} ({len(data)} bytes) at {cols}x{rows}", file=sys.stderr)
+
+    if args.at_marker is not None:
+        return _at_marker(data, cols, rows, args.at_marker)
+    if args.all:
+        return _all(data, cols, rows, args.limit, args.out_dir)
+    print(render_raw(data, cols, rows))      # --final (default)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
