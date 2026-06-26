@@ -1,10 +1,13 @@
 """Orphan reaping across daemon restart. All process inspection/killing goes through the
 ProcessInspector/ProcessKiller boundary so unit tests inject a fake process table instead
 of faking /proc, ps, PID reuse, or ppid==1."""
+import json
 import os
 import signal as _signal
 import subprocess
 import sys
+
+import paths
 
 
 class ProcessInspector:
@@ -77,3 +80,54 @@ class ProcessKiller:
             os.killpg(pgid, sig)
         except OSError:
             pass                       # already gone / not ours: best-effort
+
+
+def record_child(session_dir, record: dict) -> None:
+    """Durably publish the reaping record inside the session dir (atomic temp+rename;
+    fsync file and dir). Must be called AFTER spawn returns a pid/pgid and BEFORE the
+    monitor thread does any work."""
+    paths.ensure_private_dir(session_dir)
+    final = paths.child_record(session_dir)
+    tmp = final.with_suffix(".json.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, json.dumps(record).encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, final)
+    dfd = os.open(session_dir, os.O_RDONLY)
+    try:
+        os.fsync(dfd)                  # persist the rename's directory entry
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def read_child(session_dir):
+    """Parse the record. None if absent. Unparseable -> quarantine to child.json.bad, None."""
+    path = paths.child_record(session_dir)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        try:
+            os.replace(path, str(path) + ".bad")
+        except OSError:
+            pass
+        return None
+
+
+def forget_child(session_dir) -> None:
+    try:
+        os.unlink(paths.child_record(session_dir))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
