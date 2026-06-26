@@ -208,6 +208,30 @@ def test_unknown_executor_logs_rejected(tmp_path, monkeypatch):
     assert "session_start_rejected" in buf.getvalue()
 
 
+def test_terminal_callback_frees_slot_for_next_start():
+    m, captured = _mgr(limit=1)
+    sid, _ = m.start(EXECUTOR, "task A", "/tmp")
+    # simulate the session reaching a terminal state and invoking its on_terminal callback
+    captured[0].on_terminal(sid)
+    assert m.get(sid) is None                            # deregistered
+    sid2, _ = m.start(EXECUTOR, "task B", "/tmp")        # slot freed -> next start succeeds
+    assert sid2 is not None
+
+
+def test_manager_sets_on_terminal_and_reaper_ctx():
+    specs = {EXECUTOR: make_spec()}
+    q = EventQueue()
+    made = []
+    def factory(sid, ex, spec, ev):
+        s = FakeSession(sid, ex); made.append(s); return s
+    from daemon import reaper
+    ctx = reaper.ReaperContext(10, "d1", 5.0, reaper.ProcessInspector(), reaper.ProcessKiller())
+    m = SessionManager(specs, q, session_factory=factory, concurrency_limit=1, reaper_ctx=ctx)
+    m.start(EXECUTOR, "t", "/tmp")
+    assert made[0].reaper_ctx is ctx
+    assert callable(made[0].on_terminal)
+
+
 def test_stop_all_uses_shutdown_reason(tmp_path, monkeypatch):
     import io, json
     from daemon.obs import Logger
