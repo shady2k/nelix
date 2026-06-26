@@ -28,6 +28,12 @@ def register(ctx):
         # working dir (no static config cwd). The daemon resolves/validates it host-side.
         cwd = args.get("cwd") or os.getcwd()
         _log.info("nelix_start executor=%s cwd=%s", args["executor"], cwd)
+        # Config-first: a broken nelix.toml or a disabled executor is a relayable message, not a
+        # spawned daemon + traceback. validate() reads the same file the daemon loads (single source).
+        cfg_err = registry.config_error_for(registry.validate(), args["executor"])
+        if cfg_err:
+            _log.warning("nelix_start config error executor=%s", args["executor"])
+            return _j(cfg_err)
         resolve_launcher("auto")               # isolation parity: fail closed
         base, token = supervisor.ensure_running()
         body = RpcClient(base, token).start(args["executor"], args["task"], cwd)

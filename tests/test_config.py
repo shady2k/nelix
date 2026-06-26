@@ -1,5 +1,3 @@
-import pytest
-
 from daemon.config import load_executors, load_concurrency_limit
 
 
@@ -13,7 +11,7 @@ def test_load_executor_spec(tmp_path):
         'cwd = "~/work"\n'
         'driver = "claude"\n'
     )
-    spec = load_executors(str(cfg))["demo"]
+    spec = load_executors(str(cfg)).specs["demo"]
     assert spec.argv() == ["tool", "-x", "--", "~/w.sh"]
     assert spec.driver == "claude"
     assert spec.resolved_env()["FOO"] == "bar"
@@ -24,15 +22,18 @@ def test_load_executor_spec(tmp_path):
 def test_launcher_defaults_to_auto(tmp_path):
     cfg = tmp_path / "n.toml"
     cfg.write_text('[executors.demo]\ncommand="tool"\ndriver="claude"\n')
-    spec = load_executors(str(cfg))["demo"]
+    spec = load_executors(str(cfg)).specs["demo"]
     assert spec.launcher == "auto"
 
 
-def test_missing_driver_raises(tmp_path):
+def test_missing_driver_collected_as_error(tmp_path):
     cfg = tmp_path / "n.toml"
     cfg.write_text('[executors.demo]\ncommand="tool"\n')
-    with pytest.raises(ValueError, match="demo"):
-        load_executors(str(cfg))
+    load = load_executors(str(cfg))
+    assert "demo" not in load.specs
+    assert load.parse_error is None
+    assert any(e["name"] == "demo" and "driver" in e["problem"]
+               for e in load.executor_errors)
 
 
 def test_capture_tunables_have_defaults_and_overrides(tmp_path):
@@ -43,7 +44,7 @@ def test_capture_tunables_have_defaults_and_overrides(tmp_path):
         '[executors.b]\ncommand="y"\nargs=[]\nenv={}\ncwd="."\ndriver="claude"\nlauncher="local"\n'
         'settle_seconds=3.0\nmax_idle_seconds=120\ntail_lines=50\nstatus_tail_chars=1000\n'
         'dialog_page_chars=2000\nspool_max_bytes=4096\n')
-    specs = load_executors(str(cfg))
+    specs = load_executors(str(cfg)).specs
     a, b = specs["a"], specs["b"]
     assert (a.settle_seconds, a.max_idle_seconds, a.tail_lines) == (1.5, 600.0, 400)
     assert a.status_tail_chars == 4000 and a.dialog_page_chars == 8000 and a.spool_max_bytes == 8_388_608
@@ -57,7 +58,7 @@ def test_recovery_thresholds_defaults_and_overrides(tmp_path):
         '[executors.a]\ncommand="x"\ndriver="claude"\n'
         '[executors.b]\ncommand="y"\ndriver="claude"\n'
         'max_idle_seconds=120\nmax_restarts=5\n')
-    specs = load_executors(str(cfg))
+    specs = load_executors(str(cfg)).specs
     a, b = specs["a"], specs["b"]
     assert (a.max_idle_seconds, a.max_restarts) == (600.0, 3)
     assert (b.max_idle_seconds, b.max_restarts) == (120.0, 5)
@@ -70,7 +71,7 @@ def test_recovery_thresholds_reject_bad_values(tmp_path):
     # non-numeric / negative / bool must fall back to the default, not crash the load.
     cfg.write_text('[executors.a]\ncommand="x"\ndriver="claude"\n'
                    'max_idle_seconds="oops"\nmax_restarts=true\n')
-    a = load_executors(str(cfg))["a"]
+    a = load_executors(str(cfg)).specs["a"]
     assert (a.max_idle_seconds, a.max_restarts) == (600.0, 3)
 
 
@@ -89,7 +90,7 @@ def test_delivery_confirm_seconds_loads_with_default(tmp_path):
     p.write_text(
         '[executors.a]\ncommand="x"\ndriver="claude"\n'
         '[executors.b]\ncommand="y"\ndriver="claude"\ndelivery_confirm_seconds=3.5\n')
-    specs = load_executors(str(p))
+    specs = load_executors(str(p)).specs
     assert specs["a"].delivery_confirm_seconds == 10.0      # default
     assert specs["b"].delivery_confirm_seconds == 3.5       # overridden
 
@@ -178,3 +179,67 @@ def test_load_kill_grace_seconds(tmp_path):
     assert load_kill_grace_seconds(str(p)) == 5.0
     p.write_text('kill_grace_seconds = "nope"\n')      # bad type -> default
     assert load_kill_grace_seconds(str(p)) == 5.0
+
+
+def test_partial_load_keeps_good_skips_bad(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.good]\ncommand="g"\ndriver="claude"\n'
+                   '[executors.bad]\ncommand="b"\n')          # missing driver
+    load = load_executors(str(cfg))
+    assert set(load.specs) == {"good"}
+    assert load.parse_error is None
+    assert [e["name"] for e in load.executor_errors] == ["bad"]
+    assert "driver" in load.executor_errors[0]["problem"]
+
+
+def test_whole_file_parse_error_no_raise(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[oops')                                   # unterminated table header
+    load = load_executors(str(cfg))
+    assert load.specs == {}
+    assert load.executor_errors == []
+    assert load.parse_error                                   # non-empty message
+
+
+def test_non_table_executor_collected(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors]\ndemo = "notatable"\n')
+    load = load_executors(str(cfg))
+    assert load.specs == {}
+    assert load.executor_errors and load.executor_errors[0]["name"] == "demo"
+
+
+def test_missing_file_is_parse_error_not_raise(tmp_path):
+    load = load_executors(str(tmp_path / "absent.toml"))
+    assert load.specs == {} and load.parse_error
+
+
+def test_concurrency_limit_malformed_toml_defaults(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[oops')
+    assert load_concurrency_limit(str(cfg)) == 1
+
+
+def test_concurrency_limit_bad_type_defaults(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('concurrency_limit = "two"\n')
+    assert load_concurrency_limit(str(cfg)) == 1
+    cfg.write_text('concurrency_limit = true\n')           # bool is not a valid int here
+    assert load_concurrency_limit(str(cfg)) == 1
+    cfg.write_text('concurrency_limit = 0\n')              # floor is 1
+    assert load_concurrency_limit(str(cfg)) == 1
+
+
+def test_concurrency_limit_missing_file_defaults(tmp_path):
+    assert load_concurrency_limit(str(tmp_path / "absent.toml")) == 1
+
+
+def test_non_finite_int_field_collected_not_raised(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.good]\ncommand="g"\ndriver="claude"\n'
+                   '[executors.bigtail]\ncommand="x"\ndriver="claude"\ntail_lines=inf\n'
+                   '[executors.bigrestart]\ncommand="y"\ndriver="claude"\nmax_restarts=inf\n')
+    load = load_executors(str(cfg))           # must NOT raise
+    assert set(load.specs) == {"good"}        # both inf executors skipped
+    assert load.parse_error is None
+    assert {e["name"] for e in load.executor_errors} == {"bigtail", "bigrestart"}

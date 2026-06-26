@@ -180,3 +180,37 @@ def test_nelix_start_logs_metadata_not_task_text(monkeypatch, tmp_path, caplog):
         assert SECRET_TASK not in msgs        # task body must NOT be logged
     finally:
         nelix.supervisor.teardown()
+
+
+def test_nelix_start_disabled_executor_returns_config_error(monkeypatch, tmp_path):
+    # Good 'opencode' + a 'broken' executor missing its driver: starting 'broken' must
+    # return a structured config error WITHOUT contacting the daemon.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg = tmp_path / "workspace" / "nelix" / "nelix.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('[executors.opencode]\ncommand="opencode"\ndriver="claude"\n'
+                   '[executors.broken]\ncommand="x"\n')
+    nelix = load_plugin()
+    monkeypatch.setattr(nelix, "resolve_launcher", lambda *a, **k: "local")
+    boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("daemon must not be contacted"))
+    monkeypatch.setattr(nelix.supervisor, "ensure_running", boom)
+    ctx = FakeCtx()
+    nelix.register(ctx)
+    out = json.loads(ctx.tools["nelix_start"]["handler"]({"executor": "broken", "task": "go"}))
+    assert "broken" in out["error"] and "config" in out["error"].lower()
+    assert out["config_errors"] and out["config_errors"][0]["name"] == "broken"
+
+
+def test_nelix_start_parse_error_returns_config_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg = tmp_path / "workspace" / "nelix" / "nelix.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('[oops')                                   # whole-file parse error
+    nelix = load_plugin()
+    monkeypatch.setattr(nelix, "resolve_launcher", lambda *a, **k: "local")
+    boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("daemon must not be contacted"))
+    monkeypatch.setattr(nelix.supervisor, "ensure_running", boom)
+    ctx = FakeCtx()
+    nelix.register(ctx)
+    out = json.loads(ctx.tools["nelix_start"]["handler"]({"executor": "anything", "task": "go"}))
+    assert "config" in out["error"].lower() and out["config_errors"]

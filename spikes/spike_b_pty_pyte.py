@@ -27,7 +27,7 @@ COLS, ROWS = 120, 40
 
 
 def main():
-    execs = load_executors(os.environ.get("NELIX_CONFIG", "nelix.toml"))
+    execs = load_executors(os.environ.get("NELIX_CONFIG", "nelix.toml")).specs
     name = os.environ.get("NELIX_EXECUTOR") or next(iter(execs))
     spec = execs[name]
     os.makedirs(spec.resolved_cwd(), exist_ok=True)
