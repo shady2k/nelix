@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Out-of-band reaper. `--orphans` reaps a DEAD daemon's leftover child groups (refuses while
+a live daemon holds the root); `<sid>` force-stops one live session via the daemon RPC."""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import paths                                   # noqa: E402
+import supervisor                              # noqa: E402
+from daemon import reaper                      # noqa: E402
+from daemon.config import load_kill_grace_seconds  # noqa: E402
+
+
+def reap_orphans(inspector, killer, grace):
+    if supervisor.base_token():                 # never kill a live daemon's children
+        return {"refused": "daemon_alive"}
+    inspector = inspector or reaper.ProcessInspector()
+    killer = killer or reaper.ProcessKiller()
+    reaped = reaper.reconcile_orphans(paths.sessions_root(), daemon_pid=os.getpid(),
+                                      daemon_fingerprint="<reap-cli>", grace=grace,
+                                      inspector=inspector, killer=killer)
+    return {"reaped": reaped}
+
+
+def reap_sid(sid):
+    base = supervisor.base_token()
+    if not base:
+        return {"error": "no live daemon"}
+    import urllib.request
+    url, token = base
+    req = urllib.request.Request(url + "/stop", method="POST",
+                                 data=json.dumps({"session_id": sid}).encode(),
+                                 headers={"X-Nelix-Token": token,
+                                          "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read())
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--orphans", action="store_true")
+    ap.add_argument("sid", nargs="?")
+    args = ap.parse_args(argv)
+    if args.orphans:
+        grace = load_kill_grace_seconds(str(paths.config_path()))
+        print(json.dumps(reap_orphans(None, None, grace)))
+    elif args.sid:
+        print(json.dumps(reap_sid(args.sid)))
+    else:
+        ap.error("pass --orphans or a <sid>")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
