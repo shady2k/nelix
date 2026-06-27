@@ -2,8 +2,10 @@ import json
 import logging
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .rpc_client import RpcClient
+from .daemon.transport import Transport
 from .launcher_resolve import resolve_launcher
 from .wake import arm_waiter
 from . import supervisor, registry
@@ -18,6 +20,12 @@ _dumps = json.dumps
 def _j(obj):
     # Emit real UTF-8 (Cyrillic task text, ❯, …) to the model, not \uXXXX escapes.
     return _dumps(obj, ensure_ascii=False)
+
+
+def _client(base, token):
+    """Build an RpcClient from the (base_url, token) pair returned by supervisor."""
+    u = urlparse(base)
+    return RpcClient(Transport.tcp(u.hostname, u.port, token))
 
 
 def register(ctx):
@@ -36,7 +44,7 @@ def register(ctx):
             return _j(cfg_err)
         resolve_launcher("auto")               # isolation parity: fail closed
         base, token = supervisor.ensure_running()
-        body = RpcClient(base, token).start(args["executor"], args["task"], cwd)
+        body = _client(base, token).start(args["executor"], args["task"], cwd)
         # The daemon owns the cursor: arm the wake past anything emitted before this session,
         # scoped to this session so cross-session events never produce a stale wake. Only arm on a
         # successful start — a failed start (e.g. bad cwd) has no session, so an unscoped waiter
@@ -51,7 +59,7 @@ def register(ctx):
         if bt is None:
             return _j({"sessions": {}})
         base, token = bt
-        return _j(RpcClient(base, token).status(args.get("session_id")))
+        return _j(_client(base, token).status(args.get("session_id")))
 
     def nelix_respond(args, **k):
         _log.info("nelix_respond session=%s decision=%s", args["session_id"],
@@ -62,7 +70,7 @@ def register(ctx):
         base, token = bt
         # No event_id: the daemon binds the answer to the session's current pending decision.
         # decision_id (if the model carries it from a status pull) is an optional staleness guard.
-        ok, body = RpcClient(base, token).respond(
+        ok, body = _client(base, token).respond(
             args["session_id"], args["answer"], decision_id=args.get("decision_id"))
         if ok:
             # The daemon owns the cursor: arm the next doorbell past the decision we just answered.
@@ -75,14 +83,14 @@ def register(ctx):
         if bt is None:
             return _j({"stopped": False})
         base, token = bt
-        return _j(RpcClient(base, token).stop(args["session_id"]))
+        return _j(_client(base, token).stop(args["session_id"]))
 
     def nelix_dialog(args, **k):
         bt = supervisor.base_token()
         if bt is None:
             return _j({"error": "no active nelix daemon"})
         base, token = bt
-        return _j(RpcClient(base, token).dialog(
+        return _j(_client(base, token).dialog(
             args["session_id"], args.get("turn"), int(args.get("offset", 0)), args.get("limit")))
 
     def nelix_screen(args, **k):
@@ -90,7 +98,7 @@ def register(ctx):
         if bt is None:
             return _j({"error": "no active nelix daemon"})
         base, token = bt
-        return _j(RpcClient(base, token).screen(
+        return _j(_client(base, token).screen(
             args["session_id"], raw=bool(args.get("raw")), force=bool(args.get("force"))))
 
     names = ", ".join(registry.names()) or "a configured agent"

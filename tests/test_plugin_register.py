@@ -118,7 +118,7 @@ def test_nelix_respond_binds_to_session_without_event_id(monkeypatch, tmp_path):
         assert params["required"] == ["session_id", "answer"]      # event_id is gone
         assert "event_id" not in params["properties"]
         assert "decision_id" in params["properties"]               # optional guard
-        monkeypatch.setattr(nelix.supervisor, "base_token", lambda: ("http://x", "t"))
+        monkeypatch.setattr(nelix.supervisor, "base_token", lambda: ("http://127.0.0.1:9999", "t"))
         captured = {}
 
         class FakeRpc:

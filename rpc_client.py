@@ -1,24 +1,47 @@
+import http.client
 import json
-import urllib.error
+import socket
 import urllib.parse
-import urllib.request
+
+try:
+    from .daemon.transport import Transport     # package mode (hermes_plugins.nelix.rpc_client)
+except ImportError:
+    from daemon.transport import Transport      # top-level module mode (tests)
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path, timeout=30):
+        super().__init__("localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(self._path)
+        self.sock = s
 
 
 class RpcClient:
-    def __init__(self, base, token):
-        self._base = base.rstrip("/")
-        self._token = token
+    def __init__(self, transport):
+        self._t = transport
 
-    def _call(self, method, path, body=None):
+    def _conn(self, timeout):
+        if self._t.kind == "unix":
+            return UnixHTTPConnection(self._t.path, timeout=timeout)
+        return http.client.HTTPConnection(self._t.host, self._t.port, timeout=timeout)
+
+    def _call(self, method, path, body=None, timeout=30):
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self._base + path, data=data, method=method,
-                                     headers={"X-Nelix-Token": self._token,
-                                              "Content-Type": "application/json"})
+        headers = {"Content-Type": "application/json"}
+        if self._t.kind == "tcp":
+            headers["X-Nelix-Token"] = self._t.token
+        conn = self._conn(timeout)
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return r.status, json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read() or b"{}")
+            conn.request(method, path, body=data, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read() or b"{}")
+        finally:
+            conn.close()
 
     def start(self, executor, task, cwd):
         _, body = self._call("POST", "/start",
