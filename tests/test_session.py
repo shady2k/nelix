@@ -393,8 +393,9 @@ def test_start_strips_control_bytes_from_task(tmp_path):
     sess, handle, _ = make_session(tmp_path, frames=[box])
     sess.start("do the\x1b[Z work", str(tmp_path))
     _wait_for(lambda: sess._task_delivery == "delivered")
-    assert "\x1b" not in "".join(handle.writes)      # no escape/keystroke ever reached the PTY
-    assert "do the work" in "".join(handle.writes)   # cleaned text delivered
+    assert "\x1b[Z" not in "".join(handle.writes)              # the embedded mode-toggle was stripped
+    # The ONLY escapes that reach the PTY are the driver's bracketed-paste frame around clean text.
+    assert "\x1b[200~do the work\x1b[201~" in handle.writes
     sess.stop()
 
 
@@ -576,6 +577,20 @@ def test_delivery_confirms_when_claude_collapses_paste(tmp_path):
     assert "\r" in handle.writes                                          # Enter pressed
     task_writes = [w for w in handle.writes if "multi-paragraph" in w]
     assert len(task_writes) == 1                                          # typed exactly once
+    sess.stop()
+
+
+def test_delivery_wraps_task_in_bracketed_paste(tmp_path):
+    # nelix-10z: the claude driver delivers the task as ONE bracketed paste so Claude collapses it
+    # to a placeholder instead of re-rendering every char (0.0s vs 2.2s for 61.5KB). The markers
+    # frame only the text; Enter is a SEPARATE write AFTER the paste, never inside it.
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box], handle_cls=PasteCollapseHandle)
+    sess.start("write a big report", str(tmp_path))
+    _wait_for(lambda: sess._task_delivery == "delivered", timeout=5)
+    assert sess._task_delivery == "delivered"
+    assert "\x1b[200~write a big report\x1b[201~" in handle.writes      # one bracketed-paste write
+    assert handle.writes[-1] == "\r"                                   # Enter last, OUTSIDE the paste
     sess.stop()
 
 

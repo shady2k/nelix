@@ -48,6 +48,15 @@ class ClaudeDriver:
         f = _TOKENS.sub("N tokens", f)
         return f
 
+    def format_submission(self, text):
+        # Frame the task as a bracketed paste (ESC[200~ … ESC[201~). Claude enables bracketed-paste
+        # mode at startup (ESC[?2004h) and, inside the markers, collapses the input to a single
+        # "[Pasted text #N]" placeholder with almost no re-render (0.0s vs 2.2s raw echo for 61.5KB),
+        # which input_submission_present already detects. Markers wrap ONLY the text: the submit key
+        # (CR) is pressed separately by the session, so a CR can't be swallowed as paste content.
+        # Added AFTER core_sanitize (which strips escapes), so these framing bytes survive.
+        return f"\x1b[200~{text}\x1b[201~"
+
     def classify(self, frame, ctx):
         if not ctx.child_alive:
             return "exited" if (ctx.exit_code or 0) == 0 else "crashed"
