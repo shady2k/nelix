@@ -196,6 +196,32 @@ def make_server(manager, transport, logger=None):
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
                 self._send(200, {"stopped": stopped})
+            elif p.path == "/restart":
+                try:
+                    outcome = manager.restart(body["session_id"], force=bool(body.get("force", False)))
+                except KeyError as e:
+                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
+                if outcome.status == "restarted":
+                    self._send(200, {"status": "restarted", "session_id": outcome.session_id,
+                                     "lineage_id": outcome.lineage_id,
+                                     "restart_count": outcome.restart_count,
+                                     "restarted_from": body["session_id"]})
+                elif outcome.status == "unknown_session":
+                    if logger is not None:
+                        logger.warning("rpc", "restart_unknown_session",
+                                       session_id=body.get("session_id"), status=404)
+                    self._send(404, {"error": "unknown session"})
+                elif outcome.status == "restart_budget_exhausted":
+                    if logger is not None:
+                        logger.warning("rpc", "restart_budget_exhausted",
+                                       session_id=body.get("session_id"), status=409,
+                                       restart_count=outcome.restart_count,
+                                       max_restarts=outcome.max_restarts)
+                    self._send(409, {"error": "restart_budget_exhausted",
+                                     "restart_count": outcome.restart_count,
+                                     "max_restarts": outcome.max_restarts})
+                else:   # start_failed
+                    self._send(409, {"error": "start_failed"})
             else:
                 self._send(404, {"error": "not found"})
 

@@ -81,3 +81,8 @@ class RpcClient:
     def stop(self, session_id):
         _, body = self._call("POST", "/stop", {"session_id": session_id})
         return body
+
+    def restart(self, session_id, force=False):
+        payload = {"session_id": session_id, "force": force}
+        st, body = self._call("POST", "/restart", payload)
+        return st == 200, body
