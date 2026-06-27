@@ -64,7 +64,8 @@ class SessionManager:
 
     def __init__(self, specs, events, launcher_factory=None, driver_factory=None,
                  concurrency_limit=5, logger=None, session_factory=None,
-                 session_retain=20, session_max_age_days=7, reaper_ctx=None):
+                 session_retain=20, session_max_age_days=7, reaper_ctx=None,
+                 terminal_snapshot_ttl=300.0, clock=time.time):
         self._specs = specs
         self._events = events
         self._limit = concurrency_limit
@@ -73,6 +74,9 @@ class SessionManager:
         self._session_max_age_days = session_max_age_days
         self._reaper_ctx = reaper_ctx
         self._sessions = {}
+        self._terminal = {}            # sid -> (snapshot_dict, expires_at): disappeared-session relay
+        self._terminal_ttl = terminal_snapshot_ttl
+        self._clock = clock
         self._lock = threading.Lock()
         if session_factory is not None:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
@@ -130,7 +134,16 @@ class SessionManager:
 
     def _free_slot(self, session_id):
         with self._lock:
+            sess = self._sessions.get(session_id)
+            snap = None
+            if sess is not None:
+                try:
+                    snap = sess.terminal_snapshot()
+                except Exception:
+                    snap = None
             existed = self._sessions.pop(session_id, None) is not None
+            if snap is not None and self._terminal_ttl:
+                self._terminal[session_id] = (snap, self._clock() + self._terminal_ttl)
         if existed and self._logger is not None:
             self._logger.info("manager", "slot_freed", session_id=session_id)
 
@@ -169,9 +182,14 @@ class SessionManager:
         with self._lock:
             cursor = self._events.latest_seq()        # BEFORE snapshots: never advance past an unseen event
             snapshot = dict(self._sessions)
+            now = self._clock()
+            self._terminal = {sid: (snap, exp) for sid, (snap, exp) in self._terminal.items()
+                              if exp > now}
+            recent = {sid: snap for sid, (snap, exp) in self._terminal.items()}
         return {"sessions": {sid: s.snapshot() for sid, s in snapshot.items()},
                 "limit": self._limit,
-                "cursor": cursor}
+                "cursor": cursor,
+                "recent_terminal": recent}
 
     def stop(self, session_id, reason="user_stop"):
         with self._lock:

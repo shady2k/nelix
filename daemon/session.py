@@ -531,6 +531,7 @@ class Session:
             # render() directly (NOT self.screen(), which also takes self._lock -> deadlock).
             screen = _excerpt(self._handle.render() if self._handle is not None else "",
                               self._spec.status_tail_chars)
+            self._last_screen_excerpt = screen
             if requires_response is None:
                 requires_response = respondable
             if task_delivery is None:
@@ -614,6 +615,17 @@ class Session:
                 snap["message"] = ("Agent is still working. End your turn; nelix will wake "
                                    "you on the next event.")
             return snap
+
+    def terminal_snapshot(self):
+        """Read-only advisory snapshot for a disappearing session, so the companion can relay
+        a completion/crash even after the manager has freed the slot. Display-only; the durable
+        restart count lives in the manager's lineage table."""
+        with self._lock:
+            return {"session_id": self._id, "executor": self._executor,
+                    "task": self._task_raw, "cwd": self._cwd, "state": self._state,
+                    "screen_excerpt": self._last_screen_excerpt,
+                    "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
+                    "restart_count": self.restart_count, "terminal": True}
 
     def respond(self, answer, decision_id=None):
         # Bind to the session's CURRENT pending decision (server owns identity). decision_id is an
