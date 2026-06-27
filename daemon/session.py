@@ -87,7 +87,13 @@ class Session:
         self._norm_since = None        # ts the normalized frame became stable
         self._last_progress = None     # ts of last meaningful (normalized) change (for hang)
         self._last_byte = None         # ts of last PTY byte
-        self._task = None              # held task, delivered once a real input box appears
+        self._task = None              # held task (cleaned), delivered once a real input box appears
+        self._task_raw = None          # original task text, for the human label / restart reuse
+        self._cwd = None               # project dir, for the label / restart reuse / meta
+        self.lineage_id = None         # manager-set: restart chain id (None until manager assigns)
+        self.restarted_from = None     # manager-set: immediate predecessor session_id, or None
+        self.restart_count = 0         # manager-set snapshot of the lineage count (display only)
+        self._last_screen_excerpt = "" # last published screen excerpt (for the terminal snapshot)
         self._task_delivery = "pending"  # pending | delivered | failed
         self._finalized = False        # _finish ran (idempotency guard, under self._lock)
         self._exc = None               # sys.exc_info() if the monitor body raised
@@ -104,6 +110,18 @@ class Session:
     def dialog(self):
         return self._dialog
 
+    @property
+    def executor(self):
+        return self._executor
+
+    @property
+    def task(self):
+        return self._task_raw
+
+    @property
+    def cwd(self):
+        return self._cwd
+
     # ---- lifecycle ----
     def start(self, task, cwd):
         # Non-blocking: spawn the PTY, hold the task, and let the monitor thread own
@@ -112,6 +130,8 @@ class Session:
         # Clean the held task FIRST (CLI-agnostic byte hygiene + the driver's command-prefix
         # policy): a rejected task raises before anything is spawned, and the cleaned text is
         # both what gets typed and what input_submission_present() matches against.
+        self._task_raw = task          # keep the original for labels + restart reuse
+        self._cwd = cwd
         self._task = prepare_pty_input(task, self._driver.command_prefixes)
         self._dialog = Dialog(self._sessions_dir / self._id,
                               tail_lines=self._spec.tail_lines,
@@ -133,7 +153,9 @@ class Session:
         # sessions/<id>/raw at the right size. Private (0600) — same discipline as the raw. Best-effort:
         # never fail a session start over the capture sidecar.
         meta = {"cols": self._cols, "rows": self._rows, "executor": self._executor,
-                "driver": getattr(self._spec, "driver", None)}
+                "driver": getattr(self._spec, "driver", None),
+                "task": self._task_raw, "cwd": self._cwd,
+                "lineage_id": self.lineage_id, "restarted_from": self.restarted_from}
         try:
             with open(paths.session_meta(self._sessions_dir / self._id), "w",
                       opener=paths.private_opener) as f:
@@ -570,8 +592,13 @@ class Session:
     def snapshot(self):
         with self._lock:
             snap = {"session_id": self._id, "executor": self._executor,
+                    "task": self._task_raw, "cwd": self._cwd,
                     "state": self._state,
                     "turn_count": self._dialog.turn_count() if self._dialog else 0}
+            if self.lineage_id is not None:
+                snap["lineage_id"] = self.lineage_id
+                snap["restarted_from"] = self.restarted_from
+                snap["restart_count"] = self.restart_count
             if self._decision is not None:
                 # serve the FROZEN range, not a mutating "latest turn". decision_key is internal
                 # decision identity (never exposed); decision_id is the public guard token.
