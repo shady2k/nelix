@@ -167,9 +167,11 @@ class SessionManager:
                 sess = self._sessions.get(session_id)
             return sess.snapshot() if sess else {"error": "unknown session"}
         with self._lock:
+            cursor = self._events.latest_seq()        # BEFORE snapshots: never advance past an unseen event
             snapshot = dict(self._sessions)
         return {"sessions": {sid: s.snapshot() for sid, s in snapshot.items()},
-                "limit": self._limit}
+                "limit": self._limit,
+                "cursor": cursor}
 
     def stop(self, session_id, reason="user_stop"):
         with self._lock:
