@@ -3,7 +3,6 @@ import paths
 from daemon.config import ExecutorSpec
 from daemon.events import EventQueue
 from daemon.session import Session
-from daemon.drivers.base import Driver
 
 
 class _NoopLauncher:

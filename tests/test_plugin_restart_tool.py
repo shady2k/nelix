@@ -5,14 +5,17 @@ from plugin_loader import load_plugin
 from test_plugin_register import FakeCtx
 
 
-def _load(monkeypatch, tmp_path, restart_result):
+def _load(monkeypatch, tmp_path, restart_result, capture=None):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     nelix = load_plugin()
 
     class _Client:
         def __init__(self, t): pass
         def status(self, sid=None): return {"sessions": {}, "cursor": 3}
-        def restart(self, session_id, force=False): return restart_result
+        def restart(self, session_id, force=False):
+            if capture is not None:
+                capture.append({"session_id": session_id, "force": force})
+            return restart_result
     monkeypatch.setattr(nelix, "RpcClient", _Client)
     monkeypatch.setattr(nelix.supervisor, "endpoint", lambda: object())
     monkeypatch.setattr(nelix.supervisor, "state_file", lambda: str(tmp_path / "st.json"))
@@ -42,3 +45,21 @@ def test_restart_tool_budget_exhausted_no_arm(monkeypatch, tmp_path):
     out = json.loads(ctx.tools["nelix_restart"]["handler"]({"session_id": "s-1"}))
     assert out["error"] == "restart_budget_exhausted"
     assert _n_terminal(ctx) == 0                    # failed restart does not arm a waiter
+
+
+def test_restart_tool_forwards_force_true(monkeypatch, tmp_path):
+    cap = []
+    nelix, ctx = _load(monkeypatch, tmp_path,
+        (True, {"status": "restarted", "session_id": "s-2", "next_after_seq": 0}),
+        capture=cap)
+    ctx.tools["nelix_restart"]["handler"]({"session_id": "s-1", "force": True})
+    assert cap == [{"session_id": "s-1", "force": True}]
+
+
+def test_restart_tool_force_defaults_to_false(monkeypatch, tmp_path):
+    cap = []
+    nelix, ctx = _load(monkeypatch, tmp_path,
+        (True, {"status": "restarted", "session_id": "s-2", "next_after_seq": 0}),
+        capture=cap)
+    ctx.tools["nelix_restart"]["handler"]({"session_id": "s-1"})
+    assert cap == [{"session_id": "s-1", "force": False}]

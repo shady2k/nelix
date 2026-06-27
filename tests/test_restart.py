@@ -2,7 +2,7 @@ import json
 import paths
 import pytest
 from daemon.events import EventQueue
-from daemon.manager import SessionManager, RestartOutcome
+from daemon.manager import SessionManager
 from daemon.config import ExecutorSpec
 
 

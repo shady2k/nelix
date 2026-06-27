@@ -59,10 +59,9 @@ def register(ctx):
         resolve_launcher("auto")               # isolation parity: fail closed
         transport = supervisor.ensure_running()
         body = RpcClient(transport).start(args["executor"], args["task"], cwd)
-        # The daemon owns the cursor: arm the wake past anything emitted before this session,
-        # scoped to this session so cross-session events never produce a stale wake. Only arm on a
-        # successful start — a failed start (e.g. bad cwd) has no session, so an unscoped waiter
-        # would later wake on an unrelated session's event.
+        # Advance the observed cursor to the base seq of this new session, then arm one global
+        # waiter (no session_id) from it. Only arm on a successful start — a failed start
+        # (e.g. bad cwd) has no session and must not produce a stale wake.
         if body.get("session_id"):
             cursor.on_start(int(body.get("next_after_seq", 0)), daemon_id=_daemon_id())
             _arm()

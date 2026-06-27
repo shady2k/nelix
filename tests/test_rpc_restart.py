@@ -1,5 +1,4 @@
 import threading
-import pytest
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
 from daemon.transport import Transport
@@ -65,6 +64,27 @@ def test_restart_route_force_passed_through():
     try:
         _req("POST", base + "/restart", body={"session_id": "s-old", "force": True})
         assert mgr.calls == [("s-old", True)]
+    finally:
+        srv.shutdown()
+
+
+def test_restart_route_missing_session_id_is_400():
+    mgr = _RestartManager(RestartOutcome("restarted", session_id="s-new", lineage_id="s-old",
+                                         restart_count=1, max_restarts=3))
+    srv, base = _serve(mgr, 8776)
+    try:
+        st, b = _req("POST", base + "/restart", body={})   # no session_id field
+        assert st == 400 and "session_id" in b["error"]
+    finally:
+        srv.shutdown()
+
+
+def test_restart_route_start_failed_is_409():
+    mgr = _RestartManager(RestartOutcome("start_failed"))
+    srv, base = _serve(mgr, 8777)
+    try:
+        st, b = _req("POST", base + "/restart", body={"session_id": "s-old"})
+        assert st == 409 and b["error"] == "start_failed"
     finally:
         srv.shutdown()
 
