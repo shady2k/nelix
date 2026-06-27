@@ -473,3 +473,27 @@ def test_unexpected_exception_returns_json_500_and_logs():
     finally:
         srv.shutdown()
     assert "request_exception" in buf.getvalue()
+
+
+def test_unix_foreign_uid_is_rejected(monkeypatch, unix_sock, fake_manager):
+    """A known-foreign uid must yield 401 — the peercred boundary is enforced."""
+    import io, os
+    buf = io.StringIO()
+    from daemon.obs import Logger
+    server = make_server(fake_manager, Transport.unix(unix_sock),
+                         logger=Logger(level="debug", stream=buf))
+    # Patch peer_uid inside daemon.transport so the real peer_is_self logic is exercised
+    # but sees a uid that is definitively not ours.
+    monkeypatch.setattr("daemon.transport.peer_uid", lambda _sock: os.getuid() + 1)
+    try:
+        _start_bg(server)
+        conn = http.client.HTTPConnection("localhost")
+        conn.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        conn.sock.connect(unix_sock)
+        conn.request("GET", "/status")          # NO X-Nelix-Token header
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 401
+    finally:
+        server.shutdown(); server.server_close()
+    assert "unauthorized_peer" in buf.getvalue()

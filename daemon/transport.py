@@ -47,7 +47,7 @@ def peer_uid(sock):
     (struct xucred; cr_uid is the 2nd 32-bit field after cr_version)."""
     try:
         if sys.platform.startswith("linux"):
-            # struct ucred { pid_t pid; uid_t uid; gid_t gid; } == 3 * uint32
+            # struct ucred { pid_t pid; uid_t uid; gid_t gid; } — unpacked as 3 signed int32 (real uids < 2^31; fail-closed)
             buf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
             _pid, uid, _gid = struct.unpack("3i", buf)
             return uid

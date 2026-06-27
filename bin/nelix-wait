@@ -6,7 +6,7 @@ So the wake carries ONLY small triage metadata (session_id, seq, kind, requires_
 never the executor's screen_excerpt or its trust fence, which can be large enough to truncate the
 actionable fields away. Hermes pulls the authoritative state — and the decision_id it answers
 against — from nelix_status, an uncapped tool-result channel."""
-import argparse, json, os, sys
+import argparse, http.client, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from daemon.transport import Transport
@@ -49,7 +49,7 @@ def main():
             try:
                 _st, body = client._call("GET", path, timeout=40)
                 evt = body.get("event")
-            except (OSError, Exception):
+            except (OSError, ConnectionError, http.client.HTTPException):
                 # Daemon gone/unreachable (e.g. torn down, restarting). Don't crash with a
                 # traceback — exit cleanly so notify_on_complete wakes Hermes to reconcile
                 # via nelix_status instead of surfacing a scary background failure.

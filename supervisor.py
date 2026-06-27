@@ -219,7 +219,10 @@ def _write_state(pid: int, transport) -> None:
 def endpoint():
     """Return the live daemon's Transport, or None if no healthy daemon is running."""
     st = _read_state()
-    if not st or not _pid_alive(st.get("pid", -1)):
+    if not st:
+        return None
+    pid = st.get("pid")
+    if not pid or not _pid_alive(pid):
         return None
     try:
         t = Transport.from_state(st)
