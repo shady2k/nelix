@@ -1,6 +1,7 @@
 import json
 import os
 import socket
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -215,7 +216,12 @@ class UnixHTTPServer(ThreadingHTTPServer):
             os.unlink(self.server_address)
         except FileNotFoundError:
             pass
-        super().server_bind()
+        # Bind via the grandparent so HTTPServer.server_bind's getfqdn()/(host,port) slicing of the
+        # AF_UNIX path string never runs (it would set server_name/server_port to garbage and do a
+        # reverse-DNS attempt at startup). server_name/port are meaningless for AF_UNIX.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = 0
 
 
 def _make_unix_server(path, handler):
