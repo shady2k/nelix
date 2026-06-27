@@ -62,6 +62,35 @@ def test_render_raw_defaults_match_session_dims():
     assert len(out.split("\n")) == 40              # rows=40 viewport
 
 
+def test_render_drops_stray_kitty_keyboard_u():
+    # Regression (nelix-quv): Claude Code emits kitty-keyboard CSI sequences at startup
+    # (ESC[<u pop, ESC[>1u push). pyte does not know the '<' private prefix, terminates the
+    # CSI early on '<' and DRAWS the trailing 'u' as text -> a stray 'u' at the top of the grid
+    # that leaks into every screen_excerpt. The double-pop case yields 'uu'. Strip them.
+    from daemon.pty_session import render_raw
+    out = render_raw(b"\x1b[H\x1b[<u\x1b[>1u")
+    assert not out.splitlines()[0].startswith("u")
+    out2 = render_raw(b"\x1b[H\x1b[<u\x1b[<u")          # double pop -> 'uu' in the wild
+    assert not out2.splitlines()[0].startswith("u")
+
+
+def test_render_keeps_real_u_text():
+    # The filter must be surgical: a literal 'u' in real output, and a bare CSI ending in 'u'
+    # WITHOUT a kitty private prefix (e.g. SCO restore-cursor ESC[u), must survive untouched.
+    from daemon.pty_session import render_raw
+    assert "menu" in render_raw(b"menu")
+    assert "u-tail" in render_raw(b"\x1b[uu-tail")     # ESC[u (no <>=? prefix) is not kitty
+
+
+def test_pump_drops_kitty_u_split_across_reads():
+    # The kitty sequence can straddle two os.read() chunks. A per-chunk filter would miss the
+    # split and leak the 'u'; the carry buffer must hold the partial CSI across _feed() calls.
+    s = PtySession(None, 0, 0, cols=80, rows=24)        # pure: no fd, just feed bytes
+    s._feed(b"\x1b[H\x1b[<")                            # partial kitty sequence: ESC[< (no final byte yet)
+    s._feed(b"u\x1b[>1u")                              # completes 'u' + a push in the next read
+    assert not s.render().splitlines()[0].startswith("u")
+
+
 def test_render_captures_child_output():
     master, pid, pgid = _spawn(["printf", "HELLO-NELIX\\n"], cols=40, rows=10)
     s = PtySession(master, pid, pgid, cols=40, rows=10)

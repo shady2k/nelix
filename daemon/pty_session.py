@@ -1,10 +1,34 @@
 import os
+import re
 import select
 import time
 
 import pyte
 
 from daemon.errors import PtyWriteTimeout
+
+
+# Kitty-keyboard CSI sequences Claude Code emits at startup: CSI <priv> <params> u
+# (push/pop/set/query flags, e.g. ESC[<u, ESC[>1u). pyte does not recognise the '<' private
+# prefix, terminates the CSI early on it, and DRAWS the trailing 'u' as text -> a stray 'u' at
+# the top of every screen_excerpt (nelix-quv). They have no effect on a rendered screen, so
+# dropping them before pyte sees them is loss-free.
+_KITTY_KBD_RE = re.compile(rb"\x1b\[[<>=?][0-9;]*u")
+# A trailing partial CSI that could still grow into a kitty sequence (ESC / ESC[ / ESC[<12;3)
+# and so must be held back, not fed, until the next read completes it.
+_KITTY_TAIL_RE = re.compile(rb"\x1b(?:\[(?:[<>=?][0-9;]*)?)?\Z")
+
+
+def _filter_kitty_kbd(data, carry=b""):
+    """Strip kitty-keyboard CSI sequences so pyte never draws their trailing 'u' as text.
+    Returns (clean, carry): `clean` is safe to feed pyte now; `carry` is a trailing partial CSI to
+    prepend next call so a sequence split across reads is not missed (empty for one-shot callers)."""
+    buf = carry + data
+    buf = _KITTY_KBD_RE.sub(b"", buf)
+    m = _KITTY_TAIL_RE.search(buf)
+    if m:
+        return buf[: m.start()], buf[m.start() :]
+    return buf, b""
 
 
 def _row_text(row):
@@ -27,7 +51,8 @@ def render_raw(data, cols=120, rows=40):
     a session's persisted `raw` replays at the size it was captured. The conformance harness and the
     nelix-capture tool use this for faithful, live-process-free golden frames."""
     screen = make_pyte_screen(cols, rows)
-    pyte.ByteStream(screen).feed(data)
+    clean, _ = _filter_kitty_kbd(data)
+    pyte.ByteStream(screen).feed(clean)
     return "\n".join(screen.display)
 
 
@@ -43,6 +68,7 @@ class PtySession:
         self._screen = make_pyte_screen(cols, rows)
         self._stream = pyte.ByteStream(self._screen)
         self._history_committed = 0   # how many top-history lines already added to the dialog
+        self._kitty_carry = b""       # trailing partial kitty-kbd CSI held across reads
 
     def pump(self, timeout=0.1):
         if self._fd is None or self._eof_seen:
@@ -72,7 +98,8 @@ class PtySession:
         # scrolled-off lines. Shared by pump() and by drain-during-write in write().
         if self._dialog is not None:
             self._dialog.append_raw(data)
-        self._stream.feed(data)
+        clean, self._kitty_carry = _filter_kitty_kbd(data, self._kitty_carry)
+        self._stream.feed(clean)
         self._commit_scrolled()
 
     def _commit_scrolled(self):
