@@ -96,9 +96,10 @@ def load_executors(path):
     return ExecutorLoad(specs, errors, None)
 
 
-def load_concurrency_limit(path, default=1):
+def load_concurrency_limit(path, default=5):
     """Top-level concurrency cap. Malformed TOML/IO or a non-int / bool / below-1 value
-    falls back to `default` (mirrors load_retention's _cfg_int) — never crash the load."""
+    falls back to `default` (mirrors load_retention's _cfg_int) — never crash the load.
+    Default 5 is the supported concurrent-executor target; raise it in nelix.toml if needed."""
     try:
         with open(path, "rb") as f:
             data = tomllib.load(f)

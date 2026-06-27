@@ -60,10 +60,10 @@ def _default_session_factory(sid, executor, spec, events, launcher_factory,
 
 
 class SessionManager:
-    """Registry of sessions. MVP holds <= concurrency_limit (default 1)."""
+    """Registry of sessions. Holds <= concurrency_limit (config-driven, default 5)."""
 
     def __init__(self, specs, events, launcher_factory=None, driver_factory=None,
-                 concurrency_limit=1, logger=None, session_factory=None,
+                 concurrency_limit=5, logger=None, session_factory=None,
                  session_retain=20, session_max_age_days=7, reaper_ctx=None):
         self._specs = specs
         self._events = events
@@ -101,7 +101,7 @@ class SessionManager:
                                          reason="concurrency_limit", executor=executor_name)
                 raise RuntimeError(
                     f"concurrency_limit={self._limit} reached "
-                    f"(active: {sorted(self._sessions)}); concurrent executors are post-MVP")
+                    f"(active: {sorted(self._sessions)})")
             sid = f"s-{uuid.uuid4().hex[:8]}"
             base_seq = self._events.latest_seq()      # waiter arms past anything already emitted
             sess = self._make(sid, executor_name, spec)
