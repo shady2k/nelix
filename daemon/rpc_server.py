@@ -1,4 +1,6 @@
 import json
+import os
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -6,6 +8,7 @@ import paths
 from daemon.dialog import DialogReader
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hygiene import PtyInputRejected
+from daemon.transport import peer_is_self
 
 _MAX_BODY = 4 * 1024 * 1024   # 4 MiB body cap (post-auth memory hygiene; generous for tasks)
 
@@ -19,9 +22,20 @@ class _BadRequest(Exception):
         self.msg = msg
 
 
-def make_server(manager, token, host="127.0.0.1", port=8765, logger=None):
+def make_server(manager, transport, logger=None):
+    is_unix = transport.kind == "unix"
+    token = transport.token
+
     class Handler(BaseHTTPRequestHandler):
         def _auth(self):
+            # unix: no token — the 0600 node is the boundary; peercred rejects a known foreign uid.
+            # tcp: shared-secret token (the credential that crosses the container line).
+            if is_unix:
+                if peer_is_self(self.connection):
+                    return True
+                if logger is not None:
+                    logger.warning("rpc", "unauthorized_peer", path=self.path, status=401)
+                self._send(401, {"error": "unauthorized"}); return False
             if self.headers.get("X-Nelix-Token") != token:
                 if logger is not None:
                     logger.warning("rpc", "unauthorized", path=self.path, status=401)
@@ -187,7 +201,29 @@ def make_server(manager, token, host="127.0.0.1", port=8765, logger=None):
         def log_message(self, *a):
             pass
 
-    return ThreadingHTTPServer((host, port), Handler)
+    if is_unix:
+        return _make_unix_server(transport.path, Handler)
+    return ThreadingHTTPServer((transport.host, transport.port), Handler)
+
+
+class UnixHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_UNIX
+
+    def server_bind(self):
+        # Stale node from a prior daemon would EADDRINUSE; unlink first.
+        try:
+            os.unlink(self.server_address)
+        except FileNotFoundError:
+            pass
+        super().server_bind()
+
+
+def _make_unix_server(path, handler):
+    server = UnixHTTPServer(path, handler, bind_and_activate=False)
+    server.server_bind()
+    os.chmod(path, 0o600)                 # node readable/writable by owner only; no listen yet
+    server.server_activate()
+    return server
 
 
 def _evt_dict(e):

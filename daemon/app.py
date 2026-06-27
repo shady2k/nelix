@@ -14,6 +14,7 @@ from daemon.events import EventQueue
 from daemon.manager import SessionManager
 from daemon.obs import Logger
 from daemon.rpc_server import make_server
+from daemon.transport import Transport
 
 _LOCK_FD = None   # held for the daemon's lifetime: closing it releases the singleton flock
 
@@ -110,7 +111,7 @@ def main():
     reaper.reconcile_orphans(paths.sessions_root(), reaper_ctx.daemon_pid,
                              reaper_ctx.daemon_fingerprint, grace,
                              reaper_ctx.inspector, reaper_ctx.killer, logger=logger)
-    server = make_server(manager, token=token, port=port, logger=logger)
+    server = make_server(manager, Transport.tcp("127.0.0.1", port, token), logger=logger)
     logger.info("app", "daemon_started", executors=sorted(specs), limit=limit,
                 log_level=level_cfg.level, port=port)
     warn_invalid_log_level(logger, level_cfg)

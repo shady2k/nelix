@@ -3,6 +3,7 @@ from conftest import EXECUTOR
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
+from daemon.transport import Transport
 from rpc_client import RpcClient
 
 
@@ -18,7 +19,7 @@ class FakeManager:
 
 def test_rpc_client_roundtrip():
     m = FakeManager()
-    srv = make_server(m, token="t", port=8781)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8781, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         c = RpcClient("http://127.0.0.1:8781", "t")
@@ -52,7 +53,7 @@ class FakeManagerDialog:
 def test_rpc_client_dialog(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerDialog()
-    srv = make_server(m, token="t", port=8782)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8782, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         c = RpcClient("http://127.0.0.1:8782", "t")

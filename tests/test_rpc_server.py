@@ -1,8 +1,12 @@
+import http.client
 import json, threading, urllib.error, urllib.request
+import socket as _socket
+import pytest
 from conftest import EXECUTOR
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
+from daemon.transport import Transport
 
 
 class FakeManager:
@@ -20,6 +24,29 @@ class FakeManager:
     def stop(self, session_id): self.stopped.append(session_id); return True
 
 
+@pytest.fixture
+def fake_manager():
+    return FakeManager()
+
+
+@pytest.fixture
+def unix_sock(tmp_path):
+    """Short AF_UNIX socket path (≤103 chars incl. NUL).
+
+    pytest tmp_path on macOS resolves through /private/var/folders/… and easily
+    exceeds the 104-byte sun_path limit.  Hash tmp_path for uniqueness; put the
+    node directly under /tmp so the total stays ~20 chars.
+    """
+    import hashlib, os as _os
+    h = hashlib.md5(str(tmp_path).encode()).hexdigest()[:8]
+    p = f"/tmp/nx{h}.sock"
+    yield p
+    try:
+        _os.unlink(p)
+    except FileNotFoundError:
+        pass
+
+
 def _req(method, url, token="t", body=None):
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(url, data=data, method=method, headers={"X-Nelix-Token": token})
@@ -32,7 +59,7 @@ def _req(method, url, token="t", body=None):
 
 def test_rpc_session_scoped_roundtrip():
     m = FakeManager()
-    srv = make_server(m, token="t", port=8766)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8766, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:8766"
     try:
@@ -58,7 +85,7 @@ def test_rpc_session_scoped_roundtrip():
 
 
 def test_respond_missing_answer_is_400():
-    srv = make_server(FakeManager(), token="t", port=8786)
+    srv = make_server(FakeManager(), Transport.tcp("127.0.0.1", 8786, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", "http://127.0.0.1:8786/respond", body={"session_id": "s1"})
@@ -117,7 +144,7 @@ def test_responses_are_utf8_not_ascii_escaped():
     class CyrManager:
         def status(self, session_id=None):
             return {"msg": "вторая строка ❯"}
-    srv = make_server(CyrManager(), token="t", port=8779)
+    srv = make_server(CyrManager(), Transport.tcp("127.0.0.1", 8779, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         r = urllib.request.Request("http://127.0.0.1:8779/status?session_id=s1",
@@ -131,7 +158,7 @@ def test_responses_are_utf8_not_ascii_escaped():
 
 
 def test_rpc_requires_token():
-    srv = make_server(FakeManager(), token="t", port=8767)
+    srv = make_server(FakeManager(), Transport.tcp("127.0.0.1", 8767, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         r = urllib.request.Request("http://127.0.0.1:8767/status", method="GET")
@@ -155,7 +182,7 @@ class FakeManagerRaisesValueError:
 
 def test_rpc_start_value_error_returns_409():
     m = FakeManagerRaisesValueError()
-    srv = make_server(m, token="t", port=8768)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8768, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", "http://127.0.0.1:8768/start",
@@ -188,7 +215,7 @@ class FakeManagerWithDialog:
 
 def test_status_includes_decision():
     m = FakeManagerWithDialog()
-    srv = make_server(m, token="t", port=8770)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8770, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("GET", "http://127.0.0.1:8770/status?session_id=s1")
@@ -201,7 +228,7 @@ def test_status_includes_decision():
 def test_dialog_paginates_turn_and_defaults_to_latest(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerWithDialog()
-    srv = make_server(m, token="t", port=8771)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8771, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("GET", "http://127.0.0.1:8771/dialog?session_id=s1&turn=1&offset=2")
@@ -217,7 +244,7 @@ def test_dialog_paginates_turn_and_defaults_to_latest(monkeypatch, tmp_path):
 
 def test_rpc_start_missing_field_returns_400():
     m = FakeManager()
-    srv = make_server(m, token="t", port=8769)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8769, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         # body missing "task" key
@@ -231,7 +258,7 @@ def test_rpc_start_missing_field_returns_400():
 
 def test_rpc_start_missing_cwd_returns_400():
     m = FakeManager()
-    srv = make_server(m, token="t", port=8772)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8772, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         # cwd is required: a start without a working dir must be rejected, not defaulted.
@@ -260,7 +287,7 @@ def test_evt_dict_includes_new_fields():
 
 def test_bad_int_query_param_is_400():
     m = FakeManager()
-    srv = make_server(m, token="t", port=8783)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8783, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("GET", "http://127.0.0.1:8783/wait?after_seq=notanint")
@@ -272,7 +299,7 @@ def test_bad_int_query_param_is_400():
 def test_malformed_json_body_is_400():
     import http.client
     m = FakeManager()
-    srv = make_server(m, token="t", port=8784)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8784, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         c = http.client.HTTPConnection("127.0.0.1", 8784, timeout=5)
@@ -287,7 +314,7 @@ def test_malformed_json_body_is_400():
 def test_oversized_body_is_413():
     import http.client
     m = FakeManager()
-    srv = make_server(m, token="t", port=8785)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8785, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         c = http.client.HTTPConnection("127.0.0.1", 8785, timeout=5)
@@ -315,7 +342,7 @@ class FakeManagerWithScreen:
 
 def test_screen_endpoint_returns_live_viewport():
     m = FakeManagerWithScreen()
-    srv = make_server(m, token="t", port=8773)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8773, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("GET", "http://127.0.0.1:8773/screen?session_id=s1")
@@ -343,7 +370,7 @@ class FakeManagerWorkingScreen:
 
 def test_screen_endpoint_withholds_while_working_unless_force():
     m = FakeManagerWorkingScreen()
-    srv = make_server(m, token="t", port=8774)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8774, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("GET", "http://127.0.0.1:8774/screen?session_id=s1")
@@ -355,9 +382,41 @@ def test_screen_endpoint_withholds_while_working_unless_force():
         srv.shutdown()
 
 
+def _start_bg(server):
+    """Start server.serve_forever in a daemon thread; return the thread."""
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return t
+
+
+def test_unix_transport_serves_status_without_a_token(unix_sock, fake_manager):
+    server = make_server(fake_manager, Transport.unix(unix_sock))
+    try:
+        _start_bg(server)
+        conn = http.client.HTTPConnection("localhost")     # host ignored; we override the socket
+        conn.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        conn.sock.connect(unix_sock)
+        conn.request("GET", "/status")                      # NO X-Nelix-Token header
+        resp = conn.getresponse()
+        assert resp.status == 200
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_unix_socket_node_is_0600(unix_sock, fake_manager):
+    import os, stat
+    server = make_server(fake_manager, Transport.unix(unix_sock))
+    try:
+        mode = stat.S_IMODE(os.stat(unix_sock).st_mode)
+        assert mode == 0o600
+    finally:
+        server.server_close()
+
+
 def _serve(manager, buf):
     from daemon.obs import Logger
-    srv = make_server(manager, token="t", port=0, logger=Logger(level="debug", stream=buf))
+    srv = make_server(manager, Transport.tcp("127.0.0.1", 0, "t"),
+                      logger=Logger(level="debug", stream=buf))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     _, port = srv.server_address          # ephemeral port chosen by the OS
     return srv, f"http://127.0.0.1:{port}"
@@ -387,7 +446,7 @@ def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
 
     class _Mgr:                                   # session no longer live in the registry
         def get(self, sid): return None
-    srv = make_server(_Mgr(), token="t", port=0)
+    srv = make_server(_Mgr(), Transport.tcp("127.0.0.1", 0, "t"))
     threading.Thread(target=srv.handle_request, daemon=True).start()
     host, port = srv.server_address
     try:
