@@ -87,7 +87,14 @@ class Session:
         self._norm_since = None        # ts the normalized frame became stable
         self._last_progress = None     # ts of last meaningful (normalized) change (for hang)
         self._last_byte = None         # ts of last PTY byte
-        self._task = None              # held task, delivered once a real input box appears
+        self._task = None              # held task (cleaned), delivered once a real input box appears
+        self._task_raw = None          # original task text, for the human label / restart reuse
+        self._cwd = None               # project dir, for the label / restart reuse / meta
+        self.lineage_id = None         # manager-set: restart chain id (None until manager assigns)
+        self.restarted_from = None     # manager-set: immediate predecessor session_id, or None
+        self.restart_count = 0         # manager-set snapshot of the lineage count (display only)
+        self._last_screen_excerpt = "" # last published screen excerpt (for the terminal snapshot)
+        self._terminal_kind = None     # done | crashed | delivery_failed (set at each terminal point)
         self._task_delivery = "pending"  # pending | delivered | failed
         self._finalized = False        # _finish ran (idempotency guard, under self._lock)
         self._exc = None               # sys.exc_info() if the monitor body raised
@@ -104,6 +111,18 @@ class Session:
     def dialog(self):
         return self._dialog
 
+    @property
+    def executor(self):
+        return self._executor
+
+    @property
+    def task(self):
+        return self._task_raw
+
+    @property
+    def cwd(self):
+        return self._cwd
+
     # ---- lifecycle ----
     def start(self, task, cwd):
         # Non-blocking: spawn the PTY, hold the task, and let the monitor thread own
@@ -112,6 +131,8 @@ class Session:
         # Clean the held task FIRST (CLI-agnostic byte hygiene + the driver's command-prefix
         # policy): a rejected task raises before anything is spawned, and the cleaned text is
         # both what gets typed and what input_submission_present() matches against.
+        self._task_raw = task          # keep the original for labels + restart reuse
+        self._cwd = cwd
         self._task = prepare_pty_input(task, self._driver.command_prefixes)
         self._dialog = Dialog(self._sessions_dir / self._id,
                               tail_lines=self._spec.tail_lines,
@@ -133,7 +154,9 @@ class Session:
         # sessions/<id>/raw at the right size. Private (0600) — same discipline as the raw. Best-effort:
         # never fail a session start over the capture sidecar.
         meta = {"cols": self._cols, "rows": self._rows, "executor": self._executor,
-                "driver": getattr(self._spec, "driver", None)}
+                "driver": getattr(self._spec, "driver", None),
+                "task": self._task_raw, "cwd": self._cwd,
+                "lineage_id": self.lineage_id, "restarted_from": self.restarted_from}
         try:
             with open(paths.session_meta(self._sessions_dir / self._id), "w",
                       opener=paths.private_opener) as f:
@@ -307,6 +330,7 @@ class Session:
         # Give up cleanly: do NOT press Enter, do NOT re-type. Mark failed so the run loop
         # exits, and wake Hermes with a non-respondable advisory; the human stops + restarts.
         self._task_delivery = "failed"
+        self._terminal_kind = "delivery_failed"
         self._handle.flush_viewport(self._dialog)
         self._publish("delivery_failed", hint=reason, hung=False,
                       requires_response=False, task_delivery="failed")
@@ -386,6 +410,7 @@ class Session:
         if self._exc is not None:
             with self._lock:
                 self._state = "crashed"
+                self._terminal_kind = "crashed"
             self._publish("crashed", hint=None, hung=False, requires_response=False)
             if self._log is not None:
                 self._log.error("session", "monitor_exception", session_id=self._id,
@@ -394,30 +419,36 @@ class Session:
                     self._log_exited("monitor_exception", status)
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return
-        # 2. executor genuinely exited -> the ONE terminal exit event, status-mapped
+        # 2. delivery_failed already surfaced -> no bogus terminal event, no executor_exited.
+        # Checked BEFORE the not-alive branch: if the child exits after _fail_delivery publishes,
+        # that terminal kind is authoritative and must not be overwritten by the exit branch.
+        # Distinct from _delivery_tick setting _task_delivery="failed" without surfacing the event
+        # (child died mid-delivery): that path has _terminal_kind=None and falls through to branch 3.
+        if self._terminal_kind == "delivery_failed":
+            if self._log is not None:
+                self._log.debug("session", "monitor_exited", session_id=self._id)
+            return
+        # 3. executor genuinely exited -> the ONE terminal exit event, status-mapped
         if not alive:
             kind, final_state = self._exit_kind(status)
             with self._lock:
                 self._state = final_state
+                self._terminal_kind = "done" if kind == "done" else "crashed"
             self._publish("done" if kind == "done" else "crashed",
                           hint=None, hung=False, requires_response=False)
             self._log_exited(kind if kind == "done" else "crashed", status)
             if self._log is not None:
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return
-        # 3. operator stopped a LIVE agent -> manager logs session_stopped; no executor_exited
+        # 4. operator stopped a LIVE agent -> manager logs session_stopped; no executor_exited
         if self._stop.is_set():
-            if self._log is not None:
-                self._log.debug("session", "monitor_exited", session_id=self._id)
-            return
-        # 4. delivery already failed AND surfaced -> no bogus crashed, no executor_exited
-        if self._task_delivery == "failed":
             if self._log is not None:
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return
         # 5. crash banner while leader is still alive
         with self._lock:
             self._state = "crashed"
+            self._terminal_kind = "crashed"
         self._publish("crashed", hint=None, hung=False, requires_response=False)
         if self._log is not None:
             self._log.warning("session", "cli_crashed", session_id=self._id)
@@ -509,6 +540,7 @@ class Session:
             # render() directly (NOT self.screen(), which also takes self._lock -> deadlock).
             screen = _excerpt(self._handle.render() if self._handle is not None else "",
                               self._spec.status_tail_chars)
+            self._last_screen_excerpt = screen
             if requires_response is None:
                 requires_response = respondable
             if task_delivery is None:
@@ -570,8 +602,13 @@ class Session:
     def snapshot(self):
         with self._lock:
             snap = {"session_id": self._id, "executor": self._executor,
+                    "task": self._task_raw, "cwd": self._cwd,
                     "state": self._state,
                     "turn_count": self._dialog.turn_count() if self._dialog else 0}
+            if self.lineage_id is not None:
+                snap["lineage_id"] = self.lineage_id
+                snap["restarted_from"] = self.restarted_from
+                snap["restart_count"] = self.restart_count
             if self._decision is not None:
                 # serve the FROZEN range, not a mutating "latest turn". decision_key is internal
                 # decision identity (never exposed); decision_id is the public guard token.
@@ -587,6 +624,18 @@ class Session:
                 snap["message"] = ("Agent is still working. End your turn; nelix will wake "
                                    "you on the next event.")
             return snap
+
+    def terminal_snapshot(self):
+        """Read-only advisory snapshot for a disappearing session, so the companion can relay
+        a completion/crash even after the manager has freed the slot. Display-only; the durable
+        restart count lives in the manager's lineage table."""
+        with self._lock:
+            return {"session_id": self._id, "executor": self._executor,
+                    "task": self._task_raw, "cwd": self._cwd, "state": self._state,
+                    "terminal_kind": self._terminal_kind,
+                    "screen_excerpt": self._last_screen_excerpt,
+                    "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
+                    "restart_count": self.restart_count, "terminal": True}
 
     def respond(self, answer, decision_id=None):
         # Bind to the session's CURRENT pending decision (server owns identity). decision_id is an

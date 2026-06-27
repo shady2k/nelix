@@ -7,6 +7,10 @@ from .rpc_client import RpcClient
 from .launcher_resolve import resolve_launcher
 from .wake import arm_waiter
 from . import supervisor, registry
+try:
+    from .nelix_cursor import CursorState
+except ImportError:
+    from nelix_cursor import CursorState
 
 _log = logging.getLogger("nelix")
 _OBJ = {"type": "object", "additionalProperties": False}
@@ -23,6 +27,24 @@ def _j(obj):
 def register(ctx):
     registry.seed_if_absent()
 
+    cursor = CursorState()         # one global wake cursor + arm-dedup for this plugin process
+
+    def _daemon_id():
+        # Identity of the live daemon (its pid from the supervisor state file), so the cursor resets
+        # reliably across a daemon teardown/restart (not via a fragile seq heuristic).
+        try:
+            with open(supervisor.state_file()) as f:
+                return json.load(f).get("pid")
+        except (OSError, ValueError):
+            return None
+
+    def _arm():
+        # One global waiter (no session_id), armed from observed_cursor, deduped so a start burst
+        # spawns exactly one waiter. Call after every start/respond/restart.
+        if cursor.should_arm():
+            arm_waiter(ctx, after_seq=cursor.arm_after(), state_file=supervisor.state_file())
+            cursor.mark_armed()
+
     def nelix_start(args, **k):
         # cwd is per-session: caller-supplied project dir, else this orchestrator's own
         # working dir (no static config cwd). The daemon resolves/validates it host-side.
@@ -37,20 +59,22 @@ def register(ctx):
         resolve_launcher("auto")               # isolation parity: fail closed
         transport = supervisor.ensure_running()
         body = RpcClient(transport).start(args["executor"], args["task"], cwd)
-        # The daemon owns the cursor: arm the wake past anything emitted before this session,
-        # scoped to this session so cross-session events never produce a stale wake. Only arm on a
-        # successful start — a failed start (e.g. bad cwd) has no session, so an unscoped waiter
-        # would later wake on an unrelated session's event.
+        # Advance the observed cursor to the base seq of this new session, then arm one global
+        # waiter (no session_id) from it. Only arm on a successful start — a failed start
+        # (e.g. bad cwd) has no session and must not produce a stale wake.
         if body.get("session_id"):
-            arm_waiter(ctx, after_seq=int(body.get("next_after_seq", 0)),
-                       session_id=body["session_id"], state_file=supervisor.state_file())
+            cursor.on_start(int(body.get("next_after_seq", 0)), daemon_id=_daemon_id())
+            _arm()
         return _j(body)
 
     def nelix_status(args, **k):
         transport = supervisor.endpoint()
         if transport is None:
             return _j({"sessions": {}})
-        return _j(RpcClient(transport).status(args.get("session_id")))
+        body = RpcClient(transport).status(args.get("session_id"))
+        if isinstance(body, dict) and "cursor" in body:       # only the all-sessions read carries it
+            cursor.on_status(body["cursor"])
+        return _j(body)
 
     def nelix_respond(args, **k):
         _log.info("nelix_respond session=%s decision=%s", args["session_id"],
@@ -63,9 +87,8 @@ def register(ctx):
         ok, body = RpcClient(transport).respond(
             args["session_id"], args["answer"], decision_id=args.get("decision_id"))
         if ok:
-            # The daemon owns the cursor: arm the next doorbell past the decision we just answered.
-            arm_waiter(ctx, after_seq=int(body.get("next_after_seq", 0)),
-                       session_id=args["session_id"], state_file=supervisor.state_file())
+            cursor.on_respond(int(body.get("next_after_seq", 0)))   # no-op for the cursor
+            _arm()                                                  # one global waiter, from cursor
         return _j(body)
 
     def nelix_stop(args, **k):
@@ -80,6 +103,17 @@ def register(ctx):
             return _j({"error": "no active nelix daemon"})
         return _j(RpcClient(transport).dialog(
             args["session_id"], args.get("turn"), int(args.get("offset", 0)), args.get("limit")))
+
+    def nelix_restart(args, **k):
+        _log.info("nelix_restart session=%s force=%s", args["session_id"], args.get("force"))
+        transport = supervisor.endpoint()
+        if transport is None:
+            return _j({"error": "no active nelix daemon"})
+        ok, body = RpcClient(transport).restart(args["session_id"], force=bool(args.get("force", False)))
+        if ok:
+            # Restart succeeded -> a new session exists; arm the one global waiter from the cursor.
+            _arm()
+        return _j(body)
 
     def nelix_screen(args, **k):
         transport = supervisor.endpoint()
@@ -134,6 +168,18 @@ def register(ctx):
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
                         "required": ["session_id"]}},
         nelix_stop)
+    ctx.register_tool(
+        "nelix_restart", "nelix",
+        {"description": (
+            "Restart a crashed or wedged agent by session_id — one call, reusing its original task,"
+            " project, and agent (you do NOT re-state the task). The daemon counts restarts per agent"
+            " and refuses past its max_restarts with 'restart_budget_exhausted'; relay that to the user"
+            " and only pass force:true if they explicitly authorize continuing. After it succeeds, end"
+            " your turn — nelix wakes you on the next event."),
+         "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
+                                               "force": {"type": "boolean"}},
+                        "required": ["session_id"]}},
+        nelix_restart)
     ctx.register_tool(
         "nelix_dialog", "nelix",
         {"description": ("Read an agent's transcript: the latest turn by default, or an earlier `turn`"
