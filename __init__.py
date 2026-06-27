@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 
 from .rpc_client import RpcClient
-from .daemon.transport import Transport
 from .launcher_resolve import resolve_launcher
 from .wake import arm_waiter
 from . import supervisor, registry
@@ -19,13 +18,6 @@ _dumps = json.dumps
 def _j(obj):
     # Emit real UTF-8 (Cyrillic task text, ❯, …) to the model, not \uXXXX escapes.
     return _dumps(obj, ensure_ascii=False)
-
-
-def _transport_base(transport):
-    """Derive a base URL string from a Transport (for arm_waiter's --base arg)."""
-    if transport.kind == "tcp":
-        return f"http://{transport.host}:{transport.port}"
-    return str(transport.path)
 
 
 def register(ctx):
@@ -50,8 +42,8 @@ def register(ctx):
         # successful start — a failed start (e.g. bad cwd) has no session, so an unscoped waiter
         # would later wake on an unrelated session's event.
         if body.get("session_id"):
-            arm_waiter(ctx, _transport_base(transport), after_seq=int(body.get("next_after_seq", 0)),
-                       session_id=body["session_id"], token_file=supervisor.state_file())
+            arm_waiter(ctx, after_seq=int(body.get("next_after_seq", 0)),
+                       session_id=body["session_id"], state_file=supervisor.state_file())
         return _j(body)
 
     def nelix_status(args, **k):
@@ -72,8 +64,8 @@ def register(ctx):
             args["session_id"], args["answer"], decision_id=args.get("decision_id"))
         if ok:
             # The daemon owns the cursor: arm the next doorbell past the decision we just answered.
-            arm_waiter(ctx, _transport_base(transport), after_seq=int(body.get("next_after_seq", 0)),
-                       session_id=args["session_id"], token_file=supervisor.state_file())
+            arm_waiter(ctx, after_seq=int(body.get("next_after_seq", 0)),
+                       session_id=args["session_id"], state_file=supervisor.state_file())
         return _j(body)
 
     def nelix_stop(args, **k):
