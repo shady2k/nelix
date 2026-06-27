@@ -142,6 +142,14 @@ def test_input_submission_present_detects_typed_or_pasted_task():
     assert D.input_submission_present(output_only, "a long task that claude collapsed") is False
 
 
+def test_format_submission_wraps_task_in_bracketed_paste():
+    # nelix-10z: wrapping the task in bracketed-paste markers makes Claude collapse it to a
+    # "[Pasted text #N]" placeholder with almost no re-render output (0.0s vs 2.2s raw echo for
+    # 61.5KB). The markers frame ONLY the text — the submit key (Enter) is pressed separately,
+    # OUTSIDE the paste, so a CR inside the markers can't end the paste early.
+    assert D.format_submission("do the thing") == "\x1b[200~do the thing\x1b[201~"
+
+
 def test_pasted_placeholder_only_on_active_input_line():
     # placeholder on the real (last) input line -> True
     box = "Welcome back!\n❯ [Pasted text #1]\n⏵⏵ ask mode (shift+tab to cycle)\n"

@@ -279,8 +279,11 @@ class Session:
             # owns both the write and the read here, so draining during the write breaks that
             # flow-control deadlock and lets a large task land. (respond()'s write stays
             # non-draining: it runs on the RPC thread, where draining would race pump().)
-            self._type_text(self._task, timeout=max(0.0, deadline - time.monotonic()),
-                            drain_output=True)
+            # The driver frames the submission (the claude driver wraps it in a bracketed paste so
+            # the CLI collapses it to a placeholder instead of re-rendering every char). The submit
+            # key is pressed separately below, so it stays outside any paste frame.
+            self._type_text(self._driver.format_submission(self._task),
+                            timeout=max(0.0, deadline - time.monotonic()), drain_output=True)
         except PtyWriteTimeout:
             self._fail_delivery("write_unconfirmed")   # executor not reading stdin
             return
