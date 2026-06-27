@@ -31,7 +31,7 @@ def test_doctor_collects_strays(monkeypatch, tmp_path):
         def start_fingerprint(self, pid): return "c" if pid == 999 else "?"
         def pgid(self, pid): return 999
         def ppid(self, pid): return 1
-    monkeypatch.setattr(doctor.supervisor, "base_token", lambda: None)   # no live daemon
+    monkeypatch.setattr(doctor.supervisor, "endpoint", lambda: None)   # no live daemon
     out = doctor.collect(inspector=_Insp())
     assert any(s["sid"] == "s-stray1" for s in out["strays"])
     assert out["daemon"]["alive"] is False

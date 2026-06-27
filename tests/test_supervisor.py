@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import paths  # noqa: E402
 import supervisor  # noqa: E402
+from daemon.transport import Transport  # noqa: E402
 
 # A fake daemon: serves /status 200 iff the token header matches. Honors
 # NELIX_RPC_TOKEN / NELIX_RPC_PORT exactly like the real daemon entry.
@@ -28,6 +29,7 @@ _FAKE = textwrap.dedent("""
 
 def _use_fake_daemon(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_RPC_TRANSPORT", "tcp")
     fake = tmp_path / "fake_daemon.py"
     fake.write_text(_FAKE)
     importlib.reload(supervisor)
@@ -36,23 +38,24 @@ def _use_fake_daemon(monkeypatch, tmp_path):
 
 def test_ensure_running_spawns_and_writes_state(monkeypatch, tmp_path):
     _use_fake_daemon(monkeypatch, tmp_path)
-    base, token = supervisor.ensure_running()
-    assert base.startswith("http://127.0.0.1:")
+    transport = supervisor.ensure_running()
+    assert transport.kind == "tcp"
+    assert transport.host == "127.0.0.1"
     state = paths.state_file()
     assert state.exists()
     assert oct(state.stat().st_mode & 0o777) == "0o600"
     data = json.loads(state.read_text())
-    assert data["token"] == token and data["pid"] > 0
+    assert data["token"] == transport.token and data["pid"] > 0
     supervisor.teardown()
 
 
 def test_ensure_running_reuses_live_daemon(monkeypatch, tmp_path):
     _use_fake_daemon(monkeypatch, tmp_path)
-    base1, tok1 = supervisor.ensure_running()
+    t1 = supervisor.ensure_running()
     pid1 = json.loads(paths.state_file().read_text())["pid"]
-    base2, tok2 = supervisor.ensure_running()
+    t2 = supervisor.ensure_running()
     pid2 = json.loads(paths.state_file().read_text())["pid"]
-    assert (base1, tok1) == (base2, tok2) and pid1 == pid2  # no respawn
+    assert t1 == t2 and pid1 == pid2  # no respawn
     supervisor.teardown()
 
 
@@ -71,9 +74,10 @@ def test_stale_state_triggers_respawn(monkeypatch, tmp_path):
     _use_fake_daemon(monkeypatch, tmp_path)
     state = paths.state_file()
     state.parent.mkdir(parents=True)
-    state.write_text(json.dumps({"pid": 999999, "port": 1, "token": "dead"}))
-    base, token = supervisor.ensure_running()  # dead pid -> respawn
-    assert token != "dead"
+    state.write_text(json.dumps({"pid": 999999, "transport": "tcp",
+                                 "host": "127.0.0.1", "port": 1, "token": "dead"}))
+    transport = supervisor.ensure_running()  # dead pid -> respawn
+    assert transport.token != "dead"
     supervisor.teardown()
 
 
@@ -283,24 +287,48 @@ def test_ensure_running_reuses_race_winner(monkeypatch, tmp_path):
     import importlib, supervisor
     importlib.reload(supervisor)
     monkeypatch.setattr(supervisor, "_ensure_deps", lambda: None)
-    monkeypatch.setattr(supervisor, "_free_port", lambda: 9999)
     monkeypatch.setattr(supervisor, "_open_daemon_log", lambda root: tmp_path / "d.log")
 
-    # base_token: first call (top of ensure_running) None; later (after our spawn "loses") -> winner
+    # endpoint: first call (top of ensure_running) None; later (after our spawn "loses") -> winner
     calls = {"n": 0}
-    def fake_base_token():
+    def fake_endpoint():
         calls["n"] += 1
-        return ("http://127.0.0.1:8765", "winner-token") if calls["n"] >= 2 else None
-    monkeypatch.setattr(supervisor, "base_token", fake_base_token)
+        return Transport.tcp("127.0.0.1", 8765, "winner-token") if calls["n"] >= 2 else None
+    monkeypatch.setattr(supervisor, "endpoint", fake_endpoint)
 
     class _Proc:
         pid = 4321; returncode = 3
         def poll(self): return 3                      # our spawned daemon already exited (lost lock)
     monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *a, **k: _Proc())
-    monkeypatch.setattr(supervisor, "_healthy", lambda port, token: False)
+    monkeypatch.setattr(supervisor, "_healthy", lambda transport: False)
 
-    base, token = supervisor.ensure_running()
-    assert (base, token) == ("http://127.0.0.1:8765", "winner-token")
+    transport = supervisor.ensure_running()
+    assert transport == Transport.tcp("127.0.0.1", 8765, "winner-token")
+
+
+def test_endpoint_returns_unix_transport_from_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib, supervisor, paths
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    sock = paths.rpc_sock()
+    supervisor._write_state(os.getpid(), Transport.unix(str(sock)))
+    # health check must see a live daemon: stub _healthy True for this pid/transport.
+    monkeypatch.setattr(supervisor, "_healthy", lambda t: True)
+    ep = supervisor.endpoint()
+    assert ep == Transport.unix(str(sock))
+
+
+def test_write_state_is_0600_and_carries_transport(monkeypatch, tmp_path):
+    import importlib, supervisor, paths, os, stat, json
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    supervisor._write_state(4242, Transport.tcp("127.0.0.1", 55555, "tok"))
+    st = json.loads(paths.state_file().read_text())
+    assert st == {"pid": 4242, "transport": "tcp", "host": "127.0.0.1",
+                  "port": 55555, "token": "tok"}
+    assert stat.S_IMODE(os.stat(paths.state_file()).st_mode) == 0o600
 
 
 def test_teardown_survives_ctrl_c_and_force_kills(monkeypatch, tmp_path):

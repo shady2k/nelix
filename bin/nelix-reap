@@ -15,7 +15,7 @@ from daemon.config import load_kill_grace_seconds  # noqa: E402
 
 
 def reap_orphans(inspector, killer, grace):
-    if supervisor.base_token():                 # never kill a live daemon's children
+    if supervisor.endpoint():                   # never kill a live daemon's children
         return {"refused": "daemon_alive"}
     inspector = inspector or reaper.ProcessInspector()
     killer = killer or reaper.ProcessKiller()
@@ -26,17 +26,11 @@ def reap_orphans(inspector, killer, grace):
 
 
 def reap_sid(sid):
-    base = supervisor.base_token()
-    if not base:
+    transport = supervisor.endpoint()
+    if not transport:
         return {"error": "no live daemon"}
-    import urllib.request
-    url, token = base
-    req = urllib.request.Request(url + "/stop", method="POST",
-                                 data=json.dumps({"session_id": sid}).encode(),
-                                 headers={"X-Nelix-Token": token,
-                                          "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return json.loads(r.read())
+    from rpc_client import RpcClient
+    return RpcClient(transport).stop(sid)
 
 
 def main(argv=None):

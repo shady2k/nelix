@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from plugin_loader import load_plugin  # noqa: E402
+from daemon.transport import Transport  # noqa: E402
 
 _FAKE = textwrap.dedent("""
     import os, json
@@ -48,6 +49,7 @@ def _load_with_fake(monkeypatch, tmp_path):
     hermes_plugins.nelix.supervisor — a different object from a top-level
     `import supervisor`)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_RPC_TRANSPORT", "tcp")
     cfg = tmp_path / "workspace" / "nelix" / "nelix.toml"; cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text('[executors.opencode]\ncommand="opencode"\nargs=[]\nenv={}\ncwd="."\ndriver="claude"\nlauncher="local"\n')
     fake = tmp_path/"fake_daemon.py"; fake.write_text(_FAKE)
@@ -118,7 +120,7 @@ def test_nelix_respond_binds_to_session_without_event_id(monkeypatch, tmp_path):
         assert params["required"] == ["session_id", "answer"]      # event_id is gone
         assert "event_id" not in params["properties"]
         assert "decision_id" in params["properties"]               # optional guard
-        monkeypatch.setattr(nelix.supervisor, "base_token", lambda: ("http://127.0.0.1:9999", "t"))
+        monkeypatch.setattr(nelix.supervisor, "endpoint", lambda: Transport.tcp("127.0.0.1", 9999, "t"))
         captured = {}
 
         class FakeRpc:
