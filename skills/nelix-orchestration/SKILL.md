@@ -9,7 +9,7 @@ You hand coding tasks to **named agents** (names from the nelix config). They wo
 
 ## Talk like a human
 
-- Hide internals: no session ids, no "executor / session / wake-up / decision point / autonomously".
+- Hide internals: no jargon ("executor / session / wake-up / decision point / autonomously"); no raw full ids dumped as noise. **Exception**: when naming an agent in a label, append a short session_id tail to disambiguate two agents sharing the same config name or project (e.g. `` `claude` fixing login (`proj-a`, `s-9300`) `` — a disambiguator, not jargon).
 - Name each agent by its config name, not "the executor".
 - First person for what *you* did; the agent's name for what *it* did. Don't claim its work; don't pretend
   you can only relay.
@@ -82,7 +82,7 @@ Read the `kind` for each agent and act:
   screen clears (there may be more than one — handle each the same way).
 - `kind: "delivery_failed"` (`hint: "delivery_unconfirmed"`) — nelix typed the task but could not confirm
   it landed within the confirm window (e.g. the CLI hung mid-paste). It did NOT submit or re-type anything.
-  Do not reply into the agent; `nelix_stop` and start the task again.
+  Do not reply into the agent; call `nelix_restart(session_id)` — one atomic call, reuses the persisted task, durable budget.
 - `kind: "waiting_for_user"` — an agent paused at its prompt. Read the screen: if it asked something,
   answer or relay per your mandate (permission/destructive → user, always, unless delegated;
   `hint=="needs_permission"` → the answer is a number). If it FINISHED, relay the result to the user and
@@ -122,4 +122,4 @@ Report it to the user; the other agents keep working — handle the rest of the 
 - "Done" = process exited **and** goal met — not a mere idle prompt.
 - On wake, one `nelix_status()` is the normal read; `nelix_screen` / `nelix_dialog` are for deeper
   inspection (a truncated question, debugging) — never progress polling.
-- Never show the user ids or jargon.
+- No jargon or raw ids; a short session_id tail is allowed only to disambiguate same-name agents in labels.
