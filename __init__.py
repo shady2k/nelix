@@ -7,6 +7,10 @@ from .rpc_client import RpcClient
 from .launcher_resolve import resolve_launcher
 from .wake import arm_waiter
 from . import supervisor, registry
+try:
+    from .nelix_cursor import CursorState
+except ImportError:
+    from nelix_cursor import CursorState
 
 _log = logging.getLogger("nelix")
 _OBJ = {"type": "object", "additionalProperties": False}
@@ -22,6 +26,24 @@ def _j(obj):
 
 def register(ctx):
     registry.seed_if_absent()
+
+    cursor = CursorState()         # one global wake cursor + arm-dedup for this plugin process
+
+    def _daemon_id():
+        # Identity of the live daemon (its pid from the supervisor state file), so the cursor resets
+        # reliably across a daemon teardown/restart (not via a fragile seq heuristic).
+        try:
+            with open(supervisor.state_file()) as f:
+                return json.load(f).get("pid")
+        except (OSError, ValueError):
+            return None
+
+    def _arm():
+        # One global waiter (no session_id), armed from observed_cursor, deduped so a start burst
+        # spawns exactly one waiter. Call after every start/respond/restart.
+        if cursor.should_arm():
+            arm_waiter(ctx, after_seq=cursor.arm_after(), state_file=supervisor.state_file())
+            cursor.mark_armed()
 
     def nelix_start(args, **k):
         # cwd is per-session: caller-supplied project dir, else this orchestrator's own
@@ -42,15 +64,18 @@ def register(ctx):
         # successful start — a failed start (e.g. bad cwd) has no session, so an unscoped waiter
         # would later wake on an unrelated session's event.
         if body.get("session_id"):
-            arm_waiter(ctx, after_seq=int(body.get("next_after_seq", 0)),
-                       session_id=body["session_id"], state_file=supervisor.state_file())
+            cursor.on_start(int(body.get("next_after_seq", 0)), daemon_id=_daemon_id())
+            _arm()
         return _j(body)
 
     def nelix_status(args, **k):
         transport = supervisor.endpoint()
         if transport is None:
             return _j({"sessions": {}})
-        return _j(RpcClient(transport).status(args.get("session_id")))
+        body = RpcClient(transport).status(args.get("session_id"))
+        if isinstance(body, dict) and "cursor" in body:       # only the all-sessions read carries it
+            cursor.on_status(body["cursor"])
+        return _j(body)
 
     def nelix_respond(args, **k):
         _log.info("nelix_respond session=%s decision=%s", args["session_id"],
@@ -63,9 +88,8 @@ def register(ctx):
         ok, body = RpcClient(transport).respond(
             args["session_id"], args["answer"], decision_id=args.get("decision_id"))
         if ok:
-            # The daemon owns the cursor: arm the next doorbell past the decision we just answered.
-            arm_waiter(ctx, after_seq=int(body.get("next_after_seq", 0)),
-                       session_id=args["session_id"], state_file=supervisor.state_file())
+            cursor.on_respond(int(body.get("next_after_seq", 0)))   # no-op for the cursor
+            _arm()                                                  # one global waiter, from cursor
         return _j(body)
 
     def nelix_stop(args, **k):
