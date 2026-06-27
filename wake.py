@@ -4,17 +4,16 @@ from pathlib import Path
 _WAITER = Path(__file__).parent / "bin" / "nelix-wait"
 
 
-def arm_waiter(ctx, base, after_seq, token_file, session_id=None):
+def arm_waiter(ctx, after_seq, state_file, session_id=None):
     """Arm a background wake: a terminal command long-polls /wait and exits on the
     next event, waking Hermes via notify_on_complete. When ``session_id`` is given the
     waiter scopes /wait to that session (no cross-session stale wakes).
 
-    The RPC token is read by the waiter from the supervisor state file
-    (``token_file``), NOT passed from here: the terminal tool does not forward an
-    ``env`` dict, and keeping the token out of argv/the command avoids ps and
-    redact_secrets exposure (the token-file path itself is not secret)."""
-    cmd = (f"{shlex.quote(str(_WAITER))} --base {shlex.quote(base)}"
-           f" --after {int(after_seq)} --token-file {shlex.quote(str(token_file))}")
+    The waiter discovers the RPC endpoint and token from ``state_file`` (the supervisor
+    state file written on daemon start). This keeps the token out of argv / ps exposure
+    and avoids relying on an ``env`` dict that the terminal tool does not forward."""
+    cmd = (f"{shlex.quote(str(_WAITER))} --state-file {shlex.quote(str(state_file))}"
+           f" --after {int(after_seq)}")
     if session_id is not None:
         cmd += f" --session-id {shlex.quote(str(session_id))}"
     return ctx.dispatch_tool("terminal", {

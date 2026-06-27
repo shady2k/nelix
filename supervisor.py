@@ -17,15 +17,16 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 try:
     from . import paths
     from .daemon.config import load_retention
+    from .daemon.transport import Transport
 except ImportError:           # loaded as a top-level module (tests), not as a package
     import paths
     from daemon.config import load_retention
+    from daemon.transport import Transport
 
 PLUGIN_ROOT = Path(__file__).parent
 _HEALTH_TIMEOUT = 10.0
@@ -149,7 +150,7 @@ def _state_file() -> Path:
 
 
 def state_file() -> Path:
-    """Public path of the 0600 state file holding {pid,port,token}. The wake
+    """Public path of the 0600 state file holding {pid, **transport}. The wake
     waiter reads the RPC token from here (see wake.arm_waiter)."""
     return _state_file()
 
@@ -176,12 +177,19 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _healthy(port: int, token: str) -> bool:
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/status",
-                                 headers={"X-Nelix-Token": token})
+def _choose_transport() -> Transport:
+    import secrets
+    if os.environ.get("NELIX_RPC_TRANSPORT") == "tcp":
+        host = os.environ.get("NELIX_RPC_HOST", "127.0.0.1")
+        return Transport.tcp(host, _free_port(), secrets.token_hex(16))
+    return Transport.unix(str(paths.rpc_sock()))
+
+
+def _healthy(transport) -> bool:
+    from rpc_client import RpcClient
     try:
-        with urllib.request.urlopen(req, timeout=2) as r:
-            return r.status == 200
+        st, _ = RpcClient(transport)._call("GET", "/status", timeout=2)
+        return st == 200
     except Exception:
         return False
 
@@ -193,7 +201,7 @@ def _read_state():
         return None
 
 
-def _write_state(pid: int, port: int, token: str) -> None:
+def _write_state(pid: int, transport) -> None:
     root = _root()
     paths.ensure_private_dir(root)
     tmp = root / ".active.json.tmp"
@@ -204,15 +212,23 @@ def _write_state(pid: int, port: int, token: str) -> None:
     # 0600 AT creation (O_EXCL): the token never exists on disk world-readable, not even briefly.
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(json.dumps({"pid": pid, "port": port, "token": token}))
+        f.write(json.dumps({"pid": pid, **transport.to_state()}))
     tmp.replace(_state_file())
 
 
-def base_token():
+def endpoint():
+    """Return the live daemon's Transport, or None if no healthy daemon is running."""
     st = _read_state()
-    if st and _pid_alive(st["pid"]) and _healthy(st["port"], st["token"]):
-        return f"http://127.0.0.1:{st['port']}", st["token"]
-    return None
+    if not st:
+        return None
+    pid = st.get("pid")
+    if not pid or not _pid_alive(pid):
+        return None
+    try:
+        t = Transport.from_state(st)
+    except ValueError:
+        return None
+    return t if _healthy(t) else None
 
 
 def _open_daemon_log(root) -> Path:
@@ -283,26 +299,29 @@ def _prune_daemon_logs(root, retain, keep=None) -> None:
             pass
 
 
-def ensure_running():
-    existing = base_token()
+def ensure_running() -> Transport:
+    existing = endpoint()
     if existing:
         return existing
 
     _ensure_deps()  # daemon imports pyte/ptyprocess; install them venv-scoped if absent
 
-    import secrets
-    token = secrets.token_hex(16)
-    port = _free_port()
+    transport = _choose_transport()
     root = _root()
     paths.ensure_private_dir(root)
     log_path = _open_daemon_log(root)
     log = open(log_path, "ab")
     env = {**os.environ,
-           "NELIX_RPC_TOKEN": token,
-           "NELIX_RPC_PORT": str(port),
+           "NELIX_RPC_TRANSPORT": transport.kind,
            "NELIX_CONFIG": str(paths.config_path()),
            "HERMES_HOME": str(paths.hermes_home()),
            "PYTHONPATH": str(PLUGIN_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    if transport.kind == "unix":
+        env["NELIX_RPC_SOCK"] = transport.path
+    else:
+        env["NELIX_RPC_HOST"] = transport.host
+        env["NELIX_RPC_PORT"] = str(transport.port)
+        env["NELIX_RPC_TOKEN"] = transport.token
     try:
         proc = subprocess.Popen(
             _daemon_argv(), cwd=str(PLUGIN_ROOT), env=env,
@@ -313,12 +332,13 @@ def ensure_running():
 
     deadline = time.time() + _HEALTH_TIMEOUT
     while time.time() < deadline:
-        if _healthy(port, token):
-            _write_state(proc.pid, port, token)
-            _log.info("nelix daemon started pid=%s port=%s log=%s", proc.pid, port, log_path)
-            return f"http://127.0.0.1:{port}", token
+        if _healthy(transport):
+            _write_state(proc.pid, transport)
+            _log.info("nelix daemon started pid=%s transport=%s log=%s",
+                      proc.pid, transport.kind, log_path)
+            return transport
         if proc.poll() is not None:
-            existing = base_token()                  # we may have lost a singleton-lock race
+            existing = endpoint()                    # we may have lost a singleton-lock race
             if existing:
                 _log.info("nelix daemon: lost startup race, reusing pid-holder")
                 return existing

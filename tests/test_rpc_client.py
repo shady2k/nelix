@@ -1,8 +1,14 @@
+import hashlib
+import os
 import threading
+
+import pytest
+
 from conftest import EXECUTOR
 from daemon.events import EventQueue
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
+from daemon.transport import Transport
 from rpc_client import RpcClient
 
 
@@ -16,12 +22,34 @@ class FakeManager:
     def stop(self, s): self.calls.append(("stop", s)); return True
 
 
+@pytest.fixture
+def fake_manager():
+    return FakeManager()
+
+
+@pytest.fixture
+def unix_sock(tmp_path):
+    """Short AF_UNIX socket path (<=103 chars incl. NUL).
+
+    pytest tmp_path on macOS resolves through /private/var/folders/... and easily
+    exceeds the 104-byte sun_path limit.  Hash tmp_path for uniqueness; put the
+    node directly under /tmp so the total stays ~20 chars.
+    """
+    h = hashlib.md5(str(tmp_path).encode()).hexdigest()[:8]
+    p = f"/tmp/nxc{h}.sock"
+    yield p
+    try:
+        os.unlink(p)
+    except FileNotFoundError:
+        pass
+
+
 def test_rpc_client_roundtrip():
     m = FakeManager()
-    srv = make_server(m, token="t", port=8781)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8781, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        c = RpcClient("http://127.0.0.1:8781", "t")
+        c = RpcClient(Transport.tcp("127.0.0.1", 8781, "t"))
         assert c.start(EXECUTOR, "go", "/repo")["session_id"] == "s1"
         assert ("start", EXECUTOR, "go", "/repo") in m.calls
         ok, body = c.respond("s1", "yes")
@@ -52,10 +80,10 @@ class FakeManagerDialog:
 def test_rpc_client_dialog(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerDialog()
-    srv = make_server(m, token="t", port=8782)
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8782, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        c = RpcClient("http://127.0.0.1:8782", "t")
+        c = RpcClient(Transport.tcp("127.0.0.1", 8782, "t"))
         d = c.dialog("s1", turn=1, offset=2)
         assert d["turn_index"] == 1 and d["text"] == "t1@2"
         assert c.dialog("s1")["turn_index"] == 2          # default -> latest
@@ -65,7 +93,7 @@ def test_rpc_client_dialog(monkeypatch, tmp_path):
 
 def test_client_screen_calls_get_screen(monkeypatch):
     from rpc_client import RpcClient
-    c = RpcClient("http://x", "t")
+    c = RpcClient(Transport.tcp("x", 80, "t"))
     seen = {}
     monkeypatch.setattr(c, "_call",
                         lambda m, p, body=None: seen.update(m=m, p=p) or (200, {"screen": "S"}))
@@ -75,7 +103,7 @@ def test_client_screen_calls_get_screen(monkeypatch):
 
 def test_client_screen_raw_appends_raw_query(monkeypatch):
     from rpc_client import RpcClient
-    c = RpcClient("http://x", "t")
+    c = RpcClient(Transport.tcp("x", 80, "t"))
     seen = {}
     monkeypatch.setattr(c, "_call",
                         lambda m, p, body=None: seen.update(m=m, p=p) or (200, {"screen": "R"}))
@@ -85,9 +113,20 @@ def test_client_screen_raw_appends_raw_query(monkeypatch):
 
 def test_client_screen_force_appends_force_query(monkeypatch):
     from rpc_client import RpcClient
-    c = RpcClient("http://x", "t")
+    c = RpcClient(Transport.tcp("x", 80, "t"))
     seen = {}
     monkeypatch.setattr(c, "_call",
                         lambda m, p, body=None: seen.update(m=m, p=p) or (200, {"screen": "F"}))
     assert c.screen("s-1", force=True) == {"screen": "F"}
     assert seen == {"m": "GET", "p": "/screen?session_id=s-1&force=1"}
+
+
+def test_client_roundtrips_over_unix_socket(unix_sock, fake_manager):
+    server = make_server(fake_manager, Transport.unix(unix_sock))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = RpcClient(Transport.unix(unix_sock))
+        body = client.status()          # GET /status over the unix socket, no token
+        assert isinstance(body, dict)   # whatever fake_manager.status(None) returns
+    finally:
+        server.shutdown(); server.server_close()

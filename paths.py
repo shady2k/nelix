@@ -31,6 +31,12 @@ def state_file() -> Path:
     return nelix_root() / ".active.json"
 
 
+def rpc_sock() -> Path:
+    """AF_UNIX socket node for the local RPC transport. Lives in the 0700 nelix_root (so the node
+    inherits a private dir); the node itself is created 0600 by the daemon at bind time."""
+    return nelix_root() / "rpc.sock"
+
+
 def sessions_root() -> Path:
     return nelix_root() / "sessions"
 

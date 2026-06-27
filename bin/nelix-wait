@@ -6,47 +6,50 @@ So the wake carries ONLY small triage metadata (session_id, seq, kind, requires_
 never the executor's screen_excerpt or its trust fence, which can be large enough to truncate the
 actionable fields away. Hermes pulls the authoritative state — and the decision_id it answers
 against — from nelix_status, an uncapped tool-result channel."""
-import argparse, http.client, json, os, sys, urllib.error, urllib.request
+import argparse, http.client, json, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from daemon.transport import Transport
+from rpc_client import RpcClient
 
 # Small, fixed-size triage fields only — never executor content. event_id is intentionally absent:
 # decision identity comes from the nelix_status pull, not an opaque token the model must echo.
 _DOORBELL_FIELDS = ("session_id", "seq", "kind", "requires_response", "hung")
 
 
-def _read_token(token_file):
-    """Token from the supervisor state file (--token-file) — the terminal tool
-    that arms this waiter does NOT forward an `env` dict, so the token cannot be
-    relied on in the environment. Falls back to NELIX_RPC_TOKEN for manual runs."""
-    if token_file:
-        with open(token_file) as f:
-            return json.load(f)["token"]
-    tok = os.environ.get("NELIX_RPC_TOKEN")
-    if not tok:
-        print("nelix-wait: no token (pass --token-file or set NELIX_RPC_TOKEN)",
-              file=sys.stderr)
-        sys.exit(2)
-    return tok
+def _discover(state_file):
+    """Read the supervisor state file and return a Transport for the daemon endpoint."""
+    with open(state_file) as f:
+        return Transport.from_state(json.load(f))
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default=os.environ.get("NELIX_RPC", "http://127.0.0.1:8765"))
+    ap.add_argument("--state-file", dest="state_file", required=True,
+                    help="Path to the supervisor state file (written by nelix on start)")
     ap.add_argument("--after", type=int, default=0)
-    ap.add_argument("--token-file", dest="token_file", default=None)
     ap.add_argument("--session-id", dest="session_id", default=None)
     args = ap.parse_args()
-    token = _read_token(args.token_file)
+
+    try:
+        transport = _discover(args.state_file)
+    except (OSError, ValueError, KeyError) as e:
+        # State file missing, unreadable, or contains no valid transport — daemon gone or
+        # not yet started. Exit cleanly so notify_on_complete wakes Hermes to reconcile.
+        print(json.dumps({"kind": "none"}, ensure_ascii=False))
+        return 0
+
+    client = RpcClient(transport)
     after = args.after
     try:
         while True:
-            url = f"{args.base}/wait?after_seq={after}"
+            path = f"/wait?after_seq={after}"
             if args.session_id:
-                url += f"&session_id={args.session_id}"
-            req = urllib.request.Request(url, headers={"X-Nelix-Token": token})
+                path += f"&session_id={args.session_id}"
             try:
-                with urllib.request.urlopen(req, timeout=40) as r:
-                    evt = json.loads(r.read()).get("event")
-            except (urllib.error.URLError, OSError, http.client.HTTPException):
+                _st, body = client._call("GET", path, timeout=40)
+                evt = body.get("event")
+            except (OSError, ConnectionError, http.client.HTTPException):
                 # Daemon gone/unreachable (e.g. torn down, restarting). Don't crash with a
                 # traceback — exit cleanly so notify_on_complete wakes Hermes to reconcile
                 # via nelix_status instead of surfacing a scary background failure.

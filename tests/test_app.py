@@ -1,6 +1,10 @@
-import io, json
+import io, json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from daemon.obs import Logger
 from daemon.app import warn_invalid_log_level
+from daemon import app                       # noqa: E402
+from daemon.transport import Transport       # noqa: E402
 from daemon.config import LogLevelConfig
 
 
@@ -78,3 +82,20 @@ def test_load_specs_parse_error_returns_empty_and_logs(tmp_path):
     assert specs == {}
     recs = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
     assert any(r["event"] == "config_parse_error" for r in recs)
+
+
+def test_transport_from_env_defaults_to_unix(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("NELIX_RPC_TRANSPORT", raising=False)
+    import importlib, paths
+    importlib.reload(paths)
+    t = app.transport_from_env()
+    assert t.kind == "unix" and t.path.endswith("/rpc.sock")
+
+
+def test_transport_from_env_tcp(monkeypatch):
+    monkeypatch.setenv("NELIX_RPC_TRANSPORT", "tcp")
+    monkeypatch.setenv("NELIX_RPC_HOST", "127.0.0.1")
+    monkeypatch.setenv("NELIX_RPC_PORT", "51000")
+    monkeypatch.setenv("NELIX_RPC_TOKEN", "abc")
+    assert app.transport_from_env() == Transport.tcp("127.0.0.1", 51000, "abc")

@@ -5,18 +5,20 @@ Usage: .venv/bin/python harness/skeleton_drive.py "create hello.txt with the wor
 import json
 import os
 import sys
-import urllib.request
 
-BASE = os.environ.get("NELIX_RPC", "http://127.0.0.1:8765")
-TOKEN = os.environ["NELIX_RPC_TOKEN"]
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import paths
+from daemon.transport import Transport
+from rpc_client import RpcClient
+
+
+def _client():
+    with open(paths.state_file()) as f:
+        return RpcClient(Transport.from_state(json.load(f)))
 
 
 def call(method, path, body=None):
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(BASE + path, data=data, method=method,
-                                 headers={"X-Nelix-Token": TOKEN, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=40) as r:
-        return json.loads(r.read())
+    return _client()._call(method, path, body)[1]
 
 
 def main():

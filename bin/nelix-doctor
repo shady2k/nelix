@@ -33,19 +33,23 @@ def _scan_strays(inspector):
 
 def collect(inspector=None):
     inspector = inspector or reaper.ProcessInspector()
-    base = supervisor.base_token()
+    transport = supervisor.endpoint()
     holder = singleton.read_holder(paths.daemon_lock())
     sessions = []
-    if base:
-        import urllib.request
-        url, token = base
+    if transport:
         try:
-            req = urllib.request.Request(url + "/status", headers={"X-Nelix-Token": token})
-            with urllib.request.urlopen(req, timeout=3) as r:
-                sessions = list(json.loads(r.read()).get("sessions", {}).keys())
+            from rpc_client import RpcClient
+            data = RpcClient(transport).status()
+            sessions = list(data.get("sessions", {}).keys())
         except Exception:
             pass
-    return {"daemon": {"alive": base is not None, "base": base[0] if base else None},
+    if transport is not None and transport.kind == "tcp":
+        base_url = f"http://{transport.host}:{transport.port}"
+    elif transport is not None:
+        base_url = str(transport.path)
+    else:
+        base_url = None
+    return {"daemon": {"alive": transport is not None, "base": base_url},
             "lock_holder": holder, "sessions": sessions,
             "strays": _scan_strays(inspector)}
 
