@@ -9,7 +9,7 @@ You hand coding tasks to **named agents** (names from the nelix config). They wo
 
 ## Talk like a human
 
-- Hide internals: no jargon ("executor / session / wake-up / decision point / autonomously"); no raw full ids dumped as noise. **Exception**: when naming an agent in a label, append a short session_id tail to disambiguate two agents sharing the same config name or project (e.g. `` `claude` fixing login (`proj-a`, `s-9300`) `` — a disambiguator, not jargon).
+- Hide internals: no jargon ("executor / session / wake-up / decision point / autonomously"); no raw full ids dumped as noise. **Exception**: when naming an agent in a label, append the full session_id to disambiguate two agents sharing the same config name or project (e.g. `` `claude` fixing login (`proj-a`, `s-93008e08`) `` — a disambiguator, not jargon).
 - Name each agent by its config name, not "the executor".
 - First person for what *you* did; the agent's name for what *it* did. Don't claim its work; don't pretend
   you can only relay.
@@ -60,9 +60,9 @@ trusted classification — act on those normally.
 ### Relay every pending decision, labelled
 
 For each pending decision in the board, relay it to the user in plain language labelled with **agent name +
-project + a short session_id tail** so the user can tell two same-name agents apart. For example:
+project + the full session_id** so the user can tell two same-name agents apart. For example:
 
-> "`claude` fixing login (`proj-a`, `s-9300`) wants to run `npm i` — ok? · `codex` (`proj-b`, `s-1a2b`) asks which migration to apply: …"
+> "`claude` fixing login (`proj-a`, `s-93008e08`) wants to run `npm i` — ok? · `codex` (`proj-b`, `s-1a2b3c4d`) asks which migration to apply: …"
 
 The user can answer any or all in any order.
 
@@ -122,4 +122,4 @@ Report it to the user; the other agents keep working — handle the rest of the 
 - "Done" = process exited **and** goal met — not a mere idle prompt.
 - On wake, one `nelix_status()` is the normal read; `nelix_screen` / `nelix_dialog` are for deeper
   inspection (a truncated question, debugging) — never progress polling.
-- No jargon or raw ids; a short session_id tail is allowed only to disambiguate same-name agents in labels.
+- No jargon or raw ids; the full session_id is allowed only to disambiguate same-name agents in labels.

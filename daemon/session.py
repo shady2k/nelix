@@ -94,6 +94,7 @@ class Session:
         self.restarted_from = None     # manager-set: immediate predecessor session_id, or None
         self.restart_count = 0         # manager-set snapshot of the lineage count (display only)
         self._last_screen_excerpt = "" # last published screen excerpt (for the terminal snapshot)
+        self._terminal_kind = None     # done | crashed | delivery_failed (set at each terminal point)
         self._task_delivery = "pending"  # pending | delivered | failed
         self._finalized = False        # _finish ran (idempotency guard, under self._lock)
         self._exc = None               # sys.exc_info() if the monitor body raised
@@ -329,6 +330,7 @@ class Session:
         # Give up cleanly: do NOT press Enter, do NOT re-type. Mark failed so the run loop
         # exits, and wake Hermes with a non-respondable advisory; the human stops + restarts.
         self._task_delivery = "failed"
+        self._terminal_kind = "delivery_failed"
         self._handle.flush_viewport(self._dialog)
         self._publish("delivery_failed", hint=reason, hung=False,
                       requires_response=False, task_delivery="failed")
@@ -408,6 +410,7 @@ class Session:
         if self._exc is not None:
             with self._lock:
                 self._state = "crashed"
+                self._terminal_kind = "crashed"
             self._publish("crashed", hint=None, hung=False, requires_response=False)
             if self._log is not None:
                 self._log.error("session", "monitor_exception", session_id=self._id,
@@ -421,6 +424,7 @@ class Session:
             kind, final_state = self._exit_kind(status)
             with self._lock:
                 self._state = final_state
+                self._terminal_kind = "done" if kind == "done" else "crashed"
             self._publish("done" if kind == "done" else "crashed",
                           hint=None, hung=False, requires_response=False)
             self._log_exited(kind if kind == "done" else "crashed", status)
@@ -440,6 +444,7 @@ class Session:
         # 5. crash banner while leader is still alive
         with self._lock:
             self._state = "crashed"
+            self._terminal_kind = "crashed"
         self._publish("crashed", hint=None, hung=False, requires_response=False)
         if self._log is not None:
             self._log.warning("session", "cli_crashed", session_id=self._id)
@@ -623,6 +628,7 @@ class Session:
         with self._lock:
             return {"session_id": self._id, "executor": self._executor,
                     "task": self._task_raw, "cwd": self._cwd, "state": self._state,
+                    "terminal_kind": self._terminal_kind,
                     "screen_excerpt": self._last_screen_excerpt,
                     "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
                     "restart_count": self.restart_count, "terminal": True}
