@@ -142,7 +142,7 @@ class SessionManager:
                 except Exception:
                     snap = None
             existed = self._sessions.pop(session_id, None) is not None
-            if snap is not None and self._terminal_ttl:
+            if snap is not None and self._terminal_ttl > 0:
                 self._terminal[session_id] = (snap, self._clock() + self._terminal_ttl)
         if existed and self._logger is not None:
             self._logger.info("manager", "slot_freed", session_id=session_id)

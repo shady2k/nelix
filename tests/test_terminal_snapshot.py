@@ -57,3 +57,11 @@ def test_multiple_terminal_snapshots_coexist_and_prune_independently():
     t["now"] = 1011.0                                       # s-1 expired (>10s), s-2 not (6s)
     rt = mgr.status()["recent_terminal"]
     assert "s-1" not in rt and "s-2" in rt
+
+
+def test_negative_ttl_does_not_store_terminal_snapshot():
+    mgr = _mgr(ttl=-5)
+    sess = _FakeSession("s-1"); mgr._sessions["s-1"] = sess
+    mgr._free_slot("s-1")
+    assert "s-1" not in mgr._sessions                       # slot freed
+    assert "s-1" not in mgr._terminal                       # snapshot not stored at all
