@@ -7,9 +7,9 @@ from daemon import singleton  # noqa: E402
 
 def test_acquire_excludes_second_holder_and_exposes_metadata(tmp_path):
     lock = tmp_path / "daemon.lock"
-    fd = singleton.acquire(lock, {"pid": 111, "start_fingerprint": "fp1", "port": 8765})
+    fd = singleton.acquire(lock, {"pid": 111, "start_fingerprint": "fp1", "transport": "unix", "port": None})
     assert fd is not None
-    assert singleton.read_holder(lock) == {"pid": 111, "start_fingerprint": "fp1", "port": 8765}
+    assert singleton.read_holder(lock) == {"pid": 111, "start_fingerprint": "fp1", "transport": "unix", "port": None}
     # second acquire on the SAME lock path fails while the first fd is open
     assert singleton.acquire(lock, {"pid": 222}) is None
     import os
