@@ -26,10 +26,23 @@ def build_reaper_ctx(grace):
                                 grace=grace, inspector=insp, killer=reaper.ProcessKiller())
 
 
-def acquire_singleton(logger, port=None):
+def transport_from_env():
+    if os.environ.get("NELIX_RPC_TRANSPORT") == "tcp":
+        return Transport.tcp(os.environ.get("NELIX_RPC_HOST", "127.0.0.1"),
+                             int(os.environ["NELIX_RPC_PORT"]),
+                             os.environ["NELIX_RPC_TOKEN"])
+    return Transport.unix(os.environ.get("NELIX_RPC_SOCK", str(paths.rpc_sock())))
+
+
+def acquire_singleton(logger, transport=None):
     insp = reaper.ProcessInspector()
     pid = os.getpid()
-    meta = {"pid": pid, "start_fingerprint": insp.start_fingerprint(pid), "port": port}
+    meta = {
+        "pid": pid,
+        "start_fingerprint": insp.start_fingerprint(pid),
+        "transport": transport.kind if transport is not None else None,
+        "port": transport.port if (transport is not None and transport.kind == "tcp") else None,
+    }
     fd = singleton.acquire(paths.daemon_lock(), meta)
     if fd is None and logger is not None:
         holder = singleton.read_holder(paths.daemon_lock())
@@ -90,9 +103,8 @@ def main():
     logger = Logger(level=level_cfg.level)
     specs = load_specs(cfg_path, logger)
     limit = load_concurrency_limit(cfg_path)
-    token = os.environ["NELIX_RPC_TOKEN"]
-    port = int(os.environ.get("NELIX_RPC_PORT", "8765"))
-    _LOCK_FD = acquire_singleton(logger, port=port)
+    transport = transport_from_env()
+    _LOCK_FD = acquire_singleton(logger, transport=transport)
     if _LOCK_FD is None:
         raise SystemExit(3)               # another daemon owns this nelix_root
     set_broker(BrokerClient())            # spawn the broker BEFORE any threads exist
@@ -111,9 +123,9 @@ def main():
     reaper.reconcile_orphans(paths.sessions_root(), reaper_ctx.daemon_pid,
                              reaper_ctx.daemon_fingerprint, grace,
                              reaper_ctx.inspector, reaper_ctx.killer, logger=logger)
-    server = make_server(manager, Transport.tcp("127.0.0.1", port, token), logger=logger)
+    server = make_server(manager, transport, logger=logger)
     logger.info("app", "daemon_started", executors=sorted(specs), limit=limit,
-                log_level=level_cfg.level, port=port)
+                log_level=level_cfg.level, transport=transport.kind)
     warn_invalid_log_level(logger, level_cfg)
     install_stack_dump_handler()
     install_shutdown_handler(manager, logger)
