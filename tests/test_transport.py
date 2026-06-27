@@ -25,3 +25,18 @@ def test_from_state_rejects_unknown_transport():
         Transport.from_state({"transport": "carrier-pigeon"})
     with pytest.raises(ValueError):
         Transport.from_state({"pid": 1})        # legacy {pid,port,token} has no transport
+
+
+import os
+import socket as _socket
+from daemon.transport import peer_uid, peer_is_self  # noqa: E402
+
+
+def test_peercred_reports_own_uid_over_a_socketpair():
+    a, b = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        # Both ends are this process -> peer uid is our own uid, and peer_is_self is True.
+        assert peer_uid(a) == os.getuid()
+        assert peer_is_self(b) is True
+    finally:
+        a.close(); b.close()
