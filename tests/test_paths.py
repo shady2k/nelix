@@ -54,3 +54,10 @@ def test_daemon_lock_and_child_record(monkeypatch, tmp_path):
     assert paths.daemon_lock() == paths.nelix_root() / "daemon.lock"
     sd = paths.sessions_root() / "s-12345678"
     assert paths.child_record(sd) == sd / "child.json"
+
+
+def test_rpc_sock_lives_under_nelix_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths)
+    assert paths.rpc_sock() == paths.nelix_root() / "rpc.sock"
+    assert paths.rpc_sock().parent == paths.nelix_root()
