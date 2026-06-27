@@ -105,6 +105,17 @@ def register(ctx):
         return _j(RpcClient(transport).dialog(
             args["session_id"], args.get("turn"), int(args.get("offset", 0)), args.get("limit")))
 
+    def nelix_restart(args, **k):
+        _log.info("nelix_restart session=%s force=%s", args["session_id"], args.get("force"))
+        transport = supervisor.endpoint()
+        if transport is None:
+            return _j({"error": "no active nelix daemon"})
+        ok, body = RpcClient(transport).restart(args["session_id"], force=bool(args.get("force", False)))
+        if ok:
+            # Restart succeeded -> a new session exists; arm the one global waiter from the cursor.
+            _arm()
+        return _j(body)
+
     def nelix_screen(args, **k):
         transport = supervisor.endpoint()
         if transport is None:
@@ -158,6 +169,18 @@ def register(ctx):
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
                         "required": ["session_id"]}},
         nelix_stop)
+    ctx.register_tool(
+        "nelix_restart", "nelix",
+        {"description": (
+            "Restart a crashed or wedged agent by session_id — one call, reusing its original task,"
+            " project, and agent (you do NOT re-state the task). The daemon counts restarts per agent"
+            " and refuses past its max_restarts with 'restart_budget_exhausted'; relay that to the user"
+            " and only pass force:true if they explicitly authorize continuing. After it succeeds, end"
+            " your turn — nelix wakes you on the next event."),
+         "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
+                                               "force": {"type": "boolean"}},
+                        "required": ["session_id"]}},
+        nelix_restart)
     ctx.register_tool(
         "nelix_dialog", "nelix",
         {"description": ("Read an agent's transcript: the latest turn by default, or an earlier `turn`"

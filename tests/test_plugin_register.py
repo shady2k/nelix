@@ -65,7 +65,7 @@ def test_register_wires_tools_command_skill_hook(monkeypatch, tmp_path):
     try:
         nelix.register(ctx)
         assert set(ctx.tools) == {"nelix_start","nelix_status","nelix_respond","nelix_stop",
-                                  "nelix_dialog","nelix_screen"}
+                                  "nelix_restart","nelix_dialog","nelix_screen"}
         assert "nelix" in ctx.commands
         assert "nelix-orchestration" in ctx.skills
         # on_session_finalize (NOT on_session_end): the latter fires per run_conversation

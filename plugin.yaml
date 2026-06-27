@@ -4,6 +4,6 @@ version: 0.1.0
 description: "Orchestrate a config-defined agentic CLI over a PTY; relay decision points to the user."
 author: shady2k
 kind: standalone
-provides_tools: [nelix_start, nelix_status, nelix_respond, nelix_stop, nelix_dialog]
+provides_tools: [nelix_start, nelix_status, nelix_respond, nelix_stop, nelix_restart, nelix_dialog]
 provides_hooks:
   - on_session_finalize
