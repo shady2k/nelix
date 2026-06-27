@@ -128,3 +128,57 @@ def test_session_terminal_kind_set_by_fail_delivery(tmp_path, monkeypatch):
     sess._fail_delivery("write_unconfirmed")
     assert sess._terminal_kind == "delivery_failed"
     assert sess.terminal_snapshot()["terminal_kind"] == "delivery_failed"
+
+
+def test_delivery_failed_then_child_exits_preserves_terminal_kind(tmp_path, monkeypatch):
+    """terminal_kind stays 'delivery_failed' when the child exits after _fail_delivery.
+
+    Regression: _finish_publish branch 2 (not alive) used to fire before branch 4
+    (delivery failed), overwriting _terminal_kind and publishing a second terminal event.
+    The fix moves branch 4 above branch 2 so a surfaced delivery failure short-circuits.
+    """
+    from daemon.session import Session
+    from daemon.config import ExecutorSpec
+    from daemon.events import EventQueue
+    from daemon.dialog import Dialog
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    class _Handle:
+        def is_alive(self): return True
+        def render(self): return ""
+        def leader_pid(self): return None
+        def leader_pgid(self): return None
+        def pump(self, t): return False
+        def flush_viewport(self, dialog): pass
+
+    class _Drv:
+        command_prefixes = ()
+        submit_key = "\r"
+        def __init__(self): self._settle = 0
+
+    eq = EventQueue()
+    spec = ExecutorSpec(command="c", args=[], env={}, driver="claude")
+    sess = Session("s-df02", "claude", _Drv(), object(), spec, eq)
+    sess._dialog = Dialog(tmp_path / "s-df02", tail_lines=200, spool_max_bytes=0)
+    sess._handle = _Handle()
+
+    # Surface delivery failure (publishes exactly one terminal event).
+    sess._fail_delivery("write_unconfirmed")
+    assert sess._terminal_kind == "delivery_failed"
+    first_events = [e for e in eq._events if e.session_id == "s-df02"]
+    assert len(first_events) == 1 and first_events[0].kind == "delivery_failed"
+
+    # Child exits while delivery_failed is already surfaced — this is the bug trigger.
+    # _finish_publish is called with alive=False (status=None → _exit_kind → "crashed").
+    sess._finish_publish(status=None, alive=False)
+
+    # (a) terminal_kind must not be overwritten to "crashed" or "done"
+    assert sess.terminal_snapshot()["terminal_kind"] == "delivery_failed", (
+        "terminal_kind was overwritten by the not-alive branch"
+    )
+    # (b) no second terminal event published
+    all_events = [e for e in eq._events if e.session_id == "s-df02"]
+    assert len(all_events) == 1, (
+        f"expected 1 terminal event, got {len(all_events)}: {[e.kind for e in all_events]}"
+    )

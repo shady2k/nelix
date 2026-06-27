@@ -122,4 +122,4 @@ Report it to the user; the other agents keep working — handle the rest of the 
 - "Done" = process exited **and** goal met — not a mere idle prompt.
 - On wake, one `nelix_status()` is the normal read; `nelix_screen` / `nelix_dialog` are for deeper
   inspection (a truncated question, debugging) — never progress polling.
-- No jargon or raw ids; the full session_id is allowed only to disambiguate same-name agents in labels.
+- No jargon or raw ids; labels always include the full session_id (agent name + project + session_id).

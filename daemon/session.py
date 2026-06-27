@@ -419,7 +419,16 @@ class Session:
                     self._log_exited("monitor_exception", status)
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return
-        # 2. executor genuinely exited -> the ONE terminal exit event, status-mapped
+        # 2. delivery_failed already surfaced -> no bogus terminal event, no executor_exited.
+        # Checked BEFORE the not-alive branch: if the child exits after _fail_delivery publishes,
+        # that terminal kind is authoritative and must not be overwritten by the exit branch.
+        # Distinct from _delivery_tick setting _task_delivery="failed" without surfacing the event
+        # (child died mid-delivery): that path has _terminal_kind=None and falls through to branch 3.
+        if self._terminal_kind == "delivery_failed":
+            if self._log is not None:
+                self._log.debug("session", "monitor_exited", session_id=self._id)
+            return
+        # 3. executor genuinely exited -> the ONE terminal exit event, status-mapped
         if not alive:
             kind, final_state = self._exit_kind(status)
             with self._lock:
@@ -431,13 +440,8 @@ class Session:
             if self._log is not None:
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return
-        # 3. operator stopped a LIVE agent -> manager logs session_stopped; no executor_exited
+        # 4. operator stopped a LIVE agent -> manager logs session_stopped; no executor_exited
         if self._stop.is_set():
-            if self._log is not None:
-                self._log.debug("session", "monitor_exited", session_id=self._id)
-            return
-        # 4. delivery already failed AND surfaced -> no bogus crashed, no executor_exited
-        if self._task_delivery == "failed":
             if self._log is not None:
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return
