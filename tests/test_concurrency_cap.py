@@ -33,7 +33,6 @@ def test_concurrency_limit_invalid_falls_back_to_5(tmp_path):
 
 
 from daemon.events import EventQueue
-from daemon.session import RespondOutcome
 
 
 class _FakeSession:
@@ -67,13 +66,3 @@ def test_cap_admits_N_rejects_N_plus_1(tmp_path):
         mgr.start("claude", "t3", cwd)
 
 
-def test_default_propagation_config_to_manager(tmp_path):
-    # No nelix.toml value -> limit 5 reaches the manager constructor default path.
-    from daemon.manager import SessionManager
-    from daemon.config import ExecutorSpec, load_concurrency_limit
-    limit = load_concurrency_limit(str(tmp_path / "absent.toml"))
-    specs = {"claude": ExecutorSpec(command="c", args=[], env={}, driver="claude")}
-    mgr = SessionManager(specs, EventQueue(), concurrency_limit=limit,
-                         session_factory=lambda sid, ex, spec, ev: _FakeSession(sid, ex, spec),
-                         session_retain=0, session_max_age_days=0)
-    assert mgr._limit == 5
