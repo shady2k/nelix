@@ -233,7 +233,11 @@ def _write_state(pid: int, transport) -> None:
     # 0600 AT creation (O_EXCL): the token never exists on disk world-readable, not even briefly.
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(json.dumps({"pid": pid, **transport.to_state()}))
+        # Stamp the pid's start fingerprint so endpoint() can reject a recorded pid that has died
+        # and been reused by an unrelated process (the symmetric guard to _live_lock_holder()).
+        f.write(json.dumps({"pid": pid,
+                            "start_fingerprint": reaper.ProcessInspector().start_fingerprint(pid),
+                            **transport.to_state()}))
     tmp.replace(_state_file())
 
 
@@ -244,6 +248,10 @@ def endpoint():
         return None
     pid = st.get("pid")
     if not pid or not _pid_alive(pid):
+        return None
+    # Reject a recorded pid that died and was reused by an unrelated process: the fingerprint
+    # (process start time) is immutable for a process's life, so a reused pid won't match.
+    if reaper.ProcessInspector().start_fingerprint(pid) != st.get("start_fingerprint"):
         return None
     try:
         t = Transport.from_state(st)
@@ -273,11 +281,12 @@ def _live_lock_holder():
 
 
 def _holder_transport(meta):
-    """Best-effort Transport to reach the lock holder. The unix socket path is deterministic, so a
-    unix holder is reachable. A tcp holder is NOT: the lock metadata carries no token, so we can't
+    """Best-effort Transport to reach the lock holder. A unix holder is reachable at the socket path
+    it recorded in the lock meta (falling back to the default node for a holder predating the path
+    stamp). A tcp holder is NOT reachable: the lock metadata carries no token, so we can't
     authenticate to it — such a holder can only be reaped, never adopted."""
     if meta.get("transport") == "unix":
-        return Transport.unix(str(paths.rpc_sock()))
+        return Transport.unix(meta.get("path") or str(paths.rpc_sock()))
     return None
 
 
@@ -302,22 +311,43 @@ def _reap_daemon(pid: int, why: str) -> None:
     _force_kill(pid)
 
 
+def _await_endpoint(grace: float):
+    """Poll endpoint() until it yields a healthy daemon or `grace` elapses. Lets a holder we cannot
+    probe directly (a tcp daemon — the lock meta carries no token) prove itself by PUBLISHING a
+    usable .active.json, which distinguishes a fresh concurrent winner (will publish) from a stale
+    orphan (won't) — so we never reap a live winner just because its state write trails its lock."""
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        ep = endpoint()
+        if ep is not None:
+            return ep
+        time.sleep(0.1)
+    return None
+
+
 def _reconcile_lock_holder():
     """Reconcile a singleton-lock holder that .active.json did NOT surface as a usable endpoint
     (an orphan from a crash, a manual start, or a daemon left on stale code after a plugin update).
-    Returns a Transport to a holder we ADOPTED (alive + speaks our protocol: recorded into
-    .active.json and reused) or None — None meaning we either REAPED an incompatible/unreachable
-    holder or found none, and the caller should spawn a fresh daemon."""
+    Returns a Transport to a holder we ADOPTED/reused, or None — None meaning we either REAPED an
+    incompatible/stale holder or found none, and the caller should spawn a fresh daemon."""
     meta = _live_lock_holder()
     if not meta:
         return None
     transport = _holder_transport(meta)
-    if transport is not None and _healthy(transport):
-        _write_state(meta["pid"], transport)
-        _log.info("nelix daemon: adopted lock holder pid=%s transport=%s",
-                  meta["pid"], meta.get("transport"))
-        return transport
-    _reap_daemon(meta["pid"], "incompatible/unreachable lock holder (stale code, wedged, or tcp)")
+    if transport is not None:                            # unix: we can probe /status directly
+        if _healthy(transport):
+            _write_state(meta["pid"], transport)         # adopt: alive AND speaks our protocol
+            _log.info("nelix daemon: adopted lock holder pid=%s transport=unix", meta["pid"])
+            return transport
+        _reap_daemon(meta["pid"], "incompatible or unreachable unix lock holder")
+        return None
+    # tcp holder: the lock meta carries no token, so we cannot authenticate to /status. It is EITHER
+    # a fresh concurrent winner about to publish .active.json OR a stale orphan. Let it prove itself
+    # by publishing a usable endpoint within the health window; reap only if it never does.
+    ep = _await_endpoint(_HEALTH_TIMEOUT)
+    if ep is not None:
+        return ep
+    _reap_daemon(meta["pid"], "stale tcp lock holder (never published a usable endpoint)")
     return None
 
 
@@ -468,12 +498,14 @@ def teardown(reason: str = "") -> None:
         holder = _live_lock_holder()
         if holder and holder["pid"] not in pids:
             pids.append(holder["pid"])
+        interrupted = False
         for pid in pids:
-            try:
-                _graceful_wait(pid)
-            except KeyboardInterrupt:
-                pass                              # force exit -> fall through to SIGKILL
-            _force_kill(pid)                      # no-op if it already exited
+            if not interrupted:
+                try:
+                    _graceful_wait(pid)
+                except KeyboardInterrupt:
+                    interrupted = True            # force exit now: skip graceful for remaining pids
+            _force_kill(pid)                      # SIGKILL; no-op if it already exited
         try:
             _state_file().unlink()
         except Exception:
@@ -485,7 +517,10 @@ def teardown(reason: str = "") -> None:
 def _graceful_wait(pid: int) -> None:
     """SIGTERM, then poll up to ~10s for the pid to exit. May raise KeyboardInterrupt
     if the wait is interrupted (the caller then force-kills)."""
-    os.kill(pid, signal.SIGTERM)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return                                    # raced us and already exited — nothing to wait on
     for _ in range(20):
         try:                                      # reap if it's OUR child
             if os.waitpid(pid, os.WNOHANG)[0] == pid:

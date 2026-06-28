@@ -162,17 +162,82 @@ def test_reconcile_reaps_incompatible_unix_holder(monkeypatch, tmp_path):
     assert reaped == [4242]
 
 
-def test_reconcile_reaps_tcp_holder_it_cannot_adopt(monkeypatch, tmp_path):
-    # a tcp holder has no token in the lock meta -> unreachable -> reap, never adopt.
+def test_reconcile_reaps_stale_tcp_holder(monkeypatch, tmp_path):
+    # a tcp holder isn't probe-able (no token in lock meta). If it never publishes a usable
+    # endpoint within the grace, it's a stale orphan -> reap.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     monkeypatch.setattr(supervisor, "_live_lock_holder",
                         lambda: {"pid": 4242, "transport": "tcp", "port": 5})
-    monkeypatch.setattr(supervisor, "_healthy", lambda t: True)   # must NOT matter (no transport)
+    monkeypatch.setattr(supervisor, "_await_endpoint", lambda grace: None)   # never publishes
     reaped = []
     monkeypatch.setattr(supervisor, "_reap_daemon", lambda pid, why: reaped.append(pid))
     assert supervisor._reconcile_lock_holder() is None
     assert reaped == [4242]
+
+
+def test_reconcile_never_reaps_tcp_winner_that_publishes(monkeypatch, tmp_path):
+    # the concurrency hazard Codex flagged: a fresh winner holds the lock but its state write trails
+    # by a beat. It publishes within the grace -> we adopt it, never reap a live winner.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder",
+                        lambda: {"pid": 4242, "transport": "tcp", "port": 5})
+    winner = Transport.tcp("127.0.0.1", 5, "tok")
+    monkeypatch.setattr(supervisor, "_await_endpoint", lambda grace: winner)
+    reaped = []
+    monkeypatch.setattr(supervisor, "_reap_daemon", lambda pid, why: reaped.append(pid))
+    assert supervisor._reconcile_lock_holder() == winner
+    assert reaped == []
+
+
+def test_holder_transport_uses_recorded_unix_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    # a manually started daemon serving a non-default node: adopt the path it ACTUALLY bound
+    assert supervisor._holder_transport({"transport": "unix", "path": "/tmp/custom.sock"}) \
+        == Transport.unix("/tmp/custom.sock")
+    # a holder predating the path stamp -> fall back to the default node
+    assert supervisor._holder_transport({"transport": "unix"}) \
+        == Transport.unix(str(paths.rpc_sock()))
+    assert supervisor._holder_transport({"transport": "tcp", "port": 1}) is None
+
+
+def test_endpoint_rejects_reused_state_pid(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    supervisor._write_state(os.getpid(), Transport.unix(str(paths.rpc_sock())))
+    # the recorded pid is alive, but its fingerprint no longer matches -> it's a REUSED pid
+    st = json.loads(paths.state_file().read_text()); st["start_fingerprint"] = "STALE-MISMATCH"
+    paths.state_file().write_text(json.dumps(st))
+    monkeypatch.setattr(supervisor, "_healthy", lambda t: True)   # even if something answers
+    assert supervisor.endpoint() is None
+
+
+def test_reap_daemon_tolerates_holder_already_gone(monkeypatch):
+    importlib.reload(supervisor)
+    def gone(pid, sig):
+        raise ProcessLookupError()
+    monkeypatch.setattr(supervisor.os, "kill", gone)             # SIGTERM + kill(0) both ESRCH
+    supervisor._reap_daemon(123456, "raced us")                  # must not raise
+
+
+def test_teardown_ctrl_c_skips_graceful_for_remaining_pids(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_read_state", lambda: {"pid": 100})
+    monkeypatch.setattr(supervisor, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: {"pid": 200})
+    graceful, forced = [], []
+    def boom(pid):
+        graceful.append(pid); raise KeyboardInterrupt()         # interrupted on the FIRST pid
+    monkeypatch.setattr(supervisor, "_graceful_wait", boom)
+    monkeypatch.setattr(supervisor, "_force_kill", lambda pid: forced.append(pid))
+    monkeypatch.setattr(supervisor, "_state_file", lambda: tmp_path / "absent.json")
+    supervisor.teardown("ctrl-c multi")
+    assert graceful == [100]                                     # graceful only for the first pid
+    assert forced == [100, 200]                                  # both still force-killed
 
 
 def test_teardown_reaps_orphan_lock_holder_not_in_state(monkeypatch, tmp_path):
@@ -197,6 +262,9 @@ def test_ensure_running_reaps_stale_orphan_and_respawns(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_RPC_TRANSPORT", "tcp")
     fake = tmp_path / "fake_daemon.py"; fake.write_text(_FAKE)
     importlib.reload(supervisor)
+    # a tcp holder can't be probed directly, so reconcile grants it a grace to publish before
+    # reaping; the orphan never will, so shorten the window to keep the test fast.
+    monkeypatch.setattr(supervisor, "_HEALTH_TIMEOUT", 3.0)
 
     # 1) a live ORPHAN daemon on an OLD protocol, holding the singleton lock
     port = supervisor._free_port()
@@ -480,8 +548,9 @@ def test_write_state_is_0600_and_carries_transport(monkeypatch, tmp_path):
     paths.ensure_private_dir(paths.nelix_root())
     supervisor._write_state(4242, Transport.tcp("127.0.0.1", 55555, "tok"))
     st = json.loads(paths.state_file().read_text())
-    assert st == {"pid": 4242, "transport": "tcp", "host": "127.0.0.1",
-                  "port": 55555, "token": "tok"}
+    assert {k: st[k] for k in ("pid", "transport", "host", "port", "token")} == {
+        "pid": 4242, "transport": "tcp", "host": "127.0.0.1", "port": 55555, "token": "tok"}
+    assert "start_fingerprint" in st                      # stamped for pid-reuse rejection
     assert stat.S_IMODE(os.stat(paths.state_file()).st_mode) == 0o600
 
 
