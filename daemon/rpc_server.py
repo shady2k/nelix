@@ -9,6 +9,7 @@ import paths
 from daemon.dialog import DialogReader
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hygiene import PtyInputRejected
+from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.transport import peer_is_self
 
 _MAX_BODY = 4 * 1024 * 1024   # 4 MiB body cap (post-auth memory hygiene; generous for tasks)
@@ -95,7 +96,9 @@ def make_server(manager, transport, logger=None):
                 self._send(200, {"event": _evt_dict(evt) if evt else None})
             elif p.path == "/status":
                 sid = parse_qs(p.query).get("session_id", [None])[0]
-                self._send(200, manager.status(sid))
+                # Stamp the RPC protocol version at the wire layer (always present, regardless of
+                # session_id) so a supervisor can tell our protocol from an old daemon's.
+                self._send(200, {**manager.status(sid), "rpc_protocol": RPC_PROTOCOL_VERSION})
             elif p.path == "/dialog":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]

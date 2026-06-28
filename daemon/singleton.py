@@ -5,7 +5,10 @@ import fcntl
 import json
 import os
 
-import paths
+try:
+    from .. import paths           # package mode (hermes_plugins.nelix.daemon.singleton)
+except ImportError:
+    import paths                   # top-level module mode (daemon process / tests)
 
 
 def acquire(lock_path, meta: dict):

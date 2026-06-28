@@ -42,6 +42,10 @@ def acquire_singleton(logger, transport=None):
         "start_fingerprint": insp.start_fingerprint(pid),
         "transport": transport.kind if transport is not None else None,
         "port": transport.port if (transport is not None and transport.kind == "tcp") else None,
+        # Unix socket path is symmetric to the tcp port: a daemon started with a custom
+        # NELIX_RPC_SOCK can hold the lock while serving a non-default node, so the supervisor
+        # adopts/probes the path the holder ACTUALLY bound rather than assuming the default.
+        "path": transport.path if (transport is not None and transport.kind == "unix") else None,
     }
     fd = singleton.acquire(paths.daemon_lock(), meta)
     if fd is None and logger is not None:

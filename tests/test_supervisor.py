@@ -1,6 +1,7 @@
 import importlib
 import json
 import os
+import subprocess
 import sys
 import textwrap
 import time
@@ -11,17 +12,33 @@ import paths  # noqa: E402
 import supervisor  # noqa: E402
 from daemon.transport import Transport  # noqa: E402
 
-# A fake daemon: serves /status 200 iff the token header matches. Honors
-# NELIX_RPC_TOKEN / NELIX_RPC_PORT exactly like the real daemon entry.
+# A fake daemon: serves /status 200 (with the RPC protocol stamp) iff the token header matches.
+# Honors NELIX_RPC_TOKEN / NELIX_RPC_PORT exactly like the real daemon entry. NELIX_FAKE_PROTOCOL
+# overrides the reported protocol (default = current) to simulate a daemon left on stale code.
 _FAKE = textwrap.dedent("""
     import os, json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import paths
+    from daemon import singleton, reaper
+    from daemon.protocol import RPC_PROTOCOL_VERSION
     tok = os.environ["NELIX_RPC_TOKEN"]; port = int(os.environ["NELIX_RPC_PORT"])
+    proto = int(os.environ.get("NELIX_FAKE_PROTOCOL", RPC_PROTOCOL_VERSION))
+    # Hold the singleton lock exactly like the real daemon (app.acquire_singleton), so the
+    # supervisor's ownership guard can attribute the live endpoint to this pid.
+    _insp = reaper.ProcessInspector(); _pid = os.getpid()
+    _fd = singleton.acquire(paths.daemon_lock(),
+                            {"pid": _pid, "start_fingerprint": _insp.start_fingerprint(_pid),
+                             "transport": "tcp", "port": port})
+    if _fd is None:
+        raise SystemExit(3)
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            ok = self.headers.get("X-Nelix-Token") == tok
-            self.send_response(200 if ok else 401)
-            self.send_header("Content-Length","2"); self.end_headers(); self.wfile.write(b"{}")
+            if self.headers.get("X-Nelix-Token") != tok:
+                self.send_response(401); self.send_header("Content-Length","2")
+                self.end_headers(); self.wfile.write(b"{}"); return
+            body = json.dumps({"rpc_protocol": proto}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
         def log_message(self,*a): pass
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 """)
@@ -79,6 +96,211 @@ def test_stale_state_triggers_respawn(monkeypatch, tmp_path):
     transport = supervisor.ensure_running()  # dead pid -> respawn
     assert transport.token != "dead"
     supervisor.teardown()
+
+
+def test_healthy_requires_matching_protocol(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    t = Transport.tcp("127.0.0.1", 1, "tok")
+    monkeypatch.setattr(supervisor, "_status_body",
+                        lambda tr, timeout=2: {"rpc_protocol": supervisor.RPC_PROTOCOL_VERSION})
+    assert supervisor._healthy(t) is True
+    monkeypatch.setattr(supervisor, "_status_body", lambda tr, timeout=2: {"rpc_protocol": 0})
+    assert supervisor._healthy(t) is False          # old code, mismatched protocol
+    monkeypatch.setattr(supervisor, "_status_body", lambda tr, timeout=2: {"sessions": {}})
+    assert supervisor._healthy(t) is False          # pre-stamping daemon, no field at all
+    monkeypatch.setattr(supervisor, "_status_body", lambda tr, timeout=2: None)
+    assert supervisor._healthy(t) is False          # unreachable
+
+
+def test_endpoint_rejects_stale_protocol_daemon(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    supervisor._write_state(os.getpid(), Transport.unix(str(paths.rpc_sock())))
+    # pid alive (our own), but the daemon reports an OLD protocol -> not a usable endpoint
+    monkeypatch.setattr(supervisor, "_status_body", lambda t, timeout=2: {"rpc_protocol": 0})
+    assert supervisor.endpoint() is None
+
+
+def test_owns_lock_matches_holder_pid(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: {"pid": 777})
+    assert supervisor._owns_lock(777) is True
+    assert supervisor._owns_lock(778) is False                 # a different daemon holds the lock
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: None)
+    assert supervisor._owns_lock(777) is False                 # nobody holds it
+
+
+def test_reconcile_noop_when_no_holder(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: None)
+    assert supervisor._reconcile_lock_holder() is None         # -> caller spawns fresh
+
+
+def test_reconcile_adopts_compatible_unix_holder(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    monkeypatch.setattr(supervisor, "_live_lock_holder",
+                        lambda: {"pid": 4242, "transport": "unix"})
+    monkeypatch.setattr(supervisor, "_healthy", lambda t: True)   # holder speaks our protocol
+    t = supervisor._reconcile_lock_holder()
+    assert t == Transport.unix(str(paths.rpc_sock()))            # reused, not respawned
+    assert json.loads(paths.state_file().read_text())["pid"] == 4242   # adopted into .active.json
+
+
+def test_reconcile_reaps_incompatible_unix_holder(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder",
+                        lambda: {"pid": 4242, "transport": "unix"})
+    monkeypatch.setattr(supervisor, "_healthy", lambda t: False)  # stale code -> incompatible
+    reaped = []
+    monkeypatch.setattr(supervisor, "_reap_daemon", lambda pid, why: reaped.append(pid))
+    assert supervisor._reconcile_lock_holder() is None
+    assert reaped == [4242]
+
+
+def test_reconcile_reaps_stale_tcp_holder(monkeypatch, tmp_path):
+    # a tcp holder isn't probe-able (no token in lock meta). If it never publishes a usable
+    # endpoint within the grace, it's a stale orphan -> reap.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder",
+                        lambda: {"pid": 4242, "transport": "tcp", "port": 5})
+    monkeypatch.setattr(supervisor, "_await_endpoint", lambda grace: None)   # never publishes
+    reaped = []
+    monkeypatch.setattr(supervisor, "_reap_daemon", lambda pid, why: reaped.append(pid))
+    assert supervisor._reconcile_lock_holder() is None
+    assert reaped == [4242]
+
+
+def test_reconcile_never_reaps_tcp_winner_that_publishes(monkeypatch, tmp_path):
+    # the concurrency hazard Codex flagged: a fresh winner holds the lock but its state write trails
+    # by a beat. It publishes within the grace -> we adopt it, never reap a live winner.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder",
+                        lambda: {"pid": 4242, "transport": "tcp", "port": 5})
+    winner = Transport.tcp("127.0.0.1", 5, "tok")
+    monkeypatch.setattr(supervisor, "_await_endpoint", lambda grace: winner)
+    reaped = []
+    monkeypatch.setattr(supervisor, "_reap_daemon", lambda pid, why: reaped.append(pid))
+    assert supervisor._reconcile_lock_holder() == winner
+    assert reaped == []
+
+
+def test_holder_transport_uses_recorded_unix_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    # a manually started daemon serving a non-default node: adopt the path it ACTUALLY bound
+    assert supervisor._holder_transport({"transport": "unix", "path": "/tmp/custom.sock"}) \
+        == Transport.unix("/tmp/custom.sock")
+    # a holder predating the path stamp -> fall back to the default node
+    assert supervisor._holder_transport({"transport": "unix"}) \
+        == Transport.unix(str(paths.rpc_sock()))
+    assert supervisor._holder_transport({"transport": "tcp", "port": 1}) is None
+
+
+def test_endpoint_rejects_reused_state_pid(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    supervisor._write_state(os.getpid(), Transport.unix(str(paths.rpc_sock())))
+    # the recorded pid is alive, but its fingerprint no longer matches -> it's a REUSED pid
+    st = json.loads(paths.state_file().read_text()); st["start_fingerprint"] = "STALE-MISMATCH"
+    paths.state_file().write_text(json.dumps(st))
+    monkeypatch.setattr(supervisor, "_healthy", lambda t: True)   # even if something answers
+    assert supervisor.endpoint() is None
+
+
+def test_reap_daemon_tolerates_holder_already_gone(monkeypatch):
+    importlib.reload(supervisor)
+    def gone(pid, sig):
+        raise ProcessLookupError()
+    monkeypatch.setattr(supervisor.os, "kill", gone)             # SIGTERM + kill(0) both ESRCH
+    supervisor._reap_daemon(123456, "raced us")                  # must not raise
+
+
+def test_teardown_ctrl_c_skips_graceful_for_remaining_pids(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_read_state", lambda: {"pid": 100})
+    monkeypatch.setattr(supervisor, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: {"pid": 200})
+    graceful, forced = [], []
+    def boom(pid):
+        graceful.append(pid); raise KeyboardInterrupt()         # interrupted on the FIRST pid
+    monkeypatch.setattr(supervisor, "_graceful_wait", boom)
+    monkeypatch.setattr(supervisor, "_force_kill", lambda pid: forced.append(pid))
+    monkeypatch.setattr(supervisor, "_state_file", lambda: tmp_path / "absent.json")
+    supervisor.teardown("ctrl-c multi")
+    assert graceful == [100]                                     # graceful only for the first pid
+    assert forced == [100, 200]                                  # both still force-killed
+
+
+def test_teardown_reaps_orphan_lock_holder_not_in_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_read_state", lambda: {"pid": 100})   # recorded daemon...
+    monkeypatch.setattr(supervisor, "_pid_alive", lambda pid: pid == 200)  # ...is dead; 200 alive
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: {"pid": 200})  # orphan holder
+    killed = []
+    monkeypatch.setattr(supervisor, "_graceful_wait", lambda pid: killed.append(("term", pid)))
+    monkeypatch.setattr(supervisor, "_force_kill", lambda pid: killed.append(("kill", pid)))
+    monkeypatch.setattr(supervisor, "_state_file", lambda: tmp_path / "absent.json")
+    supervisor.teardown("orphan test")
+    assert ("term", 200) in killed and ("kill", 200) in killed   # orphan holder reaped
+    assert all(pid != 100 for _, pid in killed)                  # dead state pid skipped
+
+
+def test_ensure_running_reaps_stale_orphan_and_respawns(monkeypatch, tmp_path):
+    """The real incident: .active.json names a DEAD pid while a live daemon on STALE code holds the
+    lock+socket. ensure_running must reap the orphan and bring up a fresh, compatible daemon."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_RPC_TRANSPORT", "tcp")
+    fake = tmp_path / "fake_daemon.py"; fake.write_text(_FAKE)
+    importlib.reload(supervisor)
+    # a tcp holder can't be probed directly, so reconcile grants it a grace to publish before
+    # reaping; the orphan never will, so shorten the window to keep the test fast.
+    monkeypatch.setattr(supervisor, "_HEALTH_TIMEOUT", 3.0)
+
+    # 1) a live ORPHAN daemon on an OLD protocol, holding the singleton lock
+    port = supervisor._free_port()
+    env = {**os.environ, "HERMES_HOME": str(tmp_path), "NELIX_RPC_TRANSPORT": "tcp",
+           "NELIX_RPC_TOKEN": "orphan", "NELIX_RPC_PORT": str(port), "NELIX_FAKE_PROTOCOL": "0",
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    orphan = subprocess.Popen([sys.executable, str(fake)], env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            h = supervisor._live_lock_holder()
+            if h and h.get("pid") == orphan.pid:
+                break
+            time.sleep(0.05)
+        assert (supervisor._live_lock_holder() or {}).get("pid") == orphan.pid, "orphan never locked"
+
+        # 2) .active.json drifted to a dead pid (the recorded daemon already gone)
+        state = paths.state_file(); state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"pid": 999999, "transport": "tcp",
+                                     "host": "127.0.0.1", "port": 1, "token": "dead"}))
+
+        # 3) fresh spawn reuses the same fake but at the CURRENT protocol (no FAKE override in env)
+        monkeypatch.setattr(supervisor, "_daemon_argv", lambda: [sys.executable, str(fake)])
+        transport = supervisor.ensure_running()
+
+        time.sleep(0.3)
+        with __import__("pytest").raises(OSError):
+            os.kill(orphan.pid, 0)                              # orphan reaped
+        new = json.loads(paths.state_file().read_text())
+        assert new["pid"] not in (999999, orphan.pid) and supervisor._pid_alive(new["pid"])
+        assert supervisor._healthy(transport)                  # fresh daemon compatible & live
+    finally:
+        supervisor.teardown()
+        if orphan.poll() is None:
+            orphan.kill()
 
 
 def test_ensure_deps_installs_from_hash_lock_when_missing(monkeypatch):
@@ -326,8 +548,9 @@ def test_write_state_is_0600_and_carries_transport(monkeypatch, tmp_path):
     paths.ensure_private_dir(paths.nelix_root())
     supervisor._write_state(4242, Transport.tcp("127.0.0.1", 55555, "tok"))
     st = json.loads(paths.state_file().read_text())
-    assert st == {"pid": 4242, "transport": "tcp", "host": "127.0.0.1",
-                  "port": 55555, "token": "tok"}
+    assert {k: st[k] for k in ("pid", "transport", "host", "port", "token")} == {
+        "pid": 4242, "transport": "tcp", "host": "127.0.0.1", "port": 55555, "token": "tok"}
+    assert "start_fingerprint" in st                      # stamped for pid-reuse rejection
     assert stat.S_IMODE(os.stat(paths.state_file()).st_mode) == 0o600
 
 
