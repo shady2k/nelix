@@ -1,6 +1,7 @@
 import importlib
 import json
 import os
+import subprocess
 import sys
 import textwrap
 import time
@@ -17,9 +18,19 @@ from daemon.transport import Transport  # noqa: E402
 _FAKE = textwrap.dedent("""
     import os, json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import paths
+    from daemon import singleton, reaper
     from daemon.protocol import RPC_PROTOCOL_VERSION
     tok = os.environ["NELIX_RPC_TOKEN"]; port = int(os.environ["NELIX_RPC_PORT"])
     proto = int(os.environ.get("NELIX_FAKE_PROTOCOL", RPC_PROTOCOL_VERSION))
+    # Hold the singleton lock exactly like the real daemon (app.acquire_singleton), so the
+    # supervisor's ownership guard can attribute the live endpoint to this pid.
+    _insp = reaper.ProcessInspector(); _pid = os.getpid()
+    _fd = singleton.acquire(paths.daemon_lock(),
+                            {"pid": _pid, "start_fingerprint": _insp.start_fingerprint(_pid),
+                             "transport": "tcp", "port": port})
+    if _fd is None:
+        raise SystemExit(3)
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.headers.get("X-Nelix-Token") != tok:
@@ -110,6 +121,118 @@ def test_endpoint_rejects_stale_protocol_daemon(monkeypatch, tmp_path):
     # pid alive (our own), but the daemon reports an OLD protocol -> not a usable endpoint
     monkeypatch.setattr(supervisor, "_status_body", lambda t, timeout=2: {"rpc_protocol": 0})
     assert supervisor.endpoint() is None
+
+
+def test_owns_lock_matches_holder_pid(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: {"pid": 777})
+    assert supervisor._owns_lock(777) is True
+    assert supervisor._owns_lock(778) is False                 # a different daemon holds the lock
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: None)
+    assert supervisor._owns_lock(777) is False                 # nobody holds it
+
+
+def test_reconcile_noop_when_no_holder(monkeypatch):
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: None)
+    assert supervisor._reconcile_lock_holder() is None         # -> caller spawns fresh
+
+
+def test_reconcile_adopts_compatible_unix_holder(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    monkeypatch.setattr(supervisor, "_live_lock_holder",
+                        lambda: {"pid": 4242, "transport": "unix"})
+    monkeypatch.setattr(supervisor, "_healthy", lambda t: True)   # holder speaks our protocol
+    t = supervisor._reconcile_lock_holder()
+    assert t == Transport.unix(str(paths.rpc_sock()))            # reused, not respawned
+    assert json.loads(paths.state_file().read_text())["pid"] == 4242   # adopted into .active.json
+
+
+def test_reconcile_reaps_incompatible_unix_holder(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder",
+                        lambda: {"pid": 4242, "transport": "unix"})
+    monkeypatch.setattr(supervisor, "_healthy", lambda t: False)  # stale code -> incompatible
+    reaped = []
+    monkeypatch.setattr(supervisor, "_reap_daemon", lambda pid, why: reaped.append(pid))
+    assert supervisor._reconcile_lock_holder() is None
+    assert reaped == [4242]
+
+
+def test_reconcile_reaps_tcp_holder_it_cannot_adopt(monkeypatch, tmp_path):
+    # a tcp holder has no token in the lock meta -> unreachable -> reap, never adopt.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_live_lock_holder",
+                        lambda: {"pid": 4242, "transport": "tcp", "port": 5})
+    monkeypatch.setattr(supervisor, "_healthy", lambda t: True)   # must NOT matter (no transport)
+    reaped = []
+    monkeypatch.setattr(supervisor, "_reap_daemon", lambda pid, why: reaped.append(pid))
+    assert supervisor._reconcile_lock_holder() is None
+    assert reaped == [4242]
+
+
+def test_teardown_reaps_orphan_lock_holder_not_in_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    monkeypatch.setattr(supervisor, "_read_state", lambda: {"pid": 100})   # recorded daemon...
+    monkeypatch.setattr(supervisor, "_pid_alive", lambda pid: pid == 200)  # ...is dead; 200 alive
+    monkeypatch.setattr(supervisor, "_live_lock_holder", lambda: {"pid": 200})  # orphan holder
+    killed = []
+    monkeypatch.setattr(supervisor, "_graceful_wait", lambda pid: killed.append(("term", pid)))
+    monkeypatch.setattr(supervisor, "_force_kill", lambda pid: killed.append(("kill", pid)))
+    monkeypatch.setattr(supervisor, "_state_file", lambda: tmp_path / "absent.json")
+    supervisor.teardown("orphan test")
+    assert ("term", 200) in killed and ("kill", 200) in killed   # orphan holder reaped
+    assert all(pid != 100 for _, pid in killed)                  # dead state pid skipped
+
+
+def test_ensure_running_reaps_stale_orphan_and_respawns(monkeypatch, tmp_path):
+    """The real incident: .active.json names a DEAD pid while a live daemon on STALE code holds the
+    lock+socket. ensure_running must reap the orphan and bring up a fresh, compatible daemon."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_RPC_TRANSPORT", "tcp")
+    fake = tmp_path / "fake_daemon.py"; fake.write_text(_FAKE)
+    importlib.reload(supervisor)
+
+    # 1) a live ORPHAN daemon on an OLD protocol, holding the singleton lock
+    port = supervisor._free_port()
+    env = {**os.environ, "HERMES_HOME": str(tmp_path), "NELIX_RPC_TRANSPORT": "tcp",
+           "NELIX_RPC_TOKEN": "orphan", "NELIX_RPC_PORT": str(port), "NELIX_FAKE_PROTOCOL": "0",
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    orphan = subprocess.Popen([sys.executable, str(fake)], env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            h = supervisor._live_lock_holder()
+            if h and h.get("pid") == orphan.pid:
+                break
+            time.sleep(0.05)
+        assert (supervisor._live_lock_holder() or {}).get("pid") == orphan.pid, "orphan never locked"
+
+        # 2) .active.json drifted to a dead pid (the recorded daemon already gone)
+        state = paths.state_file(); state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"pid": 999999, "transport": "tcp",
+                                     "host": "127.0.0.1", "port": 1, "token": "dead"}))
+
+        # 3) fresh spawn reuses the same fake but at the CURRENT protocol (no FAKE override in env)
+        monkeypatch.setattr(supervisor, "_daemon_argv", lambda: [sys.executable, str(fake)])
+        transport = supervisor.ensure_running()
+
+        time.sleep(0.3)
+        with __import__("pytest").raises(OSError):
+            os.kill(orphan.pid, 0)                              # orphan reaped
+        new = json.loads(paths.state_file().read_text())
+        assert new["pid"] not in (999999, orphan.pid) and supervisor._pid_alive(new["pid"])
+        assert supervisor._healthy(transport)                  # fresh daemon compatible & live
+    finally:
+        supervisor.teardown()
+        if orphan.poll() is None:
+            orphan.kill()
 
 
 def test_ensure_deps_installs_from_hash_lock_when_missing(monkeypatch):

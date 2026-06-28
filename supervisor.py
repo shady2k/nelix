@@ -252,6 +252,75 @@ def endpoint():
     return t if _healthy(t) else None
 
 
+def _live_lock_holder():
+    """The daemon.lock holder's metadata IF it names a live, fingerprint-matched process, else
+    None. Fingerprint-matching (process start time) survives PID reuse, so a recycled pid can't
+    masquerade as the daemon. This is the source of truth the start/teardown paths consult BEYOND
+    .active.json, so an orphan daemon (crash, manual start, or one left on stale code after a
+    plugin update) that holds the lock is never invisible to us."""
+    meta = singleton.read_holder(paths.daemon_lock())
+    if not meta:
+        return None
+    pid = meta.get("pid")
+    if not pid:
+        return None
+    insp = reaper.ProcessInspector()
+    if not insp.is_alive(pid):
+        return None
+    if insp.start_fingerprint(pid) != meta.get("start_fingerprint"):
+        return None
+    return meta
+
+
+def _holder_transport(meta):
+    """Best-effort Transport to reach the lock holder. The unix socket path is deterministic, so a
+    unix holder is reachable. A tcp holder is NOT: the lock metadata carries no token, so we can't
+    authenticate to it — such a holder can only be reaped, never adopted."""
+    if meta.get("transport") == "unix":
+        return Transport.unix(str(paths.rpc_sock()))
+    return None
+
+
+def _owns_lock(pid: int) -> bool:
+    """True iff `pid` is the live, fingerprint-matched holder of daemon.lock — proof that THIS
+    process owns the RPC endpoint, not an orphan answering the deterministic unix socket."""
+    holder = _live_lock_holder()
+    return bool(holder) and holder.get("pid") == pid
+
+
+def _reap_daemon(pid: int, why: str) -> None:
+    """SIGTERM->SIGKILL a daemon we are recycling. It is (almost always) not our child, so this
+    leans on _graceful_wait/_force_kill's non-child handling. The SIGTERM trips the daemon's
+    shutdown handler -> manager.stop_all(), so any live PTY sessions it owns are interrupted —
+    hence the loud warning."""
+    _log.warning("nelix daemon: reaping pid=%s (%s); any live sessions under it are interrupted",
+                 pid, why)
+    try:
+        _graceful_wait(pid)
+    except KeyboardInterrupt:
+        pass
+    _force_kill(pid)
+
+
+def _reconcile_lock_holder():
+    """Reconcile a singleton-lock holder that .active.json did NOT surface as a usable endpoint
+    (an orphan from a crash, a manual start, or a daemon left on stale code after a plugin update).
+    Returns a Transport to a holder we ADOPTED (alive + speaks our protocol: recorded into
+    .active.json and reused) or None — None meaning we either REAPED an incompatible/unreachable
+    holder or found none, and the caller should spawn a fresh daemon."""
+    meta = _live_lock_holder()
+    if not meta:
+        return None
+    transport = _holder_transport(meta)
+    if transport is not None and _healthy(transport):
+        _write_state(meta["pid"], transport)
+        _log.info("nelix daemon: adopted lock holder pid=%s transport=%s",
+                  meta["pid"], meta.get("transport"))
+        return transport
+    _reap_daemon(meta["pid"], "incompatible/unreachable lock holder (stale code, wedged, or tcp)")
+    return None
+
+
 def _open_daemon_log(root) -> Path:
     """Create this spawn's 0600 log file under logs/, migrate any legacy root-level logs,
     point daemon-latest.log at it, prune old ones. <pid> is the supervisor's own pid (the
@@ -325,6 +394,15 @@ def ensure_running() -> Transport:
     if existing:
         return existing
 
+    # .active.json yielded nothing usable, but a daemon may still hold the singleton lock+socket
+    # (an orphan from a crash, a manual start, or one left on stale code after a plugin update).
+    # Reconcile it BEFORE spawning: adopt it if it's live and compatible, else reap it so our fresh
+    # daemon can take the lock — otherwise our spawn SystemExit(3)s on the held lock and the client
+    # is left talking to the stale orphan (the RemoteDisconnected failure mode).
+    adopted = _reconcile_lock_holder()
+    if adopted:
+        return adopted
+
     _ensure_deps()  # daemon imports pyte/ptyprocess; install them venv-scoped if absent
 
     transport = _choose_transport()
@@ -353,7 +431,10 @@ def ensure_running() -> Transport:
 
     deadline = time.time() + _HEALTH_TIMEOUT
     while time.time() < deadline:
-        if _healthy(transport):
+        # Require BOTH a compatible /status AND proof that OUR spawned pid holds the lock. A bare
+        # health check on the deterministic unix socket could be answered by a *different* daemon;
+        # recording that under proc.pid is exactly the ownership-attribution bug we are closing.
+        if _healthy(transport) and _owns_lock(proc.pid):
             _write_state(proc.pid, transport)
             _log.info("nelix daemon started pid=%s transport=%s log=%s",
                       proc.pid, transport.kind, log_path)
@@ -377,9 +458,17 @@ def teardown(reason: str = "") -> None:
     # "force exit now": cut the graceful wait short and go straight to SIGKILL.
     _log.info("nelix daemon teardown: %s", reason or "(no reason)")
     try:
+        pids = []
         st = _read_state()
-        if st and _pid_alive(st["pid"]):
-            pid = st["pid"]
+        if st and st.get("pid") and _pid_alive(st["pid"]):
+            pids.append(st["pid"])
+        # Also reap a live lock holder NOT named in .active.json — an orphan from a crash, a manual
+        # start, or a daemon left on stale code. Otherwise it survives session-end and strands the
+        # next nelix_start (the bug this hardening closes).
+        holder = _live_lock_holder()
+        if holder and holder["pid"] not in pids:
+            pids.append(holder["pid"])
+        for pid in pids:
             try:
                 _graceful_wait(pid)
             except KeyboardInterrupt:

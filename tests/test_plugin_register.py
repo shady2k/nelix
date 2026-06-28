@@ -9,9 +9,17 @@ from daemon.transport import Transport  # noqa: E402
 
 _FAKE = textwrap.dedent("""
     import os, json
+    import paths
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from daemon import singleton, reaper
     from daemon.protocol import RPC_PROTOCOL_VERSION
     tok=os.environ['NELIX_RPC_TOKEN']; port=int(os.environ['NELIX_RPC_PORT'])
+    _insp=reaper.ProcessInspector(); _pid=os.getpid()
+    _fd=singleton.acquire(paths.daemon_lock(),
+                          {'pid':_pid,'start_fingerprint':_insp.start_fingerprint(_pid),
+                           'transport':'tcp','port':port})
+    if _fd is None:
+        raise SystemExit(3)
     class H(BaseHTTPRequestHandler):
         def _j(self,o):
             b=json.dumps(o).encode(); self.send_response(200)
