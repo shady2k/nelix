@@ -23,10 +23,14 @@ try:
     from . import paths
     from .daemon.config import load_retention
     from .daemon.transport import Transport
+    from .daemon.protocol import RPC_PROTOCOL_VERSION
+    from .daemon import reaper, singleton
 except ImportError:           # loaded as a top-level module (tests), not as a package
     import paths
     from daemon.config import load_retention
     from daemon.transport import Transport
+    from daemon.protocol import RPC_PROTOCOL_VERSION
+    from daemon import reaper, singleton
 
 PLUGIN_ROOT = Path(__file__).parent
 _HEALTH_TIMEOUT = 10.0
@@ -185,16 +189,30 @@ def _choose_transport() -> Transport:
     return Transport.unix(str(paths.rpc_sock()))
 
 
-def _healthy(transport) -> bool:
+def _status_body(transport, timeout=2):
+    """The daemon's /status JSON, or None if unreachable / non-200."""
     try:
         from .rpc_client import RpcClient
     except ImportError:           # loaded as a top-level module (tests), not as a package
         from rpc_client import RpcClient
     try:
-        st, _ = RpcClient(transport)._call("GET", "/status", timeout=2)
-        return st == 200
+        st, body = RpcClient(transport)._call("GET", "/status", timeout=timeout)
+        return body if st == 200 else None
     except Exception:
-        return False
+        return None
+
+
+def _compatible(status) -> bool:
+    """True only for a /status from a daemon speaking OUR RPC protocol. A daemon left running on
+    stale code reports a different — or missing — rpc_protocol, so it is incompatible and must be
+    recycled rather than spoken past (the mismatch otherwise surfaces as RemoteDisconnected)."""
+    return bool(status) and status.get("rpc_protocol") == RPC_PROTOCOL_VERSION
+
+
+def _healthy(transport) -> bool:
+    """A daemon answering /status with a COMPATIBLE protocol version. Protocol skew (old code) is
+    treated as unhealthy so the reuse/adopt paths recycle it instead of talking past it."""
+    return _compatible(_status_body(transport))
 
 
 def _read_state():

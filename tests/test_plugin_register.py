@@ -10,6 +10,7 @@ from daemon.transport import Transport  # noqa: E402
 _FAKE = textwrap.dedent("""
     import os, json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from daemon.protocol import RPC_PROTOCOL_VERSION
     tok=os.environ['NELIX_RPC_TOKEN']; port=int(os.environ['NELIX_RPC_PORT'])
     class H(BaseHTTPRequestHandler):
         def _j(self,o):
@@ -18,7 +19,7 @@ _FAKE = textwrap.dedent("""
         def do_GET(self):
             if self.headers.get('X-Nelix-Token')!=tok:
                 self.send_response(401); self.send_header('Content-Length','2'); self.end_headers(); self.wfile.write(b'{}'); return
-            self._j({'sessions': {}, 'limit': 1})
+            self._j({'sessions': {}, 'limit': 1, 'rpc_protocol': RPC_PROTOCOL_VERSION})
         def do_POST(self):
             n=int(self.headers.get('Content-Length',0)); self.rfile.read(n)
             self._j({'session_id':'s1'})

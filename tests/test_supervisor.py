@@ -11,17 +11,23 @@ import paths  # noqa: E402
 import supervisor  # noqa: E402
 from daemon.transport import Transport  # noqa: E402
 
-# A fake daemon: serves /status 200 iff the token header matches. Honors
-# NELIX_RPC_TOKEN / NELIX_RPC_PORT exactly like the real daemon entry.
+# A fake daemon: serves /status 200 (with the RPC protocol stamp) iff the token header matches.
+# Honors NELIX_RPC_TOKEN / NELIX_RPC_PORT exactly like the real daemon entry. NELIX_FAKE_PROTOCOL
+# overrides the reported protocol (default = current) to simulate a daemon left on stale code.
 _FAKE = textwrap.dedent("""
     import os, json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from daemon.protocol import RPC_PROTOCOL_VERSION
     tok = os.environ["NELIX_RPC_TOKEN"]; port = int(os.environ["NELIX_RPC_PORT"])
+    proto = int(os.environ.get("NELIX_FAKE_PROTOCOL", RPC_PROTOCOL_VERSION))
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            ok = self.headers.get("X-Nelix-Token") == tok
-            self.send_response(200 if ok else 401)
-            self.send_header("Content-Length","2"); self.end_headers(); self.wfile.write(b"{}")
+            if self.headers.get("X-Nelix-Token") != tok:
+                self.send_response(401); self.send_header("Content-Length","2")
+                self.end_headers(); self.wfile.write(b"{}"); return
+            body = json.dumps({"rpc_protocol": proto}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
         def log_message(self,*a): pass
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 """)
@@ -79,6 +85,31 @@ def test_stale_state_triggers_respawn(monkeypatch, tmp_path):
     transport = supervisor.ensure_running()  # dead pid -> respawn
     assert transport.token != "dead"
     supervisor.teardown()
+
+
+def test_healthy_requires_matching_protocol(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(supervisor)
+    t = Transport.tcp("127.0.0.1", 1, "tok")
+    monkeypatch.setattr(supervisor, "_status_body",
+                        lambda tr, timeout=2: {"rpc_protocol": supervisor.RPC_PROTOCOL_VERSION})
+    assert supervisor._healthy(t) is True
+    monkeypatch.setattr(supervisor, "_status_body", lambda tr, timeout=2: {"rpc_protocol": 0})
+    assert supervisor._healthy(t) is False          # old code, mismatched protocol
+    monkeypatch.setattr(supervisor, "_status_body", lambda tr, timeout=2: {"sessions": {}})
+    assert supervisor._healthy(t) is False          # pre-stamping daemon, no field at all
+    monkeypatch.setattr(supervisor, "_status_body", lambda tr, timeout=2: None)
+    assert supervisor._healthy(t) is False          # unreachable
+
+
+def test_endpoint_rejects_stale_protocol_daemon(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    supervisor._write_state(os.getpid(), Transport.unix(str(paths.rpc_sock())))
+    # pid alive (our own), but the daemon reports an OLD protocol -> not a usable endpoint
+    monkeypatch.setattr(supervisor, "_status_body", lambda t, timeout=2: {"rpc_protocol": 0})
+    assert supervisor.endpoint() is None
 
 
 def test_ensure_deps_installs_from_hash_lock_when_missing(monkeypatch):
