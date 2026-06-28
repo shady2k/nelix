@@ -27,3 +27,6 @@ venv/
 *.swp
 spikes/_spike_d_raw
 spikes/_spike_d_transcript.txt
+
+# VT-render spike build artifacts (downloaded Zig + ghostty source + built wasm)
+spikes/vt-ghostty/.build/
