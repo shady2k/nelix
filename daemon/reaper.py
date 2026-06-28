@@ -9,7 +9,10 @@ import sys
 import time
 from dataclasses import dataclass
 
-import paths
+try:
+    from .. import paths           # package mode (hermes_plugins.nelix.daemon.reaper)
+except ImportError:
+    import paths                   # top-level module mode (daemon process / tests)
 
 
 class ProcessInspector:

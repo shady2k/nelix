@@ -403,6 +403,23 @@ def test_unix_transport_serves_status_without_a_token(unix_sock, fake_manager):
         server.shutdown(); server.server_close()
 
 
+def test_status_stamps_rpc_protocol_version(fake_manager):
+    """/status always carries the RPC protocol version (regardless of session_id) so a supervisor
+    can distinguish our daemon from one left running on stale code after a plugin update."""
+    import io
+    from daemon.protocol import RPC_PROTOCOL_VERSION
+    srv, base = _serve(fake_manager, io.StringIO())
+    try:
+        st, body = _req("GET", base + "/status")
+        assert st == 200
+        assert body["rpc_protocol"] == RPC_PROTOCOL_VERSION
+        # session-scoped status carries it too
+        _, body2 = _req("GET", base + "/status?session_id=s1")
+        assert body2["rpc_protocol"] == RPC_PROTOCOL_VERSION
+    finally:
+        srv.shutdown()
+
+
 def test_unix_socket_node_is_0600(unix_sock, fake_manager):
     import os, stat
     server = make_server(fake_manager, Transport.unix(unix_sock))
