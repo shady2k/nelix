@@ -186,7 +186,10 @@ def _choose_transport() -> Transport:
 
 
 def _healthy(transport) -> bool:
-    from rpc_client import RpcClient
+    try:
+        from .rpc_client import RpcClient
+    except ImportError:           # loaded as a top-level module (tests), not as a package
+        from rpc_client import RpcClient
     try:
         st, _ = RpcClient(transport)._call("GET", "/status", timeout=2)
         return st == 200
