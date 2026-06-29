@@ -15,7 +15,7 @@ import paths
 
 
 class Dialog:
-    def __init__(self, dir_path, tail_lines, spool_max_bytes):
+    def __init__(self, dir_path, tail_lines, spool_max_bytes, clock=None):
         self._dir = Path(dir_path)
         paths.ensure_private_dir(self._dir)         # 0700 session dir (holds secret-bearing output)
         self._raw_path = self._dir / "raw"
@@ -23,6 +23,10 @@ class Dialog:
         self._spool_max = int(spool_max_bytes)
         self._raw = open(self._raw_path, "ab", opener=paths.private_opener)      # 0600 raw spool
         self._jsonl = open(self._jsonl_path, "a", opener=paths.private_opener)   # 0600 transcript
+        # Timestamped capture sidecar (spec §8): keep `raw` byte-exact for the renderer; record the
+        # per-chunk timing here (injected clock) so a session is deterministically replayable.
+        from daemon.capture import CaptureWriter
+        self._capture = CaptureWriter(self._dir / "capture", clock=clock)
         self._raw_len = self._raw_path.stat().st_size if self._raw_path.exists() else 0
         self._records = []               # list[dict] — {idx, kind, speaker, text}
         self._flat_len = 0               # char length of "\n".join(r["text"] for r in _records)
@@ -36,6 +40,7 @@ class Dialog:
     # ---- writes ----
     def append_raw(self, chunk):
         with self._lock:
+            self._capture.record(chunk)     # timestamped record alongside the byte-exact raw spool
             self._raw.write(chunk)
             self._raw.flush()
             self._raw_len += len(chunk)
@@ -212,6 +217,7 @@ class Dialog:
 
     def close(self):
         with self._lock:
+            self._capture.close()
             for f in (self._raw, self._jsonl):
                 try:
                     f.close()

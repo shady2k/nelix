@@ -161,7 +161,8 @@ class Session:
         self._task = prepare_pty_input(task, self._driver.command_prefixes)
         self._dialog = Dialog(self._sessions_dir / self._id,
                               tail_lines=self._spec.tail_lines,
-                              spool_max_bytes=self._spec.spool_max_bytes)
+                              spool_max_bytes=self._spec.spool_max_bytes,
+                              clock=self._clock)
         self._transcript = TranscriptBuilder(self._dialog, self._driver, self._rows)
         self._write_meta()
         self._handle = self._launcher.start(self._spec, cwd, self._cols, self._rows,
