@@ -58,6 +58,11 @@ class BeliefEngine:
         # fingerprint timestamps
         self._semantic_fp = None
         self._semantic_change_ts = None
+        # heartbeat timestamps (spec §7.4 / IMPORTANT-10): seen whenever present, changed only on fp
+        # change. Three-valued liveness is derived from these + the driver's expected_to_change flag.
+        self._heartbeat_fp = None
+        self._heartbeat_seen_ts = None
+        self._heartbeat_changed_ts = None
         # idle candidate (contiguous prompt observation)
         self._candidate_fp = None         # the prompt_fp of the current candidate
         self._candidate_since = None
@@ -87,6 +92,7 @@ class BeliefEngine:
         now = self._clock.now()
         actions = []
         self._track_semantic(obs, now)
+        self._track_heartbeat(obs, now)
 
         # Terminal: child gone, or the driver read a crash/exit screen.
         if not ctx.child_alive or obs.prompt_kind in ("crash", "exit"):
@@ -108,6 +114,27 @@ class BeliefEngine:
         if obs.semantic_fp != self._semantic_fp:
             self._semantic_fp = obs.semantic_fp
             self._semantic_change_ts = now
+
+    def _track_heartbeat(self, obs, now):
+        hb = obs.heartbeat
+        if not hb.present:
+            return                                  # no region this frame: keep prior timestamps
+        self._heartbeat_seen_ts = now
+        if hb.fp != self._heartbeat_fp:
+            self._heartbeat_fp = hb.fp
+            self._heartbeat_changed_ts = now
+
+    def _liveness(self, obs, now):
+        # Three-valued (spec §7.4): live (heartbeat changed recently) / stale (present & expected to
+        # change but frozen past the budget) / unknown (no region, or static & not expected to tick).
+        hb = obs.heartbeat
+        if not hb.present or not hb.expected_to_change:
+            return "unknown"
+        if self._heartbeat_changed_ts is None:
+            return "unknown"
+        if (now - self._heartbeat_changed_ts) < self._cfg.heartbeat_stale_after:
+            return "live"
+        return "stale"
 
     def _on_busy(self, obs, now, actions):
         # No prompt visible -> reset the idle candidate; the agent is working.
@@ -149,4 +176,5 @@ class BeliefEngine:
             self._state.control_state = "busy"
         self._state.quiet_elapsed = (0.0 if self._semantic_change_ts is None
                                      else now - self._semantic_change_ts)
-        self._state.busy_reason = None
+        self._state.liveness = self._liveness(obs, now)
+        self._state.busy_reason = obs.busy_reason

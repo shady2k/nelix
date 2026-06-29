@@ -78,3 +78,53 @@ def test_action_types_importable():
     a = Actuate(kind="select_option", arg="1")
     assert p.respondable is True and w.reason == "turn_resumed" and a.arg == "1"
     assert isinstance(Finalize(), Finalize)
+
+
+# ---- Task 9: three-valued liveness from the heartbeat timestamps (spec §7.4) ----
+
+def _hb(fp):
+    return Observation(prompt_kind="none", semantic_fp="work",
+                       heartbeat=Heartbeat(fp, True, True))
+
+
+def test_liveness_live_when_heartbeat_fp_changes():
+    clk = FakeClock(0.0)
+    e = BeliefEngine(BeliefConfig(), clk)
+    e.tick(_hb("h1"), CTX)
+    clk.advance(1.0)
+    e.tick(_hb("h2"), CTX)                  # heartbeat fp changed -> animating -> live
+    assert e.state.liveness == "live"
+
+
+def test_liveness_stale_when_heartbeat_frozen_but_expected_to_change():
+    cfg = BeliefConfig(heartbeat_stale_after=5.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    e.tick(_hb("h1"), CTX)
+    clk.advance(2.0)
+    e.tick(_hb("h1"), CTX)                  # frozen but not long enough yet
+    assert e.state.liveness == "live"
+    clk.advance(6.0)
+    e.tick(_hb("h1"), CTX)                  # frozen past the stale budget -> stale
+    assert e.state.liveness == "stale"
+
+
+def test_liveness_unknown_when_no_heartbeat_region():
+    clk = FakeClock(0.0)
+    e = BeliefEngine(BeliefConfig(), clk)
+    e.tick(Observation(prompt_kind="none", semantic_fp="x",
+                       heartbeat=Heartbeat(present=False)), CTX)
+    assert e.state.liveness == "unknown"
+
+
+def test_liveness_unknown_for_static_heartbeat_not_expected_to_change():
+    # present but NOT expected to change (e.g. a silent shell command) -> unknown, never stale.
+    cfg = BeliefConfig(heartbeat_stale_after=1.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    obs = Observation(prompt_kind="none", semantic_fp="x",
+                      heartbeat=Heartbeat("h1", True, expected_to_change=False))
+    e.tick(obs, CTX)
+    clk.advance(10.0)
+    e.tick(obs, CTX)
+    assert e.state.liveness == "unknown"
