@@ -251,9 +251,13 @@ class BeliefEngine:
         if immediate:
             self._publish_decision(obs, decision_key, actions)
             return
-        # free_text: suppress while post-submit is active (echo lingering / within grace).
-        if self._post_submit_active and (obs.submitted_echo_present
-                                         or now < self._post_submit_grace_until):
+        # free_text post-submit suppression (spec §7.1, fixes F1):
+        #  - while our submission is STILL in the active input box, definitely suppress — it is not an
+        #    idle prompt, regardless of the grace (the box literally holds our text);
+        #  - once the echo is gone, the bounded grace still suppresses the TTFT gap (no spinner yet).
+        if obs.submitted_echo_present:
+            return
+        if self._post_submit_active and now < self._post_submit_grace_until:
             return
         # anti-flap: do not re-mint the SAME semantic_fp within the cooldown after withdrawing it.
         if (obs.semantic_fp == self._last_withdrawn_fp
