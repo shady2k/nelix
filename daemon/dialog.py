@@ -108,7 +108,7 @@ class Dialog:
             with open(tmp, "w", opener=paths.private_opener) as f:
                 json.dump({"raw_base_offset": self._raw_base, "turns": self._turn_offsets}, f)
             os.replace(tmp, self._offsets_path)
-        except OSError:
+        except Exception:
             pass
 
     def turn_text(self, turn_index, offset=0, limit=None):

@@ -21,6 +21,12 @@ _SPINNER = re.compile(r"[⠀-⣿]")
 _ELAPSED = re.compile(r"\d+(?:\.\d+)?s\b")
 _TOKENS = re.compile(r"\d+\s+tokens?\b")
 
+# Additional volatile patterns for Claude's transient in-progress tool-status chrome.
+# These lines flash and are replaced; they are not conversation content.
+_ELLIPSIS_TAIL = re.compile(r"(?:…|\.\.\.)\s*$")   # in-progress status ends in ellipsis
+_BARE_TURN_MARKER = re.compile(r"^\s*⏺\s*$")        # lone turn marker, no content
+_BACKGROUND_HINT = "(ctrl+b to run in background)"  # background-run hint line
+
 _PROMPT_FOOTER = "shift+tab to cycle"     # present at the interactive input prompt (any mode)
 _INPUT_LINE = re.compile(r"^\s*❯")                         # the prompt/input line (anchored)
 _RULE_ROW = re.compile(r"^[\s─-╿▀-▟=_]+$")   # box-drawing / rule chars only
@@ -106,6 +112,13 @@ class ClaudeDriver:
         if _INPUT_LINE.search(row):                        # ❯ prompt / [Pasted text #N] line
             return True
         if row.strip() and _RULE_ROW.match(row):           # pure separator / box rule
+            return True
+        # Claude's transient in-progress tool-status chrome (lines that flash and are replaced):
+        if _ELLIPSIS_TAIL.search(row):                     # in-progress status ends in "…" or "..."
+            return True
+        if _BARE_TURN_MARKER.match(row):                   # lone ⏺ turn marker with no content
+            return True
+        if _BACKGROUND_HINT in row:                        # "(ctrl+b to run in background)" hint
             return True
         return False
 

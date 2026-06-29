@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from daemon.pty_session import PtySession
@@ -29,13 +30,18 @@ def test_replay_transcript_is_clean_and_ordered():
     lines = _replay()
     assert lines, "transcript should not be empty for an alt-screen session"
     # 1. Low duplication (occurrence tracking; commit-on-eviction; repeated tool steps expected).
+    #    Occurrence tracking legitimately preserves cross-turn repeats (~1.7 expected after fix);
+    #    4.2 was the transient-flood bug (ellipsis/bare-⏺/ctrl+b chrome) now masked.
     dup_ratio = len(lines) / max(1, len(set(lines)))
-    assert dup_ratio < 6.0, f"dup_ratio {dup_ratio:.2f} too high"
+    assert dup_ratio < 2.0, f"dup_ratio {dup_ratio:.2f} too high"
     # 2. No volatile chrome leaked into the transcript.
     blob = "\n".join(lines)
     assert "shift+tab to cycle" not in blob
     assert "esc to interrupt" not in blob
     assert " · ↓ " not in blob          # spinner telemetry token counter (e.g. "↓ 4.0k tokens")
+    # 2b. Strong invariant: no committed line ends in an ellipsis (transient status never committed).
+    assert not any(re.search(r"(?:…|\.\.\.)\s*$", ln) for ln in lines), \
+        "ellipsis-tailed (in-progress) line committed to transcript"
     # 3. Known conversation content is present (this raw is the meshynet T3 session).
     assert any("establish_phase" in ln for ln in lines)
     assert any("Committed" in ln for ln in lines)
