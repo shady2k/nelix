@@ -103,6 +103,18 @@ def test_restart_does_not_hold_lock_across_stop(tmp_path, monkeypatch):
     assert out.status == "restarted" and src.stopped is True
 
 
+def test_restart_outcome_carries_next_after_seq(tmp_path, monkeypatch):
+    # The restarted session must report its base seq so the plugin can arm a waiter at exactly the
+    # right cursor (symmetric with /start's next_after_seq), not blindly from 0.
+    mgr = _mgr(tmp_path, monkeypatch, limit=1)
+    sid, _ = mgr.start("claude", "task A", str(tmp_path))
+    mgr._events.publish(sid, "claude", "waiting_for_user", "?", "idle_prompt")  # bump the high-water
+    out = mgr.restart(sid)
+    assert out.status == "restarted"
+    assert isinstance(out.next_after_seq, int)
+    assert out.next_after_seq == mgr._events.latest_seq()   # base seq = high-water at the new spawn
+
+
 def test_restart_balances_reserved_counter(tmp_path, monkeypatch):
     # The reservation must return to 0 after a restart (active and already-gone) so it never leaks
     # nor overcounts capacity for concurrent starts. (Guards the overcount/leak fix in _spawn.)

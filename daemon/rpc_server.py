@@ -211,6 +211,7 @@ def make_server(manager, transport, logger=None):
                     self._send(200, {"status": "restarted", "session_id": outcome.session_id,
                                      "lineage_id": outcome.lineage_id,
                                      "restart_count": outcome.restart_count,
+                                     "next_after_seq": outcome.next_after_seq,
                                      "restarted_from": body["session_id"]})
                 elif outcome.status == "unknown_session":
                     if logger is not None:

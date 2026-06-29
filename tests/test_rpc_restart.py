@@ -89,6 +89,19 @@ def test_restart_route_start_failed_is_409():
         srv.shutdown()
 
 
+def test_restart_route_includes_next_after_seq():
+    # The /restart 200 body must carry next_after_seq so the plugin arms the restarted session's
+    # waiter at the daemon-reported base cursor (symmetric with /start).
+    mgr = _RestartManager(RestartOutcome("restarted", session_id="s-new", lineage_id="lin",
+                                         restart_count=1, max_restarts=3, next_after_seq=42))
+    srv, base = _serve(mgr, 8778)
+    try:
+        st, b = _req("POST", base + "/restart", body={"session_id": "s-old"})
+        assert st == 200 and b["next_after_seq"] == 42
+    finally:
+        srv.shutdown()
+
+
 def test_rpc_client_restart_round_trip():
     from rpc_client import RpcClient
     mgr = _RestartManager(RestartOutcome("restarted", session_id="s-new", lineage_id="s-old",

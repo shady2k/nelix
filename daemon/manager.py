@@ -18,6 +18,7 @@ class RestartOutcome:
     lineage_id: str = None
     restart_count: int = None
     max_restarts: int = None
+    next_after_seq: int = None
 
 
 def _session_activity(d):
@@ -220,8 +221,8 @@ class SessionManager:
         # or releases it in its own finally if it raises before inserting. restart() must NOT also
         # touch self._reserved here (that would double-decrement).
         try:
-            new_sid, _ = self._spawn(executor, task, cwd, lineage_id=lineage_id,
-                                     restarted_from=session_id, reserve=reserve)
+            new_sid, base_seq = self._spawn(executor, task, cwd, lineage_id=lineage_id,
+                                            restarted_from=session_id, reserve=reserve)
         except Exception:
             if self._logger is not None:
                 self._logger.error("manager", "restart_spawn_failed", session_id=session_id,
@@ -233,7 +234,8 @@ class SessionManager:
                               restarted_from=session_id, lineage_id=lineage_id,
                               restart_count=count)
         return RestartOutcome("restarted", session_id=new_sid, lineage_id=lineage_id,
-                              restart_count=count, max_restarts=max_restarts)
+                              restart_count=count, max_restarts=max_restarts,
+                              next_after_seq=base_seq)
 
     def _free_slot(self, session_id):
         with self._lock:
