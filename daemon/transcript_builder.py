@@ -69,7 +69,7 @@ class TranscriptBuilder:
             else:
                 survivors.append(o)
         for o in sorted(to_commit, key=lambda o: (o.first_seen, o.y)):
-            self._dialog.add_line(o.text)
+            self._dialog.add_agent_line(o.text)
             o.committed = True
         self._tracked = survivors
         self._frame_no = fno + 1
@@ -81,5 +81,5 @@ class TranscriptBuilder:
             self.observe(frame)
         pending = [o for o in self._tracked if not o.committed]
         for o in sorted(pending, key=lambda o: (o.first_seen, o.y)):
-            self._dialog.add_line(o.text)
+            self._dialog.add_agent_line(o.text)
             o.committed = True
