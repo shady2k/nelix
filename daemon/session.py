@@ -389,8 +389,32 @@ class Session:
                 if cstate != "terminal":
                     self._state = cstate
             self._apply_actions(actions, obs)
+            self._log_trail(obs, actions)
             if obs.prompt_kind in ("crash", "exit") or not self._handle.is_alive():
                 break
+
+    def _log_trail(self, obs, actions):
+        # The transition/decision trail (spec §8): one line per emitted action — the same artifact
+        # that is the replay test oracle. Fingerprints on every transition; the screen excerpt rides
+        # only on the published decision (via _publish), not here.
+        if self._log is None or not actions:
+            return
+        est = self._engine.state
+        for a in actions:
+            if isinstance(a, Withdraw):
+                rule = f"withdraw:{a.reason}"
+            elif isinstance(a, Publish):
+                rule = f"publish:{a.kind}"
+            elif isinstance(a, Actuate):
+                rule = f"actuate:{a.kind}"
+            else:
+                rule = "finalize"
+            lifecycle_log.log_belief_transition(
+                self._log, session_id=self._id, prompt_kind=obs.prompt_kind,
+                affordances=sorted(obs.affordances), busy_reason=est.busy_reason,
+                liveness=est.liveness, semantic_fp=obs.semantic_fp, content_fp=obs.content_fp,
+                prompt_fp=obs.prompt_fp, heartbeat_fp=obs.heartbeat.fp,
+                quiet_elapsed=est.quiet_elapsed, rule=rule)
 
     def _apply_actions(self, actions, obs):
         # Translate the engine's revocable decisions into events / PTY writes. The engine is pure;
@@ -679,16 +703,23 @@ class Session:
 
     def snapshot(self):
         with self._lock:
+            # control_state is the orchestrator-visible plane (spec §6/§8): busy | awaiting_user |
+            # intervention_required | terminal. The old per-driver `state` string is gone (NIT-16);
+            # a terminal session reads control_state=terminal + terminal_kind.
+            terminal = self._terminal_kind is not None
+            est = self._engine.state
             snap = {"session_id": self._id, "executor": self._executor,
                     "task": self._task_raw, "cwd": self._cwd,
-                    "state": self._state}
-            # Expose the terminal signal on the LIVE snapshot too (not just terminal_snapshot):
-            # in the brief window between the terminal event publishing and _finish_cleanup
-            # freeing the slot, a board read still lists this session. The companion keys "is
-            # terminal -> drop the waiter" on this flag, NOT on enumerated state strings (a clean
-            # exit reports state="exited", not "done"), so no waiter is re-armed on a dead session.
-            if self._terminal_kind is not None:
+                    "control_state": "terminal" if terminal else self._state,
+                    "busy_reason": est.busy_reason, "liveness": est.liveness,
+                    "quiet_elapsed": round(est.quiet_elapsed, 3),
+                    "escalation_count": est.escalation_count}
+            # Expose the terminal signal on the LIVE snapshot too (not just terminal_snapshot): in the
+            # window between the terminal event publishing and _finish_cleanup freeing the slot, a
+            # board read still lists this session. The companion keys "drop the waiter" on this flag.
+            if terminal:
                 snap["terminal_kind"] = self._terminal_kind
+                snap["screen_excerpt"] = self._last_screen_excerpt
             if self.lineage_id is not None:
                 snap["lineage_id"] = self.lineage_id
                 snap["restarted_from"] = self.restarted_from
@@ -701,7 +732,7 @@ class Session:
             # active-working snapshots are deliberately low-information: no progress bait, just
             # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
             snap["pending"] = self._decision is not None
-            if self._decision is None and self._state == "busy":
+            if self._decision is None and not terminal and self._state == "busy":
                 snap["message"] = ("Agent is still working. End your turn; nelix will wake "
                                    "you on the next event.")
             return snap
@@ -712,9 +743,9 @@ class Session:
         restart count lives in the manager's lineage table."""
         with self._lock:
             return {"session_id": self._id, "executor": self._executor,
-                    "task": self._task_raw, "cwd": self._cwd, "state": self._state,
-                    "terminal_kind": self._terminal_kind,
-                    "screen_excerpt": self._last_screen_excerpt,
+                    "task": self._task_raw, "cwd": self._cwd,
+                    "control_state": "terminal", "terminal_kind": self._terminal_kind,
+                    "screen_excerpt": self._last_screen_excerpt, "pending": False,
                     "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
                     "restart_count": self.restart_count, "terminal": True}
 

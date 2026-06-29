@@ -246,7 +246,9 @@ class SessionManager:
                     snap = sess.terminal_snapshot()
                 except Exception:
                     snap = None
-            if snap is not None and snap.get("state") in ("exited", "done"):
+            # a CLEAN terminal (terminal_kind="done") ends the lineage; a crash/stop keeps it for a
+            # possible restart. Keyed on terminal_kind, not a state string (NIT-16).
+            if snap is not None and snap.get("terminal_kind") == "done":
                 self._lineages.pop(snap.get("lineage_id"), None)
             existed = self._sessions.pop(session_id, None) is not None
             if snap is not None and self._terminal_ttl > 0:
@@ -267,7 +269,7 @@ class SessionManager:
         # forced — the wake's screen_excerpt is the ground truth between events. `raw` only selects
         # cleaned-vs-raw formatting; it must NOT be an escape hatch around withholding (only force is).
         if sess.is_working() and not force:
-            return {"state": "working", "pending": False,
+            return {"control_state": "busy", "pending": False,
                     "message": ("Agent is still working. End your turn; nelix will wake you on the "
                                 "next event. Pass force:true to see the screen anyway.")}
         # the external-output trust fence rides WITH the captured screen content (not the doorbell).

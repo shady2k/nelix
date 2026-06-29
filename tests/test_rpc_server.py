@@ -402,7 +402,7 @@ class FakeManagerWorkingScreen:
         # mirror the real manager (M4): while working, withhold the screen unless force (raw alone
         # does NOT bypass withholding).
         if not force:
-            return {"state": "working", "pending": False,
+            return {"control_state": "busy", "pending": False,
                     "message": "Agent is still working. End your turn; nelix will wake you ..."}
         return {"screen": self._FRAME, "cols": 120, "rows": 40}
 
@@ -414,7 +414,7 @@ def test_screen_endpoint_withholds_while_working_unless_force():
     try:
         st, b = _req("GET", "http://127.0.0.1:8774/screen?session_id=s1")
         assert st == 200 and "screen" not in b
-        assert b["state"] == "working" and "End your turn" in b["message"]
+        assert b["control_state"] == "busy" and "End your turn" in b["message"]
         st, fb = _req("GET", "http://127.0.0.1:8774/screen?session_id=s1&force=1")
         assert st == 200 and fb["screen"] == FakeManagerWorkingScreen._FRAME   # force shows it
     finally:

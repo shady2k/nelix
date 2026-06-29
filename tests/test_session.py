@@ -199,13 +199,62 @@ def test_loop_working_frame_publishes_nothing(tmp_path):
     assert sess._state == "busy" and sess.is_working() is True
 
 
+def test_status_exposes_rich_belief_fields(tmp_path):
+    # Task 14: /status (snapshot) exposes control_state + busy_reason + liveness + quiet_elapsed +
+    # escalation_count — the same fields feed the live status, the trail, and the replay oracle.
+    box = "Here is my answer.\n❯ "
+    sess, ev = _session(tmp_path, ["thinking… esc to interrupt", box, box, box])
+    sess._loop()
+    snap = sess.snapshot()
+    assert snap["control_state"] == "awaiting_user"
+    for k in ("busy_reason", "liveness", "quiet_elapsed", "escalation_count"):
+        assert k in snap
+    assert "state" not in snap                          # the old per-driver state string is gone
+
+
+def test_terminal_snapshot_shape(tmp_path):
+    sess, ev = _session(tmp_path, handle=DeadHandle(0))
+    sess._spawn_ts = 0.0
+    sess._run()
+    snap = sess.snapshot()
+    assert snap["control_state"] == "terminal"          # not a per-driver state string
+    assert snap["terminal_kind"] == "done"
+    assert snap["pending"] is False and "state" not in snap
+    ts = sess.terminal_snapshot()
+    assert ts["control_state"] == "terminal" and ts["terminal_kind"] == "done"
+    assert ts["pending"] is False and "state" not in ts
+
+
+def test_belief_transition_trail_is_logged(tmp_path):
+    # Every engine action writes a trail line carrying the observation that drove it + fingerprints +
+    # the rule that fired (spec §8). This is the diagnostic line AND the replay oracle.
+    import io, json
+    from daemon.obs import Logger
+    buf = io.StringIO()
+    log = Logger(level="debug", stream=buf, audit_stream=buf)
+    box = "Here is my answer.\n❯ "
+    sess, ev = _session(tmp_path, ["thinking… esc to interrupt", box, box, box])
+    sess._log = log
+    sess._loop()
+    trail = [json.loads(l) for l in buf.getvalue().splitlines()
+             if json.loads(l)["event"] == "belief_transition"]
+    assert trail, "expected at least one belief_transition trail line"
+    pub = [t for t in trail if t["rule"] == "publish:waiting_for_user"]
+    assert pub, "the published decision must be in the trail"
+    line = pub[0]
+    for k in ("prompt_kind", "affordances", "busy_reason", "liveness",
+              "semantic_fp", "content_fp", "prompt_fp", "rule"):
+        assert k in line
+    assert line["prompt_kind"] == "free_text"
+
+
 def test_stop_edge_emits_frozen_respondable_event(tmp_path):
     frames = ["thinking… esc to interrupt", "Here is my answer. Which next?\n❯ ",
               "Here is my answer. Which next?\n❯ ", "Here is my answer. Which next?\n❯ "]
     sess, ev = _session(tmp_path, frames)
     sess._loop()
     snap = sess.snapshot()
-    assert snap["state"] == "awaiting_user"
+    assert snap["control_state"] == "awaiting_user"
     dec = snap["decision"]
     assert dec["kind"] == "waiting_for_user"
     assert "Here is my answer." in dec["text"]
@@ -231,7 +280,7 @@ def test_quiet_working_emits_no_event(tmp_path):
     sess, ev = _session(tmp_path, ["compiling…", "compiling…"])
     sess._loop()
     assert ev.pending("s1") is None
-    assert sess.snapshot()["state"] == "busy"
+    assert sess.snapshot()["control_state"] == "busy"
 
 
 def test_permission_prompt_carries_needs_permission_hint(tmp_path):
@@ -254,7 +303,7 @@ def test_exit_zero_emits_done(monkeypatch, tmp_path):
     assert ev.pending("s1") is None                       # 'done' is not respondable
     last = ev.latest_after(0)
     assert last is not None and last.kind == "done"
-    assert sess.snapshot()["state"] == "exited"
+    assert sess.snapshot()["control_state"] == "terminal"  # was state="exited"
 
 
 def test_exit_nonzero_emits_crashed(monkeypatch, tmp_path):
@@ -263,7 +312,7 @@ def test_exit_nonzero_emits_crashed(monkeypatch, tmp_path):
     sess._run()
     last = ev.latest_after(0)
     assert last is not None and last.kind == "crashed"
-    assert sess.snapshot()["state"] == "crashed"
+    assert sess.snapshot()["control_state"] == "terminal"  # was state="crashed"
 
 
 def test_loop_never_writes_esc(tmp_path):
@@ -943,14 +992,14 @@ def test_pre_delivery_death_publishes_and_sets_state(tmp_path):
     """The incident: child dies while delivery is pending -> terminal event + state, not silence."""
     sess, ev = _bare_session(tmp_path, DeadHandle(0))
     sess._run()
-    assert sess.snapshot()["state"] == "exited"
+    assert sess.snapshot()["control_state"] == "terminal"  # was state="exited"
     assert ev.latest_after(0) is not None and ev.latest_after(0).kind == "done"
 
 
 def test_pre_delivery_crash_maps_to_crashed(tmp_path):
     sess, ev = _bare_session(tmp_path, DeadHandle(2))
     sess._run()
-    assert sess.snapshot()["state"] == "crashed"
+    assert sess.snapshot()["control_state"] == "terminal"  # was state="crashed"
 
 
 def test_finish_is_idempotent(tmp_path):

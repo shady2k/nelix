@@ -32,6 +32,18 @@ def log_executor_spawned(log, *, session_id, executor, leader_pid, leader_pgid, 
              process_role="pty_leader")
 
 
+def log_belief_transition(log, *, session_id, prompt_kind, affordances, busy_reason, liveness,
+                          semantic_fp, content_fp, prompt_fp, heartbeat_fp, quiet_elapsed, rule):
+    """The decision/transition trail (spec §8): one line per engine action carrying the observation
+    that drove it (prompt_kind + affordances + busy_reason + liveness), the fingerprints, and which
+    rule fired. Observability and the replay test oracle are the same artifact — this is that line."""
+    log.info("belief", "belief_transition", session_id=session_id, rule=rule,
+             prompt_kind=prompt_kind, affordances=affordances, busy_reason=busy_reason,
+             liveness=liveness, quiet_elapsed=round(quiet_elapsed, 3),
+             semantic_fp=semantic_fp, content_fp=content_fp, prompt_fp=prompt_fp,
+             heartbeat_fp=heartbeat_fp)
+
+
 def log_executor_exited(log, *, session_id, reason, leader_exit_code, leader_signal,
                         status_available, alive_for, task_delivery, screen_fingerprint):
     clean = (reason in ("exited", "done") and leader_signal is None
