@@ -612,6 +612,13 @@ class Session:
             snap = {"session_id": self._id, "executor": self._executor,
                     "task": self._task_raw, "cwd": self._cwd,
                     "state": self._state}
+            # Expose the terminal signal on the LIVE snapshot too (not just terminal_snapshot):
+            # in the brief window between the terminal event publishing and _finish_cleanup
+            # freeing the slot, a board read still lists this session. The companion keys "is
+            # terminal -> drop the waiter" on this flag, NOT on enumerated state strings (a clean
+            # exit reports state="exited", not "done"), so no waiter is re-armed on a dead session.
+            if self._terminal_kind is not None:
+                snap["terminal_kind"] = self._terminal_kind
             if self.lineage_id is not None:
                 snap["lineage_id"] = self.lineage_id
                 snap["restarted_from"] = self.restarted_from

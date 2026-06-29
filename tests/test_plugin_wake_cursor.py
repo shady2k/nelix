@@ -156,6 +156,41 @@ def test_board_read_drops_terminal_session(monkeypatch, tmp_path):
     assert len(_terminal_cmds(ctx)) == n_before         # NO new waiter for a terminal session
 
 
+def test_board_read_drops_live_listed_terminal_session(monkeypatch, tmp_path):
+    """Publish-to-free window: a finished session is STILL listed in `sessions` (not yet moved to
+    recent_terminal) but carries a terminal_kind. A clean exit reports state='exited' (NOT 'done'),
+    so detection must key on terminal_kind, not a state allowlist — else a waiter is re-armed on a
+    dead session that emits no further events and is stranded."""
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def status(self, sid=None):
+            return {"sessions": {"s-1": {"session_id": "s-1", "state": "exited",
+                                         "terminal_kind": "done", "seq": 9}},
+                    "recent_terminal": {}, "cursor": 9}
+    nelix, ctx = _setup(monkeypatch, tmp_path, C)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    n_before = len(_terminal_cmds(ctx))
+    ctx.tools["nelix_status"]["handler"]({})            # board still lists it, but it's terminal
+    assert len(_terminal_cmds(ctx)) == n_before         # NO new waiter -> not stranded
+
+
+def test_per_session_status_live_terminal_kind_drops(monkeypatch, tmp_path):
+    """Per-session read in the same window: a live snapshot with terminal_kind='delivery_failed'
+    must drop, not re-arm."""
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def status(self, sid=None):
+            return {"session_id": "s-1", "state": "working",
+                    "terminal_kind": "delivery_failed", "cursor": 7}
+    nelix, ctx = _setup(monkeypatch, tmp_path, C)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    n_before = len(_terminal_cmds(ctx))
+    ctx.tools["nelix_status"]["handler"]({"session_id": "s-1"})
+    assert len(_terminal_cmds(ctx)) == n_before         # dropped, no re-arm
+
+
 def test_per_session_status_unknown_drops(monkeypatch, tmp_path):
     class C:
         def __init__(self, t): pass

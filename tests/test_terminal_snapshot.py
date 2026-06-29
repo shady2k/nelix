@@ -222,3 +222,25 @@ def test_operator_stop_publishes_single_stopped_event_no_double(tmp_path, monkey
     assert [e.kind for e in evs] == ["stopped"]        # exactly ONE event, kind 'stopped'
     assert sess.terminal_snapshot()["terminal_kind"] == "stopped"
     assert sess._state == "stopped"
+    # LIVE snapshot exposes the terminal flag too (publish-to-free window): the companion keys
+    # "drop the waiter" on this, so a still-listed dead session never gets a re-armed waiter.
+    assert sess.snapshot()["terminal_kind"] == "stopped"
+
+
+def test_live_snapshot_omits_terminal_kind_while_working(tmp_path, monkeypatch):
+    """A working session's snapshot has NO terminal_kind, so the companion re-arms it normally."""
+    from daemon.session import Session
+    from daemon.config import ExecutorSpec
+    from daemon.events import EventQueue
+    from daemon.dialog import Dialog
+
+    class _Drv:
+        command_prefixes = ()
+        submit_key = "\r"
+        def __init__(self): self._settle = 0
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    spec = ExecutorSpec(command="c", args=[], env={}, driver="claude")
+    sess = Session("s-w01", "claude", _Drv(), object(), spec, EventQueue())
+    sess._dialog = Dialog(tmp_path / "s-w01", tail_lines=200, spool_max_bytes=0)
+    assert "terminal_kind" not in sess.snapshot()      # _terminal_kind is None -> key absent

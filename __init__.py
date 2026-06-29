@@ -28,7 +28,14 @@ def register(ctx):
     registry.seed_if_absent()
 
     waiters = WakeRegistry()        # one wake cursor + arm-dedup PER active session
-    _TERMINAL_STATES = {"done", "crashed", "stopped"}
+
+    def _is_terminal(snap):
+        # A session is terminal once the daemon stamps a terminal_kind on it
+        # (done/crashed/stopped/delivery_failed). Key on the FLAG, never on enumerated state
+        # strings: a clean exit reports state="exited" (not "done"), so a state allowlist would
+        # miss it and re-arm a waiter on a dead session that emits no further events. Reconcile-
+        # by-absence (below) is the backstop; this closes the publish-to-free live window.
+        return bool(snap.get("terminal_kind"))
 
     def _daemon_id():
         # Identity of the live daemon (its pid from the supervisor state file), so the registry
@@ -80,7 +87,7 @@ def register(ctx):
             if isinstance(body, dict):
                 live = body.get("sessions", {}) or {}
                 for s_id, snap in live.items():
-                    if snap.get("state") in _TERMINAL_STATES:
+                    if _is_terminal(snap):
                         waiters.drop(s_id)
                         continue
                     seq = max(int(snap.get("seq", 0)),
@@ -93,7 +100,7 @@ def register(ctx):
         else:
             # PER-SESSION read (secondary trigger): reconcile just this session.
             if isinstance(body, dict) and "error" not in body \
-                    and body.get("state") not in _TERMINAL_STATES:
+                    and not _is_terminal(body):
                 seq = max(int(body.get("cursor", 0)),
                           int((body.get("decision") or {}).get("seq", 0)))
                 waiters.on_status(sid, seq)
