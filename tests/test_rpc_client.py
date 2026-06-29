@@ -61,10 +61,13 @@ def test_rpc_client_roundtrip():
 
 
 class _Dialog:
-    def turn_count(self): return 3
-    def turn_text(self, turn, offset=0, limit=None):
-        return {"turn_index": turn, "text": f"t{turn}@{offset}", "total_len": 4,
-                "truncated": False, "unavailable": False}
+    """Fake dialog exposing the flat-log page() API."""
+    available = True
+
+    def page(self, offset=0, limit=None, snap=True):
+        text = f"transcript@{offset}"
+        return {"text": text, "start_offset": offset, "next_offset": offset + len(text),
+                "speaker_at_start": "agent", "continued": False, "total_len": 100}
 
 
 class _Sess:
@@ -84,9 +87,12 @@ def test_rpc_client_dialog(monkeypatch, tmp_path):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         c = RpcClient(Transport.tcp("127.0.0.1", 8782, "t"))
-        d = c.dialog("s1", turn=1, offset=2)
-        assert d["turn_index"] == 1 and d["text"] == "t1@2"
-        assert c.dialog("s1")["turn_index"] == 2          # default -> latest
+        # Offset-based pagination (no turn parameter)
+        d = c.dialog("s1", offset=42)
+        assert d["text"] == "transcript@42"
+        assert "speaker_at_start" in d          # flat-log field present
+        d2 = c.dialog("s1")                     # default offset=0
+        assert d2["text"] == "transcript@0"
     finally:
         srv.shutdown()
 

@@ -105,16 +105,51 @@ def test_pump_tees_raw_and_flushes_viewport(tmp_path):
     try:
         for _ in range(40):
             s.pump(0.1)
-        s.flush_viewport(d)
+        s.finalize()
         raw = (tmp_path / "s" / "raw").read_bytes()
         assert b"line1" in raw and b"line6" in raw            # raw tees EVERYTHING
-        joined = d.turn_text(0)["text"]
-        assert "line6" in joined                              # viewport tail committed
-        # NOTE: line1 scrolled off; Phase 1 does not commit scrollback to the transcript.
-        # Full scrollback-derived transcript is the Phase 2 TranscriptBuilder (nelix-8ns).
+        # Transcript content is committed by TranscriptBuilder via ESU frames (Phase 2).
     finally:
         s.close()
         _reap(pid)
+
+
+def test_feed_segments_at_esu_and_finalize_commits_tail():
+    from daemon.pty_session import PtySession
+
+    class _Sink:
+        def __init__(self): self.frames = []; self.finals = 0
+        def observe(self, frame): self.frames.append([r for r in frame.rows if r.strip()])
+        def finalize(self, frame=None):
+            if frame is not None: self.observe(frame)
+            self.finals += 1
+
+    sink = _Sink()
+    s = PtySession(None, 0, 0, cols=40, rows=6, transcript=sink)
+    ESU = b"\x1b[?2026l"
+    # two complete frames in ONE chunk: "AAA"<ESU> then home+"BBB"<ESU>
+    s._feed(b"\x1b[HAAA" + ESU + b"\x1b[H\x1b[2JBBB" + ESU)
+    assert len(sink.frames) == 2                       # snapshot per ESU, not collapsed to one
+    assert any("AAA" in "".join(f) for f in sink.frames[:1])
+    assert any("BBB" in "".join(f) for f in sink.frames)
+    s.finalize()
+    assert sink.finals == 1
+
+
+def test_feed_carries_partial_esu_across_chunks():
+    from daemon.pty_session import PtySession
+
+    class _Sink:
+        def __init__(self): self.n = 0
+        def observe(self, frame): self.n += 1
+        def finalize(self, frame=None): pass
+
+    sink = _Sink()
+    s = PtySession(None, 0, 0, cols=40, rows=6, transcript=sink)
+    s._feed(b"\x1b[HZZZ\x1b[?2026")     # ESU split across reads: no frame yet
+    assert sink.n == 0
+    s._feed(b"l")                        # completes the ESU -> exactly one frame
+    assert sink.n == 1
 
 
 def test_leader_status_clean_exit():

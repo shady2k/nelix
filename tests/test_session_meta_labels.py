@@ -6,7 +6,7 @@ from daemon.session import Session
 
 
 class _NoopLauncher:
-    def start(self, spec, cwd, cols, rows, dialog=None):
+    def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
         return _NoopHandle()
     def stop(self, handle):
         pass
@@ -18,6 +18,7 @@ class _NoopHandle:
     def leader_pid(self): return None
     def leader_pgid(self): return None
     def pump(self, t): return False
+    def finalize(self): pass
 
 
 def _spec():

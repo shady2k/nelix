@@ -6,6 +6,18 @@ from daemon.errors import PtyWriteTimeout
 from daemon.renderer.base import make_renderer
 
 
+_ESU = b"\x1b[?2026l"
+
+
+def _esu_partial_len(buf):
+    # longest k in 1..len(_ESU)-1 such that buf ends with a proper prefix of the ESU sequence,
+    # so a sequence split across reads is held back (not fed early, not missed by the detector).
+    for k in range(len(_ESU) - 1, 0, -1):
+        if buf.endswith(_ESU[:k]):
+            return k
+    return 0
+
+
 def render_raw(data, cols=120, rows=40):
     """Replay raw PTY bytes through a fresh renderer and return what render() would show.
     Pure: no child, no dialog. The capture tool and the daemon share make_renderer, so offline
@@ -19,15 +31,17 @@ def render_raw(data, cols=120, rows=40):
 
 
 class PtySession:
-    def __init__(self, master_fd, pid, pgid, cols=120, rows=40, dialog=None):
+    def __init__(self, master_fd, pid, pgid, cols=120, rows=40, dialog=None, transcript=None):
         self._fd = master_fd
         self._pid = pid
         self._pgid = pgid
         self._cols = cols
         self._rows = rows
         self._dialog = dialog
+        self._transcript = transcript
         self._eof_seen = False
         self._renderer = make_renderer(cols, rows)
+        self._esu_carry = b""
 
     def pump(self, timeout=0.1):
         if self._fd is None or self._eof_seen:
@@ -53,19 +67,37 @@ class PtySession:
         return True
 
     def _feed(self, data):
-        # Ingest child output: tee raw to the transcript, advance the renderer. (Scrolled-line
-        # commit to the transcript is Phase 2 — TranscriptBuilder; Phase 1 commits the viewport
-        # at each stop via flush_viewport.)
+        # Tee the whole chunk to raw; advance the renderer. With a transcript sink, segment the
+        # stream at each DEC-2026 ESU and snapshot AT that frame boundary (a single read holds many
+        # frames), holding back a trailing partial ESU across calls.
         if self._dialog is not None:
             self._dialog.append_raw(data)
-        self._renderer.feed(data)
+        if self._transcript is None:
+            self._renderer.feed(data)
+            return
+        buf = self._esu_carry + data
+        self._esu_carry = b""
+        pos = 0
+        while True:
+            i = buf.find(_ESU, pos)
+            if i < 0:
+                break
+            end = i + len(_ESU)
+            self._renderer.feed(buf[pos:end])
+            self._transcript.observe(self._renderer.snapshot())
+            pos = end
+        rest = buf[pos:]
+        k = _esu_partial_len(rest)
+        if k:
+            self._esu_carry = rest[len(rest) - k:]
+            rest = rest[:len(rest) - k]
+        if rest:
+            self._renderer.feed(rest)
 
-    def flush_viewport(self, dialog):
-        # Commit the current viewport's non-empty rows (final turn tail / fallback snapshot).
-        for line in self._renderer.snapshot().rows:
-            t = line.rstrip()
-            if t:
-                dialog.add_line(t)
+    def finalize(self):
+        # Commit the stable visible tail at a stop (replaces the Phase-1 flush_viewport).
+        if self._transcript is not None:
+            self._transcript.finalize(self._renderer.snapshot())
 
     def render(self):
         return self._renderer.render()

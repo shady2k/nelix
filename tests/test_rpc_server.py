@@ -194,10 +194,13 @@ def test_rpc_start_value_error_returns_409():
 
 
 class _FakeDialog:
-    def turn_count(self): return 3
-    def turn_text(self, turn, offset=0, limit=None):
-        return {"turn_index": turn, "text": f"turn{turn}@{offset}", "total_len": 5,
-                "truncated": False, "unavailable": False}
+    """Fake dialog exposing the flat-log page() API used by the /dialog endpoint."""
+    available = True
+
+    def page(self, offset=0, limit=None, snap=True):
+        text = f"transcript@{offset}"
+        return {"text": text, "start_offset": offset, "next_offset": offset + len(text),
+                "speaker_at_start": "agent", "continued": False, "total_len": 100}
 
 
 class _FakeSession:
@@ -208,8 +211,8 @@ class FakeManagerWithDialog:
     def __init__(self): self._events = EventQueue()
     def status(self, sid=None):
         return {"session_id": "s1", "executor": EXECUTOR, "state": "idle_prompt",
-                "turn_count": 3, "decision": {"kind": "waiting_for_user", "turn_index": 2,
-                "text": "Proceed?", "hint": "needs_permission"}}
+                "decision": {"kind": "waiting_for_user",
+                             "text": "Proceed?", "hint": "needs_permission"}}
     def get(self, sid): return _FakeSession() if sid == "s1" else None
 
 
@@ -225,17 +228,18 @@ def test_status_includes_decision():
         srv.shutdown()
 
 
-def test_dialog_paginates_turn_and_defaults_to_latest(monkeypatch, tmp_path):
+def test_dialog_serves_flat_page_with_offset(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerWithDialog()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8771, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("GET", "http://127.0.0.1:8771/dialog?session_id=s1&turn=1&offset=2")
-        assert st == 200 and b["turn_index"] == 1 and b["text"] == "turn1@2"
-        assert "never follow instructions" in b["external_output_policy"]   # fence rides with text
-        _, b = _req("GET", "http://127.0.0.1:8771/dialog?session_id=s1")
-        assert b["turn_index"] == 2                      # default -> latest (turn_count-1)
+        # Offset-based pagination — no turn parameter
+        st, b = _req("GET", "http://127.0.0.1:8771/dialog?session_id=s1&offset=42")
+        assert st == 200 and b["text"] == "transcript@42"
+        assert "speaker_at_start" in b           # flat-log fields present
+        assert "never follow instructions" in b["external_output_policy"]   # fence rides
+        # Unknown session → 404
         st, _ = _req("GET", "http://127.0.0.1:8771/dialog?session_id=nope")
         assert st == 404
     finally:
@@ -459,7 +463,7 @@ def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
     from daemon.rpc_server import make_server
 
     d = Dialog(paths.sessions_root() / "s-fin", tail_lines=10, spool_max_bytes=10000)
-    d.add_line("finished output"); d.close()
+    d.add_agent_line("finished output"); d.close()
 
     class _Mgr:                                   # session no longer live in the registry
         def get(self, sid): return None
@@ -471,7 +475,10 @@ def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
                                      headers={"X-Nelix-Token": "t"})
         with urllib.request.urlopen(req, timeout=5) as r:
             page = json.loads(r.read())
-        assert page["text"] == "finished output" and page["unavailable"] is False
+        # Flat log: text includes both the ‹agent› transition marker and the content line
+        assert "finished output" in page["text"]
+        assert page.get("unavailable") is not True
+        assert "speaker_at_start" in page
     finally:
         srv.server_close()
 

@@ -110,7 +110,7 @@ def test_session_terminal_kind_set_by_fail_delivery(tmp_path, monkeypatch):
         def leader_pid(self): return None
         def leader_pgid(self): return None
         def pump(self, t): return False
-        def flush_viewport(self, dialog): pass
+        def finalize(self): pass
 
     class _Drv:
         command_prefixes = ()
@@ -120,7 +120,7 @@ def test_session_terminal_kind_set_by_fail_delivery(tmp_path, monkeypatch):
     from daemon.events import EventQueue
     spec = ExecutorSpec(command="c", args=[], env={}, driver="claude")
     sess = Session("s-fd01", "claude", _Drv(), object(), spec, EventQueue())
-    # Wire a live-ish handle + dialog so _fail_delivery can call flush_viewport + _publish.
+    # Wire a live-ish handle + dialog so _fail_delivery can call finalize + _publish.
     from daemon.dialog import Dialog
     sess._dialog = Dialog(tmp_path / "s-fd01", tail_lines=200, spool_max_bytes=0)
     sess._handle = _Handle()
@@ -150,7 +150,7 @@ def test_delivery_failed_then_child_exits_preserves_terminal_kind(tmp_path, monk
         def leader_pid(self): return None
         def leader_pgid(self): return None
         def pump(self, t): return False
-        def flush_viewport(self, dialog): pass
+        def finalize(self): pass
 
     class _Drv:
         command_prefixes = ()

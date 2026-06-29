@@ -102,7 +102,7 @@ def register(ctx):
         if transport is None:
             return _j({"error": "no active nelix daemon"})
         return _j(RpcClient(transport).dialog(
-            args["session_id"], args.get("turn"), int(args.get("offset", 0)), args.get("limit")))
+            args["session_id"], int(args.get("offset", 0)), args.get("limit")))
 
     def nelix_restart(args, **k):
         _log.info("nelix_restart session=%s force=%s", args["session_id"], args.get("force"))
@@ -182,11 +182,12 @@ def register(ctx):
         nelix_restart)
     ctx.register_tool(
         "nelix_dialog", "nelix",
-        {"description": ("Read an agent's transcript: the latest turn by default, or an earlier `turn`"
-                         " index, paginated by `offset`/`limit`. For a long question or earlier turns —"
-                         " not for polling progress."),
+        {"description": ("Read the agent's transcript by pages from an offset; each page says whose"
+                         " output it starts with (speaker_at_start); use next_offset to continue."
+                         " For a long session or reading from last_user_input_offset — not for"
+                         " polling progress."),
          "parameters": {**_OBJ, "properties": {
-             "session_id": {"type": "string"}, "turn": {"type": "integer"},
+             "session_id": {"type": "string"},
              "offset": {"type": "integer"}, "limit": {"type": "integer"}},
              "required": ["session_id"]}},
         nelix_dialog)

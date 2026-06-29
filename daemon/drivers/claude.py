@@ -21,7 +21,15 @@ _SPINNER = re.compile(r"[⠀-⣿]")
 _ELAPSED = re.compile(r"\d+(?:\.\d+)?s\b")
 _TOKENS = re.compile(r"\d+\s+tokens?\b")
 
+# Additional volatile patterns for Claude's transient in-progress tool-status chrome.
+# These lines flash and are replaced; they are not conversation content.
+_ELLIPSIS_TAIL = re.compile(r"(?:…|\.\.\.)\s*$")   # in-progress status ends in ellipsis
+_BARE_TURN_MARKER = re.compile(r"^\s*⏺\s*$")        # lone turn marker, no content
+_BACKGROUND_HINT = "(ctrl+b to run in background)"  # background-run hint line
+
 _PROMPT_FOOTER = "shift+tab to cycle"     # present at the interactive input prompt (any mode)
+_INPUT_LINE = re.compile(r"^\s*❯")                         # the prompt/input line (anchored)
+_RULE_ROW = re.compile(r"^[\s─-╿▀-▟=_]+$")   # box-drawing / rule chars only
 _OPTION = re.compile(r"^\s*[❯>]?\s*\d+\.\s+\S", re.M)        # a numbered menu option line
 _SELECTED_OPTION = re.compile(r"^\s*❯\s*\d+\.\s+\S", re.M)   # the cursor sits ON an option
 # Claude collapses long/multiline input into "[Pasted text #N]" ON the prompt line; the prompt marker
@@ -91,6 +99,28 @@ class ClaudeDriver:
         if self.is_modal_choice(frame):
             return False
         return ("❯" in frame) and (_PROMPT_FOOTER in frame)
+
+    def is_transcript_volatile(self, row):
+        # Terminal chrome a human sees but is not conversation content. Anchored patterns only —
+        # a loose substring (e.g. any row containing "tokens") would drop real content.
+        if _WORKING_STATUS.search(row):                    # spinner status line (+ optional telemetry)
+            return True
+        if any(m in row for m in WORKING_MARKERS):         # "esc to interrupt"
+            return True
+        if _PROMPT_FOOTER in row:                          # "shift+tab to cycle"
+            return True
+        if _INPUT_LINE.search(row):                        # ❯ prompt / [Pasted text #N] line
+            return True
+        if row.strip() and _RULE_ROW.match(row):           # pure separator / box rule
+            return True
+        # Claude's transient in-progress tool-status chrome (lines that flash and are replaced):
+        if _ELLIPSIS_TAIL.search(row):                     # in-progress status ends in "…" or "..."
+            return True
+        if _BARE_TURN_MARKER.match(row):                   # lone ⏺ turn marker with no content
+            return True
+        if _BACKGROUND_HINT in row:                        # "(ctrl+b to run in background)" hint
+            return True
+        return False
 
     def input_submission_present(self, frame, text):
         # Our submission is in the input box — either the typed text echoes verbatim, or (for a long or

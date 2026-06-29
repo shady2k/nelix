@@ -105,16 +105,19 @@ def make_server(manager, transport, logger=None):
                 if not sid:
                     self._send(400, {"error": "missing session_id"}); return
                 reader = DialogReader(paths.sessions_root() / sid)
-                if reader.turn_count() == 0:
+                if not reader.available:
                     # No transcript on disk — fall back to live session if present
                     sess = manager.get(sid)
                     if sess is None or sess.dialog is None:
                         self._send(404, {"error": "unknown session"}); return
-                    reader = sess.dialog   # duck-typed: same turn_count/turn_text interface
-                turn = self._int(qs.get("turn", [None])[0], reader.turn_count() - 1)
+                    reader = sess.dialog   # duck-typed: same page/tail interface
                 offset = self._int(qs.get("offset", ["0"])[0], 0)
                 limit = self._int(qs.get("limit", [None])[0], None)
-                page = reader.turn_text(turn, offset, limit)
+                if offset < 0:
+                    raise _BadRequest(400, "offset must be >= 0")
+                if limit is not None and limit <= 0:
+                    raise _BadRequest(400, "limit must be > 0")
+                page = reader.page(offset, limit)
                 page["external_output_policy"] = EXTERNAL_OUTPUT_POLICY
                 self._send(200, page)
             elif p.path == "/screen":
