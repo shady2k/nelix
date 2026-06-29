@@ -42,12 +42,17 @@ def test_decision_key_is_prompt_kind_and_semantic_fp():
     assert pub.decision_key == "free_text:idle"
 
 
-def test_busy_only_never_publishes():
+def test_busy_only_never_publishes_waiting_for_user():
+    # A progressing agent (meaning advancing) never mints a respondable waiting_for_user — only an
+    # idle prompt does. (A FROZEN busy screen escalates a non-respondable advisory; that is Task 13.)
     clk = FakeClock(0.0)
     e = BeliefEngine(BeliefConfig(), clk)
-    for _ in range(50):
+    for i in range(50):
         clk.advance(1.0)
-        assert e.tick(busy(), CTX) == []
+        obs = Observation(prompt_kind="none", semantic_fp=f"work{i}",
+                          heartbeat=Heartbeat(f"h{i}", True, True))
+        acts = e.tick(obs, CTX)
+        assert not any(isinstance(a, Publish) and a.kind == "waiting_for_user" for a in acts)
 
 
 def test_state_snapshot_exposes_control_state():

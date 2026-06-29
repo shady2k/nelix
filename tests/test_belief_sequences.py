@@ -116,6 +116,79 @@ def test_anti_flap_same_fp_within_cooldown():
     assert _pubs(e.tick(_idle(), CTX))                   # t=4.0, cooldown elapsed -> re-publish
 
 
+# ---- Task 13: watchdog ladder + intervention_required advisory (spec §7.4/7.5, fixes F3) ----
+
+def _interventions(actions):
+    return [a for a in actions if isinstance(a, Publish) and a.kind == "intervention_required"]
+
+
+def test_live_heartbeat_does_not_escalate_within_budget():
+    cfg = BeliefConfig(live_budget=100.0, heartbeat_stale_after=50.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    n = 0
+    for i in range(40):                       # 40s of a moving spinner, frozen meaning
+        clk.advance(1.0)
+        hb = Observation(prompt_kind="none", semantic_fp="frozen",
+                         heartbeat=Heartbeat(f"h{i}", True, True))   # animating -> live
+        acts = e.tick(hb, CTX)
+        n += len(_interventions(acts))
+    assert n == 0                             # live + within budget -> no escalation
+    assert e.state.control_state == "busy"
+
+
+def test_stale_heartbeat_escalates_non_respondable_and_nags():
+    cfg = BeliefConfig(live_budget=1000.0, stale_budget=10.0, heartbeat_stale_after=5.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    frozen = Observation(prompt_kind="none", semantic_fp="frozen",
+                         heartbeat=Heartbeat("h", True, True))       # frozen but should tick -> stale
+    fired = []
+    for _ in range(40):                       # advance 40s in 1s steps
+        clk.advance(1.0)
+        for a in _interventions(e.tick(frozen, CTX)):
+            fired.append(a)
+    assert fired, "a stale, frozen-meaning screen must escalate intervention_required"
+    first = fired[0]
+    assert first.respondable is False                            # NON-respondable advisory (BLOCKER-1)
+    assert first.payload["escalation_count"] == 1
+    assert e.state.control_state == "intervention_required"
+    # the advisory re-fires as a nag with an incrementing count while still stuck
+    counts = [a.payload["escalation_count"] for a in fired]
+    assert counts == sorted(counts) and counts[-1] >= 2          # incrementing, fired more than once
+
+
+def test_watchdog_emits_no_actuate_no_bytes():
+    cfg = BeliefConfig(stale_budget=5.0, heartbeat_stale_after=2.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    frozen = Observation(prompt_kind="none", semantic_fp="frozen",
+                         heartbeat=Heartbeat("h", True, True))
+    from daemon.belief import Actuate
+    for _ in range(20):
+        clk.advance(1.0)
+        acts = e.tick(frozen, CTX)
+        assert not any(isinstance(a, Actuate) for a in acts)     # never acts on the agent (no ESC)
+
+
+def test_progress_resets_escalation_back_to_busy():
+    cfg = BeliefConfig(stale_budget=5.0, heartbeat_stale_after=2.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    frozen = Observation(prompt_kind="none", semantic_fp="frozen",
+                         heartbeat=Heartbeat("h", True, True))
+    for _ in range(12):
+        clk.advance(1.0)
+        e.tick(frozen, CTX)
+    assert e.state.control_state == "intervention_required"
+    # real progress (semantic changes) -> the stuck episode ends, control returns to busy
+    clk.advance(1.0)
+    e.tick(Observation(prompt_kind="none", semantic_fp="moved",
+                       heartbeat=Heartbeat("h2", True, True)), CTX)
+    assert e.state.control_state == "busy"
+    assert e.state.escalation_count == 0
+
+
 def test_positive_turn_start_clears_suppression():
     # (a) a busy observation with positive liveness clears post-submit -> next real idle publishes.
     clk = FakeClock(0.0)

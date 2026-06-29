@@ -34,8 +34,15 @@ class ExecutorSpec:
     settle_seconds: float = 1.5
     delivery_confirm_seconds: float = 10.0   # how long to wait for delivery confirmation before failing
     respond_write_seconds: float = 5.0       # deadline for the respond() PTY write (wedged-stdin guard)
-    max_idle_seconds: float = 600.0      # recovery: no-progress watchdog (daemon); 0 = disabled
+    max_idle_seconds: float = 600.0      # pre-delivery blocked no-progress backstop; 0 = disabled
     max_restarts: int = 3                # recovery: consecutive auto-restarts before escalating (Hermes)
+    # belief-engine tunables (spec §7; user-overridable). Defaults mirror config.BeliefConfig.
+    post_submit_grace: float = 8.0       # §7.1 TTFT suppression bound
+    idle_confirm_window: float = 0.5     # §7.1 suspicious-idle confirmation window
+    live_budget: float = 1800.0          # §7.4 watchdog budget while liveness=live
+    stale_budget: float = 30.0           # §7.4 watchdog budget while liveness=stale
+    unknown_budget: float = 60.0         # §7.4 watchdog budget while liveness=unknown
+    heartbeat_stale_after: float = 10.0  # §7.4 frozen-but-should-tick -> stale after this long
     tail_lines: int = 400
     status_tail_chars: int = 4000
     dialog_page_chars: int = 8000
@@ -87,6 +94,12 @@ def _build_spec(name, spec):
         respond_write_seconds=_spec_num(spec, "respond_write_seconds", 5.0, cast=float),
         max_idle_seconds=_spec_num(spec, "max_idle_seconds", 600.0, cast=float),
         max_restarts=_spec_num(spec, "max_restarts", 3, cast=int),
+        post_submit_grace=_spec_num(spec, "post_submit_grace", 8.0, cast=float),
+        idle_confirm_window=_spec_num(spec, "idle_confirm_window", 0.5, cast=float),
+        live_budget=_spec_num(spec, "live_budget", 1800.0, cast=float),
+        stale_budget=_spec_num(spec, "stale_budget", 30.0, cast=float),
+        unknown_budget=_spec_num(spec, "unknown_budget", 60.0, cast=float),
+        heartbeat_stale_after=_spec_num(spec, "heartbeat_stale_after", 10.0, cast=float),
         tail_lines=int(spec.get("tail_lines", 400)),
         status_tail_chars=int(spec.get("status_tail_chars", 4000)),
         dialog_page_chars=int(spec.get("dialog_page_chars", 8000)),

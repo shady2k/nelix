@@ -74,6 +74,11 @@ class BeliefEngine:
         # anti-flap (spec §7.2): don't re-mint the same semantic_fp immediately after withdrawing it.
         self._last_withdrawn_fp = None
         self._withdrawn_cooldown_until = None
+        # watchdog / nag (spec §7.4/7.5): a frozen-meaning busy screen past the liveness-scaled budget
+        # escalates a NON-respondable intervention_required, re-firing each budget while still stuck.
+        self._intervention_active = False
+        self._escalation_count = 0
+        self._next_nag_at = None
         # post-submit suppression (spec §7.1): while active, an ambiguous free_text idle is NOT
         # published as a wake (the just-submitted echo lingering in the box during TTFT is not idle).
         self._post_submit_active = False
@@ -132,6 +137,10 @@ class BeliefEngine:
         if obs.semantic_fp != self._semantic_fp:
             self._semantic_fp = obs.semantic_fp
             self._semantic_change_ts = now
+            # meaning advanced -> the stuck episode ends: reset the watchdog/nag ladder.
+            self._intervention_active = False
+            self._escalation_count = 0
+            self._next_nag_at = None
 
     def _track_heartbeat(self, obs, now):
         hb = obs.heartbeat
@@ -181,8 +190,44 @@ class BeliefEngine:
         self._candidate_fp = None
         self._candidate_since = None
         self._state.phase = "busy"
+        self._watchdog(obs, now, actions)
+
+    def _budget(self, liveness, busy_reason):
+        # Liveness-scaled (spec §7.4): long while `live`, short while `stale`/`unknown`. A known
+        # long-running reason (silent shell command / subagents) earns the long budget even when
+        # liveness is `unknown` (a quiet shell never animates), so it is not falsely escalated.
+        if liveness == "stale":
+            return self._cfg.stale_budget
+        if liveness == "live":
+            return self._cfg.live_budget
+        if busy_reason in ("running_command", "waiting_subagents"):
+            return self._cfg.live_budget
+        return self._cfg.unknown_budget
+
+    def _watchdog(self, obs, now, actions):
+        # The ladder: semantic changed recently -> ok; else (frozen meaning) escalate once the
+        # liveness-scaled budget elapses, re-firing each budget as a nag while still stuck. The daemon
+        # NEVER acts on the agent (no ESC) — it only surfaces the advisory; the orchestrator decides.
+        quiet = 0.0 if self._semantic_change_ts is None else now - self._semantic_change_ts
+        budget = self._budget(self._liveness(obs, now), obs.busy_reason)
+        if quiet < budget:
+            self._intervention_active = False
+            return
+        self._intervention_active = True
+        if self._next_nag_at is None or now >= self._next_nag_at:
+            self._escalation_count += 1
+            self._next_nag_at = now + budget
+            self._state.phase = "suspected_hung"
+            actions.append(Publish(
+                kind="intervention_required", respondable=False,
+                decision_key=f"intervention:{self._escalation_count}",
+                payload={"escalation_count": self._escalation_count,
+                         "busy_reason": obs.busy_reason,
+                         "liveness": self._liveness(obs, now),
+                         "hint": "suspected_hung"}))
 
     def _on_prompt(self, obs, now, actions):
+        self._intervention_active = False         # a prompt is not a hang: clear any nag state
         # Auto-recovery: a published decision whose prompt region CHANGED AWAY (different prompt_fp)
         # is a stale hypothesis -> withdraw it (a fresh heartbeat alone never withdraws — that is the
         # footer timer, not a turn change, IMPORTANT-8). The new prompt is then a fresh candidate.
@@ -245,9 +290,12 @@ class BeliefEngine:
     def _refresh_state(self, obs, now):
         if self._published_key is not None:
             self._state.control_state = "awaiting_user"
+        elif self._intervention_active:
+            self._state.control_state = "intervention_required"
         else:
             self._state.control_state = "busy"
         self._state.quiet_elapsed = (0.0 if self._semantic_change_ts is None
                                      else now - self._semantic_change_ts)
         self._state.liveness = self._liveness(obs, now)
         self._state.busy_reason = obs.busy_reason
+        self._state.escalation_count = self._escalation_count

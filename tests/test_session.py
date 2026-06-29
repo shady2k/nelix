@@ -275,6 +275,25 @@ def test_loop_never_writes_esc(tmp_path):
     assert sess._handle.writes == []                      # nothing typed at all
 
 
+class InterventionSpec(Spec):
+    heartbeat_stale_after = 1.0
+    stale_budget = 2.0
+
+
+def test_frozen_screen_escalates_nonrespondable_intervention_no_bytes(tmp_path):
+    # F3: a frozen-meaning busy screen (stale) escalates a NON-respondable intervention_required —
+    # not a waiting_for_user, and the daemon types NOTHING (no ESC). It never sticks /status pending.
+    sess, ev = _session(tmp_path, ["working… esc to interrupt"] * 8, spec=InterventionSpec())
+    sess._loop()
+    inter = [e for e in ev._events if e.kind == "intervention_required"]
+    assert inter, "a stale frozen screen must escalate intervention_required"
+    assert all(e.requires_response is False for e in inter)   # non-respondable advisory
+    assert sess._decision is None                            # NOT pending -> /status never sticks
+    assert ev.pending("s1") is None                          # not in the respondable pending queue
+    assert sess._handle.writes == []                         # no ESC / no bytes written
+    assert sess._state == "intervention_required"
+
+
 def test_respond_answers_and_appends_user_input(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ "
