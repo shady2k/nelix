@@ -283,15 +283,22 @@ class SessionManager:
         if session_id is not None:
             with self._lock:
                 sess = self._sessions.get(session_id)
-            return sess.snapshot() if sess else {"error": "unknown session"}
+            if sess is None:
+                return {"error": "unknown session"}
+            cursor = self._events.latest_seq(session_id)   # BEFORE snapshot: never arm past unseen
+            snap = sess.snapshot()
+            snap["cursor"] = cursor
+            return snap
         with self._lock:
-            cursor = self._events.latest_seq()        # BEFORE snapshots: never advance past an unseen event
+            cursor = self._events.latest_seq()             # GLOBAL cursor (unchanged contract)
+            per_seq = self._events.latest_seqs(self._sessions.keys())  # one _cv pass under manager._lock
             snapshot = dict(self._sessions)
             now = self._clock()
             self._terminal = {sid: (snap, exp) for sid, (snap, exp) in self._terminal.items()
                               if exp > now}
             recent = {sid: snap for sid, (snap, exp) in self._terminal.items()}
-        return {"sessions": {sid: s.snapshot() for sid, s in snapshot.items()},
+        return {"sessions": {sid: {**s.snapshot(), "seq": per_seq.get(sid, 0)}
+                             for sid, s in snapshot.items()},
                 "limit": self._limit,
                 "cursor": cursor,
                 "recent_terminal": recent}
