@@ -1,55 +1,71 @@
-"""Plugin-held global wake cursor (observed_cursor) + single-waiter arm-dedup. One per plugin process.
+"""Per-session wake registry: one cursor + arm-dedup per active session, replacing the single
+global CursorState. Each session re-arms its own waiter independently by its own seq, so the
+old global-cursor concerns (burst-collapse, answer-B-skips-A, out-of-order) dissolve.
 
-Invariant: arm the single global waiter from `value` only; advance `value` ONLY on a full-board
-status read; never from a per-session start/respond seq. This makes a missed wake impossible
-(status is the source of truth) and is safe across out-of-order answers and start bursts.
-
-Single-waiter: `should_arm()` is True only when `value` differs from the last-armed value, so a BURST
-of starts (which leave `value` put) arms exactly one waiter; after a real wake the companion's status
-read advances `value`, so the next arm fires. The long-poll waiter is one-shot-per-event and only exits
-on an event or daemon-gone, so 'a waiter is out for this value' stays true until the next event."""
+Thread-safe: every operation is under one lock. claim_arm() makes the check-and-mark atomic so
+two concurrent status reconciles for the same session spawn exactly one waiter."""
+import threading
 
 _UNSET = object()
 
 
-class CursorState:
+class WakeRegistry:
     def __init__(self):
-        self.value = None          # None until the first start of a (re)started daemon
-        self._armed_at = _UNSET    # the `value` we last armed a waiter at (sentinel => never armed)
-        self._daemon_id = None     # identity (pid) of the daemon the cursor currently tracks
+        self._lock = threading.Lock()
+        self._value = {}        # sid -> observed cursor (seq we've seen up to)
+        self._armed_at = {}     # sid -> the value a waiter is currently out for
+        self._daemon_id = None  # identity (pid) of the daemon these sessions belong to
 
-    def on_start(self, base_seq, daemon_id=None):
-        # Reset on a DAEMON CHANGE (pid differs), not on a seq heuristic: a fresh daemon restarts
-        # its seq at ~0, so two daemons can both report base_seq=0 — a seq-only rule would then fail
-        # to re-arm (value and _armed_at both 0). Keying on daemon_id makes the reset reliable and
-        # clears the arm-dedup so the new daemon always gets a waiter.
+    def _reset_if_new_daemon(self, daemon_id):
+        # caller holds self._lock. A daemon pid change means every old session is gone (new
+        # daemon restarts seq at ~0); clear so stale sids never re-arm and new ones start fresh.
         if daemon_id is not None and daemon_id != self._daemon_id:
             self._daemon_id = daemon_id
-            self.value = base_seq
-            self._armed_at = _UNSET
-            return
-        # Same daemon (or unknown id): keep the lowest unobserved baseline; a burst (base_seq >=
-        # value) leaves it put -> no skip. Fallback `base_seq < value` reset covers a None daemon_id.
-        if self.value is None or base_seq < self.value:
-            self.value = base_seq
+            self._value.clear()
+            self._armed_at.clear()
 
-    def on_status(self, cursor):
-        # The only place the cursor advances: the companion has now SEEN the board up to `cursor`.
-        if cursor is not None:
-            self.value = cursor
+    def on_start(self, sid, base_seq, daemon_id=None):
+        with self._lock:
+            self._reset_if_new_daemon(daemon_id)
+            self._value[sid] = base_seq
 
-    def on_respond(self, next_after_seq=None):
-        # Intentionally a no-op for the cursor: per-session respond seqs must never drive the
-        # global waiter (answering B before A would otherwise skip A's wake).
-        return
+    def on_status(self, sid, seq):
+        with self._lock:
+            self._value[sid] = seq
 
-    def arm_after(self):
-        return self.value if self.value is not None else 0
+    def on_respond(self, sid, next_after_seq):
+        with self._lock:
+            self._value[sid] = next_after_seq
 
-    def should_arm(self):
-        # Arm only if no waiter is already out for the current cursor value (collapses a start burst
-        # to one waiter). After on_status advances `value`, this is True again -> re-arm.
-        return self._armed_at is _UNSET or self._armed_at != self.value
+    def drop(self, sid):
+        with self._lock:
+            self._value.pop(sid, None)
+            self._armed_at.pop(sid, None)
 
-    def mark_armed(self):
-        self._armed_at = self.value
+    def claim_arm(self, sid):
+        """Atomic: if `sid` needs a waiter (cursor differs from last-armed), mark it armed and
+        return the after_seq to arm at; else None. The caller dispatches the waiter OUTSIDE the
+        lock. Marking under the same lock as the check prevents a double-spawn under concurrency."""
+        with self._lock:
+            v = self._value.get(sid, _UNSET)
+            if v is _UNSET:
+                return None                      # unknown/dropped session — nothing to arm
+            if self._armed_at.get(sid, _UNSET) == v:
+                return None                      # a waiter is already out for this cursor value
+            self._armed_at[sid] = v
+            return v
+
+    # ---- introspection (tests / reconcile) ----
+    def value(self, sid):
+        with self._lock:
+            v = self._value.get(sid, _UNSET)
+            return None if v is _UNSET else v
+
+    def should_arm(self, sid):
+        with self._lock:
+            v = self._value.get(sid, _UNSET)
+            return v is not _UNSET and self._armed_at.get(sid, _UNSET) != v
+
+    def active_sids(self):
+        with self._lock:
+            return set(self._value)
