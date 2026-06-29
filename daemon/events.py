@@ -61,9 +61,29 @@ class EventQueue:
             self._cv.notify_all()
             return e
 
-    def latest_seq(self):
+    def latest_seq(self, session_id=None):
         with self._cv:
-            return self._events[-1].seq if self._events else 0
+            if session_id is None:
+                return self._events[-1].seq if self._events else 0
+            for e in reversed(self._events):
+                if e.session_id == session_id:
+                    return e.seq
+            return 0
+
+    def latest_seqs(self, session_ids):
+        """Latest seq for each given session in one lock acquisition (cheaper than N
+        latest_seq calls; avoids holding manager._lock across N _cv acquisitions)."""
+        wanted = set(session_ids)
+        out = {sid: 0 for sid in wanted}
+        with self._cv:
+            remaining = set(wanted)
+            for e in reversed(self._events):
+                if e.session_id in remaining:
+                    out[e.session_id] = e.seq
+                    remaining.discard(e.session_id)
+                    if not remaining:
+                        break
+        return out
 
     def latest_after(self, after_seq, session_id=None):
         for e in self._events:

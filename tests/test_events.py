@@ -109,6 +109,25 @@ def test_publish_on_publish_runs_before_waiters_are_notified():
     assert order[1] == ("woke", e.event_id)
 
 
+def test_latest_seq_global_and_per_session():
+    q = EventQueue()
+    a = q.publish("s-a", "ex", "working", "", "working")
+    b = q.publish("s-b", "ex", "working", "", "working")
+    c = q.publish("s-a", "ex", "waiting_for_user", "", "working")
+    assert q.latest_seq() == c.seq          # global unchanged
+    assert q.latest_seq("s-a") == c.seq
+    assert q.latest_seq("s-b") == b.seq
+    assert q.latest_seq("s-missing") == 0
+
+
+def test_latest_seqs_single_pass():
+    q = EventQueue()
+    q.publish("s-a", "ex", "working", "", "working")
+    b = q.publish("s-b", "ex", "working", "", "working")
+    c = q.publish("s-a", "ex", "blocked", "", "working")
+    assert q.latest_seqs(["s-a", "s-b", "s-x"]) == {"s-a": c.seq, "s-b": b.seq, "s-x": 0}
+
+
 def test_blocked_event_is_pending_and_carries_fields():
     q = EventQueue()
     e = q.publish("s-1", "agent", "blocked", "trust?", "startup_interstitial",
