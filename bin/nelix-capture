@@ -4,10 +4,10 @@ driver-conformance harness — no live process needed.
 
 Input is a session dir (reads `meta.json` for the cols/rows the raw was captured at — replaying at
 the wrong size reflows differently and yields bogus frames) or a bare `raw` file (`--cols/--rows`,
-default 120x40). Faithfulness: only `--final` is fully faithful (pyte state after ALL bytes, exactly
-what the daemon's render() shows at end-of-stream). `--at-marker`/`--all` snapshot pyte state at byte
-PREFIXES — plausible screens a human still curates, not provably ones the daemon classified at that
-instant (raw preserves bytes, not pump() chunk boundaries or inter-byte timing).
+default 120x40). Faithfulness: only `--final` is fully faithful (renderer state after ALL bytes,
+exactly what the daemon's render() shows at end-of-stream). `--at-marker`/`--all` snapshot renderer
+state at byte PREFIXES — plausible screens a human still curates, not provably ones the daemon
+classified at that instant (raw preserves bytes, not pump() chunk boundaries or inter-byte timing).
 
 Usage:
   nelix-capture <session-dir|raw-file> [--cols N --rows M] [--final | --at-marker SUBSTR | --all]
@@ -20,9 +20,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import paths                                                  # noqa: E402
-from daemon.pty_session import make_pyte_screen, render_raw   # noqa: E402
+from daemon.pty_session import render_raw                     # noqa: E402
+from daemon.renderer.base import make_renderer                # noqa: E402
 from daemon.drivers.claude import ClaudeDriver                # noqa: E402
-import pyte                                                   # noqa: E402
 
 _CHUNK = 64   # replay granularity for --at-marker/--all (small enough to catch transient frames)
 
@@ -49,13 +49,15 @@ def _resolve(path, cols_arg, rows_arg):
 
 
 def _frames(data, cols, rows):
-    # yield render() after each chunk fed — pyte state at byte-prefixes (parser state carries across
-    # feeds, so splitting mid-escape-sequence is fine).
-    screen = make_pyte_screen(cols, rows)
-    stream = pyte.ByteStream(screen)
-    for i in range(0, len(data), _CHUNK):
-        stream.feed(data[i:i + _CHUNK])
-        yield "\n".join(screen.display)
+    # yield render() after each chunk fed — renderer state carries across feeds, so splitting
+    # mid-escape-sequence is fine. Mirrors the daemon's engine exactly (make_renderer).
+    r = make_renderer(cols, rows)
+    try:
+        for i in range(0, len(data), _CHUNK):
+            r.feed(data[i:i + _CHUNK])
+            yield r.render()
+    finally:
+        r.close()
 
 
 def _at_marker(data, cols, rows, marker):
