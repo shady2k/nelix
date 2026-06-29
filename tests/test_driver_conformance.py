@@ -31,6 +31,35 @@ def test_driver_protocol_has_observe_not_classify():
     for name in _REMOVED:
         assert not hasattr(Driver, name), f"Driver protocol must NOT declare {name}()"
 
+
+def test_registry_fails_closed_for_unmigrated_driver():
+    # A driver that does not implement observe() must be REJECTED at instantiation — the registry
+    # fails closed rather than letting the core call a missing classification contract (NIT-17).
+    from daemon.drivers import register, get_driver, DRIVERS
+
+    @register("_stub_no_observe")
+    class _Stub:
+        ask_mode_toggle = ""
+        command_prefixes = ()
+        submit_key = "\r"
+        # no observe()
+
+    try:
+        with pytest.raises(TypeError):
+            get_driver("_stub_no_observe")
+    finally:
+        DRIVERS.pop("_stub_no_observe", None)
+
+
+def test_every_registered_driver_observes():
+    # Every registered driver must return an Observation from observe() for any frame.
+    from daemon.drivers import DRIVERS, get_driver
+    from daemon.observation import Observation
+    for name in DRIVERS:
+        drv = get_driver(name)
+        o = drv.observe("hello\n❯ \n⏵⏵ ask mode (shift+tab to cycle)", _CTX)
+        assert isinstance(o, Observation), f"{name}.observe() must return an Observation"
+
 GOLDEN = Path(__file__).resolve().parent / "golden" / "claude"
 CATEGORIES = ("working", "idle_prompt", "permission_prompt")
 

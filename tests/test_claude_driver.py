@@ -20,11 +20,21 @@ def test_register_decorator_adds_driver():
     from daemon.drivers import register, DRIVERS, get_driver
 
     @register("dummy")
-    class Dummy:
-        pass
+    class Dummy:                                  # a conforming stub (registry fails closed otherwise)
+        ask_mode_toggle = ""
+        command_prefixes = ()
+        submit_key = "\r"
+        def normalize_frame(self, f): return f
+        def observe(self, f, ctx): return None
+        def is_transcript_volatile(self, r): return False
+        def format_submission(self, t): return t
+        def submit_text(self, t): return t
+        def select_option(self, i): return i
+        def interrupt(self): return "\x1b"
 
     try:
         assert isinstance(get_driver("dummy"), Dummy)
+        assert "dummy" in DRIVERS
     finally:
         DRIVERS.pop("dummy", None)
 
