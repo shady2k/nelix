@@ -293,6 +293,56 @@ def test_respond_answers_and_appends_user_input(monkeypatch, tmp_path):
     assert "\r" in sess._handle.writes and any("1" in w for w in sess._handle.writes)
 
 
+_MODAL = ("How should T7 handle the table?\n❯ 1. Enrich all three\n  2. Verify-only\n"
+          "  3. Enrich establish_phase only\nEnter to select · ↑/↓ to navigate\n")
+
+
+def test_modal_decision_carries_options_and_prompt_kind(tmp_path):
+    sess, ev = _session(tmp_path, ["working esc to interrupt", _MODAL, _MODAL])
+    sess._loop()
+    dec = sess.snapshot()["decision"]
+    assert dec["prompt_kind"] == "modal_choice"
+    assert [o["id"] for o in dec["options"]] == ["1", "2", "3"]
+    assert dec["options"][0]["label"] == "Enrich all three"
+
+
+def test_respond_to_modal_routes_to_select_option(monkeypatch, tmp_path):
+    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
+    sess, ev = _session(tmp_path, ["working esc to interrupt", _MODAL, _MODAL])
+    sess._loop()
+    out = sess.respond("1")
+    assert out.status == "resumed"
+    # select_option emits the digit + submit key as ONE sequence (driver owns the keys) — NOT the
+    # free-text path of type-then-enter. This is the F2 fix: a selector, not prose.
+    assert "1\r" in sess._handle.writes
+    # the chosen option's LABEL is recorded in the transcript (not the bare id).
+    assert "Enrich all three" in sess._dialog.page()["text"]
+    assert ev.pending("s1") is None
+
+
+def test_respond_to_modal_rejects_unknown_option_keeps_pending(tmp_path):
+    sess, ev = _session(tmp_path, ["working esc to interrupt", _MODAL, _MODAL])
+    sess._loop()
+    writes_before = list(sess._handle.writes)
+    out = sess.respond("9")                              # not an option id
+    assert out.status == "invalid_option"
+    assert sess._decision is not None                    # decision stays pending
+    assert ev.pending("s1") is not None
+    assert sess._handle.writes == writes_before          # NOTHING typed into the menu
+
+
+def test_respond_to_free_text_uses_submit_text_not_select(monkeypatch, tmp_path):
+    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
+    box = "Ready — what next?\n❯ "
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
+    out = sess.respond("do the next thing")
+    assert out.status == "resumed"
+    # free-text: the text is typed then Enter pressed separately (two writes), not a select_option.
+    assert "do the next thing" in sess._handle.writes and "\r" in sess._handle.writes
+
+
 def test_respond_with_no_pending_decision_is_rejected(tmp_path):
     # No decision pending (agent still working) -> respond is a no-op, nothing typed.
     sess, _ = _session(tmp_path, ["compiling…", "compiling…"])

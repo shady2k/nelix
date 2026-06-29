@@ -191,6 +191,12 @@ def make_server(manager, transport, logger=None):
                                        pending_decision_id=pend.get("decision_id"),
                                        pending_kind=pend.get("kind"))
                     self._send(409, {"error": "stale_decision", "pending": outcome.pending})
+                elif outcome.status == "invalid_option":
+                    # a modal answer that is not one of the option ids: decision stays pending, no keys
+                    # sent. Return the options so the orchestrator can answer with a valid id.
+                    if logger is not None:
+                        logger.warning("rpc", "respond_invalid_option", session_id=sid, status=409)
+                    self._send(409, {"error": "invalid_option", "pending": outcome.pending})
                 else:   # no_pending
                     if logger is not None:
                         logger.warning("rpc", "respond_no_pending", session_id=sid, status=409,

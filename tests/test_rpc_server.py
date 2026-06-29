@@ -228,6 +228,41 @@ def test_status_includes_decision():
         srv.shutdown()
 
 
+class _ModalManager:
+    def __init__(self): self._events = EventQueue()
+    def status(self, sid=None):
+        return {"session_id": "s1", "state": "awaiting_user",
+                "decision": {"kind": "waiting_for_user", "prompt_kind": "modal_choice",
+                             "options": [{"id": "1", "label": "Enrich all three"},
+                                         {"id": "2", "label": "Verify-only"}]}}
+    def respond(self, session_id, answer, decision_id=None):
+        from daemon.session import RespondOutcome
+        return RespondOutcome("invalid_option",
+                              pending={"prompt_kind": "modal_choice",
+                                       "options": [{"id": "1", "label": "Enrich all three"}]})
+
+
+def test_status_exposes_modal_options_and_prompt_kind():
+    srv, base = _serve(_ModalManager(), __import__("io").StringIO())
+    try:
+        st, b = _req("GET", base + "/status?session_id=s1")
+        assert st == 200
+        assert b["decision"]["prompt_kind"] == "modal_choice"
+        assert [o["id"] for o in b["decision"]["options"]] == ["1", "2"]
+    finally:
+        srv.shutdown()
+
+
+def test_respond_invalid_option_is_409_with_options():
+    srv, base = _serve(_ModalManager(), __import__("io").StringIO())
+    try:
+        st, b = _req("POST", base + "/respond", body={"session_id": "s1", "answer": "9"})
+        assert st == 409 and b["error"] == "invalid_option"
+        assert b["pending"]["options"][0]["id"] == "1"
+    finally:
+        srv.shutdown()
+
+
 def test_dialog_serves_flat_page_with_offset(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerWithDialog()

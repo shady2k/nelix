@@ -36,7 +36,10 @@ class RespondOutcome:
 def _pending_meta(decision):
     return {"decision_id": decision.get("decision_id"), "kind": decision["kind"],
             "requires_response": decision.get("requires_response", True),
-            "hint": decision.get("hint"), "hung": decision.get("hung", False)}
+            "hint": decision.get("hint"), "hung": decision.get("hung", False),
+            # affordance metadata so a rejected/stale responder can reconcile (answer with an id).
+            "prompt_kind": decision.get("prompt_kind"),
+            "options": decision.get("options", [])}
 
 
 def _sessions_root():
@@ -729,6 +732,14 @@ class Session:
         # Clean the answer BEFORE claiming: a rejected answer (command prefix / empty after
         # sanitization) leaves the decision pending and nothing typed, so the caller can retry.
         clean = prepare_pty_input(answer, self._driver.command_prefixes)
+        # Affordance-aware routing (spec §7.3, fixes F2): a modal/permission decision is answered
+        # with an OPTION ID and the DRIVER performs the selection (select_option); a free-text decision
+        # keeps the type-text path. An id not in `options` is REJECTED before claiming — the decision
+        # stays pending and no keys are sent (closes the "prose into a menu" trap).
+        is_modal = decision.get("prompt_kind") in ("modal_choice", "permission_choice")
+        options = decision.get("options") or []
+        if is_modal and clean not in {o["id"] for o in options}:
+            return RespondOutcome("invalid_option", pending=_pending_meta(decision))
         # Atomically CLAIM the decision: exactly one responder clears it and goes on to type, so
         # concurrent duplicate responds can never both write to the PTY (which is non-idempotent).
         with self._lock:
@@ -743,22 +754,31 @@ class Session:
                or decision.get("seq"))
         if self._handle is not None:
             # Bound the PTY write (this runs on the RPC thread): a wedged executor that stopped
-            # draining its stdin must NOT hang respond forever. ONE deadline covers the answer text +
-            # the submit key; on timeout the answer did not land (executor wedged) -> report it, don't
-            # re-type. Non-draining (the monitor owns pump(); draining here would race it).
+            # draining its stdin must NOT hang respond forever. ONE deadline covers the whole write;
+            # on timeout the answer did not land (executor wedged) -> report it, don't re-type.
+            # Non-draining (the monitor owns pump(); draining here would race it).
             deadline = time.monotonic() + self._spec.respond_write_seconds
             try:
-                self._type_text(clean, timeout=max(0.0, deadline - time.monotonic()))
-                self._press_enter(timeout=max(0.0, deadline - time.monotonic()))
+                if is_modal:
+                    # The driver presses the digit + confirm (one sequence): never prose into a menu.
+                    self._type_text(self._driver.select_option(clean),
+                                    timeout=max(0.0, deadline - time.monotonic()))
+                else:
+                    self._type_text(self._driver.submit_text(clean),
+                                    timeout=max(0.0, deadline - time.monotonic()))
+                    self._press_enter(timeout=max(0.0, deadline - time.monotonic()))
             except PtyWriteTimeout:
                 if self._log is not None:
                     self._log.warning("session", "respond_write_timeout", session_id=self._id)
                 return RespondOutcome("write_timeout", decision_id=decision.get("decision_id"))
             if not is_blocked:
                 # Only a delivered-agent respond appends a user marker; a write_timeout must not
-                # advance the transcript. (The monitor reads dialog in _publish under self._lock.)
+                # advance the transcript. A modal records the chosen option's LABEL (not the bare id).
+                marker = clean
+                if is_modal:
+                    marker = next((o["label"] for o in options if o["id"] == clean), clean)
                 with self._lock:
-                    self._dialog.append_user_input(clean)
+                    self._dialog.append_user_input(marker)
             # A respond is a submit: tell the engine so it forgets the now-answered decision and arms
             # post-submit suppression (the answer echoed in the box must not re-mint a fresh idle, F1).
             with self._lock:
