@@ -39,8 +39,8 @@ _log = logging.getLogger("nelix.supervisor")
 # Daemon deps live in the Hermes runtime venv (our sys.executable), which does
 # not ship them. No plugin.yaml field installs deps (pip_dependencies is a
 # no-op) — self-install venv-scoped, exactly like plugins/google_meet/cli.py.
-_DAEMON_DEPS = ("pyte==0.8.2", "ptyprocess==0.7.0")        # top-level imports; versions checked
-_DAEMON_MODULES = ("pyte", "ptyprocess")                  # import names (== dist names here)
+_DAEMON_DEPS = ("wasmtime==45.0.0", "ptyprocess==0.7.0")   # top-level imports; versions checked
+_DAEMON_MODULES = ("wasmtime", "ptyprocess")              # import names (== dist names here)
 _DAEMON_LOCK = PLUGIN_ROOT / "requirements-daemon.lock"   # hash-pinned full closure for install
 
 
@@ -125,7 +125,7 @@ def _venv_pip_install(req_file):
 
 
 def _ensure_deps() -> None:
-    """Make pyte/ptyprocess importable in the Hermes runtime venv (sys.executable).
+    """Make wasmtime/ptyprocess importable in the Hermes runtime venv (sys.executable).
 
     Honors the same security gate as Hermes' lazy installer. Raises RuntimeError
     with a manual-pip hint if installs are disabled or fail."""
@@ -433,7 +433,7 @@ def ensure_running() -> Transport:
     if adopted:
         return adopted
 
-    _ensure_deps()  # daemon imports pyte/ptyprocess; install them venv-scoped if absent
+    _ensure_deps()  # daemon imports wasmtime/ptyprocess; install them venv-scoped if absent
 
     transport = _choose_transport()
     root = _root()

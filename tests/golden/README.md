@@ -25,7 +25,7 @@ bin/nelix-capture ~/.hermes/.../sessions/<id> --final          # the last screen
 bin/nelix-capture path/to/raw --cols 120 --rows 40 --final
 ```
 
-Only `--final` is fully faithful (pyte state after all bytes). `--at-marker` / `--all` snapshot pyte
+Only `--final` is fully faithful (renderer state after all bytes). `--at-marker` / `--all` snapshot renderer
 state at byte *prefixes* — plausible screens you still curate by eye, not provably ones the daemon
 classified at that instant (raw has no inter-byte timing, so "stable for N seconds" isn't replayable;
 the test simulates stability with `stable_for=9.9`).

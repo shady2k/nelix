@@ -1,4 +1,4 @@
-pyte==0.8.2
+wasmtime==45.0.0
 ptyprocess==0.7.0
 pytest==8.3.4
 pyyaml==6.0.3
