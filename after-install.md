@@ -11,7 +11,8 @@ runs in your current directory, or a project path you name. Nelix spawns its dae
 agent, and wakes Hermes only when a decision is needed. The daemon is ephemeral (one per gateway)
 and is torn down on session end.
 
-**Dependencies:** the daemon needs `pyte` and `ptyprocess`. On first use nelix installs
-them into the Hermes runtime venv automatically (venv-scoped, honoring
-`security.allow_lazy_installs`). If you disable lazy installs, install them yourself into
-that venv: `<hermes-venv>/bin/pip install pyte==0.8.2 ptyprocess==0.7.0`.
+**Dependencies:** the daemon needs `wasmtime` and `ptyprocess` (the terminal screen is
+rendered by libghostty-vt running in-process via wasmtime; a pinned `shim.wasm` ships with
+the plugin). On first use nelix installs them into the Hermes runtime venv automatically
+(venv-scoped, honoring `security.allow_lazy_installs`). If you disable lazy installs, install
+them yourself into that venv: `<hermes-venv>/bin/pip install wasmtime==45.0.0 ptyprocess==0.7.0`.
