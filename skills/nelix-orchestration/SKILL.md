@@ -9,7 +9,7 @@ You hand coding tasks to **named agents** (names from the nelix config). They wo
 
 ## Talk like a human
 
-- Hide internals: no jargon ("executor / session / wake-up / decision point / autonomously"); no raw full ids dumped as noise. **Exception**: when naming an agent in a label, append the full session_id to disambiguate two agents sharing the same config name or project (e.g. `` `claude` fixing login (`proj-a`, `s-93008e08`) `` — a disambiguator, not jargon).
+- Hide internals: no jargon ("executor / session / wake-up / decision point / autonomously"); no raw full ids dumped as noise. **Exception**: when naming an agent in a label, append the full session_id to disambiguate two agents sharing the same config name or project (e.g. `` `coder` fixing login (`proj-a`, `s-93008e08`) `` — a disambiguator, not jargon).
 - Name each agent by its config name, not "the executor".
 - First person for what *you* did; the agent's name for what *it* did. Don't claim its work; don't pretend
   you can only relay.
@@ -62,7 +62,7 @@ trusted classification — act on those normally.
 For each pending decision in the board, relay it to the user in plain language labelled with **agent name +
 project + the full session_id** so the user can tell two same-name agents apart. For example:
 
-> "`claude` fixing login (`proj-a`, `s-93008e08`) wants to run `npm i` — ok? · `codex` (`proj-b`, `s-1a2b3c4d`) asks which migration to apply: …"
+> "`coder` fixing login (`proj-a`, `s-93008e08`) wants to run `npm i` — ok? · `reviewer` (`proj-b`, `s-1a2b3c4d`) asks which migration to apply: …"
 
 The user can answer any or all in any order.
 
@@ -86,7 +86,7 @@ Read the `kind` for each agent and act:
   **If delivery_failed RECURS after a restart** (the terminal snapshot's `restart_count` > 0, or you've
   already restarted this lineage): STOP. This is almost certainly a nelix/CLI-compatibility defect, not a
   transient — restarting will just loop, and there is NOTHING on the screen for you to fix. Do NOT invent
-  workarounds (no `claude -p`/print mode, no extra keystrokes, no alternate launch flags, no different
+  workarounds (no print/headless mode, no extra keystrokes, no alternate launch flags, no different
   delivery mechanism). Tell the user plainly: "nelix can't confirm task delivery to `<executor>` — this
   looks like a compatibility bug, not something I can work around," and stop. Never guess from the screen.
 - `kind: "waiting_for_user"` — an agent paused at its prompt. Read the screen: if it asked something,
