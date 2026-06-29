@@ -318,7 +318,7 @@ class Session:
                 frame = self._handle.render()
             if self._driver.input_submission_present(frame, self._task):
                 self._press_enter()
-                self._dialog.mark_turn_boundary()    # task turn begins now
+                self._dialog.append_user_input(self._task_raw)   # first user marker
                 self._task_delivery = "delivered"
                 self._last_state = None
                 if self._log is not None:
@@ -534,10 +534,9 @@ class Session:
                  decision_key=None):
         respondable = kind in RESPONDABLE_KINDS
         with self._lock:
-            page = self._dialog.current_turn_page(limit=self._spec.status_tail_chars)
-            turn = page["turn"]
-            start, end = page["start"], page["end"]
-            text = page["text"]
+            tail = self._dialog.tail(self._spec.status_tail_chars)
+            text = tail["text"]
+            truncated = tail["start_offset"] > 0  # tail didn't start from the beginning
             # render() directly (NOT self.screen(), which also takes self._lock -> deadlock).
             screen = _excerpt(self._handle.render() if self._handle is not None else "",
                               self._spec.status_tail_chars)
@@ -546,11 +545,11 @@ class Session:
                 requires_response = respondable
             if task_delivery is None:
                 task_delivery = self._task_delivery
-            decision = {"kind": kind, "turn_index": turn, "range": (start, end),
-                        "hint": hint, "hung": hung, "text": text,
+            decision = {"kind": kind, "hint": hint, "hung": hung, "text": text,
                         "task_delivery": task_delivery, "requires_response": requires_response,
                         "screen_excerpt": screen, "external_output_policy": EXTERNAL_OUTPUT_POLICY,
-                        "total_len": page["total_len"], "truncated": page["truncated"]}
+                        "total_len": tail["total_len"], "truncated": truncated,
+                        "last_user_input_offset": self._dialog.last_user_input_offset()}
             is_reemit = False
             if respondable:
                 # decision identity: REUSE the current decision's id when this is a re-emit of the
@@ -588,7 +587,6 @@ class Session:
 
         # publish OUTSIDE the session lock (lock order: never hold it across a queue publish).
         evt = self._events.publish(self._id, self._executor, kind, text[:200], self._state,
-                                   turn_index=decision["turn_index"], range=decision["range"],
                                    hint=hint, hung=hung, task_delivery=task_delivery,
                                    requires_response=requires_response, screen_excerpt=screen,
                                    on_publish=_install if respondable else None)
@@ -604,20 +602,16 @@ class Session:
         with self._lock:
             snap = {"session_id": self._id, "executor": self._executor,
                     "task": self._task_raw, "cwd": self._cwd,
-                    "state": self._state,
-                    "turn_count": self._dialog.turn_count() if self._dialog else 0}
+                    "state": self._state}
             if self.lineage_id is not None:
                 snap["lineage_id"] = self.lineage_id
                 snap["restarted_from"] = self.restarted_from
                 snap["restart_count"] = self.restart_count
             if self._decision is not None:
-                # serve the FROZEN range, not a mutating "latest turn". decision_key is internal
-                # decision identity (never exposed); decision_id is the public guard token.
-                s, e = self._decision["range"]
-                page = self._dialog.range_text(s, e, limit=self._spec.status_tail_chars)
+                # decision_key is internal identity (never exposed); decision_id is the public
+                # guard token.  The text was captured at publish time via tail() and is frozen.
                 dec = {k: v for k, v in self._decision.items() if k != "decision_key"}
-                snap["decision"] = {**dec, "text": page["text"],
-                                    "total_len": page["total_len"], "truncated": page["truncated"]}
+                snap["decision"] = dec
             # active-working snapshots are deliberately low-information: no progress bait, just
             # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
             snap["pending"] = self._decision is not None
@@ -676,11 +670,10 @@ class Session:
                     self._log.warning("session", "respond_write_timeout", session_id=self._id)
                 return RespondOutcome("write_timeout", decision_id=decision.get("decision_id"))
             if not is_blocked:
-                # only a delivered agent turn gets a boundary, and ONLY after the answer actually
-                # submitted — a write_timeout must not advance the transcript past an undelivered turn.
-                # (the monitor reads the dialog under self._lock in _publish, so mutate it under it.)
+                # Only a delivered-agent respond appends a user marker; a write_timeout must not
+                # advance the transcript. (The monitor reads dialog in _publish under self._lock.)
                 with self._lock:
-                    self._dialog.mark_turn_boundary()
+                    self._dialog.append_user_input(clean)
             self._last_state = None
         return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"))
 

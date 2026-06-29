@@ -53,10 +53,8 @@ class RpcClient:
         _, body = self._call("GET", "/status" + q)
         return body
 
-    def dialog(self, session_id, turn=None, offset=0, limit=None):
+    def dialog(self, session_id, offset=0, limit=None):
         params = {"session_id": session_id, "offset": offset}
-        if turn is not None:
-            params["turn"] = turn
         if limit is not None:
             params["limit"] = limit
         _, body = self._call("GET", "/dialog?" + urllib.parse.urlencode(params))
