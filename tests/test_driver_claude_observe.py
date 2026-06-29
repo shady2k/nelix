@@ -37,6 +37,15 @@ def test_empty_prompt_is_free_text():
     assert "accepts_text_input" in o.affordances
 
 
+def test_stray_prompt_marker_without_footer_is_not_free_text():
+    # BLOCKER 1: a ❯ in scrolled output / chrome WITHOUT the real prompt footer must NOT be a
+    # free-text input box — delivery must never type into a non-input screen that merely contains ❯.
+    frame = "agent log: ❯ see the arrow in this output line\nmore output here\n(no mode footer)"
+    o = D.observe(frame, CTX)
+    assert o.prompt_kind == "unknown"
+    assert "accepts_text_input" not in o.affordances
+
+
 def test_numbered_menu_is_modal_choice_with_options():
     frame = ("How should T7 handle the table?\n❯ 1. Enrich all three\n  2. Verify-only\n"
              "  3. Enrich establish_phase only\nEnter to select · ↑/↓ to navigate")
@@ -65,6 +74,18 @@ def test_no_echo_when_text_absent():
     ctx = ObservationCtx(last_submitted_text="commit this", child_alive=True, exit_code=None)
     o = D.observe("done\n❯ \n⏵⏵ auto mode on (shift+tab to cycle)", ctx)
     assert o.submitted_echo_present is False
+
+
+def test_echo_only_in_scrollback_is_not_present():
+    # BLOCKER 2: our submitted text appearing in agent OUTPUT/scrollback (not the active input box)
+    # must NOT count as an echo — else it suppresses real prompts forever (spec §5.5/§10).
+    ctx = ObservationCtx(last_submitted_text="commit this", child_alive=True, exit_code=None)
+    scroll = ("agent output mentions commit this in a log line\n"
+              "❯ \n⏵⏵ ask mode (shift+tab to cycle)")
+    assert D.observe(scroll, ctx).submitted_echo_present is False
+    # but the SAME text on the active prompt line (verbatim) IS an echo
+    active = "done\n❯ commit this\n⏵⏵ ask mode (shift+tab to cycle)"
+    assert D.observe(active, ctx).submitted_echo_present is True
 
 
 def test_crash_and_exit_from_ctx():

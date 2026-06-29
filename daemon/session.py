@@ -680,6 +680,12 @@ class Session:
                     cur["hung"] = hung
                 elif not is_reemit:
                     # a genuinely new pause -> install it (supersedes any prior pending decision).
+                    # Resolve the superseded prior decision's events (targeted by its decision id) so
+                    # pending() returns THIS decision and never resurrects the old one (IMPORTANT 1).
+                    # resolve_decision re-enters the EventQueue lock (reentrant) under the install hook.
+                    prior_id = cur.get("decision_id") if cur is not None else None
+                    if prior_id is not None and prior_id != decision_id:
+                        self._events.resolve_decision(prior_id, "superseded")
                     decision["event_id"] = evt.event_id
                     decision["seq"] = evt.seq
                     self._decision = decision

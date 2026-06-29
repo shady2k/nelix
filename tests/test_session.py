@@ -182,7 +182,7 @@ def test_sessions_dir_resolves_under_hermes_home(monkeypatch, tmp_path):
 def test_loop_publishes_one_waiting_for_user_on_stable_idle(tmp_path):
     # Task 8: the monitor drives observe() -> BeliefEngine -> actions. A working frame publishes
     # nothing; a stable idle prompt publishes exactly one waiting_for_user. Clock is injected.
-    box = "Here is my answer.\n❯ "
+    box = "Here is my answer.\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["thinking… esc to interrupt", box, box, box])
     sess._loop()
     pubs = [e for e in ev._events if e.kind == "waiting_for_user"]
@@ -202,7 +202,7 @@ def test_loop_working_frame_publishes_nothing(tmp_path):
 def test_status_exposes_rich_belief_fields(tmp_path):
     # Task 14: /status (snapshot) exposes control_state + busy_reason + liveness + quiet_elapsed +
     # escalation_count — the same fields feed the live status, the trail, and the replay oracle.
-    box = "Here is my answer.\n❯ "
+    box = "Here is my answer.\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["thinking… esc to interrupt", box, box, box])
     sess._loop()
     snap = sess.snapshot()
@@ -232,7 +232,7 @@ def test_belief_transition_trail_is_logged(tmp_path):
     from daemon.obs import Logger
     buf = io.StringIO()
     log = Logger(level="debug", stream=buf, audit_stream=buf)
-    box = "Here is my answer.\n❯ "
+    box = "Here is my answer.\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["thinking… esc to interrupt", box, box, box])
     sess._log = log
     sess._loop()
@@ -249,8 +249,8 @@ def test_belief_transition_trail_is_logged(tmp_path):
 
 
 def test_stop_edge_emits_frozen_respondable_event(tmp_path):
-    frames = ["thinking… esc to interrupt", "Here is my answer. Which next?\n❯ ",
-              "Here is my answer. Which next?\n❯ ", "Here is my answer. Which next?\n❯ "]
+    frames = ["thinking… esc to interrupt", "Here is my answer. Which next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)",
+              "Here is my answer. Which next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)", "Here is my answer. Which next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"]
     sess, ev = _session(tmp_path, frames)
     sess._loop()
     snap = sess.snapshot()
@@ -268,7 +268,7 @@ def test_stop_edge_emits_frozen_respondable_event(tmp_path):
 
 
 def test_decision_reports_truncation(tmp_path):
-    box = "Hello, what now?\n❯ "
+    box = "Hello, what now?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box], spec=TruncSpec())
     sess._loop()
     dec = sess.snapshot()["decision"]
@@ -345,7 +345,7 @@ def test_frozen_screen_escalates_nonrespondable_intervention_no_bytes(tmp_path):
 
 def test_respond_answers_and_appends_user_input(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
-    box = "Ready — what next?\n❯ "
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
     pend = ev.pending("s1")
@@ -401,7 +401,7 @@ def test_respond_to_modal_rejects_unknown_option_keeps_pending(tmp_path):
 
 def test_respond_to_free_text_uses_submit_text_not_select(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
-    box = "Ready — what next?\n❯ "
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
     assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
@@ -409,6 +409,23 @@ def test_respond_to_free_text_uses_submit_text_not_select(monkeypatch, tmp_path)
     assert out.status == "resumed"
     # free-text: the text is typed then Enter pressed separately (two writes), not a select_option.
     assert "do the next thing" in sess._handle.writes and "\r" in sess._handle.writes
+
+
+def test_new_decision_supersedes_and_resolves_prior(tmp_path):
+    # IMPORTANT 1: when a genuinely new respondable decision (different decision_key) supersedes a
+    # still-pending prior one, the prior's events must be resolved (superseded) so EventQueue.pending()
+    # returns the NEW decision and never resurrects the old one.
+    sess, ev = _session(tmp_path, ["screen"])
+    sess._publish("waiting_for_user", hint=None, hung=False, requires_response=True, decision_key="k-A")
+    a_id = sess._decision["decision_id"]
+    a_events = [e for e in ev._events if e.decision_id == a_id]
+    assert a_events and all(e.resolved_reason is None for e in a_events)
+    sess._publish("waiting_for_user", hint=None, hung=False, requires_response=True, decision_key="k-B")
+    b_id = sess._decision["decision_id"]
+    assert b_id != a_id                                            # a genuinely new decision
+    assert all(e.resolved_reason == "superseded" for e in a_events)  # prior decision resolved
+    pend = ev.pending("s1")
+    assert pend is not None and pend.decision_id == b_id          # B pending; A not resurrected
 
 
 def test_respond_with_no_pending_decision_is_rejected(tmp_path):
@@ -423,7 +440,7 @@ def test_respond_claims_decision_atomically_no_double_type(monkeypatch, tmp_path
     # respond claims the decision before typing, so a second respond finds nothing pending and does
     # NOT type again (PTY input is non-idempotent — a duplicate would inject a stray line).
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
-    box = "Ready — what next?\n❯ "
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
     assert sess.respond("1").status == "resumed"
@@ -448,7 +465,7 @@ class WedgedWriteHandle:
 def test_respond_write_is_bounded_and_reports_timeout(monkeypatch, tmp_path):
     # respond's PTY write runs on the RPC thread and was unbounded: a wedged executor (not draining
     # stdin) would hang the call forever. It must be deadline-bounded -> a 'write_timeout' outcome.
-    box = "Ready — what next?\n❯ "
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
     offset_before = sess._dialog.last_user_input_offset()
@@ -476,7 +493,7 @@ def test_respond_with_stale_decision_id_is_rejected_and_returns_current(monkeypa
     # decision_id is an OPTIONAL guard from the status pull, not a required identity. A mismatch
     # is rejected as stale and the response carries the current pending decision for reconcile;
     # the correct id (or no id) still works.
-    box = "Ready — what next?\n❯ "
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
     cur = sess._decision["decision_id"]
@@ -489,7 +506,7 @@ def test_respond_with_stale_decision_id_is_rejected_and_returns_current(monkeypa
 
 
 def test_snapshot_decision_carries_decision_id_and_policy(tmp_path):
-    box = "Ready — what next?\n❯ "
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
     dec = sess.snapshot()["decision"]
@@ -858,7 +875,7 @@ def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeyp
     # runs AFTER a concurrent respond() claimed/answered it. The hook must NOT resurrect the answered
     # decision, and must mark the now-obsolete re-emit event answered (so pending() stays clean).
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
-    box = "Ready — what next?\n❯ "
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
     key = sess._decision["decision_key"]
@@ -1153,12 +1170,20 @@ _RAW_ECHO_FLOOD_CHILD = (
     "except Exception:\n"
     "    pass\n"
     "os.write(1,'\\u276f \\r\\n\\u23f5\\u23f5 ask mode (shift+tab to cycle)\\r\\n'.encode())\n"
+    "buf=b''\n"
     "while True:\n"
     "    ch=os.read(fd,1024)\n"
     "    if not ch:\n"
     "        break\n"
     "    os.write(1,ch)\n"                          # echo (advances the rendered prompt)
     "    os.write(1,ch)\n"                          # amplify: fill the output buffer faster than input drains
+    "    buf+=ch\n"
+    # Like a real bracketed-paste CLI: once the whole paste arrives, COLLAPSE it to a placeholder on
+    # the prompt line (clear + redraw) so the prompt stays visible and delivery can confirm via the
+    # active input region (the verbatim echo otherwise scrolls the prompt off-screen).
+    "    if b'\\x1b[201~' in buf:\n"
+    "        os.write(1,'\\x1b[2J\\x1b[H\\u276f [Pasted text #1]\\r\\n\\u23f5\\u23f5 ask mode (shift+tab to cycle)\\r\\n'.encode())\n"
+    "        break\n"
     "    if b'\\r' in ch:\n"                        # the submit key (sent only after confirmation)
     "        break\n"
     "time.sleep(30)\n"

@@ -19,6 +19,12 @@ class _NoopHandle:
     def leader_pgid(self): return None
     def pump(self, t): return False
     def finalize(self): pass
+    def leader_status(self):
+        # _finish() calls this during finalization; without it the monitor thread raised
+        # AttributeError (a noisy PytestUnhandledThreadExceptionWarning). No-op clean shape.
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=self.is_alive(), exit_code=None, signal=None,
+                            status_available=False)
 
 
 def _spec():

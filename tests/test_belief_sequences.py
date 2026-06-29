@@ -62,6 +62,23 @@ def test_permission_choice_carries_needs_permission_hint():
     assert len(pubs) == 1 and pubs[0].payload["hint"] == "needs_permission"
 
 
+def test_genuine_new_free_text_prompt_is_published_not_suppressed():
+    # IMPORTANT 2 regression: a genuine NEW free-text prompt (empty box, NO echo of our last
+    # submission) MUST be published — echo-suppression only fires when our text is still in the box.
+    clk = FakeClock(0.0)
+    e = BeliefEngine(BeliefConfig(), clk)
+    e.on_submit("old answer")                          # we answered earlier
+    work = Observation(prompt_kind="none", semantic_fp="w", heartbeat=Heartbeat("h", True, True))
+    clk.advance(0.5)
+    e.tick(work, CTX)                                  # turn started -> clears post-submit
+    idle = Observation(prompt_kind="free_text", submitted_echo_present=False, semantic_fp="newq",
+                       affordances=frozenset({"accepts_text_input"}))
+    clk.advance(0.5)
+    e.tick(idle, CTX)                                  # idle edge
+    clk.advance(1.0)
+    assert _pubs(e.tick(idle, CTX)), "a genuine new free-text prompt (no echo) must publish"
+
+
 # ---- Task 10: post-submit suppression of false idle (spec §7.1, fixes F1) ----
 
 def test_post_submit_gap_does_not_publish():

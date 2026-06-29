@@ -84,12 +84,20 @@ Read the `kind` for each agent and act:
   it landed within the confirm window (e.g. the CLI hung mid-paste). It did NOT submit or re-type anything.
   Do not reply into the agent; call `nelix_restart(session_id)` — one atomic call, reuses the persisted task, durable budget.
 - `kind: "waiting_for_user"` — an agent paused at its prompt. Read the screen: if it asked something,
-  answer or relay per your mandate (permission/destructive → user, always, unless delegated;
-  `hint=="needs_permission"` → the answer is a number). If it FINISHED, relay the result to the user and
-  do NOT send a bogus reply back to the agent. Then `nelix_respond(session_id, answer, decision_id)`.
-- `hung: true` — no real progress for `max_idle_seconds` (a ticking timer or long server wait is fine —
-  this fires only on a real stall). Tell the user, let them decide. If you answered and still nothing
-  reacts → wedged → recover with `nelix_restart(session_id)`.
+  answer or relay per your mandate (permission/destructive → user, always, unless delegated). If the
+  decision carries `prompt_kind: "modal_choice"` or `"permission_choice"` (a numbered menu — it lists
+  `options: [{id, label}]`; `hint=="needs_permission"` is the permission case), answer with the option
+  `id` (a number), NEVER prose — the daemon routes a modal answer to the selector, and a non-id answer
+  is rejected. A `prompt_kind: "free_text"` prompt takes a free-text answer. If it FINISHED, relay the
+  result to the user and do NOT send a bogus reply back to the agent. Then
+  `nelix_respond(session_id, answer, decision_id)`.
+- `kind: "intervention_required"` (`requires_response: false`) — the agent is stuck/hung/unresponsive
+  and is NOT accepting input (a ticking timer or long server wait stays `busy`; this fires only on a real
+  stall, and re-fires as a nag with a rising `escalation_count` while it stays stuck). It is
+  NON-respondable: do **NOT** call `nelix_respond` for it (there is no pending decision to answer).
+  Handle it with your existing operations: "wait" = simply end your turn (nelix re-arms and the next
+  nag wakes you if it's still stuck); otherwise recover with `nelix_restart(session_id)` (wedged) or
+  `nelix_stop(session_id)`. Tell the user when a stall persists and let them decide.
 - `kind: "done"` (exited) — verify the goal is met (you hold it). Met → report what was done. Not met →
   `nelix_restart(session_id)` to continue, within budget.
 - `kind: "crashed"` or wedged — recover with `nelix_restart(session_id)` — one call; do NOT stop+start

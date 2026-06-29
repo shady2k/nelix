@@ -123,11 +123,16 @@ class ClaudeDriver:
             kind = "permission_choice" if _is_choice_prompt(frame) else "modal_choice"
             return Observation(prompt_kind=kind, affordances=frozenset({kind}),
                                options=self._parse_options(frame), **common)
-        # 5. the real free-text input box (any permission mode), not a menu.
-        if any(m in frame for m in INPUT_BOX_MARKERS):
+        # 5. the real free-text input box (any permission mode), not a menu. Require the prompt
+        #    FOOTER as well as the ❯ marker: a stray ❯ in scrolled output/chrome is NOT an input box,
+        #    and delivery must never type into it (the old is_accepting_input safety requirement).
+        if any(m in frame for m in INPUT_BOX_MARKERS) and _PROMPT_FOOTER in frame:
             return Observation(prompt_kind="free_text",
                                affordances=frozenset({"accepts_text_input"}), **common)
-        # 6. alive, no markers, no prompt -> busy with no identifiable heartbeat (liveness unknown).
+        # 6. a ❯ without the footer (ambiguous chrome) or alive-no-markers -> NOT a wakeable prompt.
+        #    `unknown` so the engine treats it as busy and delivery never types into it.
+        if any(m in frame for m in INPUT_BOX_MARKERS):
+            return Observation(prompt_kind="unknown", busy_reason=self._busy_reason(frame), **common)
         return Observation(prompt_kind="none", busy_reason=self._busy_reason(frame), **common)
 
     def is_transcript_volatile(self, row):
@@ -182,10 +187,12 @@ class ClaudeDriver:
         # the prompt line. Scoped to the prompt tail (last ❯ onward), never scrollback.
         if not text:
             return False
-        needle = " ".join(text.split())[:40]
-        if needle and needle in " ".join(frame.split()):
-            return True
+        # Scope BOTH checks to the prompt TAIL (last ❯ onward) — never scrollback: our text appearing
+        # in agent output must not be read as still-in-the-box (spec §5.5/§10, BLOCKER 2).
         tail = frame[frame.rfind("❯"):] if "❯" in frame else ""
+        needle = " ".join(text.split())[:40]
+        if needle and needle in " ".join(tail.split()):
+            return True
         return bool(_PASTED_TEXT.search(tail))
 
     def _busy_reason(self, frame):
