@@ -909,13 +909,13 @@ def test_executor_exited_logged_once_on_pre_delivery_death(tmp_path):
 def test_live_stop_logs_no_executor_exited(tmp_path):
     log, buf = _capture_logger()
     sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), EventQueue(), logger=log)
-    sess._handle = FakeHandle([], stop=sess._stop)      # stays alive
+    sess._handle = FakeHandle(["❯ "], stop=sess._stop)  # stays alive; one frame for the stop publish
     sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
                           spool_max_bytes=Spec.spool_max_bytes)
     sess._spawn_ts = 0.0
     sess._stop.set()                                     # operator stop, leader still alive
     sess._finish()
-    assert "executor_exited" not in _events_in(buf)
+    assert "executor_exited" not in _events_in(buf)     # operator stop -> 'stopped', not exited
 
 
 def test_executor_exited_logged_exactly_once_under_finalize_race(tmp_path):

@@ -116,6 +116,49 @@ def test_start_failure_does_not_leak_session():
     assert sid is not None and m.status()["sessions"][sid]["state"] == "working"
 
 
+def test_operator_stop_publishes_single_stopped_event(tmp_path):
+    """A live agent stopped by the operator must emit exactly one terminal 'stopped' event (so the
+    per-session waiter fires and exits), recorded in recent_terminal, with no deadlock and no double
+    done/crashed event. manager.stop() must NOT self-pop — _free_slot captures recent_terminal."""
+    events = EventQueue()
+
+    class StoppingSession:
+        # Drives the real terminal path: on stop() publish ONE 'stopped' event, then invoke
+        # on_terminal (manager._free_slot, which re-enters manager._lock) — exactly what the real
+        # monitor's _finish_publish + _finish_cleanup do for an operator stop.
+        def __init__(self, sid, executor):
+            self.sid = sid; self.executor = executor
+            self.on_terminal = None; self.reaper_ctx = None
+            self.lineage_id = None; self.restarted_from = None; self.restart_count = 0
+        def start(self, task, cwd): pass
+        def snapshot(self): return {"session_id": self.sid, "state": "working"}
+        def terminal_snapshot(self):
+            return {"session_id": self.sid, "state": "stopped", "terminal_kind": "stopped",
+                    "terminal": True, "lineage_id": self.lineage_id,
+                    "restarted_from": None, "restart_count": 0}
+        def stop(self):
+            events.publish(self.sid, self.executor, "stopped", "", "stopped")
+            if self.on_terminal is not None:
+                self.on_terminal(self.sid)
+
+    specs = {EXECUTOR: make_spec()}
+    mgr = SessionManager(specs, events, concurrency_limit=2,
+                         session_factory=lambda sid, ex, spec, ev: StoppingSession(sid, ex),
+                         session_retain=0, session_max_age_days=0)
+    sid, base = mgr.start(EXECUTOR, "t", str(tmp_path))
+    before = events.latest_seq(sid)
+
+    assert mgr.stop(sid) is True              # returns, no deadlock
+
+    # exactly one new terminal event for this session, kind == "stopped"
+    new = [e for e in events._events if e.session_id == sid and e.seq > before]
+    assert [e.kind for e in new] == ["stopped"]
+    # a session-scoped waiter parked at `before` would now see it
+    assert events.wait_event(after_seq=before, timeout=0, session_id=sid).kind == "stopped"
+    # recorded in recent_terminal so the board read can show it
+    assert sid in mgr.status()["recent_terminal"]
+
+
 def test_status_lists_all_and_stop():
     m, captured = _mgr(limit=2)
     sid, _ = m.start(EXECUTOR, "t", "/tmp")

@@ -307,9 +307,13 @@ class SessionManager:
 
     def stop(self, session_id, reason="user_stop"):
         with self._lock:
-            sess = self._sessions.pop(session_id, None)
+            sess = self._sessions.get(session_id)   # look up only; DO NOT pop here
         if sess is None:
             return False
+        # Release manager._lock before sess.stop(): it joins the monitor thread, whose finalization
+        # re-enters manager._lock via _free_slot (on_terminal). _free_slot does the terminal_snapshot
+        # capture + pop + recent_terminal recording — so we must NOT pop first, or recent_terminal
+        # would be empty. (Holding the lock across the join would also deadlock.)
         sess.stop()
         if self._logger is not None:
             self._logger.info("manager", "session_stopped", session_id=session_id,

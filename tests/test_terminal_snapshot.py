@@ -182,3 +182,43 @@ def test_delivery_failed_then_child_exits_preserves_terminal_kind(tmp_path, monk
     assert len(all_events) == 1, (
         f"expected 1 terminal event, got {len(all_events)}: {[e.kind for e in all_events]}"
     )
+
+
+def test_operator_stop_publishes_single_stopped_event_no_double(tmp_path, monkeypatch):
+    """Operator stop on a LIVE agent: _finish_publish must publish exactly one 'stopped' terminal
+    event even though Session.stop() killed the launcher first (alive=False), and the not-alive
+    branch must NOT also publish a done/crashed event. The stop branch is checked BEFORE not-alive.
+    """
+    from daemon.session import Session
+    from daemon.config import ExecutorSpec
+    from daemon.events import EventQueue
+    from daemon.dialog import Dialog
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    class _Handle:
+        def is_alive(self): return False
+        def render(self): return ""
+        def leader_pid(self): return None
+        def leader_pgid(self): return None
+        def pump(self, t): return False
+        def finalize(self): pass
+
+    class _Drv:
+        command_prefixes = ()
+        submit_key = "\r"
+        def __init__(self): self._settle = 0
+
+    eq = EventQueue()
+    spec = ExecutorSpec(command="c", args=[], env={}, driver="claude")
+    sess = Session("s-st01", "claude", _Drv(), object(), spec, eq)
+    sess._dialog = Dialog(tmp_path / "s-st01", tail_lines=200, spool_max_bytes=0)
+    sess._handle = _Handle()
+
+    sess._stop.set()                                   # operator stop intent (Session.stop sets this)
+    sess._finish_publish(status=None, alive=False)     # child already killed by stop() -> alive False
+
+    evs = [e for e in eq._events if e.session_id == "s-st01"]
+    assert [e.kind for e in evs] == ["stopped"]        # exactly ONE event, kind 'stopped'
+    assert sess.terminal_snapshot()["terminal_kind"] == "stopped"
+    assert sess._state == "stopped"

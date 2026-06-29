@@ -430,7 +430,21 @@ class Session:
             if self._log is not None:
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return
-        # 3. executor genuinely exited -> the ONE terminal exit event, status-mapped
+        # 3. operator stopped the agent -> the ONE terminal 'stopped' event. Checked BEFORE the
+        # not-alive branch because Session.stop() kills the launcher first, so the monitor reaches
+        # _finish with alive=False; without this precedence the kill would be mis-reported as
+        # done/crashed. The monitor runs _finish exactly once -> exactly one terminal event, so the
+        # per-session waiter fires and exits. (Accepted race: a natural exit immediately followed by
+        # a stop request reports 'stopped' — the session is terminal either way.)
+        if self._stop.is_set():
+            with self._lock:
+                self._state = "stopped"
+                self._terminal_kind = "stopped"
+            self._publish("stopped", hint=None, hung=False, requires_response=False)
+            if self._log is not None:
+                self._log.debug("session", "monitor_exited", session_id=self._id)
+            return
+        # 4. executor genuinely exited -> the ONE terminal exit event, status-mapped
         if not alive:
             kind, final_state = self._exit_kind(status)
             with self._lock:
@@ -439,11 +453,6 @@ class Session:
             self._publish("done" if kind == "done" else "crashed",
                           hint=None, hung=False, requires_response=False)
             self._log_exited(kind if kind == "done" else "crashed", status)
-            if self._log is not None:
-                self._log.debug("session", "monitor_exited", session_id=self._id)
-            return
-        # 4. operator stopped a LIVE agent -> manager logs session_stopped; no executor_exited
-        if self._stop.is_set():
             if self._log is not None:
                 self._log.debug("session", "monitor_exited", session_id=self._id)
             return
