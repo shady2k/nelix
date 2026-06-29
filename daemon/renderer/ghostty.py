@@ -52,7 +52,13 @@ class GhosttyRenderer:
         ob = self._call("spike_outbuf")
         text = bytes(self._mem.read(self._store, ob, ob + n)).decode("utf-8", "replace")
         rows = [r.rstrip() for r in text.split("\n")]
-        rows = (rows + [""] * self._rows)[:self._rows]      # exactly `rows` entries, blanks as ""
+        # spike_format returns scrollback + viewport content. The active viewport is always the
+        # LAST `rows` lines; earlier lines are scrollback. Pad with empty strings when the content
+        # is shorter than the viewport height (non-scrolling terminal still filling from the top).
+        if len(rows) <= self._rows:
+            rows = rows + [""] * (self._rows - len(rows))  # not yet scrolled: pad at bottom
+        else:
+            rows = rows[-self._rows:]                       # scrolled: take the viewport tail
         cursor = (self._call("spike_cursor_x"), self._call("spike_cursor_y"))
         return Frame(rows=rows, cursor=cursor,
                      cursor_visible=bool(self._call("spike_cursor_visible")),
