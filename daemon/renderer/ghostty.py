@@ -58,6 +58,10 @@ class GhosttyRenderer:
         if len(rows) <= self._rows:
             rows = rows + [""] * (self._rows - len(rows))  # not yet scrolled: pad at bottom
         else:
+            # Limitation: the shim formats with trim=true, so for a scrolled PRIMARY screen whose
+            # viewport has trailing blank rows, those blanks are trimmed before this slice and the
+            # viewport can misalign. Safe in Phase 1 (alt-screen agent TUIs have a non-empty bottom
+            # row). Resolve before Phase 2 primary-screen scrollback (see the filed bug).
             rows = rows[-self._rows:]                       # scrolled: take the viewport tail
         cursor = (self._call("spike_cursor_x"), self._call("spike_cursor_y"))
         return Frame(rows=rows, cursor=cursor,

@@ -92,6 +92,20 @@ def test_resize_changes_grid_height():
         r.close()
 
 
+def test_scrolled_viewport_tail_slice():
+    # Feeds 8 lines (L0–L7) into a 5-row renderer so the primary screen scrolls.
+    # The viewport (rows[-5:]) must show the LAST five logical lines: L3–L7.
+    r = GhosttyRenderer(cols=20, rows=5)
+    try:
+        r.feed(b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7")
+        f = r.snapshot()
+        assert len(f.rows) == 5
+        assert [x.strip() for x in f.rows] == ["L3", "L4", "L5", "L6", "L7"]
+        assert f.alt_screen is False
+    finally:
+        r.close()
+
+
 def test_no_unbounded_memory_across_many_instances():
     # Create/close many renderers; the cached Module must be reused and instances freed.
     for _ in range(200):
