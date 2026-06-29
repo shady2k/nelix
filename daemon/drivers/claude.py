@@ -1,6 +1,8 @@
 import re
 
 from daemon.drivers import register
+from daemon.observation import Observation, ObservationCtx, Option, Heartbeat
+from daemon.fingerprints import semantic_fp, region_fp
 
 WORKING_MARKERS = ("esc to interrupt",)
 # Positive working signal for builds that DON'T keep "esc to interrupt" on screen (CLI drift):
@@ -31,16 +33,22 @@ _PROMPT_FOOTER = "shift+tab to cycle"     # present at the interactive input pro
 _INPUT_LINE = re.compile(r"^\s*❯")                         # the prompt/input line (anchored)
 _RULE_ROW = re.compile(r"^[\s─-╿▀-▟=_]+$")   # box-drawing / rule chars only
 _OPTION = re.compile(r"^\s*[❯>]?\s*\d+\.\s+\S", re.M)        # a numbered menu option line
+_OPTION_PARSE = re.compile(r"^\s*[❯>]?\s*(\d+)\.\s+(.*\S)\s*$", re.M)  # id + label capture
 _SELECTED_OPTION = re.compile(r"^\s*❯\s*\d+\.\s+\S", re.M)   # the cursor sits ON an option
 # Claude collapses long/multiline input into "[Pasted text #N]" ON the prompt line; the prompt marker
 # (❯) sits immediately before it (Claude renders a NBSP between them). The character class matches
-# space, tab, or NBSP (U+00A0) — note: " " must be in a non-raw string; it is NOT a raw string.
-_PASTED_TEXT = re.compile("❯[ \t ]*" + r"\[Pasted text #\d+\]")
+# space, tab, or NBSP (U+00A0) — note: " " must be in a non-raw string; it is NOT a raw string.
+_PASTED_TEXT = re.compile("❯[ \t ]*" + r"\[Pasted text #\d+\]")
+
+# busy_reason chrome markers (on-screen tool panels only — NEVER the agent's NL output).
+_BASH_PANEL = re.compile(r"(?m)^\s*⏺?\s*Bash\(")           # a tool-run panel header
+_SUBAGENT_PANEL = re.compile(r"(?m)^\s*⏺?\s*Task\(")       # a sub-agent panel header
 
 
 def _is_choice_prompt(frame):
-    # When Claude needs a decision it presents a numbered Yes/…/No selection menu; the
-    # Yes+No options are the stable signal across prompt types (headers differ).
+    # When Claude needs a tool-permission decision it presents a numbered Yes/…/No menu; the
+    # Yes+No options are the stable signal that this menu is a permission gate (vs the agent's
+    # own "ask the user" numbered menu, which is a plain modal_choice).
     return "1. Yes" in frame and "3. No" in frame
 
 
@@ -56,49 +64,71 @@ class ClaudeDriver:
         f = _TOKENS.sub("N tokens", f)
         return f
 
+    # ---- actuation: the driver owns the KEYS; Session encodes + writes them to the PTY ----
     def format_submission(self, text):
         # Frame the task as a bracketed paste (ESC[200~ … ESC[201~). Claude enables bracketed-paste
         # mode at startup (ESC[?2004h) and, inside the markers, collapses the input to a single
-        # "[Pasted text #N]" placeholder with almost no re-render (0.0s vs 2.2s raw echo for 61.5KB),
-        # which input_submission_present already detects. Markers wrap ONLY the text: the submit key
-        # (CR) is pressed separately by the session, so a CR can't be swallowed as paste content.
-        # Added AFTER core_sanitize (which strips escapes), so these framing bytes survive.
+        # "[Pasted text #N]" placeholder with almost no re-render (0.0s vs 2.2s raw echo for 61.5KB).
+        # Markers wrap ONLY the text: the submit key (CR) is pressed separately by the session, so a
+        # CR can't be swallowed as paste content.
         return f"\x1b[200~{text}\x1b[201~"
 
-    def classify(self, frame, ctx):
+    def submit_text(self, text):
+        # A free-text answer: type it raw (the session presses the submit key separately).
+        return text
+
+    def select_option(self, id):
+        # Pick a numbered modal/permission option: press the digit, then confirm with the submit key.
+        return f"{id}{self.submit_key}"
+
+    def interrupt(self):
+        # The interrupt key (ESC). The passive daemon never sends it; exposed for completeness.
+        return "\x1b"
+
+    # ---- observation: the SOLE classification contract ----
+    def observe(self, frame, ctx):
+        norm = self.normalize_frame(frame)
+        common = dict(
+            semantic_fp=semantic_fp(norm),
+            content_fp=self._content_fp(norm),
+            prompt_fp=self._prompt_fp(norm),
+            submitted_echo_present=self._echo_present(frame, ctx.last_submitted_text),
+            ask_mode=self._ask_mode(frame),
+        )
+
+        # 1. terminal, derived from the child (not the screen): crash/exit prompt_kind.
         if not ctx.child_alive:
-            return "exited" if (ctx.exit_code or 0) == 0 else "crashed"
+            kind = "exit" if (ctx.exit_code or 0) == 0 else "crash"
+            return Observation(prompt_kind=kind, **common)
+        # 2. crash banner on screen while the leader may still be alive.
         if any(m in frame for m in CRASH_MARKERS):
-            return "crashed"
-        # Positive working detection BEFORE the input-box/settle idle path: the ❯ box stays visible
-        # while the agent works, so "stable + ❯" alone is not idle. Legacy marker OR the spinner line.
-        if any(m in frame for m in WORKING_MARKERS) or _WORKING_STATUS.search(frame):
-            return "working"
-        at_input = any(m in frame for m in INPUT_BOX_MARKERS)
-        if at_input and ctx.stable_for >= self._settle:
-            return "permission_prompt" if _is_choice_prompt(frame) else "idle_prompt"
-        return "quiet_working"
-
-    # settle threshold is injected by the session from config before classify is used
-    _settle = 1.5
-
-    def is_ask_mode(self, frame):
-        # Ask-mode = a known mode line is present but none of the auto markers are.
-        if "shift+tab to cycle" not in frame:
-            return False
-        return not any(m in frame for m in _AUTO_MODE_MARKERS)
-
-    def is_modal_choice(self, frame):
-        # A modal selection menu: the cursor (❯) sits on a numbered option and there
-        # are >=2 numbered options. Distinguishes a menu from the input box (where ❯
-        # sits on a free-text line, not on "N. ...").
-        return bool(_SELECTED_OPTION.search(frame)) and len(_OPTION.findall(frame)) >= 2
-
-    def is_accepting_input(self, frame):
-        # The real free-text prompt is present (any permission mode) and it is NOT a menu.
-        if self.is_modal_choice(frame):
-            return False
-        return ("❯" in frame) and (_PROMPT_FOOTER in frame)
+            return Observation(prompt_kind="crash", **common)
+        # 3. working / busy — the ❯ box stays visible while the agent works, so "stable + ❯" alone is
+        #    NOT idle. A working frame exposes no prompt (prompt_kind=none) but a live heartbeat.
+        working_line = self._working_line(frame)
+        if working_line is not None:
+            aff = set()
+            if any(m in frame for m in WORKING_MARKERS):
+                aff.add("interrupt_available")
+            if _BACKGROUND_HINT in frame:
+                aff.add("background_available")
+            return Observation(prompt_kind="none", affordances=frozenset(aff),
+                               heartbeat=Heartbeat(fp=semantic_fp(working_line), present=True,
+                                                   expected_to_change=True),
+                               busy_reason=self._busy_reason(frame), **common)
+        # 4. modal pick-one menu (cursor on a numbered option, >=2 options). A Yes/No menu is a
+        #    permission gate (permission_choice); any other numbered menu is the agent's own
+        #    "ask the user" UI (modal_choice). Both are surfaced as a choice with options (fixes F2).
+        if self._modal_menu(frame):
+            kind = "permission_choice" if _is_choice_prompt(frame) else "modal_choice"
+            return Observation(prompt_kind=kind, affordances=frozenset({kind}),
+                               options=self._parse_options(frame), **common)
+        # 5. the real free-text input box (any permission mode), not a menu.
+        if any(m in frame for m in INPUT_BOX_MARKERS):
+            return Observation(prompt_kind="free_text",
+                               affordances=frozenset({"accepts_text_input"}), **common)
+        # 6. alive, no markers, no prompt -> busy with no identifiable heartbeat (liveness unknown).
+        return Observation(prompt_kind="none", busy_reason=self._busy_reason(frame), **common)
 
     def is_transcript_volatile(self, row):
         # Terminal chrome a human sees but is not conversation content. Anchored patterns only —
@@ -122,13 +152,70 @@ class ClaudeDriver:
             return True
         return False
 
-    def input_submission_present(self, frame, text):
-        # Our submission is in the input box — either the typed text echoes verbatim, or (for a long or
-        # multiline task) Claude collapsed it into a "[Pasted text #N]" placeholder on the prompt line.
+    # ---- private observation helpers (folded from the old predicates) ----
+    def _working_line(self, frame):
+        for line in frame.split("\n"):
+            if _WORKING_STATUS.search(line) or any(m in line for m in WORKING_MARKERS):
+                return line
+        return None
+
+    def _modal_menu(self, frame):
+        # A modal selection menu: the cursor (❯) sits on a numbered option and there are >=2
+        # numbered options. Distinguishes a menu from the input box (where ❯ sits on a free-text
+        # line, not on "N. ...").
+        return bool(_SELECTED_OPTION.search(frame)) and len(_OPTION.findall(frame)) >= 2
+
+    def _parse_options(self, frame):
+        return tuple(Option(m.group(1), m.group(2).strip())
+                     for m in _OPTION_PARSE.finditer(frame))
+
+    def _ask_mode(self, frame):
+        # Ask-mode = a known mode footer is present but none of the auto markers are (so the agent
+        # will surface permission prompts rather than auto-approving).
+        if _PROMPT_FOOTER not in frame:
+            return False
+        return not any(m in frame for m in _AUTO_MODE_MARKERS)
+
+    def _echo_present(self, frame, text):
+        # Our submission is in the ACTIVE input region — either the typed text echoes verbatim, or
+        # (for a long/multiline task) Claude collapsed it into a "[Pasted text #N]" placeholder on
+        # the prompt line. Scoped to the prompt tail (last ❯ onward), never scrollback.
+        if not text:
+            return False
         needle = " ".join(text.split())[:40]
         if needle and needle in " ".join(frame.split()):
             return True
-        # The placeholder only counts on the active input line (from the last ❯ onward), never in
-        # scrolled-up agent output that happens to contain the same string.
         tail = frame[frame.rfind("❯"):] if "❯" in frame else ""
         return bool(_PASTED_TEXT.search(tail))
+
+    def _busy_reason(self, frame):
+        # On-screen chrome ONLY (tool panels), never the agent's NL output (injection safety).
+        if _BASH_PANEL.search(frame):
+            return "running_command"
+        if _SUBAGENT_PANEL.search(frame):
+            return "waiting_subagents"
+        return None
+
+    def _last_input_row(self, rows):
+        last = None
+        for i, r in enumerate(rows):
+            if "❯" in r:
+                last = i
+        return last
+
+    def _content_fp(self, norm):
+        # "did real executor output change" — hash the frame EXCLUDING the active input row.
+        rows = norm.split("\n")
+        idx = self._last_input_row(rows)
+        if idx is None:
+            return region_fp(norm)
+        return region_fp(norm, exclude=(idx, len(rows)))
+
+    def _prompt_fp(self, norm):
+        # "did the published prompt change / leave" — hash ONLY the prompt/affordance region (the
+        # active input row to the end of the frame, which for a modal covers the option lines).
+        rows = norm.split("\n")
+        idx = self._last_input_row(rows)
+        if idx is None:
+            return region_fp(norm)
+        return region_fp(norm, keep=(idx, len(rows)))

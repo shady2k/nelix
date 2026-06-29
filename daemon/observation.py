@@ -49,6 +49,7 @@ class Observation:
     prompt_fp: str = ""          # the prompt/affordance region only
     heartbeat: Heartbeat = field(default_factory=Heartbeat)
     busy_reason: Optional[str] = None
+    ask_mode: bool = False       # folded is_ask_mode: the agent will surface permission prompts
 
 
 @dataclass(frozen=True)

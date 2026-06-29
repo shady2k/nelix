@@ -1,9 +1,10 @@
-"""Driver-conformance harness (Spec 2): assert the claude driver's classify() against golden frames
-captured from real CLI sessions. When Claude Code drifts (e.g. it drops a marker the driver keys on),
-this goes RED in dev — instead of the daemon misclassifying a live agent (nelix-48o).
+"""Driver-conformance harness (spec §5.6): assert the claude driver's observe() against golden
+frames captured from real CLI sessions. When Claude Code drifts (e.g. it drops a marker the driver
+keys on), this goes RED in dev — instead of the daemon misclassifying a live agent (nelix-48o).
 
-Golden frames live in tests/golden/claude/<expected-classify>/*.txt — the directory name IS the
-expected classify() result. Refresh them with bin/nelix-capture; see tests/golden/README.md.
+Golden frames live in tests/golden/claude/<expected>/*.txt — the directory name is the OLD six-state
+label; it is remapped to the new prompt_kind vocabulary (working->none, idle_prompt->free_text,
+permission_prompt->{permission_choice|modal_choice}). Refresh with bin/nelix-capture; see README.
 """
 import sys
 from pathlib import Path
@@ -34,14 +35,16 @@ GOLDEN = Path(__file__).resolve().parent / "golden" / "claude"
 CATEGORIES = ("working", "idle_prompt", "permission_prompt")
 
 
-class _SettledCtx:
-    # The decision-point condition: "if this screen is settled (stable past the settle window) and
-    # the child is alive, would we misclassify it?" Raw has no inter-byte timing, so stability is
-    # simulated here, not replayed.
-    stable_for = 9.9
-    bytes_idle_for = 9.9
-    child_alive = True
-    exit_code = None
+from daemon.observation import ObservationCtx        # noqa: E402
+
+_CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None)
+
+# The golden directory name (old six-state) maps to the allowed new prompt_kind(s).
+_REMAP = {
+    "working": {"none"},
+    "idle_prompt": {"free_text"},
+    "permission_prompt": {"permission_choice", "modal_choice"},
+}
 
 
 def _cases():
@@ -58,10 +61,11 @@ _CASES = _cases()
 
 @pytest.mark.parametrize("expected,path", _CASES,
                          ids=[str(p.relative_to(GOLDEN)) for _, p in _CASES])
-def test_claude_classify_matches_golden(expected, path):
+def test_claude_observe_matches_golden(expected, path):
     frame = path.read_text()
-    got = ClaudeDriver().classify(frame, _SettledCtx())
-    if got != expected:
+    o = ClaudeDriver().observe(frame, _CTX)
+    allowed = _REMAP[expected]
+    if o.prompt_kind not in allowed:
         head = "\n".join(ln for ln in frame.splitlines() if ln.strip())[:400]
-        pytest.fail(f"{path.relative_to(GOLDEN.parent)}: expected {expected!r}, got {got!r}\n"
-                    f"--- first non-blank lines ---\n{head}")
+        pytest.fail(f"{path.relative_to(GOLDEN.parent)}: expected prompt_kind in {allowed}, "
+                    f"got {o.prompt_kind!r}\n--- first non-blank lines ---\n{head}")

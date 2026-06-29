@@ -2,6 +2,9 @@ import pytest
 
 from daemon.drivers import get_driver
 from daemon.drivers.claude import ClaudeDriver
+from daemon.observation import ObservationCtx
+
+_CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None)
 
 
 @pytest.fixture
@@ -27,6 +30,7 @@ def test_register_decorator_adds_driver():
 
 
 def test_ask_mode_toggle_and_detection(driver):
+    # is_ask_mode is folded into observe() as the ask_mode field (spec §5.6).
     assert driver.ask_mode_toggle == "\x1b[Z"
-    assert driver.is_ask_mode("... ⏵⏵ accept edits on (shift+tab to cycle)") is False
-    assert driver.is_ask_mode("... (shift+tab to cycle)  normal mode") is True
+    assert driver.observe("... ⏵⏵ accept edits on (shift+tab to cycle)", _CTX).ask_mode is False
+    assert driver.observe("... (shift+tab to cycle)  normal mode", _CTX).ask_mode is True
