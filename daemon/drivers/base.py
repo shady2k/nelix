@@ -8,9 +8,9 @@ class Driver(Protocol):
     Observation value; the generic core (BeliefEngine) owns all temporal interpretation. The
     driver owns the KEYS (actuation returns the sequence to send); Session owns every PTY write.
 
-    `classify`/the six-state vocabulary and the folded predicates
-    (`is_accepting_input`/`is_modal_choice`/`is_ask_mode`/`input_submission_present`) are removed —
-    their logic lives in `observe()` as Observation fields.
+    The legacy single-verdict classifier and its folded screen predicates are gone — their logic now
+    lives entirely in `observe()` as Observation fields (prompt_kind / affordances / options /
+    submitted_echo_present / ask_mode).
     """
     ask_mode_toggle: str
     command_prefixes: tuple      # leading tokens the CLI reads as a command, not a prompt

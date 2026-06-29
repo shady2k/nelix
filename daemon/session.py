@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import paths
 from daemon import lifecycle_log
 from daemon import reaper
-from daemon.belief import BeliefEngine, Publish, Withdraw, Finalize, Actuate
+from daemon.belief import BeliefEngine, Publish, Withdraw, Actuate
 from daemon.clock import WallClock
 from daemon.config import BeliefConfig
 from daemon.dialog import Dialog
