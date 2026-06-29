@@ -75,7 +75,7 @@ class FakeHandle:
             for ln in self.render().splitlines():
                 t = ln.rstrip()
                 if t:
-                    dialog.add_line(t)
+                    dialog.add_agent_line(t)
 
     def leader_pid(self): return 4242
     def leader_pgid(self): return 4242
@@ -178,13 +178,13 @@ def test_stop_edge_emits_frozen_respondable_event(monkeypatch, tmp_path):
     snap = sess.snapshot()
     assert snap["state"] == "idle_prompt"
     dec = snap["decision"]
-    assert dec["kind"] == "waiting_for_user" and dec["turn_index"] == 0
+    assert dec["kind"] == "waiting_for_user"
     assert "Here is my answer." in dec["text"]
     pend = ev.pending("s1")
     assert pend is not None and pend.event_id == dec["event_id"]
-    # After emit, later output must NOT change the event's frozen range text.
+    # After emit, later output must NOT change the event's frozen tail text.
     frozen = dec["text"]
-    sess._dialog.add_line("LATE OUTPUT")
+    sess._dialog.add_agent_line("LATE OUTPUT")
     assert sess.snapshot()["decision"]["text"] == frozen
     assert "LATE OUTPUT" not in sess.snapshot()["decision"]["text"]
 
@@ -245,7 +245,7 @@ def test_no_progress_escalates_hung_without_esc(monkeypatch, tmp_path):
     assert pend is not None and pend.hung is True         # no-progress still escalates (wakes Hermes)
 
 
-def test_respond_answers_and_advances_turn(monkeypatch, tmp_path):
+def test_respond_answers_and_appends_user_input(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ "
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
@@ -254,11 +254,12 @@ def test_respond_answers_and_advances_turn(monkeypatch, tmp_path):
     pend = ev.pending("s1")
     did = sess._decision["decision_id"]
     assert did.startswith("dec-")
-    assert sess._dialog.current_turn() == 0
+    offset_before = sess._dialog.last_user_input_offset()
     out = sess.respond("1")                                # no event_id: binds to current pending
     assert out.status == "resumed" and out.seq == pend.seq and out.decision_id == did
     assert ev.pending("s1") is None                       # answered
-    assert sess._dialog.current_turn() == 1               # new turn boundary
+    # respond() must append a user_input marker (flat-log model)
+    assert sess._dialog.last_user_input_offset() > offset_before
     assert sess.snapshot().get("decision") is None        # cleared
     assert "\r" in sess._handle.writes and any("1" in w for w in sess._handle.writes)
 
@@ -305,12 +306,13 @@ def test_respond_write_is_bounded_and_reports_timeout(monkeypatch, tmp_path):
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
     monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
-    turn_before = sess._dialog.current_turn()
+    offset_before = sess._dialog.last_user_input_offset()
     sess._handle = WedgedWriteHandle()              # executor stops draining stdin
     out = sess.respond("1")
     assert out.status == "write_timeout"            # bounded, not a hung RPC thread
     assert sess._decision is None                   # decision was claimed, not left half-pending
-    assert sess._dialog.current_turn() == turn_before   # transcript NOT advanced past an undelivered turn
+    # transcript must NOT have a new user marker when the write timed out
+    assert sess._dialog.last_user_input_offset() == offset_before
 
 
 def test_answering_reemitted_blocked_clears_pending(tmp_path):
@@ -464,7 +466,7 @@ class LiveHandle:
             for ln in self.render().splitlines():
                 t = ln.rstrip()
                 if t:
-                    dialog.add_line(t)
+                    dialog.add_agent_line(t)
 
     def advance_to_input_box(self):
         self._i = len(self._frames) - 1
@@ -635,15 +637,16 @@ def test_blocked_is_not_respammed_while_screen_unchanged(tmp_path):
     sess.stop()
 
 
-def test_respond_to_blocked_does_not_mark_turn_boundary(tmp_path):
+def test_respond_to_blocked_does_not_append_user_input(tmp_path):
     trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
     sess, handle, _ = make_session(tmp_path, frames=[trust])
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
-    turns_before = sess._dialog.turn_count()
+    offset_before = sess._dialog.last_user_input_offset()
     assert sess.respond("1").status == "resumed"     # binds to the current pending decision
     assert "1" in "".join(handle.writes) and "\r" in handle.writes   # answer injected
-    assert sess._dialog.turn_count() == turns_before                 # NO task turn boundary
+    # A blocked respond must NOT append a user_input marker (flat-log model)
+    assert sess._dialog.last_user_input_offset() == offset_before
     sess.stop()
 
 
@@ -1153,7 +1156,7 @@ def test_respond_after_terminal_is_rejected_without_writing(tmp_path):
     sess = Session("s-11112222", "demo", ClaudeDriver(), _NoopLauncher(h), Spec(), ev)
     sess._handle = h
     sess._decision = {"kind": "waiting_for_user", "event_id": "e1", "decision_id": "d1",
-                      "range": (0, 0), "seq": 1}
+                      "seq": 1, "text": "", "hint": None, "hung": False}
     sess._closing = True                                  # terminal cleanup has started
     out = sess.respond("answer")
     assert out.status == "terminal"

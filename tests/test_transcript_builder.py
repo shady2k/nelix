@@ -8,8 +8,27 @@ class _Frame:
 
 
 class _Dialog:
-    def __init__(self): self.lines = []
-    def add_line(self, text): self.lines.append(text)
+    """Fake dialog that exposes add_agent_line (flat-log API) and tracks records."""
+
+    def __init__(self):
+        self.records = []     # list of (kind, text) — simplified flat log
+        self._current_speaker = None
+
+    def add_agent_line(self, text):
+        # Mirror the real Dialog: emit ‹agent› marker on transition, then the line.
+        if self._current_speaker != "agent":
+            self.records.append(("marker", "‹agent›"))
+            self._current_speaker = "agent"
+        self.records.append(("line", text))
+
+    @property
+    def lines(self):
+        """Content lines only (kind == "line"), for backward-compatible assertions."""
+        return [t for (k, t) in self.records if k == "line"]
+
+    @property
+    def agent_markers(self):
+        return [t for (k, t) in self.records if k == "marker" and t == "‹agent›"]
 
 
 class _Driver:
@@ -46,10 +65,10 @@ def test_spinner_churn_not_committed():
 def test_reflow_jitter_not_double_committed():
     d = _Dialog(); b = TranscriptBuilder(d, _Driver(), 3, stable=2, grace=3)
     b.observe(_frame(["A"], 3)); b.observe(_frame(["A"], 3))   # stable
-    b.observe(_frame([""], 3))                                 # A blinks out 1 frame (< grace)
+    b.observe(_frame([""], 3))                                  # A blinks out 1 frame (< grace)
     b.observe(_frame(["A"], 3)); b.observe(_frame(["A"], 3))   # returns, same object
     for _ in range(4):
-        b.observe(_frame(["Z"], 3))                            # now A truly gone
+        b.observe(_frame(["Z"], 3))                             # now A truly gone
     assert d.lines.count("A") == 1
 
 
@@ -76,3 +95,36 @@ def test_two_identical_rows_in_one_frame_both_committed():
     b.observe(_frame(["dup", "dup"], 4))       # two objects at y=0 and y=1
     for _ in range(3): b.observe(_frame(["z"], 4))
     assert d.lines.count("dup") == 2
+
+
+def test_agent_transition_marker_appears_once_per_span():
+    """‹agent› should appear exactly once per agent span, not per committed line."""
+    d = _Dialog(); b = TranscriptBuilder(d, _Driver(), 3, stable=2, grace=2)
+    # Emit several agent lines in a single uninterrupted span
+    for _ in range(3):
+        b.observe(_frame(["step 1", "step 2"], 3))
+    for _ in range(3):
+        b.observe(_frame(["step 3"], 3))    # scrolls out step 1 & 2
+    b.finalize()
+    assert len(d.agent_markers) == 1, (
+        f"expected exactly 1 ‹agent› marker for an uninterrupted span, got {len(d.agent_markers)}: "
+        f"{d.records}"
+    )
+    assert len(d.lines) >= 1
+
+
+def test_agent_marker_repeats_on_new_span():
+    """If a new agent span starts after the dialog's speaker is reset, a new ‹agent› appears."""
+    # Simulate: agent lines committed, then dialog speaker reset to user between two builder runs.
+    d = _Dialog()
+    b1 = TranscriptBuilder(d, _Driver(), 3, stable=1, grace=2)
+    b1.observe(_frame(["span1"], 3)); b1.observe(_frame(["span1"], 3))
+    b1.finalize()
+    assert len(d.agent_markers) == 1     # first span
+
+    # Simulate a user input resetting the speaker
+    d._current_speaker = "user"
+    b2 = TranscriptBuilder(d, _Driver(), 3, stable=1, grace=2)
+    b2.observe(_frame(["span2"], 3)); b2.observe(_frame(["span2"], 3))
+    b2.finalize()
+    assert len(d.agent_markers) == 2     # second span gets its own marker
