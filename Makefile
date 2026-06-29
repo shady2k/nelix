@@ -38,6 +38,12 @@ clean:  ## Remove Python caches (keeps the venv)
 capture:  ## Replay a session raw into golden frame(s): make capture ARGS="<session-dir> --all"
 	$(PY) bin/nelix-capture $(ARGS)
 
+.PHONY: vendor-shim
+vendor-shim: ## Copy the built libghostty-vt shim.wasm into the daemon package (run after vt-spike-build)
+	@test -f spikes/vt-ghostty/.build/shim.wasm || { echo "missing shim.wasm — run 'make vt-spike-build' first"; exit 1; }
+	cp spikes/vt-ghostty/.build/shim.wasm daemon/renderer/shim.wasm
+	@echo ">> vendored daemon/renderer/shim.wasm"
+
 .PHONY: vt-spike-build
 vt-spike-build:  ## Build the libghostty-vt wasm renderer for the VT-render spike (downloads pinned Zig+ghostty)
 	spikes/vt-ghostty/build.sh
