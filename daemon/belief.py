@@ -69,6 +69,11 @@ class BeliefEngine:
         # currently published decision
         self._published_key = None
         self._published_kind = None
+        # post-submit suppression (spec §7.1): while active, an ambiguous free_text idle is NOT
+        # published as a wake (the just-submitted echo lingering in the box during TTFT is not idle).
+        self._post_submit_active = False
+        self._post_submit_grace_until = None
+        self._post_submit_content_fp = None   # content_fp captured on the first post-submit tick
         # state snapshot
         self._state = EngineState()
 
@@ -78,14 +83,17 @@ class BeliefEngine:
 
     # ---- submit edge (post-submit suppression entry, spec §7.1) ----
     def on_submit(self, text):
-        # A positive turn-start edge: the agent just received our text. Forget any published decision
-        # (it was answered / will be superseded) and reset the idle candidate so the echoed submission
-        # lingering in the box during TTFT is not read as a fresh idle prompt. Task 10 extends this
-        # with the post-submit grace window.
+        # The agent just received our text. Forget any published decision (it was answered / will be
+        # superseded), reset the idle candidate, and ENTER post_submit_ttft: while active, an
+        # ambiguous free_text idle is suppressed (the echoed submission is not a fresh prompt, F1).
+        now = self._clock.now()
         self._published_key = None
         self._published_kind = None
         self._candidate_fp = None
         self._candidate_since = None
+        self._post_submit_active = True
+        self._post_submit_grace_until = now + self._cfg.post_submit_grace
+        self._post_submit_content_fp = None
 
     # ---- main entry ----
     def tick(self, obs, ctx):
@@ -101,6 +109,7 @@ class BeliefEngine:
             actions.append(Finalize())
             return actions
 
+        self._update_post_submit(obs, now)
         if obs.prompt_kind in _PROMPT_KINDS:
             self._on_prompt(obs, now, actions)
         else:
@@ -136,6 +145,25 @@ class BeliefEngine:
             return "live"
         return "stale"
 
+    def _update_post_submit(self, obs, now):
+        # Clear post-submit suppression on a positive turn-start signal (spec §7.1 a-d). Until then
+        # an ambiguous free_text idle is suppressed in _on_prompt.
+        if not self._post_submit_active:
+            return
+        if self._post_submit_content_fp is None:
+            self._post_submit_content_fp = obs.content_fp     # baseline (our echo, not real output)
+        if now >= self._post_submit_grace_until:              # (d) bounded grace expired
+            self._post_submit_active = False
+            return
+        if obs.prompt_kind == "none" and self._liveness(obs, now) == "live":   # (a) busy + live
+            self._post_submit_active = False
+            return
+        if (not obs.submitted_echo_present
+                and obs.content_fp != self._post_submit_content_fp):           # (b) real output
+            self._post_submit_active = False
+            return
+        # (c) child exit/crash is handled by the terminal branch in tick().
+
     def _on_busy(self, obs, now, actions):
         # No prompt visible -> reset the idle candidate; the agent is working.
         self._candidate_fp = None
@@ -153,6 +181,17 @@ class BeliefEngine:
         decision_key = f"{obs.prompt_kind}:{obs.semantic_fp}"
         if self._published_key == decision_key:
             return                                    # same decision already published
+        # A modal/permission prompt is high-confidence: it bypasses post-submit suppression AND the
+        # confirm window and publishes promptly (P3, IMPORTANT-9) — an explicit question is never
+        # swallowed, even during TTFT.
+        immediate = obs.prompt_kind in ("modal_choice", "permission_choice")
+        if immediate:
+            self._publish_decision(obs, decision_key, actions)
+            return
+        # free_text: suppress while post-submit is active (echo lingering / within grace).
+        if self._post_submit_active and (obs.submitted_echo_present
+                                         or now < self._post_submit_grace_until):
+            return
         settled = (now - self._candidate_since) >= self._cfg.idle_confirm_window
         if not settled:
             return
