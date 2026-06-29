@@ -71,6 +71,17 @@ class BeliefEngine:
     def state(self):
         return self._state
 
+    # ---- submit edge (post-submit suppression entry, spec §7.1) ----
+    def on_submit(self, text):
+        # A positive turn-start edge: the agent just received our text. Forget any published decision
+        # (it was answered / will be superseded) and reset the idle candidate so the echoed submission
+        # lingering in the box during TTFT is not read as a fresh idle prompt. Task 10 extends this
+        # with the post-submit grace window.
+        self._published_key = None
+        self._published_kind = None
+        self._candidate_fp = None
+        self._candidate_since = None
+
     # ---- main entry ----
     def tick(self, obs, ctx):
         now = self._clock.now()
@@ -123,10 +134,11 @@ class BeliefEngine:
     def _publish_decision(self, obs, decision_key, actions):
         self._published_key = decision_key
         self._published_kind = obs.prompt_kind
+        hint = "needs_permission" if obs.prompt_kind == "permission_choice" else None
         payload = {"prompt_kind": obs.prompt_kind,
                    "options": obs.options,
                    "busy_reason": None,
-                   "hint": None}
+                   "hint": hint}
         actions.append(Publish(kind="waiting_for_user", respondable=True,
                                decision_key=decision_key, payload=payload))
 

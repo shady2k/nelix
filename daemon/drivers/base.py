@@ -1,18 +1,6 @@
-from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Protocol
 
 from daemon.observation import Observation, ObservationCtx
-
-
-# ClassifyCtx is the legacy per-tick context consumed by the delivery loop's settle gate. It is
-# removed together with the classify-based delivery path when Session is migrated to observe()
-# (Task 8); the rich observe() contract replaces it. Kept here only while Session still uses it.
-@dataclass
-class ClassifyCtx:
-    stable_for: float
-    bytes_idle_for: float
-    child_alive: bool
-    exit_code: Optional[int] = None
 
 
 class Driver(Protocol):

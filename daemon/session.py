@@ -11,9 +11,12 @@ from dataclasses import dataclass
 import paths
 from daemon import lifecycle_log
 from daemon import reaper
+from daemon.belief import BeliefEngine, Publish, Withdraw, Finalize, Actuate
+from daemon.clock import WallClock
+from daemon.config import BeliefConfig
 from daemon.dialog import Dialog
+from daemon.observation import ObservationCtx
 from daemon.transcript_builder import TranscriptBuilder
-from daemon.drivers.base import ClassifyCtx
 from daemon.events import EXTERNAL_OUTPUT_POLICY, RESPONDABLE_KINDS
 from daemon.hygiene import prepare_pty_input
 from daemon.errors import PtyWriteTimeout
@@ -66,7 +69,7 @@ def _excerpt(screen, max_chars):
 
 class Session:
     def __init__(self, session_id, executor, driver, launcher, spec, events,
-                 cols=120, rows=40, logger=None):
+                 cols=120, rows=40, logger=None, clock=None):
         self._id = session_id
         self._executor = executor
         self._driver = driver
@@ -76,13 +79,20 @@ class Session:
         self._cols = cols
         self._rows = rows
         self._log = logger
+        # Clock seam (spec §5.7): the belief path reads `now` from the injected clock, never time.*
+        # directly — so a recorded capture can drive the engine deterministically.
+        self._clock = clock if clock is not None else WallClock()
+        self._engine = BeliefEngine(self._belief_config(), self._clock)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
         self._handle = None
         self._dialog = None
-        self._state = "working"
-        self._last_state = None
+        # control_state ∈ busy | awaiting_user | intervention_required (live), or a terminal kind
+        # (exited|crashed|stopped|done) set by _finish. The six driver states are gone (spec §6).
+        self._state = "busy"
+        self._last_submitted = None    # last text we submitted (task at delivery; answer at respond)
+        self._intervention = None      # latest non-respondable intervention advisory payload, or None
         self._decision = None          # frozen dict for the current pending stop
         self._norm = ""                # last normalized frame
         self._norm_since = None        # ts the normalized frame became stable
@@ -106,7 +116,18 @@ class Session:
         self.on_terminal = None        # manager-set: free the slot on terminal state
         self.reaper_ctx = None         # daemon-set reaper.ReaperContext (None => no reaping)
         self._closing = False          # terminal cleanup started: respond/screen must not write
-        driver._settle = spec.settle_seconds   # keep classify a pure (frame, ctx) fn
+
+    def _belief_config(self):
+        # Build the engine config from the executor spec (liveness-scaled budgets, grace, etc.).
+        # Falls back to BeliefConfig defaults for any field the spec does not override.
+        cfg = BeliefConfig()
+        for f in ("idle_confirm_window", "post_submit_grace", "withdrawn_cooldown",
+                  "heartbeat_stale_after", "live_budget", "stale_budget", "unknown_budget",
+                  "reason_ttl"):
+            v = getattr(self._spec, f, None)
+            if v is not None:
+                setattr(cfg, f, v)
+        return cfg
 
     @property
     def dialog(self):
@@ -131,7 +152,7 @@ class Session:
         # /start returns once the PTY is spawned, NOT once the task is delivered.
         # Clean the held task FIRST (CLI-agnostic byte hygiene + the driver's command-prefix
         # policy): a rejected task raises before anything is spawned, and the cleaned text is
-        # both what gets typed and what input_submission_present() matches against.
+        # both what gets typed and what observe()'s submitted_echo_present matches against.
         self._task_raw = task          # keep the original for labels + restart reuse
         self._cwd = cwd
         self._task = prepare_pty_input(task, self._driver.command_prefixes)
@@ -216,10 +237,10 @@ class Session:
                 return
 
     def _ensure_ask_mode(self, attempts=4):
-        # Cycle the driver's mode toggle until it reports ask-mode (not auto/plan).
+        # Cycle the driver's mode toggle until observe() reports ask-mode (not auto/plan).
         for _ in range(attempts):
             self._handle.pump(0.1)
-            if self._driver.is_ask_mode(self._handle.render()):
+            if self._driver.observe(self._handle.render(), self._obs_ctx()).ask_mode:
                 return
             self._handle.write(self._driver.ask_mode_toggle)
             time.sleep(0.3)
@@ -227,10 +248,11 @@ class Session:
             self._log.warning("session", "ask_mode_failed", session_id=self._id)
 
     # ---- loop ----
-    def _ctx(self, now):
-        return ClassifyCtx(
-            stable_for=0.0 if self._norm_since is None else now - self._norm_since,
-            bytes_idle_for=0.0 if self._last_byte is None else now - self._last_byte,
+    def _obs_ctx(self):
+        # The non-screen facts observe() needs. Timing/liveness are core-owned (the engine reads
+        # the injected clock), so the driver is given no clock — only these raw facts.
+        return ObservationCtx(
+            last_submitted_text=self._last_submitted,
             child_alive=self._handle.is_alive(),
             exit_code=self._handle.exit_code(),
         )
@@ -258,7 +280,7 @@ class Session:
                     self._norm = norm
                     self._norm_since = now
                     self._last_progress = now
-                self._delivery_tick(frame, now)
+                self._delivery_tick(frame)
                 # no-progress backstop while blocked (spec §6): re-surface an unanswered blocked with
                 # hung=True so Hermes is reminded; bypass the fingerprint dedup (call _publish directly).
                 blocked_outstanding = self._decision is not None and self._decision["kind"] == "blocked"
@@ -278,18 +300,18 @@ class Session:
         finally:
             self._finish()
 
-    def _delivery_tick(self, frame, now):
-        state = self._driver.classify(frame, self._ctx(now))
-        if state in ("working", "quiet_working"):
-            return                                   # CLI busy / not settled: keep waiting
-        if state in ("crashed", "exited") or not self._handle.is_alive():
+    def _delivery_tick(self, frame):
+        obs = self._driver.observe(frame, self._obs_ctx())
+        if obs.prompt_kind == "none":
+            return                                   # CLI busy / no input box: keep waiting
+        if obs.prompt_kind in ("crash", "exit") or not self._handle.is_alive():
             self._task_delivery = "failed"            # loop exits -> finally -> _finish
             return
-        if self._driver.is_accepting_input(frame):
+        if "accepts_text_input" in obs.affordances:   # the real free-text prompt
             self._ensure_ask_mode()
             self._deliver_task()
         else:
-            self._emit_blocked(frame)                # modal / onboarding / unknown
+            self._emit_blocked(frame)                # modal / permission / onboarding / unknown
 
     def _deliver_task(self):
         if self._log is not None:
@@ -312,15 +334,23 @@ class Session:
         except PtyWriteTimeout:
             self._fail_delivery("write_unconfirmed")   # executor not reading stdin
             return
+        # During the confirm loop our submission is not yet recorded as last_submitted, so build a
+        # ctx that points observe() at the task we just typed (echo detection keys off it).
+        confirm_ctx = ObservationCtx(last_submitted_text=self._task,
+                                     child_alive=True, exit_code=None)
         while time.monotonic() < deadline and not self._stop.is_set():
             self._handle.pump(0.1)
             with self._lock:
                 frame = self._handle.render()
-            if self._driver.input_submission_present(frame, self._task):
+            if self._driver.observe(frame, confirm_ctx).submitted_echo_present:
                 self._press_enter()
                 self._dialog.append_user_input(self._task_raw)   # first user marker
                 self._task_delivery = "delivered"
-                self._last_state = None
+                # The initial task is a submit: arm post-submit suppression for the first turn so the
+                # echoed task lingering in the box during TTFT is not read as a fresh idle prompt (F1).
+                with self._lock:
+                    self._last_submitted = self._task
+                    self._engine.on_submit(self._task)
                 if self._log is not None:
                     self._log.audit_task(self._id, self._executor, self._task)
                     self._log.info("session", "delivery_confirmed", session_id=self._id)
@@ -340,48 +370,89 @@ class Session:
             self._log.warning("session", "delivery_failed", session_id=self._id, reason=reason)
 
     def _loop(self):
-        self._last_progress = self._last_byte = time.time()
+        # Post-delivery monitor loop: observe the screen, feed the pure BeliefEngine, and apply the
+        # actions it emits. ALL detection rules live in the engine (P4); Session only pumps/renders,
+        # calls observe(), and owns every PTY write. The daemon never acts on the agent (passive
+        # bridge): on a no-progress timeout the engine escalates an advisory, it does NOT send ESC.
         while not self._stop.is_set():
-            advanced = self._handle.pump(0.1)
-            now = time.time()
-            if advanced:
-                self._last_byte = now
+            self._handle.pump(0.1)
             with self._lock:
                 frame = self._handle.render()
-            norm = self._driver.normalize_frame(frame)
-            if norm != self._norm:
-                self._norm = norm
-                self._norm_since = now
-                self._last_progress = now          # meaningful (normalized) change
-            state = self._driver.classify(frame, self._ctx(now))
-            self._on_state(state, now)
-            if state in ("crashed", "exited") or not self._handle.is_alive():
+            ctx = self._obs_ctx()
+            obs = self._driver.observe(frame, ctx)
+            with self._lock:
+                actions = self._engine.tick(obs, ctx)
+                cstate = self._engine.state.control_state
+                if cstate != "terminal":
+                    self._state = cstate
+            self._apply_actions(actions, obs)
+            if obs.prompt_kind in ("crash", "exit") or not self._handle.is_alive():
                 break
 
-    def _on_state(self, state, now):
-        running = state in ("working", "quiet_working")
-        # no-progress backstop: running but no meaningful progress for max_idle_seconds (0 = off).
-        # The daemon is a bridge — it reports the fact and wakes Hermes; it does NOT nudge (no ESC)
-        # or act. Hermes decides (relay to the user, stop, restart).
-        if running and self._spec.max_idle_seconds and now - self._last_progress > self._spec.max_idle_seconds:
-            self._emit_stop("idle_prompt", hung=True)
-            self._last_progress = now              # re-arm so it doesn't re-fire every loop
-            return
+    def _apply_actions(self, actions, obs):
+        # Translate the engine's revocable decisions into events / PTY writes. The engine is pure;
+        # this is the only place its verdicts touch the world.
+        for a in actions:
+            if isinstance(a, Publish):
+                self._apply_publish(a)
+            elif isinstance(a, Withdraw):
+                self._apply_withdraw(a)
+            elif isinstance(a, Actuate):
+                self._apply_actuate(a)
+            # Finalize: the loop's own terminal check exits and _finish owns the terminal event.
+
+    def _apply_publish(self, action):
+        p = action.payload
+        if action.kind == "intervention_required":
+            self._emit_intervention(action.decision_key, p)
+        else:
+            # Commit the stable visible tail so the turn tail is in the transcript, then freeze the
+            # decision's frozen text/excerpt (mirrors the old emit path).
+            self._handle.finalize()
+            self._publish("waiting_for_user", hint=p.get("hint"), hung=False,
+                          requires_response=True, decision_key=action.decision_key,
+                          options=p.get("options", ()), prompt_kind=p.get("prompt_kind"),
+                          busy_reason=p.get("busy_reason"))
+
+    def _apply_withdraw(self, action):
+        # Withdraw the current pending decision IF it is still the one the engine published and
+        # nobody has claimed it via respond() (claim-before-write, under the lock). Resolve that
+        # decision's events as withdrawn (targeted by decision id, not a blanket session-answer).
         with self._lock:
-            prev = self._last_state
-            self._state = state
-            self._last_state = state
-        if state == prev:
-            return
-        if state == "idle_prompt":
-            # The daemon can't reliably tell "asked a question" from "finished" (the real prompt
-            # has a mode footer below the input line). Hermes reads the live screen on every wake,
-            # so defaulting to waiting_for_user is fail-safe — never a silent dead-end.
-            self._emit_stop("idle_prompt", hung=False)
-        elif state == "permission_prompt":
-            self._emit_stop("permission_prompt", hung=False)
-        # crashed/exited are terminal: _loop breaks and _finish() (run from _run's finally)
-        # owns the single terminal event + state, status-mapped from leader_status().
+            dec = self._decision
+            if dec is None or dec.get("decision_key") != action.decision_key:
+                return                                  # already claimed or superseded — no-op
+            decision_id = dec.get("decision_id")
+            self._decision = None
+            self._state = "busy"
+        if decision_id is not None:
+            self._events.resolve_decision(decision_id, action.reason)
+        if self._log is not None:
+            self._log.info("session", "decision_withdrawn", session_id=self._id,
+                           decision_id=decision_id, reason=action.reason)
+
+    def _apply_actuate(self, action):
+        # The passive bridge never has the engine act on the agent, so the engine emits no Actuate
+        # in normal operation. Kept for contract completeness: Session owns the write if one appears.
+        seq = {"interrupt": self._driver.interrupt(),
+               "select_option": self._driver.select_option(action.arg or ""),
+               "submit_text": self._driver.submit_text(action.arg or "")}.get(action.kind)
+        if seq and self._handle is not None:
+            self._handle.write(seq)
+
+    def _emit_intervention(self, decision_key, payload):
+        # A NON-respondable advisory (spec §7.5): the agent is stuck/hung and is NOT accepting input.
+        # It does not freeze a pending _decision (so /status never sticks `pending`); each nag is a
+        # FRESH event carrying the escalation count. The orchestrator handles it with existing ops.
+        count = payload.get("escalation_count", 1)
+        with self._lock:
+            self._intervention = {"decision_key": decision_key, "escalation_count": count,
+                                  "busy_reason": payload.get("busy_reason"),
+                                  "liveness": payload.get("liveness")}
+        self._handle.finalize()
+        self._publish("intervention_required", hint=payload.get("hint"), hung=True,
+                      requires_response=False, busy_reason=payload.get("busy_reason"),
+                      escalation_count=count)
 
     def _exit_kind(self, status):
         # deterministic from leader status (NOT driver classification)
@@ -513,17 +584,6 @@ class Session:
             alive_for=alive_for, task_delivery=self._task_delivery,
             screen_fingerprint=self._screen_fp())
 
-    def _emit_stop(self, state, hung):
-        # commit the final viewport so the turn tail is in the transcript, then freeze the range.
-        self._handle.finalize()
-        hint = "needs_permission" if state == "permission_prompt" else None
-        # decision_key identifies the pause by what is ON SCREEN, not just the classifier label:
-        # the same stalled/idle screen reuses its decision_id (a hung re-emit), a different screen
-        # (a genuinely different question) starts a new decision. Mirrors blocked's fingerprint key.
-        fp = self._driver.normalize_frame(self._handle.render()) if self._handle is not None else ""
-        self._publish("waiting_for_user", hint=hint, hung=hung, requires_response=True,
-                      decision_key=f"stop:{state}:{fp}")
-
     def _emit_blocked(self, frame, hint="task_not_delivered"):
         # Surface a pre-delivery interstitial (modal / onboarding / unknown). Type/press NOTHING.
         # Dedup by normalized-screen fingerprint alone: emit once per distinct screen. A new
@@ -540,7 +600,8 @@ class Session:
                       task_delivery="pending", decision_key=fp)
 
     def _publish(self, kind, hint, hung, requires_response=None, task_delivery=None,
-                 decision_key=None):
+                 decision_key=None, options=(), prompt_kind=None, busy_reason=None,
+                 escalation_count=None):
         respondable = kind in RESPONDABLE_KINDS
         with self._lock:
             tail = self._dialog.tail(self._spec.status_tail_chars)
@@ -558,6 +619,11 @@ class Session:
                         "task_delivery": task_delivery, "requires_response": requires_response,
                         "screen_excerpt": screen, "external_output_policy": EXTERNAL_OUTPUT_POLICY,
                         "total_len": tail["total_len"], "truncated": truncated,
+                        # affordance-aware fields: a modal/permission decision carries its options +
+                        # prompt_kind so respond() can route a selector to driver.select_option (F2).
+                        "options": [{"id": o.id, "label": o.label} for o in options],
+                        "prompt_kind": prompt_kind, "busy_reason": busy_reason,
+                        "escalation_count": escalation_count,
                         "last_user_input_offset": self._dialog.last_user_input_offset()}
             is_reemit = False
             if respondable:
@@ -605,7 +671,7 @@ class Session:
     # ---- reads / control ----
     def is_working(self):
         with self._lock:
-            return self._decision is None and self._state in ("working", "quiet_working")
+            return self._decision is None and self._state == "busy"
 
     def snapshot(self):
         with self._lock:
@@ -631,7 +697,7 @@ class Session:
             # active-working snapshots are deliberately low-information: no progress bait, just
             # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
             snap["pending"] = self._decision is not None
-            if self._decision is None and self._state in ("working", "quiet_working"):
+            if self._decision is None and self._state == "busy":
                 snap["message"] = ("Agent is still working. End your turn; nelix will wake "
                                    "you on the next event.")
             return snap
@@ -690,7 +756,11 @@ class Session:
                 # advance the transcript. (The monitor reads dialog in _publish under self._lock.)
                 with self._lock:
                     self._dialog.append_user_input(clean)
-            self._last_state = None
+            # A respond is a submit: tell the engine so it forgets the now-answered decision and arms
+            # post-submit suppression (the answer echoed in the box must not re-mint a fresh idle, F1).
+            with self._lock:
+                self._last_submitted = clean
+                self._engine.on_submit(clean)
         return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"))
 
     def stop(self):

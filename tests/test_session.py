@@ -44,15 +44,21 @@ class TruncSpec(Spec):
 
 class FakeHandle:
     """Scripted PTY: render() walks `frames`; process stays alive, the loop is terminated
-    by setting `stop` once the last frame is reached (so classify never sees a false exit)."""
-    def __init__(self, frames, stop=None):
+    by setting `stop` once the last frame is reached (so observe never sees a false exit).
+    Each pump() advances the injected FakeClock by `step` so the engine's settle/grace windows
+    elapse deterministically (no real sleeps, no time.* in the belief path)."""
+    def __init__(self, frames, stop=None, clock=None, step=1.0):
         self.frames = frames
         self.i = -1
         self.writes = []
         self._stop = stop
+        self._clock = clock
+        self._step = step
 
     def pump(self, timeout=0.1):
         self.i += 1
+        if self._clock is not None:
+            self._clock.advance(self._step)
         if self._stop is not None and self.i >= len(self.frames) - 1:
             self._stop.set()
         return True
@@ -152,14 +158,18 @@ def _clock(values):
     return now
 
 
-def _session(tmp_path, frames=(), handle=None, spec=None):
+def _session(tmp_path, frames=(), handle=None, spec=None, step=1.0):
+    from daemon.clock import FakeClock
     ev = EventQueue()
-    sess = Session("s1", "demo", ClaudeDriver(), None, spec or Spec(), ev)
-    sess._handle = handle if handle is not None else FakeHandle(list(frames), stop=sess._stop)
+    clock = FakeClock(0.0)
+    sess = Session("s1", "demo", ClaudeDriver(), None, spec or Spec(), ev, clock=clock)
+    sess._handle = (handle if handle is not None
+                    else FakeHandle(list(frames), stop=sess._stop, clock=clock, step=step))
     sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
                           spool_max_bytes=Spec.spool_max_bytes)
     sess._handle._dialog = sess._dialog   # give fake handle a dialog ref for finalize()
     sess._task_delivery = "delivered"     # these tests drive the post-delivery run loop directly
+    sess._clock = clock
     return sess, ev
 
 
@@ -169,14 +179,33 @@ def test_sessions_dir_resolves_under_hermes_home(monkeypatch, tmp_path):
     assert sess._sessions_dir == paths.sessions_root()
 
 
-def test_stop_edge_emits_frozen_respondable_event(monkeypatch, tmp_path):
+def test_loop_publishes_one_waiting_for_user_on_stable_idle(tmp_path):
+    # Task 8: the monitor drives observe() -> BeliefEngine -> actions. A working frame publishes
+    # nothing; a stable idle prompt publishes exactly one waiting_for_user. Clock is injected.
+    box = "Here is my answer.\n❯ "
+    sess, ev = _session(tmp_path, ["thinking… esc to interrupt", box, box, box])
+    sess._loop()
+    pubs = [e for e in ev._events if e.kind == "waiting_for_user"]
+    assert len(pubs) == 1                                 # exactly one decision
+    assert sess._state == "awaiting_user"
+    assert sess._decision is not None and sess._decision["kind"] == "waiting_for_user"
+
+
+def test_loop_working_frame_publishes_nothing(tmp_path):
+    sess, ev = _session(tmp_path, ["compiling things… esc to interrupt",
+                                   "compiling things… esc to interrupt"])
+    sess._loop()
+    assert ev.pending("s1") is None
+    assert sess._state == "busy" and sess.is_working() is True
+
+
+def test_stop_edge_emits_frozen_respondable_event(tmp_path):
     frames = ["thinking… esc to interrupt", "Here is my answer. Which next?\n❯ ",
               "Here is my answer. Which next?\n❯ ", "Here is my answer. Which next?\n❯ "]
     sess, ev = _session(tmp_path, frames)
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     snap = sess.snapshot()
-    assert snap["state"] == "idle_prompt"
+    assert snap["state"] == "awaiting_user"
     dec = snap["decision"]
     assert dec["kind"] == "waiting_for_user"
     assert "Here is my answer." in dec["text"]
@@ -189,31 +218,32 @@ def test_stop_edge_emits_frozen_respondable_event(monkeypatch, tmp_path):
     assert "LATE OUTPUT" not in sess.snapshot()["decision"]["text"]
 
 
-def test_decision_reports_truncation(monkeypatch, tmp_path):
+def test_decision_reports_truncation(tmp_path):
     box = "Hello, what now?\n❯ "
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box], spec=TruncSpec())
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     dec = sess.snapshot()["decision"]
     assert dec["truncated"] is True
     assert dec["total_len"] > len(dec["text"]) and len(dec["text"]) <= 5
 
 
-def test_quiet_working_emits_no_event(monkeypatch, tmp_path):
+def test_quiet_working_emits_no_event(tmp_path):
     sess, ev = _session(tmp_path, ["compiling…", "compiling…"])
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 1]))
     sess._loop()
     assert ev.pending("s1") is None
-    assert sess.snapshot()["state"] == "quiet_working"
+    assert sess.snapshot()["state"] == "busy"
 
 
-def test_permission_prompt_carries_needs_permission_hint(monkeypatch, tmp_path):
-    box = "Proceed?\n 1. Yes\n 3. No\n❯ "
+def test_permission_prompt_carries_needs_permission_hint(tmp_path):
+    # A real claude permission menu (cursor on "1. Yes", a "3. No" option) surfaces as a
+    # permission_choice carrying the needs_permission hint and its options (fixes F2 routing).
+    box = "Proceed with the edit?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\n"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     dec = sess.snapshot()["decision"]
     assert dec["kind"] == "waiting_for_user" and dec["hint"] == "needs_permission"
+    assert dec["prompt_kind"] == "permission_choice"
+    assert [o["id"] for o in dec["options"]] == ["1", "2", "3"]
     assert ev.pending("s1").hint == "needs_permission"
 
 
@@ -236,20 +266,19 @@ def test_exit_nonzero_emits_crashed(monkeypatch, tmp_path):
     assert sess.snapshot()["state"] == "crashed"
 
 
-def test_no_progress_escalates_hung_without_esc(monkeypatch, tmp_path):
+def test_loop_never_writes_esc(tmp_path):
+    # The daemon is a passive bridge (P2): the monitor loop NEVER writes ESC (or any byte) to the
+    # agent. A long-running working screen escalates an advisory (Task 13), it does not nudge.
     sess, ev = _session(tmp_path, ["working… esc to interrupt"] * 3, spec=HangSpec())
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 10]))
     sess._loop()
-    assert "\x1b" not in sess._handle.writes              # daemon is a bridge: no ESC nudge / action
-    pend = ev.pending("s1")
-    assert pend is not None and pend.hung is True         # no-progress still escalates (wakes Hermes)
+    assert "\x1b" not in sess._handle.writes              # no ESC nudge / no action on the agent
+    assert sess._handle.writes == []                      # nothing typed at all
 
 
 def test_respond_answers_and_appends_user_input(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ "
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     pend = ev.pending("s1")
     did = sess._decision["decision_id"]
@@ -278,7 +307,6 @@ def test_respond_claims_decision_atomically_no_double_type(monkeypatch, tmp_path
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ "
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     assert sess.respond("1").status == "resumed"
     writes_after_first = list(sess._handle.writes)
@@ -304,7 +332,6 @@ def test_respond_write_is_bounded_and_reports_timeout(monkeypatch, tmp_path):
     # stdin) would hang the call forever. It must be deadline-bounded -> a 'write_timeout' outcome.
     box = "Ready — what next?\n❯ "
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = WedgedWriteHandle()              # executor stops draining stdin
@@ -333,7 +360,6 @@ def test_respond_with_stale_decision_id_is_rejected_and_returns_current(monkeypa
     # the correct id (or no id) still works.
     box = "Ready — what next?\n❯ "
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     cur = sess._decision["decision_id"]
     out = sess.respond("1", decision_id="dec-stale99")
@@ -344,10 +370,9 @@ def test_respond_with_stale_decision_id_is_rejected_and_returns_current(monkeypa
     assert sess.respond("1", decision_id=cur).status == "resumed"   # correct id works
 
 
-def test_snapshot_decision_carries_decision_id_and_policy(monkeypatch, tmp_path):
+def test_snapshot_decision_carries_decision_id_and_policy(tmp_path):
     box = "Ready — what next?\n❯ "
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     dec = sess.snapshot()["decision"]
     assert dec["decision_id"].startswith("dec-")
@@ -658,10 +683,10 @@ def test_idle_prompt_with_footer_below_input_is_waiting_for_user(monkeypatch, tm
            "❯ \n"
            "⏵⏵ ask mode · shift+tab to cycle\n")
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     dec = sess.snapshot()["decision"]
     assert dec["kind"] == "waiting_for_user" and dec["requires_response"] is True
+    assert dec["prompt_kind"] == "free_text"
     assert ev.pending("s1") is not None
 
 
@@ -717,7 +742,6 @@ def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeyp
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ "
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
-    monkeypatch.setattr("daemon.session.time.time", _clock([0, 0, 2, 4, 6]))
     sess._loop()
     key = sess._decision["decision_key"]
     real_publish = ev.publish
