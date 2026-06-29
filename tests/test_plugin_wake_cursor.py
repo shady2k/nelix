@@ -78,3 +78,104 @@ def test_concurrent_claim_arms_exactly_once():
     for t in ts: t.start()
     for t in ts: t.join()
     assert sum(1 for x in results if x is not None) == 1   # exactly one waiter claimed
+
+
+# ---------------------------------------------------------------------------
+# Plugin-integration: per-session arm / re-arm / drop across the tool handlers
+# ---------------------------------------------------------------------------
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
+from plugin_loader import load_plugin
+from test_plugin_register import FakeCtx
+
+
+def _terminal_cmds(ctx):
+    return [args["command"] for name, args in ctx.dispatched if name == "terminal"]
+
+
+def _setup(monkeypatch, tmp_path, client_cls):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    nelix = load_plugin()
+    monkeypatch.setattr(nelix, "RpcClient", client_cls)
+    monkeypatch.setattr(nelix.supervisor, "ensure_running", lambda: object())
+    monkeypatch.setattr(nelix.supervisor, "endpoint", lambda: object())
+    monkeypatch.setattr(nelix.supervisor, "state_file", lambda: str(tmp_path / "st.json"))
+    monkeypatch.setattr(nelix, "resolve_launcher", lambda *a, **k: None)
+    monkeypatch.setattr(nelix.registry, "config_error_for", lambda *a, **k: None)
+    monkeypatch.setattr(nelix.registry, "validate", lambda: {})
+    monkeypatch.setattr(nelix.registry, "seed_if_absent", lambda: None)
+    # stable daemon id so on_start does not reset the registry mid-test
+    (tmp_path / "st.json").write_text('{"pid": 4242}')
+    ctx = FakeCtx()
+    nelix.register(ctx)
+    return nelix, ctx
+
+
+def test_start_arms_per_session_waiter(monkeypatch, tmp_path):
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+    _, ctx = _setup(monkeypatch, tmp_path, C)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    cmds = _terminal_cmds(ctx)
+    assert len(cmds) == 1
+    assert "--session-id s-1" in cmds[-1] and "--after 0" in cmds[-1]
+
+
+def test_board_read_rearms_after_wake_second_event_wakes_again(monkeypatch, tmp_path):
+    """THE primary bug anchor: a wake -> board read re-arms -> a second event delivers a
+    second wake. Modelled as: start (arm@0), board shows seq=4 -> re-arm@4."""
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def status(self, sid=None):
+            # all-sessions board read after the first wake; session advanced to seq 4
+            return {"sessions": {"s-1": {"session_id": "s-1", "state": "waiting_for_user",
+                                         "seq": 4, "decision": {"seq": 4}}},
+                    "recent_terminal": {}, "cursor": 4}
+    _, ctx = _setup(monkeypatch, tmp_path, C)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    ctx.tools["nelix_status"]["handler"]({})           # board read
+    cmds = _terminal_cmds(ctx)
+    assert len(cmds) == 2                               # re-armed -> a second waiter exists
+    assert "--session-id s-1" in cmds[-1] and "--after 4" in cmds[-1]
+
+
+def test_board_read_drops_terminal_session(monkeypatch, tmp_path):
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def status(self, sid=None):
+            # s-1 finished: absent from live sessions, present in recent_terminal
+            return {"sessions": {}, "recent_terminal": {"s-1": {"terminal": True}}, "cursor": 9}
+    nelix, ctx = _setup(monkeypatch, tmp_path, C)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    n_before = len(_terminal_cmds(ctx))
+    ctx.tools["nelix_status"]["handler"]({})            # board read sees it terminal
+    assert len(_terminal_cmds(ctx)) == n_before         # NO new waiter for a terminal session
+
+
+def test_per_session_status_unknown_drops(monkeypatch, tmp_path):
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def status(self, sid=None):
+            return {"error": "unknown session"}         # per-session read of a gone session
+    nelix, ctx = _setup(monkeypatch, tmp_path, C)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    n_before = len(_terminal_cmds(ctx))
+    ctx.tools["nelix_status"]["handler"]({"session_id": "s-1"})
+    assert len(_terminal_cmds(ctx)) == n_before         # dropped, no re-arm
+
+
+def test_respond_rearms_without_prior_status(monkeypatch, tmp_path):
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def respond(self, *a, **k): return True, {"next_after_seq": 6}
+    _, ctx = _setup(monkeypatch, tmp_path, C)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    ctx.tools["nelix_respond"]["handler"]({"session_id": "s-1", "answer": "1"})
+    cmds = _terminal_cmds(ctx)
+    assert "--session-id s-1" in cmds[-1] and "--after 6" in cmds[-1]   # armed past answered seq
