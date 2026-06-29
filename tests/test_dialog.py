@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -87,3 +88,65 @@ def test_dialog_reader_missing_is_unavailable(tmp_path):
     r = DialogReader(tmp_path / "nope")
     assert r.turn_count() == 0
     assert r.turn_text(0)["unavailable"] is True
+
+
+def test_current_turn_page_matches_manual(tmp_path):
+    d = Dialog(tmp_path / "s", tail_lines=100, spool_max_bytes=1_000_000)
+    d.add_line("t0a"); d.add_line("t0b"); d.mark_turn_boundary(); d.add_line("t1a")
+    page = d.current_turn_page()
+    assert page["turn"] == 1
+    assert page["start"] == 2 and page["end"] == 3
+    assert page["text"] == "t1a"
+    d.close()
+
+
+def test_turn_offsets_sidecar_records_absolute_offsets(tmp_path):
+    sd = tmp_path / "s"
+    d = Dialog(sd, tail_lines=100, spool_max_bytes=1_000_000)
+    d.append_raw(b"x" * 100)
+    d.mark_turn_boundary()          # turn 1 starts at absolute offset 100
+    d.append_raw(b"y" * 50)
+    d.mark_turn_boundary()          # turn 2 starts at 150
+    rec = json.loads((sd / "turn_offsets.json").read_text())
+    assert rec["raw_base_offset"] == 0
+    assert rec["turns"] == [0, 100, 150]   # turn 0 starts at 0
+    d.close()
+
+
+def test_raw_base_offset_advances_on_truncation(tmp_path):
+    d = Dialog(tmp_path / "s", tail_lines=100, spool_max_bytes=200)
+    d.append_raw(b"a" * 150)
+    d.append_raw(b"b" * 150)        # total 300 > 200 -> retain last 200
+    assert d.raw_base_offset() == 100  # 300 - 200
+    d.close()
+
+
+def test_dialog_concurrent_append_and_read_is_safe(tmp_path):
+    d = Dialog(tmp_path / "s", tail_lines=100, spool_max_bytes=10_000_000)
+    stop = threading.Event()
+    exc_holder = []
+
+    def writer():
+        try:
+            for i in range(2000):
+                d.add_line(f"L{i}")
+        except Exception as e:
+            exc_holder.append(e)
+
+    def reader():
+        try:
+            while not stop.is_set():
+                d.current_turn_page(limit=50)
+        except Exception as e:
+            exc_holder.append(e)
+
+    t1 = threading.Thread(target=writer)
+    t2 = threading.Thread(target=reader)
+    t2.start()
+    t1.start()
+    t1.join()
+    stop.set()
+    t2.join()
+    d.close()
+    assert exc_holder == []
+    assert d.line_count() == 2000
