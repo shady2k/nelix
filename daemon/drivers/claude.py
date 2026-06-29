@@ -21,7 +21,10 @@ _AUTO_MODE_MARKERS = ("accept edits on", "plan mode on", "bypass permissions")
 #   braille spinners, "<n.n>s", "<n> tokens", standalone changing counters.
 _SPINNER = re.compile(r"[⠀-⣿]")
 _ELAPSED = re.compile(r"\d+(?:\.\d+)?s\b")
-_TOKENS = re.compile(r"\d+\s+tokens?\b")
+# Token counters render with a k/M suffix and a decimal once they pass 1000 (e.g. "↓ 33.8k tokens",
+# "1.2M tokens"); a bare "\d+ tokens" misses those, leaking the live counter into the fingerprint
+# and defeating the engine's anti-flap. Match the optional decimal + magnitude suffix too.
+_TOKENS = re.compile(r"\d[\d.,]*[kKmM]?\s+tokens?\b")
 
 # Additional volatile patterns for Claude's transient in-progress tool-status chrome.
 # These lines flash and are replaced; they are not conversation content.
@@ -44,6 +47,12 @@ _PASTED_TEXT = re.compile("\u276f[ \t\xa0]*" + r"\[Pasted text #\d+\]")
 # busy_reason chrome markers (on-screen tool panels only — NEVER the agent's NL output).
 _BASH_PANEL = re.compile(r"(?m)^\s*⏺?\s*Bash\(")           # a tool-run panel header
 _SUBAGENT_PANEL = re.compile(r"(?m)^\s*⏺?\s*Task\(")       # a sub-agent panel header
+# The main-loop status line while ≥1 background subagent runs: "✻ Waiting for N background agent(s)
+# to finish". Anchored to a leading spinner glyph (same class as _WORKING_STATUS) so it matches the
+# CHROME status line, never the agent's own NL narration — injection-safety, like the panels above.
+# Unlike _SUBAGENT_PANEL ("Task(") it also covers custom-typed subagents (e.g. "golang-pro(...)"),
+# whose panel header is the agent name, not "Task(".
+_BG_AGENT_STATUS = re.compile(r"(?im)^\s*[·✢✳✶✻✽✺✦]\s*waiting for \d+ background agents?")
 
 
 def _is_choice_prompt(frame):
@@ -128,6 +137,16 @@ class ClaudeDriver:
         #    FOOTER as well as the ❯ marker: a stray ❯ in scrolled output/chrome is NOT an input box,
         #    and delivery must never type into it (the old is_accepting_input safety requirement).
         if any(m in frame for m in INPUT_BOX_MARKERS) and _PROMPT_FOOTER in frame:
+            # ...BUT a running background subagent keeps the box live while the main turn is BLOCKED
+            # on it (Claude shows "✻ Waiting for N background agent(s) to finish", with the subagent's
+            # live token ticker BELOW the ❯ row). That box is not a genuine prompt: read it as busy so
+            # the orchestrator is not woken and the ticker can't flap a decision (real-capture
+            # s-039a61b4). A real menu (branch 4) wins first, so a permission prompt is never masked.
+            bg_line = self._bg_agent_line(frame)
+            if bg_line is not None:
+                return Observation(prompt_kind="none", busy_reason="waiting_subagents",
+                                   heartbeat=Heartbeat(fp=semantic_fp(bg_line), present=True,
+                                                       expected_to_change=True), **common)
             return Observation(prompt_kind="free_text",
                                affordances=frozenset({"accepts_text_input"}), **common)
         # 6. a ❯ without the footer (ambiguous chrome) or alive-no-markers -> NOT a wakeable prompt.
@@ -140,6 +159,8 @@ class ClaudeDriver:
         # Terminal chrome a human sees but is not conversation content. Anchored patterns only —
         # a loose substring (e.g. any row containing "tokens") would drop real content.
         if _WORKING_STATUS.search(row):                    # spinner status line (+ optional telemetry)
+            return True
+        if _BG_AGENT_STATUS.search(row):                   # "✻ Waiting for N background agent(s)…"
             return True
         if any(m in row for m in WORKING_MARKERS):         # "esc to interrupt"
             return True
@@ -197,11 +218,19 @@ class ClaudeDriver:
         return bool(_PASTED_TEXT.search(tail))
 
     def _busy_reason(self, frame):
-        # On-screen chrome ONLY (tool panels), never the agent's NL output (injection safety).
+        # On-screen chrome ONLY (tool panels / status line), never the agent's NL output (injection
+        # safety). The subagent status line + the "Task(" panel both mean the turn is blocked on a
+        # subagent; the status line also covers custom-typed subagents the panel regex would miss.
         if _BASH_PANEL.search(frame):
             return "running_command"
-        if _SUBAGENT_PANEL.search(frame):
+        if _BG_AGENT_STATUS.search(frame) or _SUBAGENT_PANEL.search(frame):
             return "waiting_subagents"
+        return None
+
+    def _bg_agent_line(self, frame):
+        for line in frame.split("\n"):
+            if _BG_AGENT_STATUS.search(line):
+                return line
         return None
 
     def _last_input_row(self, rows):

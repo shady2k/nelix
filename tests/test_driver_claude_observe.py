@@ -144,3 +144,46 @@ def test_classify_and_folded_predicates_are_gone():
     for gone in ("classify", "is_accepting_input", "is_modal_choice", "is_ask_mode",
                  "input_submission_present"):
         assert not hasattr(D, gone), f"{gone} must be removed (folded into observe)"
+
+
+# ---- background subagent: a running subagent is BUSY, never waiting_for_user ----
+# While a background subagent runs, Claude keeps the input box live (❯ + footer) AND shows
+# "✻ Waiting for N background agent(s) to finish". That empty-looking box is NOT a genuine
+# free-text prompt — the main turn is blocked on the subagent. (Real-capture: s-039a61b4.)
+_BG_FRAME = (
+    "⏺ The implementer is running in the background. I'll report when it's done.\n"
+    "\n"
+    "✻ Waiting for 1 background agent to finish\n"
+    "────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────\n"
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage\n"
+    "  ⏺ main\n"
+    "  ◯ golang-pro  Implement T8 stats ticker wiring          33s · ↓ 33.8k tokens"
+)
+
+
+def test_running_background_subagent_is_busy_not_free_text():
+    o = D.observe(_BG_FRAME, CTX)
+    assert o.prompt_kind == "none"                       # busy, not awaiting the user
+    assert "accepts_text_input" not in o.affordances
+    assert o.busy_reason == "waiting_subagents"
+
+
+def test_background_subagent_ticker_does_not_churn_semantic_fp():
+    # The subagent's live "<elapsed> · ↓ <N>k tokens" ticker must be normalized away, else every
+    # tick re-mints the fingerprint and defeats the engine's anti-flap (spec §7.2).
+    a = D.observe(_BG_FRAME, CTX)
+    b = D.observe(_BG_FRAME.replace("33s · ↓ 33.8k tokens", "41s · ↓ 90.8k tokens"), CTX)
+    assert a.semantic_fp == b.semantic_fp
+
+
+def test_modal_prompt_during_background_subagent_still_surfaces():
+    # Guard: a REAL prompt (permission/modal) that co-occurs with a running subagent must NOT be
+    # masked by the busy-subagent read — the orchestrator must still be woken for the decision.
+    frame = ("Do you want to make this edit?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\n"
+             "✻ Waiting for 1 background agent to finish\n"
+             "  ◯ golang-pro  Implement T8 stats ticker wiring          33s · ↓ 33.8k tokens")
+    o = D.observe(frame, CTX)
+    assert o.prompt_kind == "permission_choice"
+    assert [x.id for x in o.options] == ["1", "2", "3"]
