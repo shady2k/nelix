@@ -3,7 +3,7 @@ driven through the pure BeliefEngine with a FakeClock — about transitions over
 observe() calls."""
 from daemon.belief import BeliefEngine, Publish, Withdraw
 from daemon.clock import FakeClock
-from daemon.observation import Observation, ObservationCtx, Heartbeat
+from daemon.observation import Observation, ObservationCtx, Heartbeat, Option
 from daemon.config import BeliefConfig
 
 CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None)
@@ -11,6 +11,55 @@ CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None)
 
 def _pubs(actions):
     return [a for a in actions if isinstance(a, Publish)]
+
+
+# ---- Task 17: the canonical timed sequence (spec §9 tier-2 worked example) ----
+
+def test_canonical_submit_then_idle_sequence():
+    # "submit -> 3 frames [text in box, no spinner, stable] -> assert NO decision -> working frame
+    #  -> still none -> empty-box idle -> exactly one waiting_for_user." One sequence, over time.
+    clk = FakeClock(0.0)
+    e = BeliefEngine(BeliefConfig(), clk)
+    e.on_submit("commit this")
+    echo = Observation(prompt_kind="free_text", submitted_echo_present=True, semantic_fp="echo",
+                       affordances=frozenset({"accepts_text_input"}))
+    for _ in range(3):                                  # text-in-box, no spinner, stable
+        clk.advance(0.2)
+        assert _pubs(e.tick(echo, ObservationCtx("commit this", True, None))) == []
+    work = Observation(prompt_kind="none", semantic_fp="w", heartbeat=Heartbeat("h", True, True))
+    clk.advance(0.2)
+    assert _pubs(e.tick(work, CTX)) == []               # working frame -> still nothing
+    idle = Observation(prompt_kind="free_text", submitted_echo_present=False, semantic_fp="done",
+                       affordances=frozenset({"accepts_text_input"}))
+    clk.advance(0.2)
+    e.tick(idle, CTX)                                   # empty-box idle edge
+    clk.advance(1.0)
+    pubs = _pubs(e.tick(idle, CTX))
+    assert len(pubs) == 1 and pubs[0].kind == "waiting_for_user"   # exactly one
+
+
+def test_modal_publishes_immediately_with_options():
+    # A modal pick-one prompt publishes promptly (no multi-second settle) and carries its options +
+    # prompt_kind so respond can route a selector to select_option (P3 + §7.3).
+    clk = FakeClock(0.0)
+    e = BeliefEngine(BeliefConfig(), clk)
+    modal = Observation(prompt_kind="modal_choice", semantic_fp="menu",
+                        affordances=frozenset({"modal_choice"}),
+                        options=(Option("1", "Enrich all three"), Option("2", "Verify-only")))
+    pubs = _pubs(e.tick(modal, CTX))                    # immediate, no settle wait
+    assert len(pubs) == 1
+    assert pubs[0].payload["prompt_kind"] == "modal_choice"
+    assert [o.id for o in pubs[0].payload["options"]] == ["1", "2"]
+
+
+def test_permission_choice_carries_needs_permission_hint():
+    clk = FakeClock(0.0)
+    e = BeliefEngine(BeliefConfig(), clk)
+    perm = Observation(prompt_kind="permission_choice", semantic_fp="perm",
+                       affordances=frozenset({"permission_choice"}),
+                       options=(Option("1", "Yes"), Option("3", "No")))
+    pubs = _pubs(e.tick(perm, CTX))
+    assert len(pubs) == 1 and pubs[0].payload["hint"] == "needs_permission"
 
 
 # ---- Task 10: post-submit suppression of false idle (spec §7.1, fixes F1) ----
