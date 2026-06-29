@@ -4,6 +4,27 @@ from dataclasses import dataclass
 
 
 @dataclass
+class BeliefConfig:
+    """Tunables for the pure BeliefEngine (spec §7). All durations are seconds; the engine reads
+    `now` from its injected clock and never sleeps. Task 13 wires liveness-scaled watchdog budgets;
+    the defaults here are the engine's standalone defaults."""
+    # §7.1 confirmation window for *suspicious* idle edges (not a multi-second settle).
+    idle_confirm_window: float = 0.5
+    # §7.1 post-submit TTFT suppression bound (cleared early by a positive turn-start signal).
+    post_submit_grace: float = 8.0
+    # §7.2 anti-flap: don't re-mint the same semantic_fp within this cooldown after withdrawing it.
+    withdrawn_cooldown: float = 1.0
+    # §7.4 heartbeat frozen-but-should-tick -> stale after this long without a heartbeat fp change.
+    heartbeat_stale_after: float = 10.0
+    # §7.4 liveness-scaled watchdog budgets: long while `live`, short while `stale`/`unknown`.
+    live_budget: float = 1800.0
+    stale_budget: float = 30.0
+    unknown_budget: float = 60.0
+    # §7.4 busy_reason hysteresis: keep a known reason this long after its on-screen marker vanishes.
+    reason_ttl: float = 30.0
+
+
+@dataclass
 class ExecutorSpec:
     command: str
     args: list
