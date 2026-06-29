@@ -25,7 +25,7 @@ bin/nelix-capture ~/.hermes/.../sessions/<id> --final          # the last screen
 bin/nelix-capture path/to/raw --cols 120 --rows 40 --final
 ```
 
-Only `--final` is fully faithful (pyte state after all bytes). `--at-marker` / `--all` snapshot pyte
+Only `--final` is fully faithful (renderer state after all bytes). `--at-marker` / `--all` snapshot renderer
 state at byte *prefixes* — plausible screens you still curate by eye, not provably ones the daemon
 classified at that instant (raw has no inter-byte timing, so "stable for N seconds" isn't replayable;
 the test simulates stability with `stable_for=9.9`).
@@ -56,3 +56,18 @@ per-frame ctx overrides are deferred (they would arrive as a `manifest.toml` bes
 > Note: the trust menu (`1. Yes` / `2. No, exit`) is handled in production by `is_modal_choice`, not
 > by `classify()` (which returns `idle_prompt` for it). It therefore belongs to the deferred
 > primitive-conformance set, not to `permission_prompt/` here.
+
+## Engine note (Phase 1 — libghostty-vt)
+
+The daemon now renders via **libghostty-vt** (`make_renderer` in `daemon/pty_session.py`); pyte is
+removed.  `bin/nelix-capture` replays raw through the same engine, so captured frames remain exactly
+what `classify()` sees.
+
+The existing 9 golden `.txt` frames under `working/`, `idle_prompt/`, and `permission_prompt/` remain
+valid: `test_driver_conformance.py` asserts `classify()` against their text content, which is
+engine-independent (the driver keys on text tokens, not rendering internals).
+
+`claude/_regression/3p1_alt_screen.raw` is the faithful-render regression fixture (session
+s-e54b456e, 120x40, ~1.8 MB).  `tests/test_render_3p1.py` asserts that libghostty-vt renders this
+Claude Code alt-screen capture cleanly — pyte rendered 24/40 rows with stale/overlapping chars;
+ghostty renders all 40 rows intact (validated against xterm.js in spike nelix-ks5).

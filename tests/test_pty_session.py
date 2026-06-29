@@ -62,33 +62,20 @@ def test_render_raw_defaults_match_session_dims():
     assert len(out.split("\n")) == 40              # rows=40 viewport
 
 
-def test_render_drops_stray_kitty_keyboard_u():
-    # Regression (nelix-quv): Claude Code emits kitty-keyboard CSI sequences at startup
-    # (ESC[<u pop, ESC[>1u push). pyte does not know the '<' private prefix, terminates the
-    # CSI early on '<' and DRAWS the trailing 'u' as text -> a stray 'u' at the top of the grid
-    # that leaks into every screen_excerpt. The double-pop case yields 'uu'. Strip them.
-    from daemon.pty_session import render_raw
-    out = render_raw(b"\x1b[H\x1b[<u\x1b[>1u")
-    assert not out.splitlines()[0].startswith("u")
-    out2 = render_raw(b"\x1b[H\x1b[<u\x1b[<u")          # double pop -> 'uu' in the wild
-    assert not out2.splitlines()[0].startswith("u")
+def test_render_no_stray_kitty_u_native():
+    # nelix-quv was a pyte artifact. A faithful engine consumes kitty-keyboard CSI natively,
+    # including a sequence split across two _feed() calls (parser state carries). No pre-filter.
+    s = PtySession(None, 0, 0, cols=80, rows=24)
+    s._feed(b"\x1b[H\x1b[<u\x1b[>1u")
+    assert not s.render().splitlines()[0].startswith("u")
+    s2 = PtySession(None, 0, 0, cols=80, rows=24)
+    s2._feed(b"\x1b[H\x1b[<"); s2._feed(b"u\x1b[>1u")
+    assert not s2.render().splitlines()[0].startswith("u")
 
 
 def test_render_keeps_real_u_text():
-    # The filter must be surgical: a literal 'u' in real output, and a bare CSI ending in 'u'
-    # WITHOUT a kitty private prefix (e.g. SCO restore-cursor ESC[u), must survive untouched.
     from daemon.pty_session import render_raw
     assert "menu" in render_raw(b"menu")
-    assert "u-tail" in render_raw(b"\x1b[uu-tail")     # ESC[u (no <>=? prefix) is not kitty
-
-
-def test_pump_drops_kitty_u_split_across_reads():
-    # The kitty sequence can straddle two os.read() chunks. A per-chunk filter would miss the
-    # split and leak the 'u'; the carry buffer must hold the partial CSI across _feed() calls.
-    s = PtySession(None, 0, 0, cols=80, rows=24)        # pure: no fd, just feed bytes
-    s._feed(b"\x1b[H\x1b[<")                            # partial kitty sequence: ESC[< (no final byte yet)
-    s._feed(b"u\x1b[>1u")                              # completes 'u' + a push in the next read
-    assert not s.render().splitlines()[0].startswith("u")
 
 
 def test_render_captures_child_output():
@@ -105,13 +92,12 @@ def test_render_captures_child_output():
         _reap(pid)
 
 
-def test_pump_tees_raw_and_commits_scrolled_lines(tmp_path):
+def test_pump_tees_raw_and_flushes_viewport(tmp_path):
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from daemon.dialog import Dialog
     d = Dialog(tmp_path / "s", tail_lines=100, spool_max_bytes=1_000_000)
-    # Echo more lines than the 4-row screen so the top scrolls off into history.
     master, pid, pgid = _spawn(
         ["/bin/sh", "-c", "for i in 1 2 3 4 5 6; do echo line$i; done; sleep 0.2"],
         cols=40, rows=4)
@@ -121,9 +107,11 @@ def test_pump_tees_raw_and_commits_scrolled_lines(tmp_path):
             s.pump(0.1)
         s.flush_viewport(d)
         raw = (tmp_path / "s" / "raw").read_bytes()
-        assert b"line1" in raw and b"line6" in raw            # raw has everything
+        assert b"line1" in raw and b"line6" in raw            # raw tees EVERYTHING
         joined = d.turn_text(0)["text"]
-        assert "line1" in joined and "line6" in joined         # transcript preserved beyond viewport
+        assert "line6" in joined                              # viewport tail committed
+        # NOTE: line1 scrolled off; Phase 1 does not commit scrollback to the transcript.
+        # Full scrollback-derived transcript is the Phase 2 TranscriptBuilder (nelix-8ns).
     finally:
         s.close()
         _reap(pid)

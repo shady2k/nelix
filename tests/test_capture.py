@@ -13,7 +13,7 @@ def _run(*args):
 
 
 def test_capture_final_renders_last_screen(tmp_path):
-    # --final = pyte state after ALL bytes. A clear sequence wipes earlier output, so the final
+    # --final = renderer state after ALL bytes. A clear sequence wipes earlier output, so the final
     # frame shows DONE and not the cleared "loading" line — proving faithful rendering.
     raw = tmp_path / "raw"
     raw.write_bytes("loading...\r\n\x1b[2J\x1b[HDONE\r\n❯ ".encode())

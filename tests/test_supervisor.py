@@ -317,10 +317,10 @@ def test_ensure_deps_installs_from_hash_lock_when_missing(monkeypatch):
 
 def test_deps_present_requires_exact_version(monkeypatch):
     importlib.reload(supervisor)
-    versions = {"pyte": "0.8.2", "ptyprocess": "0.7.0"}
+    versions = {"wasmtime": "45.0.0", "ptyprocess": "0.7.0"}
     monkeypatch.setattr(supervisor.importlib.metadata, "version", lambda n: versions[n])
     assert supervisor._deps_present() is True
-    versions["pyte"] = "0.8.1"                     # a wrong version present must NOT count as ok
+    versions["wasmtime"] = "44.0.0"                # a wrong version present must NOT count as ok
     assert supervisor._deps_present() is False
 
 
@@ -337,7 +337,7 @@ def test_deps_present_false_when_module_files_gone(monkeypatch):
     # exact metadata present but the module is not importable (corrupted install) -> reinstall
     importlib.reload(supervisor)
     monkeypatch.setattr(supervisor.importlib.metadata, "version",
-                        lambda n: {"pyte": "0.8.2", "ptyprocess": "0.7.0"}[n])
+                        lambda n: {"wasmtime": "45.0.0", "ptyprocess": "0.7.0"}[n])
     monkeypatch.setattr(supervisor.importlib.util, "find_spec", lambda m: None)
     assert supervisor._deps_present() is False
 

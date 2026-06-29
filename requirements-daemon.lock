@@ -1,13 +1,22 @@
-# Hash-pinned daemon deps for the nelix PTY daemon (pyte/ptyprocess + transitive wcwidth).
+# Hash-pinned daemon deps for the nelix PTY daemon (wasmtime + ptyprocess).
 # Consumed by supervisor.py: `pip|uv pip install --require-hashes -r requirements-daemon.lock`.
 # Regenerate after bumping requirements-daemon.in:
 #   uv pip compile requirements-daemon.in --generate-hashes --no-header -o requirements-daemon.lock
 ptyprocess==0.7.0 \
     --hash=sha256:4b41f3967fce3af57cc7e94b888626c18bf37a083e3651ca8feeb66d492fef35 \
     --hash=sha256:5c5d0a3b48ceee0b48485e0c26037c0acd7d29765ca3fbb5cb3831d347423220
-pyte==0.8.2 \
-    --hash=sha256:5af970e843fa96a97149d64e170c984721f20e52227a2f57f0a54207f08f083f \
-    --hash=sha256:85db42a35798a5aafa96ac4d8da78b090b2c933248819157fc0e6f78876a0135
-wcwidth==0.8.1 \
-    --hash=sha256:f453740b1e4a4f3291faa37944c555d71056c4da08d59809b307ef4feba695c8 \
-    --hash=sha256:faf5b4a5366a72dc49cad48cdf21f52bdf63bdda995178e483ba247ff79089b9
+    # via -r requirements-daemon.in
+wasmtime==45.0.0 \
+    --hash=sha256:1736a70a48f713aaf1a878514d29cc6f554213b5431e04447813a3b9b4320381 \
+    --hash=sha256:2ad4bf7ca286ceea35c1e420d10b368d7f83faf9a5ffde87b4ee334a9b7f55f3 \
+    --hash=sha256:31d10f25c330cebcfb364e9a357123deeec96c41725ff2bba91b705587f38a93 \
+    --hash=sha256:3579b0ec6d001750d66ec7089aaeee2c048f88328c82743e15f099af01b0cf84 \
+    --hash=sha256:35e713f907264e470f3bc9b592b81b8ed0f8f5651725d9f07a5d52beb0642e38 \
+    --hash=sha256:4e843795b53e66c71313f2254731467372e5e1549227cf14accb9e2d57701c10 \
+    --hash=sha256:5d1416ec6da8cd87c29e2e9eb074358c91839c2fff971fe428c8921eaae68e73 \
+    --hash=sha256:6251ee5074a8b8bfaa98e6e99cb5d49d6d0f2320b3265d5aa6c2ee5df5fb4519 \
+    --hash=sha256:a0b6ca14b4628a5d1ffa91ccf2c0f2c58fa171f126ec085d564b09d5795395dd \
+    --hash=sha256:a499f6ab0eebb70dca83d6a4904b743cd122f322af3abe86af08ad753533d946 \
+    --hash=sha256:ae9726590e6d90c6305b8b507c93468b145204d4390aa9a2e29e26babcae110e \
+    --hash=sha256:bef65282b7de744106a91da43e4d06ba19d2d587bc54abb83b3e757f0c4fc030
+    # via -r requirements-daemon.in

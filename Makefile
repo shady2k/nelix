@@ -38,15 +38,20 @@ clean:  ## Remove Python caches (keeps the venv)
 capture:  ## Replay a session raw into golden frame(s): make capture ARGS="<session-dir> --all"
 	$(PY) bin/nelix-capture $(ARGS)
 
+.PHONY: vendor-shim
+vendor-shim: ## Copy the built libghostty-vt shim.wasm into the daemon package (run after vt-spike-build)
+	@test -f spikes/vt-ghostty/.build/shim.wasm || { echo "missing shim.wasm — run 'make vt-spike-build' first"; exit 1; }
+	cp spikes/vt-ghostty/.build/shim.wasm daemon/renderer/shim.wasm
+	@echo ">> vendored daemon/renderer/shim.wasm"
+
 .PHONY: vt-spike-build
 vt-spike-build:  ## Build the libghostty-vt wasm renderer for the VT-render spike (downloads pinned Zig+ghostty)
 	spikes/vt-ghostty/build.sh
 
 .PHONY: vt-spike-run
-vt-spike-run: venv  ## Render a captured raw via libghostty-vt vs pyte: make vt-spike-run RAW=<session-raw>
+vt-spike-run: venv  ## Render a captured raw via libghostty-vt: make vt-spike-run RAW=<session-raw>
 	@test -n "$(RAW)" || { echo "usage: make vt-spike-run RAW=<path-to-session-raw>"; exit 1; }
 	@test -f spikes/vt-ghostty/.build/shim.wasm || { echo "missing shim.wasm — run 'make vt-spike-build' first"; exit 1; }
-	@$(PY) -c "import pyte" 2>/dev/null || { echo "pyte missing — run 'make install' first"; exit 1; }
 	@$(PY) -c "import wasmtime" 2>/dev/null || $(PIP) install 'wasmtime==45.0.0'
 	$(PY) spikes/vt-ghostty/compare.py "$(RAW)"
 

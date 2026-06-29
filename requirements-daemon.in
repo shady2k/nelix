@@ -1,2 +1,2 @@
-pyte==0.8.2
+wasmtime==45.0.0
 ptyprocess==0.7.0
