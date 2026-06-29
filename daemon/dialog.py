@@ -49,20 +49,38 @@ class Dialog:
                 self._raw = open(self._raw_path, "ab", opener=paths.private_opener)
 
     def _append_record(self, kind, speaker, text):
-        """Append one record; return its start char-offset in the flat text."""
-        idx = len(self._records)
-        start_offset = (self._flat_len + 1) if self._records else 0
-        self._flat_len = start_offset + len(text)
-        rec = {"idx": idx, "kind": kind, "speaker": speaker, "text": text}
-        self._records.append(rec)
-        self._jsonl.write(json.dumps(rec) + "\n")
+        """Append one record; return its start char-offset in the flat text.
+
+        Defensive: if *text* contains ``\\n``, splits into multiple single-line records
+        (first keeps *kind*, continuation records use ``'line'``).
+        """
+        lines = text.split("\n") if "\n" in text else [text]
+        first_offset = None
+        for i, line in enumerate(lines):
+            rec_kind = kind if i == 0 else "line"
+            idx = len(self._records)
+            start_offset = (self._flat_len + 1) if self._records else 0
+            if first_offset is None:
+                first_offset = start_offset
+            self._flat_len = start_offset + len(line)
+            rec = {"idx": idx, "kind": rec_kind, "speaker": speaker, "text": line}
+            self._records.append(rec)
+            self._jsonl.write(json.dumps(rec) + "\n")
         self._jsonl.flush()
-        return start_offset
+        return first_offset
 
     def append_user_input(self, text):
-        """Append a user-input marker; return its start offset."""
+        """Append a user-input marker; return its start offset.
+
+        Multiline *text* is split on ``\\n``: the first line becomes a ``marker`` record with
+        the ``» `` prefix; each subsequent line becomes a ``line`` record (same speaker, no
+        prefix).  This preserves the single-line-per-record invariant.
+        """
         with self._lock:
-            offset = self._append_record("marker", "user", "» " + text)
+            lines = text.split("\n")
+            offset = self._append_record("marker", "user", "» " + lines[0])
+            for line in lines[1:]:
+                self._append_record("line", "user", line)
             self._current_speaker = "user"
             self._last_user_input_offset = offset
             return offset
@@ -118,10 +136,16 @@ class Dialog:
         if cut == -1 or cut < int(0.6 * limit):
             # No usable snap point — hard-split
             return chunk[:limit], offset + limit
-        # Snap: exclude the newline, next page starts after it
-        return chunk[:cut], offset + cut + 1
+        # Snap: INCLUDE the boundary newline in the page so that
+        # flat_text[start_offset:next_offset] == page_text exactly and
+        # "".join(pages) reproduces the full flat text without gaps.
+        return chunk[:cut + 1], offset + cut + 1
 
     def page(self, offset=0, limit=None, snap=True):
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset!r}")
+        if limit is not None and limit <= 0:
+            raise ValueError(f"limit must be > 0 (or None for 'read to end'), got {limit!r}")
         with self._lock:
             text = self._flat_text()
             total_len = len(text)
@@ -230,6 +254,10 @@ class DialogReader:
         return "\n".join(r["text"] for r in self._records)
 
     def page(self, offset=0, limit=None, snap=True):
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset!r}")
+        if limit is not None and limit <= 0:
+            raise ValueError(f"limit must be > 0 (or None for 'read to end'), got {limit!r}")
         if not self._available:
             return {"text": "", "start_offset": offset, "next_offset": 0,
                     "speaker_at_start": "agent", "continued": False,

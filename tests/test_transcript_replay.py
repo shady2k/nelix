@@ -123,7 +123,7 @@ def test_replay_full_pagination_reproduces_text():
             if p["next_offset"] >= p["total_len"]:
                 break
             off = p["next_offset"]
-        reconstructed = "\n".join(parts)
+        reconstructed = "".join(parts)
         full = dlg.page()["text"]
         assert reconstructed == full, "paginating via next_offset must reproduce the full text"
         dlg.close()

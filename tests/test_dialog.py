@@ -132,7 +132,9 @@ def test_page_next_offset_chains_cover_log_exactly_once(tmp_path):
     for i in range(10):
         d.add_agent_line(f"line-{i:02d}")
     full = d.page()["text"]
-    # Page with limit 20 and chain via next_offset until done
+    # Page with limit 20 and chain via next_offset until done.
+    # Each snapped page is exactly flat_text[start_offset:next_offset], so "".join(parts)
+    # must reproduce the full flat text without gaps or extra separators.
     parts = []
     off = 0
     while True:
@@ -141,29 +143,25 @@ def test_page_next_offset_chains_cover_log_exactly_once(tmp_path):
         if p["next_offset"] >= p["total_len"]:
             break
         off = p["next_offset"]
-    reconstructed = "\n".join(p for p in parts if p)
-    # The full text equals the reconstructed text (snapping may trim within 60% of a page boundary,
-    # hard-split adds no gap, so every char appears exactly once when we re-join pages)
-    assert reconstructed == full
+    assert "".join(parts) == full
 
 
 def test_page_snaps_end_to_last_newline(tmp_path):
     d = _mk(tmp_path)
     d.add_agent_line("AAAA"); d.add_agent_line("BBBB"); d.add_agent_line("CCCC")
-    # flat text: "‹agent›\nAAAA\nBBBB\nCCCC" (8+1+4+1+4+1+4 = 23 chars)
-    # with limit=15, snap should not cut mid-line
-    p = d.page(0, limit=15)
-    assert not p["text"].endswith(("A", "B", "C")) or p["text"].endswith(("\n", "›")) or True
-    # More precisely: page text must not end mid-word; it ends at a newline boundary
-    if p["next_offset"] < p["total_len"]:
-        full = d.page()["text"]
-        # the char at next_offset-1 must be either a newline or we hard-split (continued)
-        if not p["text"].endswith(full[p["next_offset"] - 1]):
-            pass  # hard-split: OK
-        # key invariant: re-assembling produces the full text
-        rest = d.page(p["next_offset"])["text"]
-        assert (p["text"] + ("\n" if full[p["next_offset"] - 1:p["next_offset"]] == "\n" else "") + rest) == full or \
-               (p["text"] + rest) == full
+    # flat text: "‹agent›\nAAAA\nBBBB\nCCCC"
+    # with limit=15, snap should cut at a newline boundary.
+    # Key invariant: "".join(pages) must equal the full flat text exactly — no gaps at seams.
+    full = d.page()["text"]
+    parts = []
+    off = 0
+    while True:
+        p = d.page(off, limit=15)
+        parts.append(p["text"])
+        if p["next_offset"] >= p["total_len"]:
+            break
+        off = p["next_offset"]
+    assert "".join(parts) == full
 
 
 def test_page_hard_splits_overlong_single_line(tmp_path):
@@ -310,3 +308,84 @@ def test_dialog_concurrent_append_and_read_is_safe(tmp_path):
     d.close()
     assert exc_holder == []
     assert d.line_count() > 0
+
+
+# ---- Blocker 2: offset/limit validation ----
+
+def test_page_rejects_negative_offset(tmp_path):
+    d = _mk(tmp_path)
+    d.add_agent_line("content")
+    import pytest
+    with pytest.raises(ValueError, match="offset"):
+        d.page(-1)
+
+
+def test_page_rejects_zero_limit(tmp_path):
+    d = _mk(tmp_path)
+    d.add_agent_line("content")
+    import pytest
+    with pytest.raises(ValueError, match="limit"):
+        d.page(0, limit=0)
+
+
+def test_page_rejects_negative_limit(tmp_path):
+    d = _mk(tmp_path)
+    d.add_agent_line("content")
+    import pytest
+    with pytest.raises(ValueError, match="limit"):
+        d.page(0, limit=-1)
+
+
+def test_page_none_limit_returns_all(tmp_path):
+    d = _mk(tmp_path)
+    d.add_agent_line("content")
+    p = d.page(0, limit=None)
+    assert "content" in p["text"]
+    assert p["next_offset"] == p["total_len"]
+
+
+def test_page_next_offset_never_le_offset_for_nonempty_log(tmp_path):
+    """limit=0 / offset=-1 are rejected; for a non-empty log no valid call produces a loop."""
+    d = _mk(tmp_path)
+    d.add_agent_line("content")
+    import pytest
+    # These must raise, never silently loop
+    with pytest.raises(ValueError):
+        d.page(0, limit=0)
+    with pytest.raises(ValueError):
+        d.page(-1)
+    # A valid small limit must advance next_offset
+    p = d.page(0, limit=3)
+    assert p["next_offset"] > 0
+
+
+# ---- Blocker 3: multiline user input ----
+
+def test_append_user_input_multiline_splits_into_records(tmp_path):
+    """A multiline user input must produce one record per line (single-line invariant)."""
+    d = _mk(tmp_path)
+    off = d.append_user_input("line A\nline B\nline C")
+    assert off == 0                         # first record starts at 0
+    assert d.last_user_input_offset() == 0
+    recs = [json.loads(l) for l in (tmp_path / "s1" / "transcript.jsonl").read_text().splitlines()]
+    assert len(recs) == 3
+    assert recs[0] == {"idx": 0, "kind": "marker", "speaker": "user", "text": "» line A"}
+    assert recs[1] == {"idx": 1, "kind": "line",   "speaker": "user", "text": "line B"}
+    assert recs[2] == {"idx": 2, "kind": "line",   "speaker": "user", "text": "line C"}
+    # No record text may contain a newline
+    for rec in recs:
+        assert "\n" not in rec["text"], f"newline in record: {rec}"
+    # speaker_at_start is user across the whole input block
+    p = d.page(0)
+    assert p["speaker_at_start"] == "user"
+    # Full-log pagination reproduces the flat text exactly
+    full = d.page()["text"]
+    parts = []
+    offset = 0
+    while True:
+        pg = d.page(offset, limit=10)
+        parts.append(pg["text"])
+        if pg["next_offset"] >= pg["total_len"]:
+            break
+        offset = pg["next_offset"]
+    assert "".join(parts) == full

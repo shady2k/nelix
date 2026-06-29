@@ -113,6 +113,10 @@ def make_server(manager, transport, logger=None):
                     reader = sess.dialog   # duck-typed: same page/tail interface
                 offset = self._int(qs.get("offset", ["0"])[0], 0)
                 limit = self._int(qs.get("limit", [None])[0], None)
+                if offset < 0:
+                    raise _BadRequest(400, "offset must be >= 0")
+                if limit is not None and limit <= 0:
+                    raise _BadRequest(400, "limit must be > 0")
                 page = reader.page(offset, limit)
                 page["external_output_policy"] = EXTERNAL_OUTPUT_POLICY
                 self._send(200, page)
