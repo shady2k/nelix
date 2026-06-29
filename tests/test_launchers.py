@@ -44,7 +44,7 @@ def test_local_launcher_start_spawns(monkeypatch):
             return 7, 111, 111                       # master_fd, pid, pgid
 
     class FakePty:
-        def __init__(self, master_fd, pid, pgid, cols=120, rows=40, dialog=None):
+        def __init__(self, master_fd, pid, pgid, cols=120, rows=40, dialog=None, transcript=None):
             spawned["master_fd"] = master_fd; spawned["pid"] = pid; spawned["pgid"] = pgid
             spawned["dialog"] = dialog
         def close(self): spawned["closed"] = True
@@ -70,7 +70,7 @@ def test_local_launcher_uses_given_cwd(monkeypatch):
             return 7, 111, 111
 
     class FakePty:
-        def __init__(self, master_fd, pid, pgid, cols=120, rows=40, dialog=None):
+        def __init__(self, master_fd, pid, pgid, cols=120, rows=40, dialog=None, transcript=None):
             pass
         def close(self): pass
 
