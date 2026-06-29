@@ -69,11 +69,13 @@ class FakeHandle:
     def write(self, data, timeout=None, drain_output=False):
         self.writes.append(data)
 
-    def flush_viewport(self, dialog):
-        for ln in self.render().splitlines():
-            t = ln.rstrip()
-            if t:
-                dialog.add_line(t)
+    def finalize(self):
+        dialog = getattr(self, '_dialog', None)
+        if dialog is not None:
+            for ln in self.render().splitlines():
+                t = ln.rstrip()
+                if t:
+                    dialog.add_line(t)
 
     def leader_pid(self): return 4242
     def leader_pgid(self): return 4242
@@ -113,7 +115,7 @@ class DeadHandle:
     def write(self, data, timeout=None, drain_output=False):
         self.writes.append(data)
 
-    def flush_viewport(self, dialog):
+    def finalize(self):
         pass
 
     def leader_pid(self): return 4242
@@ -133,7 +135,7 @@ class DeadHandle:
 
 class _NoopLauncher:
     def __init__(self, handle): self._handle = handle
-    def start(self, spec, cwd, cols, rows, dialog=None): return self._handle
+    def start(self, spec, cwd, cols, rows, dialog=None, transcript=None): return self._handle
     def stop(self, handle): handle.close()
 
 
@@ -156,6 +158,7 @@ def _session(tmp_path, frames=(), handle=None, spec=None):
     sess._handle = handle if handle is not None else FakeHandle(list(frames), stop=sess._stop)
     sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
                           spool_max_bytes=Spec.spool_max_bytes)
+    sess._handle._dialog = sess._dialog   # give fake handle a dialog ref for finalize()
     sess._task_delivery = "delivered"     # these tests drive the post-delivery run loop directly
     return sess, ev
 
@@ -355,7 +358,7 @@ def test_start_passes_cwd_to_launcher(monkeypatch, tmp_path):
     seen = {}
 
     class FakeLauncher:
-        def start(self, spec, cwd, cols, rows, dialog=None):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
             seen["cwd"] = cwd
             return FakeHandle(["x"])
 
@@ -372,7 +375,7 @@ def test_start_rejects_command_prefix_task_without_spawning(tmp_path):
     spawned = {"v": False}
 
     class _Launcher:
-        def start(self, *a, **k):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
             spawned["v"] = True
             return FakeHandle(["x"])
 
@@ -455,11 +458,13 @@ class LiveHandle:
     def exit_code(self):
         return None
 
-    def flush_viewport(self, dialog):
-        for ln in self.render().splitlines():
-            t = ln.rstrip()
-            if t:
-                dialog.add_line(t)
+    def finalize(self):
+        dialog = getattr(self, '_dialog', None)
+        if dialog is not None:
+            for ln in self.render().splitlines():
+                t = ln.rstrip()
+                if t:
+                    dialog.add_line(t)
 
     def advance_to_input_box(self):
         self._i = len(self._frames) - 1
@@ -492,7 +497,7 @@ def make_session(tmp_path, frames, handle_cls=LiveHandle, spec=None):
     handle = handle_cls(list(frames))
 
     class _Launcher:
-        def start(self, spec, cwd, cols, rows, dialog=None):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
             handle._dialog = dialog
             return handle
 
@@ -964,9 +969,10 @@ def test_delivery_does_not_wedge_when_executor_ignores_stdin(tmp_path, monkeypat
     broker = BrokerClient()                          # real spawn path: PTY fork happens in the broker
 
     class _Launcher:
-        def start(self, spec, cwd, cols, rows, dialog=None):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
             master, pid, pgid = broker.spawn(child, cwd, dict(os.environ), cols, rows)
-            return PtySession(master, pid, pgid, cols=cols, rows=rows, dialog=dialog)
+            return PtySession(master, pid, pgid, cols=cols, rows=rows,
+                              dialog=dialog, transcript=transcript)
         def stop(self, h):
             h.close()
 
@@ -1032,9 +1038,10 @@ def test_delivery_drains_output_so_large_task_reaches_executor(tmp_path, monkeyp
     broker = BrokerClient()                          # real spawn path: PTY fork happens in the broker
 
     class _Launcher:
-        def start(self, spec, cwd, cols, rows, dialog=None):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
             master, pid, pgid = broker.spawn(child, cwd, dict(os.environ), cols, rows)
-            return PtySession(master, pid, pgid, cols=cols, rows=rows, dialog=dialog)
+            return PtySession(master, pid, pgid, cols=cols, rows=rows,
+                              dialog=dialog, transcript=transcript)
         def stop(self, h):
             h.close()
 

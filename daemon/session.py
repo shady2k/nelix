@@ -12,6 +12,7 @@ import paths
 from daemon import lifecycle_log
 from daemon import reaper
 from daemon.dialog import Dialog
+from daemon.transcript_builder import TranscriptBuilder
 from daemon.drivers.base import ClassifyCtx
 from daemon.events import EXTERNAL_OUTPUT_POLICY, RESPONDABLE_KINDS
 from daemon.hygiene import prepare_pty_input
@@ -137,9 +138,10 @@ class Session:
         self._dialog = Dialog(self._sessions_dir / self._id,
                               tail_lines=self._spec.tail_lines,
                               spool_max_bytes=self._spec.spool_max_bytes)
+        self._transcript = TranscriptBuilder(self._dialog, self._driver, self._rows)
         self._write_meta()
         self._handle = self._launcher.start(self._spec, cwd, self._cols, self._rows,
-                                            dialog=self._dialog)
+                                            dialog=self._dialog, transcript=self._transcript)
         self._task_delivery = "pending"
         self._spawn_ts = time.time()
         self._log_spawned(self._spec.argv(), type(self._launcher).__name__)
@@ -331,7 +333,7 @@ class Session:
         # exits, and wake Hermes with a non-respondable advisory; the human stops + restarts.
         self._task_delivery = "failed"
         self._terminal_kind = "delivery_failed"
-        self._handle.flush_viewport(self._dialog)
+        self._handle.finalize()
         self._publish("delivery_failed", hint=reason, hung=False,
                       requires_response=False, task_delivery="failed")
         if self._log is not None:
@@ -504,7 +506,7 @@ class Session:
 
     def _emit_stop(self, state, hung):
         # commit the final viewport so the turn tail is in the transcript, then freeze the range.
-        self._handle.flush_viewport(self._dialog)
+        self._handle.finalize()
         hint = "needs_permission" if state == "permission_prompt" else None
         # decision_key identifies the pause by what is ON SCREEN, not just the classifier label:
         # the same stalled/idle screen reuses its decision_id (a hung re-emit), a different screen
@@ -522,7 +524,7 @@ class Session:
         if fp == self._blocked_fp:
             return
         self._blocked_fp = fp
-        self._handle.flush_viewport(self._dialog)
+        self._handle.finalize()
         # decision_key = the normalized-frame fingerprint: a new interstitial (different fp) is a
         # new decision; the no-progress backstop re-emits the SAME fp and reuses the decision_id.
         self._publish("blocked", hint=hint, hung=False, requires_response=True,
@@ -532,10 +534,9 @@ class Session:
                  decision_key=None):
         respondable = kind in RESPONDABLE_KINDS
         with self._lock:
-            turn = self._dialog.current_turn()
-            start = self._dialog._turn_starts[turn]
-            end = self._dialog.line_count()
-            page = self._dialog.range_text(start, end, limit=self._spec.status_tail_chars)
+            page = self._dialog.current_turn_page(limit=self._spec.status_tail_chars)
+            turn = page["turn"]
+            start, end = page["start"], page["end"]
             text = page["text"]
             # render() directly (NOT self.screen(), which also takes self._lock -> deadlock).
             screen = _excerpt(self._handle.render() if self._handle is not None else "",

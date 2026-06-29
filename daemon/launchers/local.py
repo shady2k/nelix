@@ -9,10 +9,11 @@ class LocalLauncher:
 
     capabilities = ExecutorCapabilities(isolation_class="host", can_attach=False)
 
-    def start(self, spec, cwd, cols=120, rows=40, dialog=None):
+    def start(self, spec, cwd, cols=120, rows=40, dialog=None, transcript=None):
         master_fd, pid, pgid = get_broker().spawn(
             spec.argv(), cwd, spec.resolved_env(), cols, rows)
-        return PtySession(master_fd, pid, pgid, cols=cols, rows=rows, dialog=dialog)
+        return PtySession(master_fd, pid, pgid, cols=cols, rows=rows,
+                          dialog=dialog, transcript=transcript)
 
     def stop(self, handle):
         handle.close()
