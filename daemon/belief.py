@@ -69,6 +69,11 @@ class BeliefEngine:
         # currently published decision
         self._published_key = None
         self._published_kind = None
+        self._published_prompt_fp = None      # prompt region fp at publish (detects "prompt changed")
+        self._published_semantic_fp = None    # semantic fp at publish (anti-flap key)
+        # anti-flap (spec §7.2): don't re-mint the same semantic_fp immediately after withdrawing it.
+        self._last_withdrawn_fp = None
+        self._withdrawn_cooldown_until = None
         # post-submit suppression (spec §7.1): while active, an ambiguous free_text idle is NOT
         # published as a wake (the just-submitted echo lingering in the box during TTFT is not idle).
         self._post_submit_active = False
@@ -91,6 +96,10 @@ class BeliefEngine:
         self._published_kind = None
         self._candidate_fp = None
         self._candidate_since = None
+        self._published_prompt_fp = None
+        self._published_semantic_fp = None
+        self._last_withdrawn_fp = None          # a fresh turn: clear anti-flap from the prior turn
+        self._withdrawn_cooldown_until = None
         self._post_submit_active = True
         self._post_submit_grace_until = now + self._cfg.post_submit_grace
         self._post_submit_content_fp = None
@@ -165,12 +174,21 @@ class BeliefEngine:
         # (c) child exit/crash is handled by the terminal branch in tick().
 
     def _on_busy(self, obs, now, actions):
-        # No prompt visible -> reset the idle candidate; the agent is working.
+        # No prompt visible -> the turn resumed. Withdraw a still-pending decision (auto-recovery,
+        # spec §7.2) and reset the idle candidate; the agent is working.
+        if self._published_key is not None:
+            self._withdraw(actions, "turn_resumed", now)
         self._candidate_fp = None
         self._candidate_since = None
         self._state.phase = "busy"
 
     def _on_prompt(self, obs, now, actions):
+        # Auto-recovery: a published decision whose prompt region CHANGED AWAY (different prompt_fp)
+        # is a stale hypothesis -> withdraw it (a fresh heartbeat alone never withdraws — that is the
+        # footer timer, not a turn change, IMPORTANT-8). The new prompt is then a fresh candidate.
+        if self._published_key is not None and obs.prompt_fp != self._published_prompt_fp:
+            self._withdraw(actions, "prompt_changed", now)
+
         # Track the contiguous idle/prompt candidate by its prompt fingerprint.
         key = obs.prompt_fp or obs.semantic_fp
         if key != self._candidate_fp:
@@ -192,14 +210,30 @@ class BeliefEngine:
         if self._post_submit_active and (obs.submitted_echo_present
                                          or now < self._post_submit_grace_until):
             return
+        # anti-flap: do not re-mint the SAME semantic_fp within the cooldown after withdrawing it.
+        if (obs.semantic_fp == self._last_withdrawn_fp
+                and self._withdrawn_cooldown_until is not None
+                and now < self._withdrawn_cooldown_until):
+            return
         settled = (now - self._candidate_since) >= self._cfg.idle_confirm_window
         if not settled:
             return
         self._publish_decision(obs, decision_key, actions)
 
+    def _withdraw(self, actions, reason, now):
+        actions.append(Withdraw(decision_key=self._published_key, reason=reason))
+        self._last_withdrawn_fp = self._published_semantic_fp
+        self._withdrawn_cooldown_until = now + self._cfg.withdrawn_cooldown
+        self._published_key = None
+        self._published_kind = None
+        self._published_prompt_fp = None
+        self._published_semantic_fp = None
+
     def _publish_decision(self, obs, decision_key, actions):
         self._published_key = decision_key
         self._published_kind = obs.prompt_kind
+        self._published_prompt_fp = obs.prompt_fp
+        self._published_semantic_fp = obs.semantic_fp
         hint = "needs_permission" if obs.prompt_kind == "permission_choice" else None
         payload = {"prompt_kind": obs.prompt_kind,
                    "options": obs.options,

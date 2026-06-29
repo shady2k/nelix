@@ -24,7 +24,11 @@ class Event:
     kind: str
     summary: str
     state: str
-    answered: bool = False
+    # resolved_reason ∈ {None, answered, withdrawn, superseded} (spec §8): None = unresolved. It
+    # SUBSUMES the old `answered: bool`. Several events may share one decision_id (re-emits / nags);
+    # resolving a decision resolves all its events (resolve_decision), targeted by decision id.
+    resolved_reason: str = None
+    decision_id: str = None
     turn_index: int = 0
     range: tuple = (0, 0)
     hint: str = None
@@ -46,11 +50,11 @@ class EventQueue:
     def publish(self, session_id, executor, kind, summary, state, *,
                 turn_index=0, range=(0, 0), hint=None, hung=False,
                 task_delivery="delivered", requires_response=False, screen_excerpt="",
-                on_publish=None):
+                decision_id=None, on_publish=None):
         with self._cv:
             e = Event(next(self._seq), f"evt-{uuid.uuid4().hex[:8]}", session_id, executor,
-                      kind, summary, state, turn_index=turn_index, range=range,
-                      hint=hint, hung=hung, task_delivery=task_delivery,
+                      kind, summary, state, decision_id=decision_id, turn_index=turn_index,
+                      range=range, hint=hint, hung=hung, task_delivery=task_delivery,
                       requires_response=requires_response, screen_excerpt=screen_excerpt)
             self._events.append(e)
             # on_publish runs HERE — event reserved, not yet visible to waiters — so the session can
@@ -107,28 +111,29 @@ class EventQueue:
         with self._cv:
             for e in self._events:
                 if e.event_id == event_id:
-                    e.answered = True
-                    return e.seq               # the answered event's seq (cursor to arm from)
+                    e.resolved_reason = "answered"
+                    return e.seq               # the resolved event's seq (cursor to arm from)
             return None
 
-    def mark_session_answered(self, session_id):
-        """Answer the whole logical decision: one pause can span several notification events (a
-        no-progress backstop re-emits the same decision with a fresh event_id), so mark every
-        unanswered respondable event for the session. Returns the highest seq answered (the cursor
-        to arm past), or None if there was nothing to answer. Keeps pending() honest after a respond."""
+    def resolve_decision(self, decision_id, reason):
+        """Resolve a whole logical decision by its id: one pause can span several notification events
+        (re-emits / nags share one decision_id), so set resolved_reason on EVERY unresolved event
+        carrying that decision_id. `reason` ∈ {answered, withdrawn, superseded}. Returns the highest
+        seq resolved (the cursor to arm past), or None if there was nothing to resolve. Targeted by
+        decision id (not a blanket session-answer), so coexisting decisions are untouched."""
         with self._cv:
             seq = None
             for e in self._events:
-                if (e.session_id == session_id and e.kind in RESPONDABLE_KINDS
-                        and not e.answered):
-                    e.answered = True
+                if (e.decision_id == decision_id and e.kind in RESPONDABLE_KINDS
+                        and e.resolved_reason is None):
+                    e.resolved_reason = reason
                     seq = e.seq
             return seq
 
     def pending(self, session_id=None):
         with self._cv:
             for e in reversed(self._events):
-                if e.kind in RESPONDABLE_KINDS and not e.answered:
+                if e.kind in RESPONDABLE_KINDS and e.resolved_reason is None:
                     if session_id is None or e.session_id == session_id:
                         return e
             return None

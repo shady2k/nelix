@@ -657,13 +657,14 @@ class Session:
                     self._decision = decision
                 else:
                     # a re-emit whose decision was answered/superseded between build and publish:
-                    # obsolete -> mark the event answered so pending() never resurrects it.
-                    evt.answered = True
+                    # obsolete -> resolve the event so pending() never resurrects it.
+                    evt.resolved_reason = "superseded"
 
         # publish OUTSIDE the session lock (lock order: never hold it across a queue publish).
         evt = self._events.publish(self._id, self._executor, kind, text[:200], self._state,
                                    hint=hint, hung=hung, task_delivery=task_delivery,
                                    requires_response=requires_response, screen_excerpt=screen,
+                                   decision_id=(decision.get("decision_id") if respondable else None),
                                    on_publish=_install if respondable else None)
         if self._log is not None:
             self._log.audit_decision(self._id, self._executor, kind, evt.event_id, text)
@@ -735,9 +736,11 @@ class Session:
                 return RespondOutcome("no_pending")    # already claimed, or superseded by a new pause
             self._decision = None
         is_blocked = decision["kind"] == "blocked"
-        # one logical decision may span several notification events (backstop re-emits) -> answer all,
-        # so pending() stays honest and the next waiter arms past the whole resolved decision.
-        seq = self._events.mark_session_answered(self._id) or decision.get("seq")
+        # one logical decision may span several notification events (re-emits) -> resolve the whole
+        # decision by id (targeted, not a blanket session-answer), so pending() stays honest and the
+        # next waiter arms past the whole resolved decision. Coexisting decisions are untouched.
+        seq = (self._events.resolve_decision(decision.get("decision_id"), "answered")
+               or decision.get("seq"))
         if self._handle is not None:
             # Bound the PTY write (this runs on the RPC thread): a wedged executor that stopped
             # draining its stdin must NOT hang respond forever. ONE deadline covers the answer text +

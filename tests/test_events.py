@@ -71,18 +71,33 @@ def test_publish_carries_range_and_hint_under_lock():
     assert q.pending() is None
 
 
-def test_mark_session_answered_clears_all_reemits_of_a_decision():
-    # A pause can span several events (a no-progress backstop re-emit). Answering the decision must
-    # clear ALL of them so pending() never surfaces a stale earlier event for the resolved decision.
+def test_resolve_decision_clears_all_reemits_of_that_decision():
+    # A pause can span several events (a re-emit / nag) sharing one decision_id. Resolving the
+    # decision (by id) must clear ALL of them — targeted, not a blanket session-answer (IMPORTANT-7).
     q = EventQueue()
-    q.publish("s1", "x", "blocked", "trust?", "startup_interstitial", requires_response=True)
+    q.publish("s1", "x", "blocked", "trust?", "startup_interstitial",
+              requires_response=True, decision_id="dec-A")
     b = q.publish("s1", "x", "blocked", "trust?", "startup_interstitial",
-                  requires_response=True, hung=True)
-    q.publish("s2", "x", "waiting_for_user", "?", "idle_prompt", requires_response=True)
-    assert q.mark_session_answered("s1") == b.seq      # highest answered seq (cursor to arm past)
-    assert q.pending("s1") is None                     # both s1 re-emits cleared
-    assert q.pending("s2") is not None                 # other session untouched
-    assert q.mark_session_answered("s1") is None       # nothing left to answer
+                  requires_response=True, hung=True, decision_id="dec-A")
+    # a DIFFERENT decision for the same session must NOT be resolved
+    other = q.publish("s1", "x", "waiting_for_user", "?", "idle_prompt",
+                      requires_response=True, decision_id="dec-B")
+    q.publish("s2", "x", "waiting_for_user", "?", "idle_prompt",
+              requires_response=True, decision_id="dec-C")
+    assert q.resolve_decision("dec-A", "answered") == b.seq    # highest seq of that decision
+    assert q.pending("s1") is other                            # dec-B still pending (not resolved)
+    assert q.pending("s2") is not None                         # other session untouched
+    assert q.resolve_decision("dec-A", "answered") is None     # nothing left to resolve for dec-A
+
+
+def test_resolve_decision_records_the_reason():
+    q = EventQueue()
+    e = q.publish("s1", "x", "waiting_for_user", "?", "idle_prompt",
+                  requires_response=True, decision_id="dec-Z")
+    assert e.resolved_reason is None
+    q.resolve_decision("dec-Z", "withdrawn")
+    assert e.resolved_reason == "withdrawn"
+    assert q.pending("s1") is None                             # withdrawn -> not pending
 
 
 def test_publish_on_publish_runs_before_waiters_are_notified():

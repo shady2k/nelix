@@ -61,6 +61,61 @@ def test_grace_expiry_then_real_idle_publishes():
     assert _pubs(acts), "a real idle after grace must publish"
 
 
+# ---- Task 11: revocable decisions + auto-recovery + anti-flap (spec §7.2) ----
+
+def _idle(sfp="q", pfp="pq", hb=None):
+    return Observation(prompt_kind="free_text", semantic_fp=sfp, prompt_fp=pfp,
+                       affordances=frozenset({"accepts_text_input"}),
+                       heartbeat=hb or Heartbeat())
+
+
+def _publish_idle(e, clk):
+    e.tick(_idle(), CTX)
+    clk.advance(1.0)
+    return e.tick(_idle(), CTX)
+
+
+def test_withdraw_on_turn_resumption():
+    clk = FakeClock(0.0)
+    e = BeliefEngine(BeliefConfig(), clk)
+    assert _pubs(_publish_idle(e, clk))
+    work = Observation(prompt_kind="none", semantic_fp="w", heartbeat=Heartbeat("h", True, True))
+    clk.advance(0.5)
+    acts = e.tick(work, CTX)                   # agent resumed, no respond -> withdraw
+    assert any(isinstance(a, Withdraw) for a in acts)
+    assert e.state.control_state == "busy"
+
+
+def test_fresh_heartbeat_alone_does_not_withdraw():
+    clk = FakeClock(0.0)
+    e = BeliefEngine(BeliefConfig(), clk)
+    e.tick(_idle(hb=Heartbeat("hb1", True, True)), CTX)
+    clk.advance(1.0)
+    assert _pubs(e.tick(_idle(hb=Heartbeat("hb1", True, True)), CTX))
+    clk.advance(0.5)
+    # same prompt (same prompt_fp), only the footer heartbeat ticked -> MUST NOT withdraw (IMPORTANT-8)
+    acts = e.tick(_idle(hb=Heartbeat("hb2", True, True)), CTX)
+    assert not any(isinstance(a, Withdraw) for a in acts)
+    assert e.state.control_state == "awaiting_user"
+
+
+def test_anti_flap_same_fp_within_cooldown():
+    cfg = BeliefConfig(withdrawn_cooldown=2.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    assert _pubs(_publish_idle(e, clk))                 # publish at t=1.0
+    work = Observation(prompt_kind="none", semantic_fp="w", heartbeat=Heartbeat("h", True, True))
+    clk.advance(0.5)
+    assert any(isinstance(a, Withdraw) for a in e.tick(work, CTX))   # withdraw at t=1.5
+    # the SAME idle fingerprint reappears within cooldown (until 3.5) -> NOT re-minted
+    clk.advance(0.5)
+    e.tick(_idle(), CTX)                                  # candidate at t=2.0
+    clk.advance(1.0)
+    assert not _pubs(e.tick(_idle(), CTX))               # t=3.0, settled but within cooldown
+    clk.advance(1.0)
+    assert _pubs(e.tick(_idle(), CTX))                   # t=4.0, cooldown elapsed -> re-publish
+
+
 def test_positive_turn_start_clears_suppression():
     # (a) a busy observation with positive liveness clears post-submit -> next real idle publishes.
     clk = FakeClock(0.0)
