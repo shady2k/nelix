@@ -12,6 +12,23 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from daemon.drivers.claude import ClaudeDriver   # noqa: E402
+from daemon.drivers.base import Driver           # noqa: E402
+
+
+# ---- protocol-shape conformance (spec §5.6) --------------------------------------------
+# The driver contract is REPLACED outright: observe() is the sole classification contract;
+# classify() and the folded predicates are gone.
+_REMOVED = ("classify", "is_accepting_input", "is_modal_choice", "is_ask_mode",
+            "input_submission_present")
+_REQUIRED = ("observe", "normalize_frame", "is_transcript_volatile",
+             "format_submission", "submit_text", "select_option", "interrupt")
+
+
+def test_driver_protocol_has_observe_not_classify():
+    for name in _REQUIRED:
+        assert hasattr(Driver, name), f"Driver protocol must declare {name}()"
+    for name in _REMOVED:
+        assert not hasattr(Driver, name), f"Driver protocol must NOT declare {name}()"
 
 GOLDEN = Path(__file__).resolve().parent / "golden" / "claude"
 CATEGORIES = ("working", "idle_prompt", "permission_prompt")
