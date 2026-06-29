@@ -81,8 +81,14 @@ Read the `kind` for each agent and act:
   with `nelix_respond` (or relay to the user if your mandate says so). The task delivers itself once the
   screen clears (there may be more than one — handle each the same way).
 - `kind: "delivery_failed"` (`hint: "delivery_unconfirmed"`) — nelix typed the task but could not confirm
-  it landed within the confirm window (e.g. the CLI hung mid-paste). It did NOT submit or re-type anything.
-  Do not reply into the agent; call `nelix_restart(session_id)` — one atomic call, reuses the persisted task, durable budget.
+  it landed within the confirm window. It did NOT submit or re-type anything. Do not reply into the agent;
+  call `nelix_restart(session_id)` ONCE (reuses the persisted task, durable budget).
+  **If delivery_failed RECURS after a restart** (the terminal snapshot's `restart_count` > 0, or you've
+  already restarted this lineage): STOP. This is almost certainly a nelix/CLI-compatibility defect, not a
+  transient — restarting will just loop, and there is NOTHING on the screen for you to fix. Do NOT invent
+  workarounds (no `claude -p`/print mode, no extra keystrokes, no alternate launch flags, no different
+  delivery mechanism). Tell the user plainly: "nelix can't confirm task delivery to `<executor>` — this
+  looks like a compatibility bug, not something I can work around," and stop. Never guess from the screen.
 - `kind: "waiting_for_user"` — an agent paused at its prompt. Read the screen: if it asked something,
   answer or relay per your mandate (permission/destructive → user, always, unless delegated). If the
   decision carries `prompt_kind: "modal_choice"` or `"permission_choice"` (a numbered menu — it lists

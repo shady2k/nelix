@@ -36,9 +36,10 @@ _OPTION = re.compile(r"^\s*[❯>]?\s*\d+\.\s+\S", re.M)        # a numbered menu
 _OPTION_PARSE = re.compile(r"^\s*[❯>]?\s*(\d+)\.\s+(.*\S)\s*$", re.M)  # id + label capture
 _SELECTED_OPTION = re.compile(r"^\s*❯\s*\d+\.\s+\S", re.M)   # the cursor sits ON an option
 # Claude collapses long/multiline input into "[Pasted text #N]" ON the prompt line; the prompt marker
-# (❯) sits immediately before it (Claude renders a NBSP between them). The character class matches
-# space, tab, or NBSP (U+00A0) — note: " " must be in a non-raw string; it is NOT a raw string.
-_PASTED_TEXT = re.compile("❯[ \t ]*" + r"\[Pasted text #\d+\]")
+# (❯) sits immediately before it, and real Claude Code (v2.1.x) renders a NBSP (U+00A0) between them
+# — verified from a live capture (s-b8a30317). The class must include the NBSP *explicitly* ( );
+# a literal " " here is a plain space (0x20) and silently misses the real placeholder.
+_PASTED_TEXT = re.compile("\u276f[ \t\xa0]*" + r"\[Pasted text #\d+\]")
 
 # busy_reason chrome markers (on-screen tool panels only — NEVER the agent's NL output).
 _BASH_PANEL = re.compile(r"(?m)^\s*⏺?\s*Bash\(")           # a tool-run panel header
