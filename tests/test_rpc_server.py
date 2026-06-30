@@ -4,6 +4,7 @@ import socket as _socket
 import pytest
 from conftest import EXECUTOR
 from daemon.events import EventQueue
+from daemon.manager import StartOutcome
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
 from daemon.transport import Transport
@@ -12,7 +13,11 @@ from daemon.transport import Transport
 class FakeManager:
     def __init__(self):
         self._events = EventQueue(); self.started = None; self.responded = []; self.stopped = []
-    def start(self, executor, task, cwd): self.started = (executor, task, cwd); return "s1", 0
+    def start(self, executor, task, cwd):
+        self.started = (executor, task, cwd)
+        return StartOutcome(session_id="s1", base_seq=0,
+                            snapshot={"session_id": "s1", "control_state": "busy",
+                                      "task_delivery": "pending", "pending": False})
     def respond(self, session_id, answer, decision_id=None):
         # respond binds to the session's CURRENT pending decision; decision_id is an optional
         # guard. No decision_id -> resumed; a mismatched guard -> stale (carries current meta).

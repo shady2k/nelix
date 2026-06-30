@@ -36,7 +36,7 @@ def test_status_cursor_zero_when_no_events():
 def test_per_session_status_carries_session_cursor(tmp_path):
     events = EventQueue()
     mgr = _mgr(events)
-    sid, _ = mgr.start("claude", "t", str(tmp_path))
+    _out = mgr.start("claude", "t", str(tmp_path)); sid = _out.session_id
     events.publish(sid, "claude", "waiting_for_user", "", "working")  # one event for this session
     out = mgr.status(sid)
     assert out["session_id"] == sid
@@ -50,7 +50,7 @@ def test_per_session_status_unknown_session():
 def test_all_sessions_status_carries_per_session_seq(tmp_path):
     events = EventQueue()
     mgr = _mgr(events)
-    sid, _ = mgr.start("claude", "t", str(tmp_path))
+    _out = mgr.start("claude", "t", str(tmp_path)); sid = _out.session_id
     events.publish(sid, "claude", "working", "", "working")
     out = mgr.status()
     assert out["cursor"] == events.latest_seq()           # top-level stays GLOBAL

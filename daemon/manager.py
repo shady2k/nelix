@@ -12,6 +12,13 @@ from daemon.session import RespondOutcome, Session
 
 
 @dataclass
+class StartOutcome:
+    session_id: str
+    base_seq: int
+    snapshot: dict = None
+
+
+@dataclass
 class RestartOutcome:
     status: str                    # 'restarted' | 'unknown_session' | 'restart_budget_exhausted' | 'start_failed'
     session_id: str = None
@@ -164,7 +171,7 @@ class SessionManager:
             if self._logger is not None:
                 self._logger.error("manager", "session_start_failed", session_id=sid, exc_info=True)
             raise
-        return sid, base_seq
+        return StartOutcome(session_id=sid, base_seq=base_seq, snapshot=sess.snapshot())
 
     def _restart_source(self, session_id):
         """Resolve (executor, task, cwd, lineage_id, active_session_or_None) for a restart.
@@ -221,8 +228,9 @@ class SessionManager:
         # or releases it in its own finally if it raises before inserting. restart() must NOT also
         # touch self._reserved here (that would double-decrement).
         try:
-            new_sid, base_seq = self._spawn(executor, task, cwd, lineage_id=lineage_id,
-                                            restarted_from=session_id, reserve=reserve)
+            started = self._spawn(executor, task, cwd, lineage_id=lineage_id,
+                                  restarted_from=session_id, reserve=reserve)
+            new_sid, base_seq = started.session_id, started.base_seq
         except Exception:
             if self._logger is not None:
                 self._logger.error("manager", "restart_spawn_failed", session_id=session_id,

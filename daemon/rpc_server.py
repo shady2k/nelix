@@ -147,14 +147,15 @@ def make_server(manager, transport, logger=None):
             body = self._read_json()
             if p.path == "/start":
                 try:
-                    sid, base_seq = manager.start(body["executor"], body["task"], body["cwd"])
+                    outcome = manager.start(body["executor"], body["task"], body["cwd"])
                 except PtyInputRejected as e:        # subclass of ValueError: catch BEFORE it
                     self._send(400, {"error": str(e)}); return
                 except (RuntimeError, ValueError) as e:
                     self._send(409, {"error": str(e)}); return
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
-                self._send(200, {"session_id": sid, "next_after_seq": base_seq})
+                self._send(200, {"session_id": outcome.session_id,
+                                 "next_after_seq": outcome.base_seq})
             elif p.path == "/respond":
                 # respond binds to the session's CURRENT pending decision; event_id is gone and
                 # decision_id is an OPTIONAL guard (sourced from the status pull, not the wake).

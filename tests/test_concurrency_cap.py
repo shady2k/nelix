@@ -43,8 +43,8 @@ class _FakeSession:
         self.started = False
     def start(self, task, cwd):
         self.started = True
-    def stop(self):
-        pass
+    def stop(self): pass
+    def snapshot(self): return {"session_id": self._id, "control_state": "busy", "task_delivery": "pending"}
 
 
 def _manager(tmp_path, limit):

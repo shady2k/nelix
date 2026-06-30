@@ -6,6 +6,7 @@ import pytest
 
 from conftest import EXECUTOR
 from daemon.events import EventQueue
+from daemon.manager import StartOutcome
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
 from daemon.transport import Transport
@@ -14,7 +15,11 @@ from rpc_client import RpcClient
 
 class FakeManager:
     def __init__(self): self._events = EventQueue(); self.calls = []
-    def start(self, e, t, c): self.calls.append(("start", e, t, c)); return "s1", 0
+    def start(self, e, t, c):
+        self.calls.append(("start", e, t, c))
+        return StartOutcome(session_id="s1", base_seq=0,
+                            snapshot={"session_id": "s1", "control_state": "busy",
+                                      "task_delivery": "pending", "pending": False})
     def respond(self, s, a, decision_id=None):
         self.calls.append(("respond", s, a, decision_id))
         return RespondOutcome("resumed", seq=3, decision_id="dec-x")
