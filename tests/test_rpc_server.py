@@ -27,6 +27,8 @@ class FakeManager:
         if s == "write_timeout":
             return RespondOutcome("write_timeout", answered_decision_id="dec-1",
                                   snapshot={"session_id": session_id, "control_state": "busy", "pending": False})
+        if s == "unknown_session":
+            return RespondOutcome("unknown_session")
         return RespondOutcome("stale", pending={"decision_id": "dec-1", "kind": "waiting_for_user"})
     def status(self, session_id=None): return {"sessions": {}} if session_id is None else {"state": "working"}
     def stop(self, session_id):
@@ -119,7 +121,8 @@ class _NoPendingManager:
 class _WedgedManager:
     def __init__(self): self._events = EventQueue()
     def respond(self, session_id, answer, decision_id=None):
-        return RespondOutcome("write_timeout")
+        return RespondOutcome("write_timeout",
+                              snapshot={"session_id": "s-w", "control_state": "busy", "pending": False})
 
 
 def test_respond_write_timeout_is_503():
@@ -158,6 +161,18 @@ def test_respond_write_timeout_is_503_recover():
         st, b = _req("POST", "http://127.0.0.1:8801/respond", body={"session_id": "s1", "answer": "x"})
         assert st == 503 and b["status"] == "write_timeout" and b["next_action"] == "recover"
         assert b["snapshot"]["pending"] is False
+    finally:
+        srv.shutdown()
+
+
+def test_respond_unknown_session_is_404_refresh_status():
+    m = FakeManager(); m.respond_status = "unknown_session"
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8803, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8803/respond", body={"session_id": "s1", "answer": "x"})
+        assert st == 404 and b["operation"] == "respond" and b["status"] == "unknown_session"
+        assert b["next_action"] == "refresh_status" and b["session_id"] == "s1"
     finally:
         srv.shutdown()
 

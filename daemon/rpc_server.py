@@ -194,6 +194,10 @@ def make_server(manager, transport, logger=None):
                 elif outcome.status == "terminal":
                     self._send(409, {"operation": "respond", "status": "terminal", "session_id": sid,
                                      "error": "session_terminal", "next_action": "refresh_status"})
+                elif outcome.status == "unknown_session":
+                    self._send(404, {"operation": "respond", "status": "unknown_session",
+                                     "session_id": sid, "error": "unknown session",
+                                     "next_action": "refresh_status"})
                 else:   # no_pending
                     if logger is not None:
                         logger.warning("rpc", "respond_no_pending", session_id=sid, status=409,
