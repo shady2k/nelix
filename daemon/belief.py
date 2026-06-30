@@ -84,6 +84,10 @@ class BeliefEngine:
         self._post_submit_active = False
         self._post_submit_grace_until = None
         self._post_submit_content_fp = None   # content_fp captured on the first post-submit tick
+        # stuck-input bound (spec §7.1, fixes nelix-sud): when our just-submitted answer's Enter does
+        # not land, the echo stays in the box indefinitely; `_echo_since` clocks how long it has held
+        # so a never-clearing box surfaces a wake instead of suppressing every wake forever.
+        self._echo_since = None
         # state snapshot
         self._state = EngineState()
 
@@ -108,6 +112,7 @@ class BeliefEngine:
         self._post_submit_active = True
         self._post_submit_grace_until = now + self._cfg.post_submit_grace
         self._post_submit_content_fp = None
+        self._echo_since = None                  # a fresh submit: re-clock the stuck-input bound
 
     # ---- main entry ----
     def tick(self, obs, ctx):
@@ -189,6 +194,7 @@ class BeliefEngine:
             self._withdraw(actions, "turn_resumed", now)
         self._candidate_fp = None
         self._candidate_since = None
+        self._echo_since = None                  # the box cleared / turn moved: stuck-input bound off
         self._state.phase = "busy"
         self._watchdog(obs, now, actions)
 
@@ -225,6 +231,26 @@ class BeliefEngine:
                          "busy_reason": obs.busy_reason,
                          "liveness": self._liveness(obs, now),
                          "hint": "suspected_hung"}))
+
+    def _escalate_stuck_input(self, obs, now, actions):
+        # A submitted answer whose Enter never landed: the box is frozen holding our text and will not
+        # clear on its own (spec §7.1, fixes nelix-sud). Surface a NON-respondable needs-attention
+        # advisory — re-respond would just double-type into the still-full box, so the safe recovery is
+        # restart, which the orchestrator drives off this wake. Mirrors _watchdog's nag throttle
+        # (shared escalation counter, reset by real semantic progress in _track_semantic).
+        self._intervention_active = True
+        budget = self._budget(self._liveness(obs, now), obs.busy_reason)
+        if self._next_nag_at is None or now >= self._next_nag_at:
+            self._escalation_count += 1
+            self._next_nag_at = now + budget
+            self._state.phase = "submit_unconfirmed"
+            actions.append(Publish(
+                kind="intervention_required", respondable=False,
+                decision_key=f"intervention:{self._escalation_count}",
+                payload={"escalation_count": self._escalation_count,
+                         "busy_reason": obs.busy_reason,
+                         "liveness": self._liveness(obs, now),
+                         "hint": "submit_unconfirmed"}))
 
     def _on_prompt(self, obs, now, actions):
         self._intervention_active = False         # a prompt is not a hang: clear any nag state
@@ -265,11 +291,22 @@ class BeliefEngine:
             self._publish_decision(obs, decision_key, actions)
             return
         # free_text post-submit suppression (spec §7.1, fixes F1):
-        #  - while our submission is STILL in the active input box, definitely suppress — it is not an
-        #    idle prompt, regardless of the grace (the box literally holds our text);
+        #  - while our submission is STILL in the active input box, suppress — it is not an idle
+        #    prompt, regardless of the grace (the box literally holds our text);
         #  - once the echo is gone, the bounded grace still suppresses the TTFT gap (no spinner yet).
+        # BUT the echo suppression is BOUNDED (fixes nelix-sud): if our answer's Enter never landed
+        # (executor mid-render / misread the keystroke) the echo would otherwise hold forever and
+        # suppress every wake into infinite silence. Past echo_stuck_after the box is not clearing on
+        # its own — surface a needs-attention advisory so the orchestrator recovers (re-respond /
+        # restart) instead of the executor sitting idle, silently, indefinitely.
         if obs.submitted_echo_present:
+            if self._echo_since is None:
+                self._echo_since = now
+            if (now - self._echo_since) < self._cfg.echo_stuck_after:
+                return
+            self._escalate_stuck_input(obs, now, actions)
             return
+        self._echo_since = None                       # echo gone: the submit landed, clear the clock
         if self._post_submit_active and now < self._post_submit_grace_until:
             return
         # anti-flap: do not re-mint the SAME semantic_fp within the cooldown after withdrawing it.

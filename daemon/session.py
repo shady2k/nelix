@@ -128,9 +128,9 @@ class Session:
         # Build the engine config from the executor spec (liveness-scaled budgets, grace, etc.).
         # Falls back to BeliefConfig defaults for any field the spec does not override.
         cfg = BeliefConfig()
-        for f in ("idle_confirm_window", "post_submit_grace", "withdrawn_cooldown",
-                  "heartbeat_stale_after", "live_budget", "stale_budget", "unknown_budget",
-                  "reason_ttl"):
+        for f in ("idle_confirm_window", "post_submit_grace", "echo_stuck_after",
+                  "withdrawn_cooldown", "heartbeat_stale_after", "live_budget", "stale_budget",
+                  "unknown_budget", "reason_ttl"):
             v = getattr(self._spec, f, None)
             if v is not None:
                 setattr(cfg, f, v)
