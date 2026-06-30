@@ -63,7 +63,7 @@ def test_every_registered_driver_observes():
 GOLDEN = Path(__file__).resolve().parent / "golden" / "claude"
 
 from daemon.observation import ObservationCtx        # noqa: E402
-from tests.golden._harness import build_ctx, assert_observation  # noqa: E402
+from tests.golden._harness import load_expectation, build_ctx, assert_observation  # noqa: E402
 
 _CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None)
 
@@ -85,7 +85,6 @@ def _cases():
 
     New category dirs are discovered automatically (no hardcoded CATEGORIES list).
     """
-    import yaml
     cases = []
     for cat_dir in sorted(GOLDEN.iterdir()):
         if not cat_dir.is_dir() or cat_dir.name.startswith("_"):
@@ -97,7 +96,7 @@ def _cases():
         for f in txt_files:
             sidecar = f.with_suffix(".yaml")
             if sidecar.exists():
-                data = yaml.safe_load(sidecar.read_text())
+                data = load_expectation(sidecar)
                 cases.append(("sidecar", cat_dir.name, f, data))
             else:
                 cases.append(("legacy", cat_dir.name, f, None))

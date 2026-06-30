@@ -8,6 +8,20 @@ Provides:
 import yaml
 from daemon.observation import ObservationCtx
 
+# Every key that assert_observation recognises.  A key absent from this set is
+# almost certainly a typo that would otherwise silently skip the assertion.
+_KNOWN_EXPECT_KEYS = frozenset({
+    "prompt_kind",
+    "submitted_echo_present",
+    "ask_mode",
+    "busy_reason",
+    "heartbeat_present",
+    "options_ids",
+    "affordances_include",
+    "affordances_exclude",
+    "semantic_fp_nonempty",
+})
+
 
 def load_expectation(yaml_path):
     """Parse a YAML sidecar file and return its raw dict."""
@@ -47,6 +61,10 @@ def assert_observation(obs, expect, *, fixture_id):
     """
     def fail(msg):
         raise AssertionError(f"[{fixture_id}] {msg}")
+
+    for k in expect:
+        if k not in _KNOWN_EXPECT_KEYS:
+            raise AssertionError(f"[{fixture_id}] unknown expect-key {k!r}")
 
     if "prompt_kind" in expect and obs.prompt_kind != expect["prompt_kind"]:
         fail(f"prompt_kind {obs.prompt_kind!r} != {expect['prompt_kind']!r}")
