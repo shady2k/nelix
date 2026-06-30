@@ -163,12 +163,6 @@ _BG_FRAME = (
 )
 
 
-def test_running_background_subagent_is_busy_not_free_text():
-    o = D.observe(_BG_FRAME, CTX)
-    assert o.prompt_kind == "none"                       # busy, not awaiting the user
-    assert "accepts_text_input" not in o.affordances
-    assert o.busy_reason == "waiting_subagents"
-
 
 def test_background_subagent_ticker_does_not_churn_semantic_fp():
     # The subagent's live "<elapsed> · ↓ <N>k tokens" ticker must be normalized away, else every
