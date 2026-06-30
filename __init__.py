@@ -47,11 +47,20 @@ def register(ctx):
             return None
 
     def _arm(sid):
-        # Arm/re-arm exactly one waiter for THIS session, scoped to it. claim_arm is atomic
-        # (check + mark) so concurrent reconciles never double-spawn; dispatch outside the lock.
+        # Arm/re-arm exactly one waiter for THIS session. claim_arm is atomic (check + mark);
+        # dispatch outside the lock. Returns the after_seq armed at, or None if no waiter dispatched.
         after = waiters.claim_arm(sid)
         if after is not None:
             arm_waiter(ctx, after_seq=after, state_file=supervisor.state_file(), session_id=sid)
+        return after
+
+    def _with_waiter(body, armed_after):
+        armed = armed_after is not None
+        body["waiter"] = {"armed": armed,
+                          "after_seq": armed_after if armed else int(body.get("next_after_seq", 0))}
+        if not armed and body.get("next_action") == "end_turn":
+            body["next_action"] = "refresh_status"   # success expected an arm but none happened -> reconcile
+        return body
 
     def nelix_start(args, **k):
         # cwd is per-session: caller-supplied project dir, else this orchestrator's own
@@ -69,11 +78,12 @@ def register(ctx):
         body = RpcClient(transport).start(args["executor"], args["task"], cwd)
         # Register this new session's base cursor, then arm one waiter scoped to it. Only arm on a
         # successful start — a failed start (e.g. bad cwd) has no session and must not arm a waiter.
+        armed_after = None
         if body.get("session_id"):
             sid = body["session_id"]
             waiters.on_start(sid, int(body.get("next_after_seq", 0)), daemon_id=_daemon_id())
-            _arm(sid)
-        return _j(body)
+            armed_after = _arm(sid)
+        return _j(_with_waiter(body, armed_after))
 
     def nelix_status(args, **k):
         transport = supervisor.endpoint()
@@ -117,21 +127,24 @@ def register(ctx):
             return _j({"error": "no active nelix daemon"})
         # No event_id: the daemon binds the answer to the session's current pending decision.
         # decision_id (if the model carries it from a status pull) is an optional staleness guard.
+        # RpcClient.respond returns (ok, body) where ok = (st == 200); write_timeout is HTTP 503
+        # → ok=False → no arm.
         ok, body = RpcClient(transport).respond(
             args["session_id"], args["answer"], decision_id=args.get("decision_id"))
-        if ok:
+        armed_after = None
+        if ok and body.get("status") == "resumed":
             waiters.on_respond(args["session_id"], int(body.get("next_after_seq", 0)))
-            _arm(args["session_id"])                                # re-arm this session past its answer
-        return _j(body)
+            armed_after = _arm(args["session_id"])
+        return _j(_with_waiter(body, armed_after))
 
     def nelix_stop(args, **k):
         transport = supervisor.endpoint()
         if transport is None:
-            return _j({"stopped": False})
+            return _j({"error": "no active nelix daemon"})
         body = RpcClient(transport).stop(args["session_id"])
-        if isinstance(body, dict) and body.get("stopped"):
-            waiters.drop(args["session_id"])   # the daemon's stop event fires the live waiter
-        return _j(body)
+        if isinstance(body, dict) and body.get("status") in ("stopped", "stop_requested"):
+            waiters.drop(args["session_id"])
+        return _j(_with_waiter(body, None))
 
     def nelix_dialog(args, **k):
         transport = supervisor.endpoint()
@@ -146,13 +159,14 @@ def register(ctx):
         if transport is None:
             return _j({"error": "no active nelix daemon"})
         ok, body = RpcClient(transport).restart(args["session_id"], force=bool(args.get("force", False)))
-        if ok:
-            waiters.drop(args["session_id"])                 # old session is gone
+        armed_after = None
+        if ok and body.get("status") == "restarted":
+            waiters.drop(args["session_id"])                 # old session gone
             new_sid = body.get("session_id")
             if new_sid:
                 waiters.on_start(new_sid, int(body.get("next_after_seq", 0)), daemon_id=_daemon_id())
-                _arm(new_sid)
-        return _j(body)
+                armed_after = _arm(new_sid)
+        return _j(_with_waiter(body, armed_after))
 
     def nelix_screen(args, **k):
         transport = supervisor.endpoint()

@@ -33,7 +33,9 @@ def _n_terminal(ctx):
 
 def test_restart_tool_success_arms_waiter(monkeypatch, tmp_path):
     nelix, ctx = _load(monkeypatch, tmp_path,
-        (True, {"status": "restarted", "session_id": "s-2", "next_after_seq": 0}))
+        (True, {"operation": "restart", "status": "restarted", "session_id": "s-2",
+                "snapshot": {"session_id": "s-2", "control_state": "busy"},
+                "next_after_seq": 0, "next_action": "end_turn"}))
     out = json.loads(ctx.tools["nelix_restart"]["handler"]({"session_id": "s-1"}))
     assert out["status"] == "restarted" and out["session_id"] == "s-2"
     assert _n_terminal(ctx) == 1                    # armed one global waiter after restart
@@ -50,7 +52,9 @@ def test_restart_tool_budget_exhausted_no_arm(monkeypatch, tmp_path):
 def test_restart_tool_forwards_force_true(monkeypatch, tmp_path):
     cap = []
     nelix, ctx = _load(monkeypatch, tmp_path,
-        (True, {"status": "restarted", "session_id": "s-2", "next_after_seq": 0}),
+        (True, {"operation": "restart", "status": "restarted", "session_id": "s-2",
+                "snapshot": {"session_id": "s-2", "control_state": "busy"},
+                "next_after_seq": 0, "next_action": "end_turn"}),
         capture=cap)
     ctx.tools["nelix_restart"]["handler"]({"session_id": "s-1", "force": True})
     assert cap == [{"session_id": "s-1", "force": True}]
@@ -59,7 +63,9 @@ def test_restart_tool_forwards_force_true(monkeypatch, tmp_path):
 def test_restart_tool_force_defaults_to_false(monkeypatch, tmp_path):
     cap = []
     nelix, ctx = _load(monkeypatch, tmp_path,
-        (True, {"status": "restarted", "session_id": "s-2", "next_after_seq": 0}),
+        (True, {"operation": "restart", "status": "restarted", "session_id": "s-2",
+                "snapshot": {"session_id": "s-2", "control_state": "busy"},
+                "next_after_seq": 0, "next_action": "end_turn"}),
         capture=cap)
     ctx.tools["nelix_restart"]["handler"]({"session_id": "s-1"})
     assert cap == [{"session_id": "s-1", "force": False}]
