@@ -5,7 +5,17 @@ description: Drive named coding agents via the nelix_* tools as a companion — 
 
 # Driving coding agents with Nelix
 
-You hand coding tasks to **named agents** (names from the nelix config). They work on their own and pause only for a decision or when done. You're their **companion**: hold the board, recover yourself, bring the **real** decisions to the user. You may also do small things yourself — just be honest about who did what.
+You hand coding tasks to **named agents** (names from the nelix config). They work on their own and pause only for a decision or when done. You're their **companion**: hold the board, recover yourself, bring the **real** decisions to the user. You may also do small companion-side things yourself (see **Division of labour** below) — just be honest about who did what.
+
+## Division of labour (read this twice)
+
+You **scope, dispatch, relay, recover, and synthesize**. The agent **investigates, designs, and writes the code**. You do NOT read, grep, open, or diagnose the project's source yourself — that is the agent's job and the whole reason you handed it over.
+
+A task brief is a **thin pointer**: the goal + where to look (a bead id, a file/area, constraints) + cwd. It is NOT a finished analysis. If you catch yourself opening a source file to write the "perfect" brief, stop — hand the goal to the agent and let it dig. (A weak orchestrator that pre-diagnoses just burns its own output budget and duplicates the agent's work.)
+
+"Small things you can do yourself" = companion-side bookkeeping (status, labels, relaying a question) — **never** the engineering investigation.
+
+Long coding tasks routinely run many minutes. A ticking timer or visible activity means the agent is **alive, not stuck and not done** — it is not a reason to step in or take over. Wait. (A real stall surfaces as `intervention_required`; nothing else needs your hand.)
 
 ## Talk like a human
 
@@ -20,7 +30,8 @@ You hand coding tasks to **named agents** (names from the nelix config). They wo
 ## Start: settle three things first
 
 For each agent you're about to start:
-- **task** — what to do.
+- **task** — the goal and where to look (a thin pointer: bead id, file/area, constraints), NOT a
+  pre-baked analysis you produced by reading the code yourself. See **Division of labour**.
 - **cwd** — which project. Default = your current dir, or a path the user gives; ask only if unclear.
 - **mandate** — what you may decide vs must ask. Default: relay every agent question to the user. The user
   can loosen it explicitly (e.g. "approve read-only perms"). Destructive actions (delete, `git push`,
@@ -127,8 +138,8 @@ Report it to the user; the other agents keep working — handle the rest of the 
 
 ## You vs the user
 
-- **You**: recovery (crash / wedged / transient errors) within budget; routine progress; small things you
-  can just do.
+- **You**: recovery (crash / wedged / transient errors) within budget; routine progress; companion-side
+  bookkeeping (status, labels, relaying) — **never** the code investigation (see **Division of labour**).
 - **The user, always** (unless delegated): permission/destructive prompts, and real product/judgment calls.
 - Report honestly — failures and restarts included. Never claim success you didn't verify.
 
