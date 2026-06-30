@@ -718,6 +718,7 @@ class Session:
             snap = {"session_id": self._id, "executor": self._executor,
                     "task": self._task_raw, "cwd": self._cwd,
                     "control_state": "terminal" if terminal else self._state,
+                    "task_delivery": self._task_delivery,
                     "busy_reason": est.busy_reason, "liveness": est.liveness,
                     "quiet_elapsed": round(est.quiet_elapsed, 3),
                     "escalation_count": est.escalation_count}
@@ -752,6 +753,7 @@ class Session:
             return {"session_id": self._id, "executor": self._executor,
                     "task": self._task_raw, "cwd": self._cwd,
                     "control_state": "terminal", "terminal_kind": self._terminal_kind,
+                    "task_delivery": self._task_delivery,
                     "screen_excerpt": self._last_screen_excerpt, "pending": False,
                     "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
                     "restart_count": self.restart_count, "terminal": True}

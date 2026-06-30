@@ -1352,3 +1352,16 @@ def test_start_asserts_group_leader_when_reaping(tmp_path, monkeypatch):
     sess._stop.set()
     with pytest.raises(RuntimeError):
         sess.start("hi", str(tmp_path))
+
+
+def test_snapshot_includes_task_delivery(tmp_path):
+    sess, _ = _session(tmp_path)
+    sess._task_delivery = "pending"
+    assert sess.snapshot()["task_delivery"] == "pending"
+
+
+def test_terminal_snapshot_includes_task_delivery(tmp_path):
+    sess, _ = _session(tmp_path)
+    sess._terminal_kind = "stopped"
+    sess._task_delivery = "delivered"
+    assert sess.terminal_snapshot()["task_delivery"] == "delivered"
