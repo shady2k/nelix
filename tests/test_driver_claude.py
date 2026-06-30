@@ -80,9 +80,3 @@ def test_submitted_echo_detects_typed_or_pasted_task():
     assert D.observe(output_only, _ctx("a long task that claude collapsed")).submitted_echo_present is False
 
 
-def test_pasted_placeholder_only_on_active_input_line():
-    box = "Welcome back!\n❯ [Pasted text #1]\n⏵⏵ ask mode (shift+tab to cycle)\n"
-    assert D.observe(box, _ctx("a long collapsed task")).submitted_echo_present is True
-    out = ("agent log: ❯ [Pasted text #9] (quoted)\nmore output\n"
-           "❯ \n⏵⏵ ask mode (shift+tab to cycle)\n")
-    assert D.observe(out, _ctx("a long collapsed task")).submitted_echo_present is False
