@@ -6,16 +6,18 @@ spans the full sequence of observations rather than a single frame.
 
 I2b — bg-subagent session never publishes waiting_for_user            (regression: cd3352d)
 I8  — post-submit echo window suppressed (no false-idle publish)       (regression: 6de482c)
+I4b — submitted echo detected only in the ACTIVE input region          (regression: 68d6c7c)
 
 Real captures (tests/golden/claude/_regression/):
   s-039a61b4-bg-subagent.raw  — bg subagent running (I2b)
-  s-b8a30317-delivery.raw     — paste delivery, echo visible post-submit (I8)
+  s-b8a30317-delivery.raw     — paste delivery, echo visible post-submit (I8, I4b+)
+  s-2190cfb2-remint.raw       — free-text prompt churn (I4b-)
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tests._replay import replay_frames                        # noqa: E402
+from tests._replay import replay_frames, replay_observations   # noqa: E402
 from daemon.drivers.claude import ClaudeDriver                 # noqa: E402
 from daemon.observation import ObservationCtx                  # noqa: E402
 from daemon.belief import BeliefEngine, Publish                # noqa: E402
@@ -25,6 +27,7 @@ from daemon.config import BeliefConfig                         # noqa: E402
 _GOLDEN   = Path(__file__).parent / "golden" / "claude" / "_regression"
 _BG       = (_GOLDEN / "s-039a61b4-bg-subagent.raw").read_bytes()
 _DELIVERY = (_GOLDEN / "s-b8a30317-delivery.raw").read_bytes()
+_REMINT   = (_GOLDEN / "s-2190cfb2-remint.raw").read_bytes()
 
 _CTX_PLAIN = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None)
 
@@ -122,3 +125,85 @@ def test_post_submit_echo_suppresses_waiting_for_user():
     assert wakes_during_echo == 0, (
         f"{wakes_during_echo} waiting_for_user publish(es) fired while submitted echo was "
         "visible in the active input box (submitted_echo_present=True)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# I4b — submitted echo detected only in the ACTIVE input region
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_echo_in_active_box_is_detected():
+    """Positive half (I4b): when the submitted text's placeholder appears in the ACTIVE
+    input tail (last ❯ onward), submitted_echo_present is True.
+
+    Source: s-b8a30317-delivery — frames at offsets 1792 and 2048 carry the placeholder
+    '❯\\xa0[Pasted text #1]' in the active tail; _PASTED_TEXT must match there.
+
+    RED (same mutation as negative half — both halves share the 68d6c7c bug trigger):
+        In ClaudeDriver._echo_present(), change
+            tail = frame[frame.rfind("❯"):] if "❯" in frame else ""
+        to
+            tail = frame
+        The positive assertion still passes (text IS in the tail ⊂ whole frame), but
+        test_echo_in_scrollback_not_detected FAILS — demonstrating the bug.
+    """
+    ctx = ObservationCtx(last_submitted_text="a task that was pasted", child_alive=True, exit_code=None)
+    found = any(obs.submitted_echo_present for _, obs in replay_observations(_DELIVERY, ctx))
+    assert found, (
+        "delivery capture must have ≥1 frame with submitted_echo_present=True "
+        "(paste placeholder '❯\\xa0[Pasted text #1]' expected in active tail)")
+
+
+def test_echo_in_scrollback_not_detected():
+    """Negative half (I4b): text appearing ONLY in the scrollback (not in the active tail)
+    must NOT trigger submitted_echo_present=True.  Regression: 68d6c7c — echo detection was
+    not scoped to the active tail, so a user's prior submission visible in scrollback was
+    misread as still-in-the-box.
+
+    Source: s-2190cfb2-remint — at offset 396032 the phrase 'Checking for updates' appears
+    in the scrollback (conversation history) but the active tail is just '❯\\n──…'.
+    We scan frames at offset > 7000 to skip the capture's own paste-delivery window
+    (offsets 1792–6400 carry [Pasted text #1] in the active tail), isolating the
+    scrollback-only case.
+
+    RED mutation (local, NOT committed):
+        In daemon/drivers/claude.py, in ClaudeDriver._echo_present(), change:
+            tail = frame[frame.rfind("❯"):] if "❯" in frame else ""
+        to:
+            tail = frame
+        Then run:
+            .venv/bin/python -m pytest tests/test_sequence_oracles.py::test_echo_in_scrollback_not_detected -v
+    RED result: 'Checking for updates' found via needle search in the full frame at
+    offset 396032 → echo_frames=1 → assert echo_frames==0 → FAIL.
+    Restore: git checkout daemon/drivers/claude.py.
+
+    GREEN: 0 late frames with submitted_echo_present=True.
+
+    # DOCUMENTED GAP (corpus lacks a scrollback-only negative for the _PASTED_TEXT path;
+    # the remint capture starts with a paste-delivery phase at offsets 1792–6400 that also
+    # places [Pasted text #1] in the active tail; the text-needle path IS covered by the
+    # 'Checking for updates' frame at offset 396032; see INVENTORY.md I4b row).
+    """
+    ctx = ObservationCtx(last_submitted_text="Checking for updates", child_alive=True, exit_code=None)
+    drv = ClaudeDriver()
+
+    scrollback_only_frames = 0   # text in scrollback but NOT in active tail (makes test non-trivial)
+    echo_frames = 0              # frames where submitted_echo_present is incorrectly True
+
+    for off, frame in replay_frames(_REMINT):
+        if off <= 7000:   # skip the capture's paste-delivery window (offsets 1792–6400)
+            continue
+        tail_start = frame.rfind("❯")
+        tail = frame[tail_start:] if tail_start >= 0 else ""
+        scrollback = frame[:tail_start] if tail_start >= 0 else frame
+        if "Checking for updat" in scrollback and "Checking for updat" not in tail:
+            scrollback_only_frames += 1
+        obs = drv.observe(frame, ctx)
+        if obs.submitted_echo_present:
+            echo_frames += 1
+
+    assert scrollback_only_frames >= 1, (
+        "fixture must have ≥1 late frame with 'Checking for updates' in scrollback "
+        "(makes the negative test non-trivial: text IS in session, just not in active tail)")
+    assert echo_frames == 0, (
+        f"{echo_frames} late remint frames erroneously report submitted_echo_present=True "
+        f"(text 'Checking for updates' leaked from scrollback into active-tail detection)")
