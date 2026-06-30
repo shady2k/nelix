@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from daemon.renderer.ghostty import GhosttyRenderer   # noqa: E402
+from tests._replay import replay_frames               # noqa: E402
 from daemon.drivers.claude import ClaudeDriver         # noqa: E402
 
 _CAPTURE = Path(__file__).parent / "golden" / "claude" / "_regression" / "s-b8a30317-delivery.raw"
@@ -20,14 +20,7 @@ def _confirms_during_replay(raw, task, cols=120, rows=40):
     """Mirror `_deliver_task`'s confirm loop: render the capture incrementally and report whether
     `submitted_echo_present` ever becomes True (as the daemon would, polling each pump)."""
     drv = ClaudeDriver()
-    r = GhosttyRenderer(cols, rows)
-    seen = None
-    for i in range(0, len(raw), 256):
-        r.feed(raw[i:i + 256])
-        frame = r.render()
-        if frame == seen:
-            continue
-        seen = frame
+    for _, frame in replay_frames(raw, cols=cols, rows=rows, chunk=256):
         if drv._echo_present(frame, task):
             return True
     return False
