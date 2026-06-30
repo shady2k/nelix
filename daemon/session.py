@@ -25,12 +25,16 @@ from daemon.errors import PtyWriteTimeout
 @dataclass
 class RespondOutcome:
     """Result of binding an answer to a session's current pending decision. `status` is one of
-    'resumed' | 'no_pending' | 'stale' | 'unknown_session'; `pending` carries the current
-    decision metadata when an optional decision_id guard mismatches (so the caller can reconcile)."""
+    'resumed' | 'no_pending' | 'stale' | 'invalid_option' | 'write_timeout' | 'terminal';
+    `pending` carries current decision metadata on a pre-claim guard mismatch; `snapshot` is the
+    post-respond session snapshot on resumed/write_timeout; `answered_decision_id` names the
+    decision this answer was bound to."""
     status: str
     seq: int = None
     decision_id: str = None
     pending: dict = None
+    snapshot: dict = None
+    answered_decision_id: str = None
 
 
 def _pending_meta(decision):
@@ -810,7 +814,9 @@ class Session:
             except PtyWriteTimeout:
                 if self._log is not None:
                     self._log.warning("session", "respond_write_timeout", session_id=self._id)
-                return RespondOutcome("write_timeout", decision_id=decision.get("decision_id"))
+                return RespondOutcome("write_timeout", decision_id=decision.get("decision_id"),
+                                      answered_decision_id=decision.get("decision_id"),
+                                      snapshot=self.snapshot())
             if not is_blocked:
                 # Only a delivered-agent respond appends a user marker; a write_timeout must not
                 # advance the transcript. A modal records the chosen option's LABEL (not the bare id).
@@ -824,7 +830,10 @@ class Session:
             with self._lock:
                 self._last_submitted = clean
                 self._engine.on_submit(clean)
-        return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"))
+                self._state = "busy"   # Invariant A: resumed -> working again (no stale awaiting_user)
+        return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"),
+                              answered_decision_id=decision.get("decision_id"),
+                              snapshot=self.snapshot())
 
     def stop(self):
         self._stop.set()

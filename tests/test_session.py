@@ -580,6 +580,25 @@ def test_respond_rejects_command_prefix_answer_keeps_pending(tmp_path):
     sess.stop()
 
 
+def _seed_pending_decision(sess, decision_id="dec-t"):
+    sess._decision = {"kind": "waiting_for_user", "hint": None, "hung": False,
+                      "text": "?", "requires_response": True, "options": [],
+                      "prompt_kind": "free_text", "decision_key": "k",
+                      "decision_id": decision_id, "event_id": "e1", "seq": 1}
+
+
+def test_respond_resumes_to_busy_without_echoed_decision(tmp_path):
+    sess, _ = _session(tmp_path)
+    _seed_pending_decision(sess)
+    out = sess.respond("hi")
+    assert out.status == "resumed"
+    assert out.answered_decision_id == "dec-t"
+    assert out.snapshot["control_state"] == "busy"
+    assert out.snapshot["pending"] is False
+    assert "decision" not in out.snapshot
+    assert "still working" in out.snapshot["message"].lower()
+
+
 def test_ensure_ask_mode_writes_driver_toggle(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     sess, _ = _session(tmp_path, ["normal mode, no askmode marker"])
