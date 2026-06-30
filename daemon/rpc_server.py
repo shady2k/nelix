@@ -205,10 +205,10 @@ def make_server(manager, transport, logger=None):
                     self._send(409, {"error": "no_pending_decision"})
             elif p.path == "/stop":
                 try:
-                    stopped = manager.stop(body["session_id"])
+                    outcome = manager.stop(body["session_id"])
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
-                self._send(200, {"stopped": stopped})
+                self._send(200, {"stopped": outcome.status in ("stopped", "stop_requested")})
             elif p.path == "/restart":
                 try:
                     outcome = manager.restart(body["session_id"], force=bool(body.get("force", False)))

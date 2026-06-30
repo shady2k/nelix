@@ -19,6 +19,12 @@ class StartOutcome:
 
 
 @dataclass
+class StopOutcome:
+    status: str                    # 'stopped' | 'stop_requested' | 'unknown_session'
+    snapshot: dict = None
+
+
+@dataclass
 class RestartOutcome:
     status: str                    # 'restarted' | 'unknown_session' | 'restart_budget_exhausted' | 'start_failed'
     session_id: str = None
@@ -319,16 +325,23 @@ class SessionManager:
         with self._lock:
             sess = self._sessions.get(session_id)   # look up only; DO NOT pop here
         if sess is None:
-            return False
-        # Release manager._lock before sess.stop(): it joins the monitor thread, whose finalization
-        # re-enters manager._lock via _free_slot (on_terminal). _free_slot does the terminal_snapshot
-        # capture + pop + recent_terminal recording — so we must NOT pop first, or recent_terminal
-        # would be empty. (Holding the lock across the join would also deadlock.)
+            return StopOutcome("unknown_session")
+        # Release the lock before sess.stop(): it joins the monitor, whose finalization re-enters
+        # manager._lock via _free_slot to capture the terminal snapshot into self._terminal.
         sess.stop()
+        with self._lock:
+            entry = self._terminal.get(session_id)
+        snap = entry[0] if entry is not None else None
+        if snap is not None and snap.get("terminal_kind") == "stopped":
+            status = "stopped"                       # Invariant B: confirmed terminal
+        else:
+            status = "stop_requested"                # teardown not confirmed within the bounded join
+            snap = {**(snap or {}), "session_id": session_id,
+                    "control_state": "stopping", "pending": False}
         if self._logger is not None:
             self._logger.info("manager", "session_stopped", session_id=session_id,
-                              reason=reason, slot_freed=True)
-        return True
+                              reason=reason, status=status)
+        return StopOutcome(status, snapshot=snap)
 
     def stop_all(self, reason="shutdown"):
         with self._lock:

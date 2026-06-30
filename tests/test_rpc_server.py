@@ -4,7 +4,7 @@ import socket as _socket
 import pytest
 from conftest import EXECUTOR
 from daemon.events import EventQueue
-from daemon.manager import StartOutcome
+from daemon.manager import StartOutcome, StopOutcome
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
 from daemon.transport import Transport
@@ -26,7 +26,11 @@ class FakeManager:
             return RespondOutcome("resumed", seq=7, decision_id="dec-1")
         return RespondOutcome("stale", pending={"decision_id": "dec-1", "kind": "waiting_for_user"})
     def status(self, session_id=None): return {"sessions": {}} if session_id is None else {"state": "working"}
-    def stop(self, session_id): self.stopped.append(session_id); return True
+    def stop(self, session_id):
+        self.stopped.append(session_id)
+        return StopOutcome("stopped", snapshot={"session_id": session_id,
+                                                "control_state": "terminal",
+                                                "terminal_kind": "stopped", "pending": False})
 
 
 @pytest.fixture

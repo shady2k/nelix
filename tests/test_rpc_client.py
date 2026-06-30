@@ -6,7 +6,7 @@ import pytest
 
 from conftest import EXECUTOR
 from daemon.events import EventQueue
-from daemon.manager import StartOutcome
+from daemon.manager import StartOutcome, StopOutcome
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
 from daemon.transport import Transport
@@ -24,7 +24,11 @@ class FakeManager:
         self.calls.append(("respond", s, a, decision_id))
         return RespondOutcome("resumed", seq=3, decision_id="dec-x")
     def status(self, sid=None): return {"sessions": {}}
-    def stop(self, s): self.calls.append(("stop", s)); return True
+    def stop(self, s):
+        self.calls.append(("stop", s))
+        return StopOutcome("stopped", snapshot={"session_id": s,
+                                                "control_state": "terminal",
+                                                "terminal_kind": "stopped", "pending": False})
 
 
 @pytest.fixture

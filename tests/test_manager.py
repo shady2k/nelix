@@ -149,7 +149,7 @@ def test_operator_stop_publishes_single_stopped_event(tmp_path):
     _out = mgr.start(EXECUTOR, "t", str(tmp_path)); sid = _out.session_id; base = _out.base_seq
     before = events.latest_seq(sid)
 
-    assert mgr.stop(sid) is True              # returns, no deadlock
+    assert mgr.stop(sid).status in ("stopped", "stop_requested")   # returns, no deadlock
 
     # exactly one new terminal event for this session, kind == "stopped"
     new = [e for e in events._events if e.session_id == sid and e.seq > before]
@@ -165,7 +165,7 @@ def test_status_lists_all_and_stop():
     _out = m.start(EXECUTOR, "t", "/tmp"); sid = _out.session_id
     all_status = m.status()
     assert sid in all_status["sessions"]
-    assert m.stop(sid) is True and captured[0].stopped is True
+    assert m.stop(sid).status in ("stopped", "stop_requested") and captured[0].stopped is True
 
 
 import time as _time
@@ -299,3 +299,39 @@ def test_start_returns_outcome_with_snapshot(tmp_path):
     assert out.snapshot["session_id"] == out.session_id
     assert out.snapshot["task_delivery"] == "pending"
     assert out.snapshot["control_state"] == "busy"
+
+
+def test_stop_unknown_session_outcome(tmp_path):
+    m, _ = _mgr()
+    out = m.stop("s-nope")
+    assert out.status == "unknown_session" and out.snapshot is None
+
+
+class _StoppedSession:
+    def __init__(self, sid, executor, *a, **k):
+        self.sid = sid; self.executor = executor; self.on_terminal = None
+        self.reaper_ctx = None; self.lineage_id = sid; self.restarted_from = None
+        self.restart_count = 0; self.stopped = False
+    def start(self, task, cwd): pass
+    def snapshot(self): return {"session_id": self.sid, "control_state": "busy",
+                                "task_delivery": "delivered"}
+    def terminal_snapshot(self):
+        return {"session_id": self.sid, "control_state": "terminal", "terminal_kind": "stopped",
+                "task_delivery": "delivered", "pending": False, "lineage_id": self.sid,
+                "restarted_from": None, "restart_count": 0, "terminal": True}
+    def stop(self):
+        self.stopped = True
+        if self.on_terminal is not None:
+            self.on_terminal(self.sid)        # mimic the monitor finalizing -> _free_slot captures
+
+
+def test_stop_confirmed_terminal_outcome():
+    specs = {EXECUTOR: make_spec()}
+    def factory(sid, executor, spec, events):
+        return _StoppedSession(sid, executor)
+    m = SessionManager(specs, EventQueue(), session_factory=factory, concurrency_limit=1)
+    out0 = m.start(EXECUTOR, "t", "/tmp")
+    out = m.stop(out0.session_id)
+    assert out.status == "stopped"
+    assert out.snapshot["terminal_kind"] == "stopped"
+    assert out.snapshot["control_state"] == "terminal"
