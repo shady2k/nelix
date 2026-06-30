@@ -30,7 +30,7 @@ Verdict: **convert** (→ real frame + sidecar), **keep** (actuation / pure-help
 ### test_stray_prompt_marker_without_footer_is_not_free_text
 | assertion | verdict | invariant | source/notes |
 |-----------|---------|-----------|-------------|
-| `prompt_kind != "free_text"` | convert | I4a | → idle_prompt/bare-prompt.yaml `prompt_kind: none` |
+| `prompt_kind != "free_text"` | convert | I4a | → idle_prompt/bare-prompt.yaml `prompt_kind: unknown` |
 
 ### test_numbered_menu_is_modal_choice_with_options
 | assertion | verdict | invariant | source/notes |

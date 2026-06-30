@@ -36,22 +36,6 @@ _CTX_PLAIN = ObservationCtx(last_submitted_text=None, child_alive=True, exit_cod
 # I2b — bg-subagent session never publishes waiting_for_user
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _count_waiting_publishes(raw, ctx, *, cfg=None):
-    """Replay `raw` through renderer+driver+BeliefEngine; return count of
-    waiting_for_user Publish actions emitted."""
-    cfg = cfg or BeliefConfig()
-    drv, clk = ClaudeDriver(), FakeClock(0.0)
-    eng = BeliefEngine(cfg, clk)
-    n = 0
-    for _, frame in replay_frames(raw):
-        obs = drv.observe(frame, ctx)
-        clk.advance(1.0)
-        for a in eng.tick(obs, ctx):
-            if isinstance(a, Publish) and a.kind == "waiting_for_user":
-                n += 1
-    return n
-
-
 def test_bg_subagent_never_publishes_waiting_for_user():
     """While a background subagent runs, the screen is busy — the engine must NOT tell the
     orchestrator the user is needed.  Regression: cd3352d (bg frames classified free_text →

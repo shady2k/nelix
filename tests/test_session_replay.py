@@ -129,6 +129,12 @@ def test_delivery_confirms_once_and_publishes_terminal_over_real_capture(tmp_pat
     # the first user marker was appended on the confirmed delivery (0 == none appended)
     assert sess._dialog.last_user_input_offset() > 0
 
+    # SCOPE NOTE: This oracle deliberately asserts delivery-confirm-once + one terminal, but NOT
+    # "blocked published exactly once". Neutralizing _wait_until_ready in the harness (for deterministic
+    # in-process replay) creates transient startup-frame artifacts where _emit_blocked fires on frames
+    # that production's settle-wait would skip; a full count assertion would be brittle and test-harness-
+    # dependent rather than invariant. The core delivery guarantee (confirm once, enter once) is covered.
+
     # TERMINAL GLUE: _finish publishes exactly ONE terminal event with the correct kind. The capture
     # ends with the child still alive (stopped at the box) -> the handle sets _stop -> 'stopped'.
     terminals = [e.kind for e in ev._events
