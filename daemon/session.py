@@ -25,10 +25,11 @@ from daemon.errors import PtyWriteTimeout
 @dataclass
 class RespondOutcome:
     """Result of binding an answer to a session's current pending decision. `status` is one of
-    'resumed' | 'no_pending' | 'stale' | 'invalid_option' | 'write_timeout' | 'terminal';
-    `pending` carries current decision metadata on a pre-claim guard mismatch; `snapshot` is the
-    post-respond session snapshot on resumed/write_timeout; `answered_decision_id` names the
-    decision this answer was bound to."""
+    'resumed' | 'respond_failed' | 'no_pending' | 'stale' | 'invalid_option' | 'write_timeout' |
+    'terminal'; `pending` carries current decision metadata on a pre-claim guard mismatch;
+    `snapshot` is the post-respond session snapshot on resumed/write_timeout/respond_failed;
+    `respond_failed` means the answer was typed but never LEFT the box (submit unconfirmed) so the
+    caller must recover; `answered_decision_id` names the decision this answer was bound to."""
     status: str
     seq: int = None
     decision_id: str = None
@@ -762,6 +763,25 @@ class Session:
                     "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
                     "restart_count": self.restart_count, "terminal": True}
 
+    # respond's submit-confirm poll interval (read-only render reads; the monitor owns pump()).
+    _CONFIRM_POLL = 0.1
+
+    def _confirm_submit(self, deadline):
+        # Confirm a free-text submit LANDED, read-only (the monitor thread owns pump(), so draining
+        # here would race it — we only render() under the lock, exactly as snapshot() does). The
+        # submit is confirmed once our answer has LEFT the input box (submitted_echo_present clears);
+        # it is UNCONFIRMED iff the answer is still echoed in the box when the window expires — the
+        # Enter never advanced the turn (executor mid-render / misread keystroke). The belief engine's
+        # bounded echo-suppression is the async backstop for any case that slips past this window.
+        while True:
+            with self._lock:
+                frame = self._handle.render() if self._handle is not None else ""
+            if not self._driver.observe(frame, self._obs_ctx()).submitted_echo_present:
+                return True                          # answer left the box -> submit confirmed
+            if self._stop.is_set() or time.monotonic() >= deadline:
+                return False                         # still echoed at the deadline -> unconfirmed
+            time.sleep(min(self._CONFIRM_POLL, max(0.0, deadline - time.monotonic())))
+
     def respond(self, answer, decision_id=None):
         # Bind to the session's CURRENT pending decision (server owns identity). decision_id is an
         # OPTIONAL staleness guard sourced from the status pull, never required from the wake.
@@ -817,6 +837,23 @@ class Session:
                 return RespondOutcome("write_timeout", decision_id=decision.get("decision_id"),
                                       answered_decision_id=decision.get("decision_id"),
                                       snapshot=self.snapshot())
+            # observe() keys echo detection off _last_submitted — set it BEFORE confirming so both the
+            # confirm poll and the monitor thread match the answer we just typed.
+            with self._lock:
+                self._last_submitted = clean
+            # Confirm the submit LANDED (free-text only): mirror START's echo->confirm. A free-text
+            # answer that the executor failed to submit (Enter dropped while mid-render) stays stranded
+            # in the box; without this check respond() would falsely report 'resumed' and the lingering
+            # echo would then suppress every wake (nelix-sud). A modal/blocked selection is a single
+            # high-confidence keypress with no lingering text echo, so it keeps the prompt behaviour.
+            if decision.get("prompt_kind") == "free_text":
+                confirm_deadline = time.monotonic() + self._spec.respond_confirm_seconds
+                if not self._confirm_submit(confirm_deadline):
+                    if self._log is not None:
+                        self._log.warning("session", "respond_unconfirmed", session_id=self._id)
+                    return RespondOutcome("respond_failed", decision_id=decision.get("decision_id"),
+                                          answered_decision_id=decision.get("decision_id"),
+                                          snapshot=self.snapshot())
             if not is_blocked:
                 # Only a delivered-agent respond appends a user marker; a write_timeout must not
                 # advance the transcript. A modal records the chosen option's LABEL (not the bare id).
@@ -827,8 +864,9 @@ class Session:
                     self._dialog.append_user_input(marker)
             # A respond is a submit: tell the engine so it forgets the now-answered decision and arms
             # post-submit suppression (the answer echoed in the box must not re-mint a fresh idle, F1).
+            # _last_submitted was set above (before the confirm); on_submit re-clocks the stuck-input
+            # bound so a confirmed answer's brief lingering echo is the legitimate TTFT, not a stall.
             with self._lock:
-                self._last_submitted = clean
                 self._engine.on_submit(clean)
                 self._state = "busy"   # Invariant A: resumed -> working again (no stale awaiting_user)
         return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"),

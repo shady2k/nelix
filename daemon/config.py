@@ -37,6 +37,7 @@ class ExecutorSpec:
     settle_seconds: float = 1.5
     delivery_confirm_seconds: float = 10.0   # how long to wait for delivery confirmation before failing
     respond_write_seconds: float = 5.0       # deadline for the respond() PTY write (wedged-stdin guard)
+    respond_confirm_seconds: float = 6.0     # window to confirm a respond's answer LEFT the box (nelix-sud)
     max_idle_seconds: float = 600.0      # pre-delivery blocked no-progress backstop; 0 = disabled
     max_restarts: int = 3                # recovery: consecutive auto-restarts before escalating (Hermes)
     # belief-engine tunables (spec §7; user-overridable). Defaults mirror config.BeliefConfig.
@@ -96,6 +97,7 @@ def _build_spec(name, spec):
         settle_seconds=float(spec.get("settle_seconds", 1.5)),
         delivery_confirm_seconds=_spec_num(spec, "delivery_confirm_seconds", 10.0, cast=float),
         respond_write_seconds=_spec_num(spec, "respond_write_seconds", 5.0, cast=float),
+        respond_confirm_seconds=_spec_num(spec, "respond_confirm_seconds", 6.0, cast=float),
         max_idle_seconds=_spec_num(spec, "max_idle_seconds", 600.0, cast=float),
         max_restarts=_spec_num(spec, "max_restarts", 3, cast=int),
         post_submit_grace=_spec_num(spec, "post_submit_grace", 8.0, cast=float),
