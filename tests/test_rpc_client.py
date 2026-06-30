@@ -64,7 +64,7 @@ def test_rpc_client_roundtrip():
         ok, body = c.respond("s1", "yes")
         assert ok is True and ("respond", "s1", "yes", None) in m.calls
         assert body["decision_id"] == "dec-x"
-        assert c.stop("s1")["stopped"] is True
+        assert c.stop("s1")["status"] == "stopped"
     finally:
         srv.shutdown()
 

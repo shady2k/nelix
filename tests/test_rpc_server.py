@@ -13,17 +13,20 @@ from daemon.transport import Transport
 class FakeManager:
     def __init__(self):
         self._events = EventQueue(); self.started = None; self.responded = []; self.stopped = []
+        self.respond_status = "resumed"
     def start(self, executor, task, cwd):
         self.started = (executor, task, cwd)
         return StartOutcome(session_id="s1", base_seq=0,
                             snapshot={"session_id": "s1", "control_state": "busy",
                                       "task_delivery": "pending", "pending": False})
     def respond(self, session_id, answer, decision_id=None):
-        # respond binds to the session's CURRENT pending decision; decision_id is an optional
-        # guard. No decision_id -> resumed; a mismatched guard -> stale (carries current meta).
-        self.responded.append((session_id, answer, decision_id))
-        if decision_id is None:
-            return RespondOutcome("resumed", seq=7, decision_id="dec-1")
+        self.responded.append((session_id, answer, decision_id)); s = self.respond_status
+        if s == "resumed":
+            return RespondOutcome("resumed", seq=7, decision_id="dec-1", answered_decision_id="dec-1",
+                                  snapshot={"session_id": session_id, "control_state": "busy", "pending": False})
+        if s == "write_timeout":
+            return RespondOutcome("write_timeout", answered_decision_id="dec-1",
+                                  snapshot={"session_id": session_id, "control_state": "busy", "pending": False})
         return RespondOutcome("stale", pending={"decision_id": "dec-1", "kind": "waiting_for_user"})
     def status(self, session_id=None): return {"sessions": {}} if session_id is None else {"state": "working"}
     def stop(self, session_id):
@@ -74,19 +77,23 @@ def test_rpc_session_scoped_roundtrip():
     try:
         st, b = _req("POST", base + "/start",
                      body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo"})
-        assert st == 200 and b["session_id"] == "s1" and m.started == (EXECUTOR, "hi", "/repo")
+        assert st == 200 and b["operation"] == "start" and b["session_id"] == "s1"
         assert b["next_after_seq"] == 0          # daemon-owned start cursor (high-water before start)
+        assert m.started == (EXECUTOR, "hi", "/repo")
         m._events.publish("s1", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
         _, wb = _req("GET", base + "/wait?after_seq=0")
         assert wb["event"]["session_id"] == "s1"
         st, rb = _req("POST", base + "/respond",
                       body={"session_id": "s1", "answer": "yes"})       # no event_id needed
         assert st == 200 and m.responded[-1] == ("s1", "yes", None)
-        assert rb == {"status": "resumed", "next_after_seq": 7, "decision_id": "dec-1"}
+        assert rb["operation"] == "respond" and rb["status"] == "resumed"
+        assert rb["next_after_seq"] == 7 and rb["next_action"] == "end_turn"
+        m.respond_status = "stale"
         st, sb = _req("POST", base + "/respond",
                       body={"session_id": "s1", "answer": "yes", "decision_id": "dec-stale"})
-        assert st == 409 and sb["error"] == "stale_decision"
+        assert st == 409 and sb["status"] == "stale"
         assert sb["pending"]["decision_id"] == "dec-1"               # current decision for reconcile
+        assert sb["next_action"] == "fix_call"
         st, _ = _req("POST", base + "/stop", body={"session_id": "s1"})
         assert st == 200 and m.stopped == ["s1"]
     finally:
@@ -123,10 +130,48 @@ def test_respond_write_timeout_is_503():
     srv, base = _serve(_WedgedManager(), buf)
     try:
         st, b = _req("POST", base + "/respond", body={"session_id": "s-w", "answer": "1"})
-        assert st == 503 and b["error"] == "write_timeout" and "stdin" in b["detail"]
+        assert st == 503 and b["status"] == "write_timeout" and b["next_action"] == "recover"
     finally:
         srv.shutdown()
     assert "respond_write_timeout" in buf.getvalue()
+
+
+def test_start_envelope_shape():
+    m = FakeManager()
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8790, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8790/start",
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo"})
+        assert st == 200 and b["operation"] == "start" and b["status"] == "started"
+        assert b["session_id"] == "s1" and b["next_after_seq"] == 0
+        assert b["snapshot"]["control_state"] == "busy" and b["next_action"] == "end_turn"
+    finally:
+        srv.shutdown()
+
+
+def test_respond_write_timeout_is_503_recover():
+    m = FakeManager(); m.respond_status = "write_timeout"
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8801, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8801/respond", body={"session_id": "s1", "answer": "x"})
+        assert st == 503 and b["status"] == "write_timeout" and b["next_action"] == "recover"
+        assert b["snapshot"]["pending"] is False
+    finally:
+        srv.shutdown()
+
+
+def test_stop_confirmed_terminal_is_report():
+    m = FakeManager()
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8792, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8792/stop", body={"session_id": "s1"})
+        assert st == 200 and b["operation"] == "stop" and b["status"] == "stopped"
+        assert b["next_action"] == "report" and b["snapshot"]["terminal_kind"] == "stopped"
+    finally:
+        srv.shutdown()
 
 
 def test_respond_no_pending_is_409_and_logs_session_id():

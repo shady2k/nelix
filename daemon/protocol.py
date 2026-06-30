@@ -11,4 +11,4 @@ No project imports here (stdlib-free, in fact) so both the package-mode in-proce
 top-level-module daemon resolve the identical constant.
 """
 
-RPC_PROTOCOL_VERSION = 1
+RPC_PROTOCOL_VERSION = 2

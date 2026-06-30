@@ -154,11 +154,10 @@ def make_server(manager, transport, logger=None):
                     self._send(409, {"error": str(e)}); return
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
-                self._send(200, {"session_id": outcome.session_id,
-                                 "next_after_seq": outcome.base_seq})
+                self._send(200, {"operation": "start", "status": "started",
+                                 "session_id": outcome.session_id, "snapshot": outcome.snapshot,
+                                 "next_after_seq": outcome.base_seq, "next_action": "end_turn"})
             elif p.path == "/respond":
-                # respond binds to the session's CURRENT pending decision; event_id is gone and
-                # decision_id is an OPTIONAL guard (sourced from the status pull, not the wake).
                 try:
                     outcome = manager.respond(body["session_id"], body["answer"],
                                               decision_id=body.get("decision_id"))
@@ -169,73 +168,73 @@ def make_server(manager, transport, logger=None):
                 sid = body.get("session_id")
                 provided = body.get("decision_id")
                 if outcome.status == "resumed":
-                    self._send(200, {"status": "resumed", "next_after_seq": outcome.seq,
-                                     "decision_id": outcome.decision_id})
-                elif outcome.status == "unknown_session":
-                    if logger is not None:
-                        logger.warning("rpc", "respond_unknown_session", session_id=sid, status=404)
-                    self._send(404, {"error": "unknown session"})
+                    self._send(200, {"operation": "respond", "status": "resumed", "session_id": sid,
+                                     "snapshot": outcome.snapshot, "next_after_seq": outcome.seq,
+                                     "answered_decision_id": outcome.answered_decision_id,
+                                     "decision_id": outcome.decision_id, "next_action": "end_turn"})
                 elif outcome.status == "write_timeout":
-                    # executor stopped draining stdin: the answer did not land and was not re-typed.
                     if logger is not None:
                         logger.warning("rpc", "respond_write_timeout", session_id=sid, status=503)
-                    self._send(503, {"error": "write_timeout",
-                                     "detail": "executor did not accept input (stdin wedged); stop and restart"})
-                elif outcome.status == "terminal":
-                    self._send(409, {"error": "session_terminal"})
+                    self._send(503, {"operation": "respond", "status": "write_timeout", "session_id": sid,
+                                     "snapshot": outcome.snapshot,
+                                     "answered_decision_id": outcome.answered_decision_id,
+                                     "next_action": "recover", "error": "write_unconfirmed"})
                 elif outcome.status == "stale":
-                    # rich, self-contained diagnosis: who, what was sent, what is actually pending.
                     if logger is not None:
-                        pend = outcome.pending or {}
-                        logger.warning("rpc", "respond_stale", session_id=sid, status=409,
-                                       provided_decision_id=provided,
-                                       pending_decision_id=pend.get("decision_id"),
-                                       pending_kind=pend.get("kind"))
-                    self._send(409, {"error": "stale_decision", "pending": outcome.pending})
+                        logger.warning("rpc", "respond_stale", session_id=sid, status=409)
+                    self._send(409, {"operation": "respond", "status": "stale", "session_id": sid,
+                                     "error": "stale_decision", "pending": outcome.pending,
+                                     "next_action": "fix_call"})
                 elif outcome.status == "invalid_option":
-                    # a modal answer that is not one of the option ids: decision stays pending, no keys
-                    # sent. Return the options so the orchestrator can answer with a valid id.
                     if logger is not None:
                         logger.warning("rpc", "respond_invalid_option", session_id=sid, status=409)
-                    self._send(409, {"error": "invalid_option", "pending": outcome.pending})
+                    self._send(409, {"operation": "respond", "status": "invalid_option", "session_id": sid,
+                                     "error": "invalid_option", "pending": outcome.pending,
+                                     "next_action": "fix_call"})
+                elif outcome.status == "terminal":
+                    self._send(409, {"operation": "respond", "status": "terminal", "session_id": sid,
+                                     "error": "session_terminal", "next_action": "refresh_status"})
                 else:   # no_pending
                     if logger is not None:
                         logger.warning("rpc", "respond_no_pending", session_id=sid, status=409,
                                        provided_decision_id=provided)
-                    self._send(409, {"error": "no_pending_decision"})
+                    self._send(409, {"operation": "respond", "status": "no_pending", "session_id": sid,
+                                     "error": "no_pending_decision", "next_action": "fix_call"})
             elif p.path == "/stop":
                 try:
                     outcome = manager.stop(body["session_id"])
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
-                self._send(200, {"stopped": outcome.status in ("stopped", "stop_requested")})
+                if outcome.status == "unknown_session":
+                    self._send(404, {"operation": "stop", "status": "unknown_session",
+                                     "session_id": body["session_id"], "error": "unknown session",
+                                     "next_action": "refresh_status"})
+                else:
+                    self._send(200, {"operation": "stop", "status": outcome.status,
+                                     "session_id": body["session_id"], "snapshot": outcome.snapshot,
+                                     "next_action": "report" if outcome.status == "stopped" else "end_turn"})
             elif p.path == "/restart":
                 try:
                     outcome = manager.restart(body["session_id"], force=bool(body.get("force", False)))
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
                 if outcome.status == "restarted":
-                    self._send(200, {"status": "restarted", "session_id": outcome.session_id,
-                                     "lineage_id": outcome.lineage_id,
-                                     "restart_count": outcome.restart_count,
+                    self._send(200, {"operation": "restart", "status": "restarted",
+                                     "session_id": outcome.session_id, "snapshot": outcome.snapshot,
+                                     "lineage_id": outcome.lineage_id, "restart_count": outcome.restart_count,
                                      "next_after_seq": outcome.next_after_seq,
-                                     "restarted_from": body["session_id"]})
+                                     "restarted_from": body["session_id"], "next_action": "end_turn"})
                 elif outcome.status == "unknown_session":
-                    if logger is not None:
-                        logger.warning("rpc", "restart_unknown_session",
-                                       session_id=body.get("session_id"), status=404)
-                    self._send(404, {"error": "unknown session"})
+                    self._send(404, {"operation": "restart", "status": "unknown_session",
+                                     "error": "unknown session", "next_action": "refresh_status"})
                 elif outcome.status == "restart_budget_exhausted":
-                    if logger is not None:
-                        logger.warning("rpc", "restart_budget_exhausted",
-                                       session_id=body.get("session_id"), status=409,
-                                       restart_count=outcome.restart_count,
-                                       max_restarts=outcome.max_restarts)
-                    self._send(409, {"error": "restart_budget_exhausted",
+                    self._send(409, {"operation": "restart", "status": "restart_budget_exhausted",
+                                     "error": "restart_budget_exhausted",
                                      "restart_count": outcome.restart_count,
-                                     "max_restarts": outcome.max_restarts})
+                                     "max_restarts": outcome.max_restarts, "next_action": "ask_user"})
                 else:   # start_failed
-                    self._send(409, {"error": "start_failed"})
+                    self._send(409, {"operation": "restart", "status": "start_failed",
+                                     "error": "start_failed", "next_action": "recover"})
             else:
                 self._send(404, {"error": "not found"})
 
