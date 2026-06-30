@@ -12,6 +12,9 @@ class BeliefConfig:
     idle_confirm_window: float = 0.5
     # §7.1 post-submit TTFT suppression bound (cleared early by a positive turn-start signal).
     post_submit_grace: float = 8.0
+    # §7.1 hard bound on echo suppression: an answer whose Enter never landed holds the echo in the
+    # box forever; past this long the never-clearing box surfaces a needs-attention wake (nelix-sud).
+    echo_stuck_after: float = 20.0
     # §7.2 anti-flap: don't re-mint the same semantic_fp within this cooldown after withdrawing it.
     withdrawn_cooldown: float = 1.0
     # §7.4 heartbeat frozen-but-should-tick -> stale after this long without a heartbeat fp change.
@@ -34,10 +37,12 @@ class ExecutorSpec:
     settle_seconds: float = 1.5
     delivery_confirm_seconds: float = 10.0   # how long to wait for delivery confirmation before failing
     respond_write_seconds: float = 5.0       # deadline for the respond() PTY write (wedged-stdin guard)
+    respond_confirm_seconds: float = 6.0     # window to confirm a respond's answer LEFT the box (nelix-sud)
     max_idle_seconds: float = 600.0      # pre-delivery blocked no-progress backstop; 0 = disabled
     max_restarts: int = 3                # recovery: consecutive auto-restarts before escalating (Hermes)
     # belief-engine tunables (spec §7; user-overridable). Defaults mirror config.BeliefConfig.
     post_submit_grace: float = 8.0       # §7.1 TTFT suppression bound
+    echo_stuck_after: float = 20.0       # §7.1 never-clearing input box surfaces a wake (nelix-sud)
     idle_confirm_window: float = 0.5     # §7.1 suspicious-idle confirmation window
     live_budget: float = 1800.0          # §7.4 watchdog budget while liveness=live
     stale_budget: float = 30.0           # §7.4 watchdog budget while liveness=stale
@@ -92,9 +97,11 @@ def _build_spec(name, spec):
         settle_seconds=float(spec.get("settle_seconds", 1.5)),
         delivery_confirm_seconds=_spec_num(spec, "delivery_confirm_seconds", 10.0, cast=float),
         respond_write_seconds=_spec_num(spec, "respond_write_seconds", 5.0, cast=float),
+        respond_confirm_seconds=_spec_num(spec, "respond_confirm_seconds", 6.0, cast=float),
         max_idle_seconds=_spec_num(spec, "max_idle_seconds", 600.0, cast=float),
         max_restarts=_spec_num(spec, "max_restarts", 3, cast=int),
         post_submit_grace=_spec_num(spec, "post_submit_grace", 8.0, cast=float),
+        echo_stuck_after=_spec_num(spec, "echo_stuck_after", 20.0, cast=float),
         idle_confirm_window=_spec_num(spec, "idle_confirm_window", 0.5, cast=float),
         live_budget=_spec_num(spec, "live_budget", 1800.0, cast=float),
         stale_budget=_spec_num(spec, "stale_budget", 30.0, cast=float),

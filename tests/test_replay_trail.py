@@ -83,6 +83,48 @@ def replay(capture_path, *, cols=120, rows=40, dt=0.3):
     return trail
 
 
+def replay_notes(capture_path, *, cols=120, rows=40, dt=0.3):
+    """Replay the capture through the REAL engine and collect the diagnostic NOTES it drains each tick
+    (nelix-jwv): the suppression rationale + post-submit window edges. This is the real-capture oracle
+    for the observability records — the same byte stream the F1 trail asserts, now also asserting that
+    the post-submit echo windows leave an EXPLICIT suppressed-because record instead of silence."""
+    renderer = GhosttyRenderer(cols, rows)
+    driver = ClaudeDriver()
+    clock = FakeClock(0.0)
+    engine = BeliefEngine(BeliefConfig(), clock)
+    notes = []
+    prev_box = ""
+    try:
+        for offset, chunk in read_capture(capture_path):
+            clock.advance(dt)
+            renderer.feed(chunk)
+            frame = renderer.render()
+            box = _box_text(frame)
+            if box and box != prev_box:
+                engine.on_submit(box)
+            ctx = ObservationCtx(last_submitted_text=(box or None), child_alive=True, exit_code=None)
+            obs = driver.observe(frame, ctx)
+            engine.tick(obs, ctx)
+            for n in engine.drain_notes():
+                notes.append({"offset": offset, "event": n.event, **n.fields})
+            prev_box = box
+    finally:
+        renderer.close()
+    return notes
+
+
+def test_post_submit_windows_leave_explicit_suppression_records():
+    # nelix-jwv: the F1 post-submit echo windows (our submission lingering in the box) must now be an
+    # EXPLICIT belief_suppressed(submitted_echo_present) record, not silence — bracketed by the
+    # post_submit_armed edge. A silent stall is therefore diagnosable from the log alone.
+    notes = replay_notes(FIXTURE)
+    events = {n["event"] for n in notes}
+    assert "post_submit_armed" in events, "a submit edge must arm post-submit suppression in the trail"
+    echo = [n for n in notes if n["event"] == "belief_suppressed"
+            and n.get("reason") == "submitted_echo_present"]
+    assert echo, "the post-submit echo windows must surface as explicit suppressed-because records"
+
+
 def _publishes(trail, kind="waiting_for_user"):
     return [t for t in trail if t["action"] == "publish" and t["kind"] == kind]
 

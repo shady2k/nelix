@@ -217,6 +217,26 @@ def test_respond_rearms_without_prior_status(monkeypatch, tmp_path):
     assert "--session-id s-1" in cmds[-1] and "--after 6" in cmds[-1]   # armed past answered seq
 
 
+def test_respond_failed_arms_no_waiter_and_keeps_recover(monkeypatch, tmp_path):
+    # nelix-sud: an unconfirmed submit (HTTP 503 -> ok=False) must NOT arm a waiter (the turn did
+    # not resume) and must keep the daemon-owned next_action='recover' so the orchestrator recovers.
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def respond(self, *a, **k):
+            return False, {"operation": "respond", "status": "respond_failed", "session_id": "s-1",
+                           "snapshot": {"session_id": "s-1", "control_state": "busy", "pending": False},
+                           "answered_decision_id": "dec-1", "next_action": "recover",
+                           "error": "submit_unconfirmed"}
+    _, ctx = _setup(monkeypatch, tmp_path, C)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    cmds_before = len(_terminal_cmds(ctx))
+    body = json.loads(ctx.tools["nelix_respond"]["handler"]({"session_id": "s-1", "answer": "go now"}))
+    assert body["status"] == "respond_failed" and body["next_action"] == "recover"
+    assert body["waiter"]["armed"] is False               # the turn did not resume -> no wake armed
+    assert len(_terminal_cmds(ctx)) == cmds_before        # no new waiter dispatched
+
+
 class _EnvelopeClient:
     def __init__(self, t): pass
     def start(self, *a):

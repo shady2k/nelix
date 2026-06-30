@@ -36,6 +36,16 @@ class Actuate:
     arg: Optional[str] = None
 
 
+@dataclass
+class Note:
+    """A pure DIAGNOSTIC the engine surfaces about WHY it did (or did not) act — the suppression
+    rationale and post-submit window edges (spec §7.1). Carried on a side-channel buffer drained by
+    Session (drain_notes), NEVER on tick()'s action list: actuation is unchanged, and the engine's
+    action-equality tests keep asserting `== []`. Session maps it to a structured log record."""
+    event: str
+    fields: dict = field(default_factory=dict)
+
+
 # ---- Read-only state snapshot exposed for /status, the trail, and the test oracle ----
 
 @dataclass
@@ -84,12 +94,35 @@ class BeliefEngine:
         self._post_submit_active = False
         self._post_submit_grace_until = None
         self._post_submit_content_fp = None   # content_fp captured on the first post-submit tick
+        # stuck-input bound (spec §7.1, fixes nelix-sud): when our just-submitted answer's Enter does
+        # not land, the echo stays in the box indefinitely; `_echo_since` clocks how long it has held
+        # so a never-clearing box surfaces a wake instead of suppressing every wake forever.
+        self._echo_since = None
+        # diagnostic note buffer (nelix-jwv): WHY we suppressed / post-submit edges, edge-triggered so
+        # a persistent reason logs once (signal, not per-tick noise). Drained by Session, off `actions`.
+        self._notes = []
+        self._suppress_reason = None     # last emitted suppression reason (edge detection)
         # state snapshot
         self._state = EngineState()
 
     @property
     def state(self):
         return self._state
+
+    # ---- diagnostic notes (nelix-jwv): pure, off the action list; Session drains + logs ----
+    def _note(self, event, **fields):
+        self._notes.append(Note(event, fields))
+
+    def drain_notes(self):
+        notes, self._notes = self._notes, []
+        return notes
+
+    def _suppressed(self, reason):
+        # Edge-triggered: emit one note when the suppression reason CHANGES (a stall that suppresses
+        # for many ticks under the same reason logs exactly once until the reason changes or we act).
+        if reason != self._suppress_reason:
+            self._suppress_reason = reason
+            self._note("belief_suppressed", reason=reason)
 
     # ---- submit edge (post-submit suppression entry, spec §7.1) ----
     def on_submit(self, text):
@@ -108,6 +141,9 @@ class BeliefEngine:
         self._post_submit_active = True
         self._post_submit_grace_until = now + self._cfg.post_submit_grace
         self._post_submit_content_fp = None
+        self._echo_since = None                  # a fresh submit: re-clock the stuck-input bound
+        self._suppress_reason = None             # a fresh turn: re-arm the suppression edge
+        self._note("post_submit_armed", grace=self._cfg.post_submit_grace)
 
     # ---- main entry ----
     def tick(self, obs, ctx):
@@ -172,13 +208,16 @@ class BeliefEngine:
             self._post_submit_content_fp = obs.content_fp     # baseline (our echo, not real output)
         if now >= self._post_submit_grace_until:              # (d) bounded grace expired
             self._post_submit_active = False
+            self._note("post_submit_cleared", reason="grace_expired")
             return
         if obs.prompt_kind == "none" and self._liveness(obs, now) == "live":   # (a) busy + live
             self._post_submit_active = False
+            self._note("post_submit_cleared", reason="busy_live")
             return
         if (not obs.submitted_echo_present
                 and obs.content_fp != self._post_submit_content_fp):           # (b) real output
             self._post_submit_active = False
+            self._note("post_submit_cleared", reason="real_output")
             return
         # (c) child exit/crash is handled by the terminal branch in tick().
 
@@ -189,6 +228,8 @@ class BeliefEngine:
             self._withdraw(actions, "turn_resumed", now)
         self._candidate_fp = None
         self._candidate_since = None
+        self._echo_since = None                  # the box cleared / turn moved: stuck-input bound off
+        self._suppress_reason = None             # turn moved: re-arm the suppression edge
         self._state.phase = "busy"
         self._watchdog(obs, now, actions)
 
@@ -226,6 +267,26 @@ class BeliefEngine:
                          "liveness": self._liveness(obs, now),
                          "hint": "suspected_hung"}))
 
+    def _escalate_stuck_input(self, obs, now, actions):
+        # A submitted answer whose Enter never landed: the box is frozen holding our text and will not
+        # clear on its own (spec §7.1, fixes nelix-sud). Surface a NON-respondable needs-attention
+        # advisory — re-respond would just double-type into the still-full box, so the safe recovery is
+        # restart, which the orchestrator drives off this wake. Mirrors _watchdog's nag throttle
+        # (shared escalation counter, reset by real semantic progress in _track_semantic).
+        self._intervention_active = True
+        budget = self._budget(self._liveness(obs, now), obs.busy_reason)
+        if self._next_nag_at is None or now >= self._next_nag_at:
+            self._escalation_count += 1
+            self._next_nag_at = now + budget
+            self._state.phase = "submit_unconfirmed"
+            actions.append(Publish(
+                kind="intervention_required", respondable=False,
+                decision_key=f"intervention:{self._escalation_count}",
+                payload={"escalation_count": self._escalation_count,
+                         "busy_reason": obs.busy_reason,
+                         "liveness": self._liveness(obs, now),
+                         "hint": "submit_unconfirmed"}))
+
     def _on_prompt(self, obs, now, actions):
         self._intervention_active = False         # a prompt is not a hang: clear any nag state
         # Auto-recovery: a published decision whose prompt region CHANGED AWAY (different prompt_fp)
@@ -233,6 +294,19 @@ class BeliefEngine:
         # footer timer, not a turn change, IMPORTANT-8). The new prompt is then a fresh candidate.
         if self._published_key is not None and obs.prompt_fp != self._published_prompt_fp:
             self._withdraw(actions, "prompt_changed", now)
+
+        # Re-mint backstop (spec §7.2): if a decision is STILL published here, its prompt_fp matched
+        # the published one (else the block above just withdrew it) -> the SAME respondable prompt is
+        # still on screen, unanswered. Do NOT re-publish on semantic_fp churn: the TUI repaints the
+        # scrolled conversation row-by-row, so the whole-frame meaning flickers while the bottom-
+        # anchored ❯ box is held stable. _published_key only persists while Claude sits CONTINUOUSLY
+        # at a prompt (a turn_resumed clears it in _on_busy, on_submit clears it on answer), during
+        # which a single foreground turn cannot change its pending question without an answer first.
+        # So once a respondable prompt is published it holds until its region changes / goes busy /
+        # terminal / is answered. (_refresh_state still reports awaiting_user while it is set.)
+        if self._published_key is not None:
+            self._state.phase = "pause_candidate"
+            return
 
         # Track the contiguous idle/prompt candidate by its prompt fingerprint.
         key = obs.prompt_fp or obs.semantic_fp
@@ -252,20 +326,35 @@ class BeliefEngine:
             self._publish_decision(obs, decision_key, actions)
             return
         # free_text post-submit suppression (spec §7.1, fixes F1):
-        #  - while our submission is STILL in the active input box, definitely suppress — it is not an
-        #    idle prompt, regardless of the grace (the box literally holds our text);
+        #  - while our submission is STILL in the active input box, suppress — it is not an idle
+        #    prompt, regardless of the grace (the box literally holds our text);
         #  - once the echo is gone, the bounded grace still suppresses the TTFT gap (no spinner yet).
+        # BUT the echo suppression is BOUNDED (fixes nelix-sud): if our answer's Enter never landed
+        # (executor mid-render / misread the keystroke) the echo would otherwise hold forever and
+        # suppress every wake into infinite silence. Past echo_stuck_after the box is not clearing on
+        # its own — surface a needs-attention advisory so the orchestrator recovers (re-respond /
+        # restart) instead of the executor sitting idle, silently, indefinitely.
         if obs.submitted_echo_present:
+            if self._echo_since is None:
+                self._echo_since = now
+            if (now - self._echo_since) < self._cfg.echo_stuck_after:
+                self._suppressed("submitted_echo_present")
+                return
+            self._escalate_stuck_input(obs, now, actions)
             return
+        self._echo_since = None                       # echo gone: the submit landed, clear the clock
         if self._post_submit_active and now < self._post_submit_grace_until:
+            self._suppressed("post_submit_grace")
             return
         # anti-flap: do not re-mint the SAME semantic_fp within the cooldown after withdrawing it.
         if (obs.semantic_fp == self._last_withdrawn_fp
                 and self._withdrawn_cooldown_until is not None
                 and now < self._withdrawn_cooldown_until):
+            self._suppressed("anti_flap")
             return
         settled = (now - self._candidate_since) >= self._cfg.idle_confirm_window
         if not settled:
+            self._suppressed("not_settled")
             return
         self._publish_decision(obs, decision_key, actions)
 
@@ -279,6 +368,7 @@ class BeliefEngine:
         self._published_semantic_fp = None
 
     def _publish_decision(self, obs, decision_key, actions):
+        self._suppress_reason = None              # we published: re-arm the suppression edge
         self._published_key = decision_key
         self._published_kind = obs.prompt_kind
         self._published_prompt_fp = obs.prompt_fp

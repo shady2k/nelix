@@ -139,6 +139,31 @@ def test_respond_write_timeout_is_503():
     assert "respond_write_timeout" in buf.getvalue()
 
 
+class _UnconfirmedManager:
+    def __init__(self): self._events = EventQueue()
+    def respond(self, session_id, answer, decision_id=None):
+        return RespondOutcome("respond_failed", decision_id="dec-1", answered_decision_id="dec-1",
+                              snapshot={"session_id": "s-u", "control_state": "busy", "pending": False})
+
+
+def test_respond_unconfirmed_submit_is_503_recover():
+    # nelix-sud: the answer was typed but never LEFT the box (submit unconfirmed). It must surface as
+    # 503 with next_action='recover' (not a false 200/end_turn) so the MCP layer does NOT arm a
+    # waiter and the orchestrator recovers instead of going silent.
+    import io
+    buf = io.StringIO()
+    srv, base = _serve(_UnconfirmedManager(), buf)
+    try:
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-u", "answer": "do the thing"})
+        assert st == 503 and b["status"] == "respond_failed" and b["next_action"] == "recover"
+        assert b["error"] == "submit_unconfirmed"
+        assert b["snapshot"]["pending"] is False
+        assert b["answered_decision_id"] == "dec-1"
+    finally:
+        srv.shutdown()
+    assert "respond_unconfirmed" in buf.getvalue()
+
+
 def test_start_envelope_shape():
     m = FakeManager()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8790, "t"))
@@ -580,6 +605,25 @@ def test_unauthorized_is_logged():
     finally:
         srv.shutdown()
     assert "unauthorized" in buf.getvalue()
+
+
+def test_status_read_is_logged(tmp_path):
+    # nelix-jwv gap 4: a status/screen/dialog read leaves a light `read` record (which tool, session,
+    # seq) at debug, so "nelix_screen called twice in a turn" is visible without replaying the capture.
+    import io
+    buf = io.StringIO()
+    srv, base = _serve(FakeManager(), buf)
+    try:
+        st, _ = _req("GET", base + "/status?session_id=s1")
+        assert st == 200
+    finally:
+        srv.shutdown()
+    reads = [json.loads(l) for l in buf.getvalue().splitlines()
+             if l.strip() and json.loads(l)["event"] == "read"]
+    assert reads, "a GET /status must emit a read record"
+    r = reads[-1]
+    assert r["level"] == "debug" and r["tool"] == "status" and r["session_id"] == "s1"
+    assert "seq" in r
 
 
 def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):

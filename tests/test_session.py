@@ -15,6 +15,7 @@ class Spec:
     driver = "claude"
     settle_seconds = 1.5
     respond_write_seconds = 5.0
+    respond_confirm_seconds = 0.3       # short submit-confirm window for fast tests
     delivery_confirm_seconds = 2.0
     max_idle_seconds = 600.0
     tail_lines = 100
@@ -477,6 +478,229 @@ def test_respond_write_is_bounded_and_reports_timeout(monkeypatch, tmp_path):
     assert sess._dialog.last_user_input_offset() == offset_before
 
 
+class StrandedAnswerHandle:
+    """nelix-sud stall: submit_text lands the answer in the input box (it echoes) but the Enter is
+    dropped (executor mid-render / misread keystroke), so the answer sits stranded in the box
+    forever — submitted_echo_present stays True and the turn never advances."""
+    def __init__(self, answer):
+        self._answer = answer
+        self.writes = []
+
+    def pump(self, timeout=0.1):
+        return True
+
+    def render(self):
+        return f"Ready — what next?\n❯ {self._answer}\n⏵⏵ ask mode (shift+tab to cycle)"
+
+    def is_alive(self):
+        return True
+
+    def exit_code(self):
+        return None
+
+    def write(self, data, timeout=None, drain_output=False):
+        self.writes.append(data)
+
+    def finalize(self):
+        pass
+
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self): pass
+
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
+
+    def close(self):
+        pass
+
+
+class SubmitLandsHandle:
+    """The submit DOES land: the first render shows the answer echoed in the box, then it CLEARS
+    (Enter processed -> the turn advances), so the confirm observes the answer leave the box."""
+    def __init__(self, answer):
+        self._answer = answer
+        self.writes = []
+        self._renders = 0
+
+    def pump(self, timeout=0.1):
+        return True
+
+    def render(self):
+        self._renders += 1
+        if self._renders <= 1:
+            return f"Ready — what next?\n❯ {self._answer}\n⏵⏵ ask mode (shift+tab to cycle)"
+        return "✶ Working… (esc to interrupt)"          # turn advanced; the box is gone
+
+    def is_alive(self):
+        return True
+
+    def exit_code(self):
+        return None
+
+    def write(self, data, timeout=None, drain_output=False):
+        self.writes.append(data)
+
+    def finalize(self):
+        pass
+
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self): pass
+
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
+
+    def close(self):
+        pass
+
+
+def test_respond_free_text_reports_respond_failed_when_submit_unconfirmed(tmp_path):
+    # nelix-sud: respond typed the answer + Enter, but the Enter never landed — the answer is
+    # stranded in the box. respond() must NOT claim a false 'resumed'; it confirms the answer LEFT
+    # the box within respond_confirm_seconds and, failing that, returns 'respond_failed' so the
+    # daemon-owned next_action tells Hermes to recover instead of going silent.
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()                               # a real respond runs while the monitor is live
+    assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
+    offset_before = sess._dialog.last_user_input_offset()
+    sess._handle = StrandedAnswerHandle("do the next thing")   # Enter dropped: answer stuck in box
+    out = sess.respond("do the next thing")
+    assert out.status == "respond_failed"
+    assert out.snapshot is not None                  # carries the snapshot for the recovery path
+    assert sess._decision is None                    # claimed, not left half-pending
+    # an unconfirmed submit did NOT advance the transcript (the answer never went through)
+    assert sess._dialog.last_user_input_offset() == offset_before
+
+
+class StalePreWriteThenStrandedHandle:
+    """The Codex-flagged race: the FIRST render after _press_enter() is the STALE pre-write empty box
+    (the monitor has not rendered our keystrokes yet), then the typed answer appears and STAYS (Enter
+    was dropped). A confirm that trusted the first 'no echo' would falsely resume; it must keep
+    polling, observe the echo appear, and report the unconfirmed submit."""
+    def __init__(self, answer):
+        self._answer = answer
+        self.writes = []
+        self._renders = 0
+
+    def pump(self, timeout=0.1):
+        return True
+
+    def render(self):
+        self._renders += 1
+        if self._renders <= 1:
+            return "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"   # stale, pre-echo
+        return f"Ready — what next?\n❯ {self._answer}\n⏵⏵ ask mode (shift+tab to cycle)"
+
+    def is_alive(self):
+        return True
+
+    def exit_code(self):
+        return None
+
+    def write(self, data, timeout=None, drain_output=False):
+        self.writes.append(data)
+
+    def finalize(self):
+        pass
+
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self): pass
+
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
+
+    def close(self):
+        pass
+
+
+class AmbiguousThenStrandedHandle:
+    """First post-write poll is an AMBIGUOUS frame (a `❯` with no prompt footer -> prompt_kind
+    'unknown', e.g. a transient redraw that briefly dropped the footer), then the stranded echoed
+    answer renders and STAYS. 'unknown' is NOT a positive turn-start, so it must not confirm."""
+    def __init__(self, answer):
+        self._answer = answer
+        self.writes = []
+        self._renders = 0
+
+    def pump(self, timeout=0.1):
+        return True
+
+    def render(self):
+        self._renders += 1
+        if self._renders <= 1:
+            return "❯ "                              # ambiguous: box marker, no footer -> 'unknown'
+        return f"Ready — what next?\n❯ {self._answer}\n⏵⏵ ask mode (shift+tab to cycle)"
+
+    def is_alive(self):
+        return True
+
+    def exit_code(self):
+        return None
+
+    def write(self, data, timeout=None, drain_output=False):
+        self.writes.append(data)
+
+    def finalize(self):
+        pass
+
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self): pass
+
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
+
+    def close(self):
+        pass
+
+
+def test_respond_does_not_confirm_on_ambiguous_unknown_frame(tmp_path):
+    # Regression: an ambiguous 'unknown' redraw frame is not a turn-start signal — confirm must keep
+    # polling, see the stranded echo, and fail. (A broad 'prompt_kind != free_text' check would have
+    # falsely confirmed here.)
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()
+    sess._handle = AmbiguousThenStrandedHandle("do the next thing")
+    out = sess.respond("do the next thing")
+    assert out.status == "respond_failed"
+
+
+def test_respond_does_not_falsely_confirm_on_stale_pre_write_frame(tmp_path):
+    # Regression for the confirm race: a stale empty frame on the first poll must not be read as
+    # 'answer left the box'. Once the dropped-Enter echo renders and stays, respond reports failure.
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()
+    sess._handle = StalePreWriteThenStrandedHandle("do the next thing")
+    out = sess.respond("do the next thing")
+    assert out.status == "respond_failed"            # not a false 'resumed' off the stale first frame
+
+
+def test_respond_free_text_resumes_when_answer_leaves_box(tmp_path):
+    # The happy path: the submit lands, the answer leaves the box -> confirmed -> 'resumed'.
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()                               # a real respond runs while the monitor is live
+    offset_before = sess._dialog.last_user_input_offset()
+    sess._handle = SubmitLandsHandle("do the next thing")
+    out = sess.respond("do the next thing")
+    assert out.status == "resumed"
+    assert ev.pending("s1") is None
+    assert sess._dialog.last_user_input_offset() > offset_before   # confirmed -> marker appended
+
+
 def test_answering_reemitted_blocked_clears_pending(tmp_path):
     # Answering a decision the backstop re-emitted must clear pending() for ALL its events, not just
     # the latest — otherwise pending() surfaces a stale earlier event for the resolved decision.
@@ -588,9 +812,11 @@ def _seed_pending_decision(sess, decision_id="dec-t"):
 
 
 def test_respond_resumes_to_busy_without_echoed_decision(tmp_path):
-    sess, _ = _session(tmp_path)
+    # "without echoed decision" = the answer is not sitting in the box (the turn moved): respond's
+    # submit-confirm sees no echo and resumes. A clean box frame is provided so the confirm can read.
+    sess, _ = _session(tmp_path, ["Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"])
     _seed_pending_decision(sess)
-    out = sess.respond("hi")
+    out = sess.respond("do that")
     assert out.status == "resumed"
     assert out.answered_decision_id == "dec-t"
     assert out.snapshot["control_state"] == "busy"

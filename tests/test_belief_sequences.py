@@ -271,3 +271,65 @@ def test_positive_turn_start_clears_suppression():
     e.tick(idle, CTX)
     clk.advance(1.0)
     assert _pubs(e.tick(idle, CTX)), "post-turn-start idle should publish"
+
+
+# ---- nelix-sud: bounded echo-suppression (a never-clearing input box must surface) ----
+
+def test_stuck_unsubmitted_echo_surfaces_intervention():
+    # The core nelix-sud stall: an answer typed into the box whose Enter never landed holds
+    # submitted_echo_present True forever. The engine must NOT suppress every wake into infinite
+    # silence — past echo_stuck_after the never-clearing box surfaces a needs-attention advisory so
+    # the orchestrator can recover (re-respond / restart) instead of the executor sitting idle.
+    cfg = BeliefConfig(echo_stuck_after=10.0, unknown_budget=10.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    e.on_submit("the stranded answer")            # respond typed + (we believe) submitted
+    ctx = ObservationCtx("the stranded answer", True, None)
+    stuck = Observation(prompt_kind="free_text", submitted_echo_present=True, semantic_fp="frozen",
+                        prompt_fp="box", affordances=frozenset({"accepts_text_input"}))
+    fired = []
+    for _ in range(40):                           # 40s of the SAME stranded echo in the box
+        clk.advance(1.0)
+        fired += _interventions(e.tick(stuck, ctx))
+    assert fired, "a never-clearing input box must surface a wake, not infinite silence"
+    first = fired[0]
+    assert first.respondable is False             # needs-attention advisory, not a re-respond trap
+    assert first.payload["hint"] == "submit_unconfirmed"
+    assert e.state.control_state == "intervention_required"
+    counts = [a.payload["escalation_count"] for a in fired]
+    assert counts == sorted(counts) and counts[-1] >= 2   # re-fires as a nag while still stuck
+
+
+def test_lingering_echo_still_suppressed_within_bound():
+    # The backstop must NOT over-fire: within echo_stuck_after the lingering echo is still the
+    # legitimate TTFT suppression — no wake, no escalation.
+    cfg = BeliefConfig(echo_stuck_after=10.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    e.on_submit("answer")
+    ctx = ObservationCtx("answer", True, None)
+    echo = Observation(prompt_kind="free_text", submitted_echo_present=True, semantic_fp="e",
+                       prompt_fp="box", affordances=frozenset({"accepts_text_input"}))
+    for _ in range(9):                            # 9s < 10s bound
+        clk.advance(1.0)
+        assert e.tick(echo, ctx) == [], "the lingering echo must stay suppressed within the bound"
+    assert e.state.control_state == "busy"
+
+
+def test_cleared_echo_resets_stuck_bound_no_false_intervention():
+    # A submit that DOES land (echo clears) before the bound must reset the stuck-input clock: a
+    # later, unrelated quiet must not inherit a phantom stuck-echo escalation.
+    cfg = BeliefConfig(echo_stuck_after=5.0, post_submit_grace=2.0)
+    clk = FakeClock(0.0)
+    e = BeliefEngine(cfg, clk)
+    e.on_submit("answer")
+    echo = Observation(prompt_kind="free_text", submitted_echo_present=True, semantic_fp="e",
+                       prompt_fp="box", affordances=frozenset({"accepts_text_input"}))
+    clk.advance(1.0)
+    e.tick(echo, ObservationCtx("answer", True, None))      # echo lingering, inside the bound
+    work = Observation(prompt_kind="none", semantic_fp="w", heartbeat=Heartbeat("h", True, True))
+    fired = []
+    for _ in range(10):                           # 10s > bound, but the echo is GONE (box cleared)
+        clk.advance(1.0)
+        fired += _interventions(e.tick(work, CTX))
+    assert not fired, "a cleared echo must reset the stuck-input bound (no phantom intervention)"

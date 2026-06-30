@@ -25,10 +25,11 @@ from daemon.errors import PtyWriteTimeout
 @dataclass
 class RespondOutcome:
     """Result of binding an answer to a session's current pending decision. `status` is one of
-    'resumed' | 'no_pending' | 'stale' | 'invalid_option' | 'write_timeout' | 'terminal';
-    `pending` carries current decision metadata on a pre-claim guard mismatch; `snapshot` is the
-    post-respond session snapshot on resumed/write_timeout; `answered_decision_id` names the
-    decision this answer was bound to."""
+    'resumed' | 'respond_failed' | 'no_pending' | 'stale' | 'invalid_option' | 'write_timeout' |
+    'terminal'; `pending` carries current decision metadata on a pre-claim guard mismatch;
+    `snapshot` is the post-respond session snapshot on resumed/write_timeout/respond_failed;
+    `respond_failed` means the answer was typed but never LEFT the box (submit unconfirmed) so the
+    caller must recover; `answered_decision_id` names the decision this answer was bound to."""
     status: str
     seq: int = None
     decision_id: str = None
@@ -128,9 +129,9 @@ class Session:
         # Build the engine config from the executor spec (liveness-scaled budgets, grace, etc.).
         # Falls back to BeliefConfig defaults for any field the spec does not override.
         cfg = BeliefConfig()
-        for f in ("idle_confirm_window", "post_submit_grace", "withdrawn_cooldown",
-                  "heartbeat_stale_after", "live_budget", "stale_budget", "unknown_budget",
-                  "reason_ttl"):
+        for f in ("idle_confirm_window", "post_submit_grace", "echo_stuck_after",
+                  "withdrawn_cooldown", "heartbeat_stale_after", "live_budget", "stale_budget",
+                  "unknown_budget", "reason_ttl"):
             v = getattr(self._spec, f, None)
             if v is not None:
                 setattr(cfg, f, v)
@@ -359,9 +360,11 @@ class Session:
                 with self._lock:
                     self._last_submitted = self._task
                     self._engine.on_submit(self._task)
+                    notes = self._engine.drain_notes()       # post_submit_armed for the first turn
                 if self._log is not None:
                     self._log.audit_task(self._id, self._executor, self._task)
                     self._log.info("session", "delivery_confirmed", session_id=self._id)
+                self._log_notes(notes)
                 return
         # Not confirmed within the window (a slow paste should have shown by now): give up.
         self._fail_delivery("delivery_unconfirmed")
@@ -390,11 +393,13 @@ class Session:
             obs = self._driver.observe(frame, ctx)
             with self._lock:
                 actions = self._engine.tick(obs, ctx)
+                notes = self._engine.drain_notes()
                 cstate = self._engine.state.control_state
                 if cstate != "terminal":
                     self._state = cstate
             self._apply_actions(actions, obs)
             self._log_trail(obs, actions)
+            self._log_notes(notes)
             if obs.prompt_kind in ("crash", "exit") or not self._handle.is_alive():
                 break
 
@@ -420,6 +425,19 @@ class Session:
                 liveness=est.liveness, semantic_fp=obs.semantic_fp, content_fp=obs.content_fp,
                 prompt_fp=obs.prompt_fp, heartbeat_fp=obs.heartbeat.fp,
                 quiet_elapsed=est.quiet_elapsed, rule=rule)
+
+    # The engine's suppression rationale (nelix-jwv): the post-submit WINDOW edges are info (one pair
+    # per turn — an `armed` with no matching `cleared` is the silent-stall signal, visible without
+    # debug), the per-reason suppression detail is debug (it fires on every TTFT, so info would be
+    # noise). The replay/decision narrative stays legible from these + the decision_* lifecycle.
+    _NOTE_LEVELS = {"post_submit_armed": "info", "post_submit_cleared": "info"}
+
+    def _log_notes(self, notes):
+        if self._log is None or not notes:
+            return
+        for n in notes:
+            self._log.emit(self._NOTE_LEVELS.get(n.event, "debug"),
+                           "belief", n.event, self._id, **n.fields)
 
     def _apply_actions(self, actions, obs):
         # Translate the engine's revocable decisions into events / PTY writes. The engine is pure;
@@ -669,6 +687,10 @@ class Session:
                 decision["decision_key"] = decision_key
                 decision["decision_id"] = decision_id
 
+        # _install records what it actually did here (off the lock) so the decision lifecycle (nelix-jwv:
+        # published / superseded) is logged AFTER the publish, never holding a lock across log I/O.
+        installed = {}
+
         def _install(evt):
             # Runs under the EventQueue lock, AFTER the event is reserved but BEFORE waiters are
             # notified: a woken status pull therefore always observes the installed decision (no
@@ -690,9 +712,11 @@ class Session:
                     prior_id = cur.get("decision_id") if cur is not None else None
                     if prior_id is not None and prior_id != decision_id:
                         self._events.resolve_decision(prior_id, "superseded")
+                        installed["superseded"] = prior_id
                     decision["event_id"] = evt.event_id
                     decision["seq"] = evt.seq
                     self._decision = decision
+                    installed["published"] = decision_id
                 else:
                     # a re-emit whose decision was answered/superseded between build and publish:
                     # obsolete -> resolve the event so pending() never resurrects it.
@@ -706,6 +730,16 @@ class Session:
                                    on_publish=_install if respondable else None)
         if self._log is not None:
             self._log.audit_decision(self._id, self._executor, kind, evt.event_id, text)
+            # The session/EventQueue decision lifecycle (nelix-jwv gap 3): a newly installed respondable
+            # decision and the prior it superseded — so a re-mint/supersede chain is legible at info
+            # (the belief side already logs the publish/withdraw transition; this is the queue side).
+            if "superseded" in installed:
+                self._log.info("session", "decision_superseded", session_id=self._id,
+                               decision_id=installed["superseded"], superseded_by=decision_id)
+            if "published" in installed:
+                self._log.info("session", "decision_published", session_id=self._id,
+                               decision_id=decision_id, kind=kind,
+                               prompt_kind=prompt_kind, hung=hung)
 
     # ---- reads / control ----
     def is_working(self):
@@ -762,6 +796,39 @@ class Session:
                     "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
                     "restart_count": self.restart_count, "terminal": True}
 
+    # respond's submit-confirm poll interval (read-only render reads; the monitor owns pump()).
+    _CONFIRM_POLL = 0.1
+
+    def _confirm_submit(self, deadline):
+        # Confirm a free-text submit LANDED, read-only (the monitor thread owns pump(), so draining
+        # here would race it — we only render() under the lock, exactly as snapshot() does). The
+        # submit is confirmed once our answer has LEFT the input box; it is UNCONFIRMED iff the answer
+        # is still echoed in the box when the window expires (the Enter never advanced the turn).
+        #
+        # A bare "no echo" is NOT enough on its own: the first render right after _press_enter() can
+        # still be the stale pre-write frame (the monitor may not have rendered our keystrokes yet),
+        # so accepting it would falsely confirm the very dropped-Enter race we are catching. Require
+        # POSITIVE post-write evidence to confirm EARLY — the echo seen then gone, or the turn moved
+        # to a HIGH-CONFIDENCE state; otherwise keep polling and accept "no echo" only at the deadline.
+        # The "moved" allowlist is deliberate: a live working spinner (none + heartbeat), a fresh
+        # modal/permission question, or a terminal child — NEVER an ambiguous `unknown`/blank repaint
+        # frame (a transient redraw dropping the footer would otherwise false-confirm a stranded echo).
+        # The belief engine's bounded echo-suppression is the async backstop for anything past this.
+        saw_echo = False
+        while True:
+            with self._lock:
+                frame = self._handle.render() if self._handle is not None else ""
+            obs = self._driver.observe(frame, self._obs_ctx())
+            moved = ((obs.prompt_kind == "none" and obs.heartbeat.present)
+                     or obs.prompt_kind in ("modal_choice", "permission_choice", "crash", "exit"))
+            if obs.submitted_echo_present:
+                saw_echo = True
+            elif saw_echo or moved:
+                return True                          # echo cleared / turn moved -> submit confirmed
+            if self._stop.is_set() or time.monotonic() >= deadline:
+                return not obs.submitted_echo_present  # at the deadline: unconfirmed iff still echoed
+            time.sleep(min(self._CONFIRM_POLL, max(0.0, deadline - time.monotonic())))
+
     def respond(self, answer, decision_id=None):
         # Bind to the session's CURRENT pending decision (server owns identity). decision_id is an
         # OPTIONAL staleness guard sourced from the status pull, never required from the wake.
@@ -791,11 +858,22 @@ class Session:
                 return RespondOutcome("no_pending")    # already claimed, or superseded by a new pause
             self._decision = None
         is_blocked = decision["kind"] == "blocked"
+        did = decision.get("decision_id")
+        # Respond lifecycle (nelix-jwv): mirror START's delivery_attempt -> delivery_confirmed |
+        # delivery_failed. attempt/submitted are debug (granular steps); confirmed is info and failed
+        # is warning, so a successful resume and a respond-fail are both legible from the log alone.
+        if self._log is not None:
+            self._log.debug("session", "respond_attempt", session_id=self._id, decision_id=did,
+                            prompt_kind=decision.get("prompt_kind"), is_modal=is_modal,
+                            is_blocked=is_blocked, answer_chars=len(clean))
         # one logical decision may span several notification events (re-emits) -> resolve the whole
         # decision by id (targeted, not a blanket session-answer), so pending() stays honest and the
         # next waiter arms past the whole resolved decision. Coexisting decisions are untouched.
-        seq = (self._events.resolve_decision(decision.get("decision_id"), "answered")
-               or decision.get("seq"))
+        seq = (self._events.resolve_decision(did, "answered") or decision.get("seq"))
+        if self._log is not None:
+            # The EventQueue-side answer record (the belief side is silent here): with decision_published
+            # / decision_superseded / decision_withdrawn this makes a re-mint/supersede chain legible.
+            self._log.info("session", "decision_answered", session_id=self._id, decision_id=did, seq=seq)
         if self._handle is not None:
             # Bound the PTY write (this runs on the RPC thread): a wedged executor that stopped
             # draining its stdin must NOT hang respond forever. ONE deadline covers the whole write;
@@ -813,10 +891,29 @@ class Session:
                     self._press_enter(timeout=max(0.0, deadline - time.monotonic()))
             except PtyWriteTimeout:
                 if self._log is not None:
-                    self._log.warning("session", "respond_write_timeout", session_id=self._id)
-                return RespondOutcome("write_timeout", decision_id=decision.get("decision_id"),
-                                      answered_decision_id=decision.get("decision_id"),
-                                      snapshot=self.snapshot())
+                    self._log.warning("session", "respond_failed", session_id=self._id,
+                                      decision_id=did, reason="write_unconfirmed")
+                return RespondOutcome("write_timeout", decision_id=did,
+                                      answered_decision_id=did, snapshot=self.snapshot())
+            if self._log is not None:
+                self._log.debug("session", "respond_submitted", session_id=self._id, decision_id=did)
+            # observe() keys echo detection off _last_submitted — set it BEFORE confirming so both the
+            # confirm poll and the monitor thread match the answer we just typed.
+            with self._lock:
+                self._last_submitted = clean
+            # Confirm the submit LANDED (free-text only): mirror START's echo->confirm. A free-text
+            # answer that the executor failed to submit (Enter dropped while mid-render) stays stranded
+            # in the box; without this check respond() would falsely report 'resumed' and the lingering
+            # echo would then suppress every wake (nelix-sud). A modal/blocked selection is a single
+            # high-confidence keypress with no lingering text echo, so it keeps the prompt behaviour.
+            if decision.get("prompt_kind") == "free_text":
+                confirm_deadline = time.monotonic() + self._spec.respond_confirm_seconds
+                if not self._confirm_submit(confirm_deadline):
+                    if self._log is not None:
+                        self._log.warning("session", "respond_failed", session_id=self._id,
+                                          decision_id=did, reason="submit_unconfirmed")
+                    return RespondOutcome("respond_failed", decision_id=did,
+                                          answered_decision_id=did, snapshot=self.snapshot())
             if not is_blocked:
                 # Only a delivered-agent respond appends a user marker; a write_timeout must not
                 # advance the transcript. A modal records the chosen option's LABEL (not the bare id).
@@ -827,10 +924,16 @@ class Session:
                     self._dialog.append_user_input(marker)
             # A respond is a submit: tell the engine so it forgets the now-answered decision and arms
             # post-submit suppression (the answer echoed in the box must not re-mint a fresh idle, F1).
+            # _last_submitted was set above (before the confirm); on_submit re-clocks the stuck-input
+            # bound so a confirmed answer's brief lingering echo is the legitimate TTFT, not a stall.
             with self._lock:
-                self._last_submitted = clean
                 self._engine.on_submit(clean)
+                notes = self._engine.drain_notes()           # post_submit_armed for the answered turn
                 self._state = "busy"   # Invariant A: resumed -> working again (no stale awaiting_user)
+            if self._log is not None:
+                self._log.info("session", "respond_confirmed", session_id=self._id,
+                               decision_id=did, seq=seq)
+            self._log_notes(notes)
         return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"),
                               answered_decision_id=decision.get("decision_id"),
                               snapshot=self.snapshot())
