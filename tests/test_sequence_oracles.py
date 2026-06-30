@@ -57,15 +57,38 @@ def test_bg_subagent_never_publishes_waiting_for_user():
     orchestrator the user is needed.  Regression: cd3352d (bg frames classified free_text →
     engine published waiting_for_user while the turn was blocked on a golang-pro subagent).
 
-    RED command:
+    RED command (pre-fix historical checkout — cd3352d~1 is the actual broken code):
         git show cd3352d~1:daemon/drivers/claude.py > daemon/drivers/claude.py
         .venv/bin/python -m pytest tests/test_sequence_oracles.py::test_bg_subagent_never_publishes_waiting_for_user -v
     RED result: 61 waiting_for_user publishes → assert 61 == 0 → FAIL.
     Restore: git checkout daemon/drivers/claude.py.
 
     GREEN: 0 waiting_for_user publishes across the full 570 kB replay.
+
+    Non-vacuity guard: assert >100 frames have busy_reason='waiting_subagents' before
+    the zero-publishes assertion — if the fixture is wrong or the driver has regressed
+    to never seeing a bg window, the guard fails rather than the test passing 0==0.
+    Observed in real replay: ~1002 waiting_subagents frames out of 2076 total.
     """
-    assert _count_waiting_publishes(_BG, _CTX_PLAIN) == 0
+    cfg = BeliefConfig()
+    drv, clk = ClaudeDriver(), FakeClock(0.0)
+    eng = BeliefEngine(cfg, clk)
+    n_waiting_publishes = 0
+    bg_frames = 0
+    for _, frame in replay_frames(_BG):
+        obs = drv.observe(frame, _CTX_PLAIN)
+        clk.advance(1.0)
+        if obs.busy_reason == "waiting_subagents":
+            bg_frames += 1
+        for a in eng.tick(obs, _CTX_PLAIN):
+            if isinstance(a, Publish) and a.kind == "waiting_for_user":
+                n_waiting_publishes += 1
+    assert bg_frames > 100, (
+        f"bg-subagent replay must contain >100 frames with busy_reason='waiting_subagents'; "
+        f"saw {bg_frames} — fixture may be wrong or driver classification has regressed")
+    assert n_waiting_publishes == 0, (
+        f"{n_waiting_publishes} waiting_for_user publish(es) fired during bg-subagent session "
+        f"(bg_frames={bg_frames})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,13 +138,29 @@ def test_post_submit_echo_suppresses_waiting_for_user():
     eng = BeliefEngine(cfg, clk)
     # No on_submit(): see docstring — cold-start replay clears post_submit_active early.
     wakes_during_echo = 0
+    echo_frames = 0          # frames where submitted_echo_present=True
+    echo_free_text_frames = 0  # echo-visible frames that are also prompt_kind=free_text
     for _, frame in replay_frames(_DELIVERY):
         obs = drv.observe(frame, ctx)
         clk.advance(1.0)
+        if obs.submitted_echo_present:
+            echo_frames += 1
+            if obs.prompt_kind == "free_text":
+                echo_free_text_frames += 1
         for a in eng.tick(obs, ctx):
             if isinstance(a, Publish) and a.kind == "waiting_for_user":
                 if obs.submitted_echo_present:
                     wakes_during_echo += 1
+    # Non-vacuity guards: assert the echo window was actually observed before claiming
+    # zero wakes.  Without these, if echo detection regresses to always-False the test
+    # passes 0==0 while guarding nothing.
+    # Observed in real replay: echo_frames=2, echo_free_text_frames=1.
+    assert echo_frames > 0, (
+        f"delivery capture must have ≥1 frame with submitted_echo_present=True "
+        "(echo detection may have regressed to always-False; saw echo_frames=0)")
+    assert echo_free_text_frames > 0, (
+        f"delivery capture must have ≥1 echo-visible free_text frame "
+        "(the prompt phase where suppression must fire; saw echo_free_text_frames=0)")
     assert wakes_during_echo == 0, (
         f"{wakes_during_echo} waiting_for_user publish(es) fired while submitted echo was "
         "visible in the active input box (submitted_echo_present=True)")
