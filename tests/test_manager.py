@@ -9,8 +9,8 @@ from daemon.manager import SessionManager
 class FakeSession:
     def __init__(self, sid, executor, *a, **k):
         self.sid = sid; self.executor = executor; self.started = None
-        self.started_cwd = None; self.stopped = False
-    def start(self, task, cwd): self.started = task; self.started_cwd = cwd
+        self.started_cwd = None; self.stopped = False; self.task = None; self.cwd = None
+    def start(self, task, cwd): self.started = task; self.started_cwd = cwd; self.task = task; self.cwd = cwd
     def respond(self, answer, decision_id=None):
         from daemon.session import RespondOutcome
         return RespondOutcome("resumed", seq=1, decision_id="dec-1")
@@ -335,3 +335,12 @@ def test_stop_confirmed_terminal_outcome():
     assert out.status == "stopped"
     assert out.snapshot["terminal_kind"] == "stopped"
     assert out.snapshot["control_state"] == "terminal"
+
+
+def test_restart_outcome_carries_new_snapshot(tmp_path):
+    m, _ = _mgr(limit=2)
+    out0 = m.start(EXECUTOR, "do it", "/tmp")
+    out = m.restart(out0.session_id, force=True)
+    assert out.status == "restarted"
+    assert out.snapshot["session_id"] == out.session_id
+    assert out.snapshot["control_state"] == "busy"

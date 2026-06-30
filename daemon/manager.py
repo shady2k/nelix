@@ -32,6 +32,7 @@ class RestartOutcome:
     restart_count: int = None
     max_restarts: int = None
     next_after_seq: int = None
+    snapshot: dict = None
 
 
 def _session_activity(d):
@@ -249,7 +250,7 @@ class SessionManager:
                               restart_count=count)
         return RestartOutcome("restarted", session_id=new_sid, lineage_id=lineage_id,
                               restart_count=count, max_restarts=max_restarts,
-                              next_after_seq=base_seq)
+                              next_after_seq=base_seq, snapshot=started.snapshot)
 
     def _free_slot(self, session_id):
         with self._lock:
