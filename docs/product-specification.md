@@ -241,11 +241,11 @@ hatch, never the production runtime.
 
 | Tool | Type | Description |
 |------|------|-------------|
-| `nelix_start(task, workdir, tool)` | Sync, returns immediately | RPC → daemon: spawn PTY child for `tool`, attach its driver, **arm the wake-up waiter** (§4), return `{"status":"started","session_id":"…"}`. MVP rejects a start while another session is active (§3.7) |
+| `nelix_start(task, workdir, tool)` | Sync, returns immediately | RPC → daemon: spawn PTY child for `tool`, attach its driver, **arm the wake-up waiter** (§4), return `{operation, status, session_id, snapshot, next_after_seq, next_action}`. MVP rejects a start while another session is active (§3.7) |
 | `nelix_respond(session_id, event_id, answer)` | Sync | RPC → daemon: validate the answer (§5), inject it via the PTY, mark the event `answered`, resume classification, re-arm the waiter. Rejects a stale/closed `event_id` |
 | `nelix_status(session_id)` | Sync | RPC → daemon: return current driver state + the **canonical pending event** (if any) + last summary + duration. The reconciliation/fetch path (§4) |
 | `nelix_stop(session_id)` | Sync | RPC → daemon: cancel the session — graceful interrupt → timeout → force kill — and return a post-stop status (§3.7) |
-| `nelix_restart(session_id, mode, task?)` | Sync | RPC → daemon: terminate the current CLI child and re-spawn in the **same** session/workdir. `mode="fresh"` or `mode="resume"`; optional `task`. Re-arms the waiter. Returns `{"status":"restarted","mode":"…"}` or `{"status":"resume_unsupported"}` (§3.7) |
+| `nelix_restart(session_id, mode, task?)` | Sync | RPC → daemon: terminate the current CLI child and re-spawn in the **same** session/workdir. `mode="fresh"` or `mode="resume"`; optional `task`. Re-arms the waiter. Returns `{operation, status, session_id, snapshot, next_after_seq, next_action}` (§3.7) |
 
 All are thin RPC clients with **fast, non-blocking** handlers returning a JSON string — none blocks
 waiting for the CLI. The long wait (until the next event) is handled out-of-band by the background

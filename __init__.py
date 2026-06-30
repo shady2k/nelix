@@ -188,7 +188,11 @@ def register(ctx):
             " only for a decision or when done. Returns at once — you're brought back when it needs"
             " you or finishes, and spend nothing meanwhile. 'executor' is the agent's configured"
             " name; 'cwd' is the project dir it runs in (omit = your current dir). Before driving"
-            " it, you MUST call skill_view(\"nelix:nelix-orchestration\")."),
+            " it, you MUST call skill_view(\"nelix:nelix-orchestration\")."
+            " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
+            " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
+            " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."
+            " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ,
                         "properties": {"executor": {"type": "string"}, "task": {"type": "string"},
                                        "cwd": {"type": "string"}},
@@ -209,7 +213,11 @@ def register(ctx):
             "Send the user's answer to a paused agent (e.g. '1' to approve, or free text) so it"
             " continues. It is delivered to the agent's CURRENT pending decision — you do NOT need"
             " an event id. (Optional: pass decision_id from a nelix_status read as a staleness"
-            " guard.) After it succeeds, end your turn — nelix wakes you on the next event."),
+            " guard.) After it succeeds, end your turn — nelix wakes you on the next event."
+            " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
+            " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
+            " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."
+            " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ,
                         "properties": {"session_id": {"type": "string"}, "answer": {"type": "string"},
                                        "decision_id": {"type": "string"}},
@@ -217,7 +225,11 @@ def register(ctx):
         nelix_respond)
     ctx.register_tool(
         "nelix_stop", "nelix",
-        {"description": "Stop a running agent by session_id.",
+        {"description": ("Stop a running agent by session_id."
+                         " The returned result is the COMPLETE outcome of this call — obey its"
+                         " `next_action` (`end_turn` → stop and wait to be woken; `report` → relay"
+                         " to the user; `ask_user`/`fix_call`/`recover`/`refresh_status` → act"
+                         " accordingly). Do NOT call nelix_status after this."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
                         "required": ["session_id"]}},
         nelix_stop)
@@ -228,7 +240,11 @@ def register(ctx):
             " project, and agent (you do NOT re-state the task). The daemon counts restarts per agent"
             " and refuses past its max_restarts with 'restart_budget_exhausted'; relay that to the user"
             " and only pass force:true if they explicitly authorize continuing. After it succeeds, end"
-            " your turn — nelix wakes you on the next event."),
+            " your turn — nelix wakes you on the next event."
+            " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
+            " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
+            " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."
+            " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
                                                "force": {"type": "boolean"}},
                         "required": ["session_id"]}},
