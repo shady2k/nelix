@@ -48,7 +48,43 @@ A green harness is worthless if the goldens don't cover the drifted state. So:
      screen genuinely changed, the expected class. Never move a frame to a different class merely to
      silence the test.
 
-## Scope (v1)
+## Sidecar schema (v2 — Task 3)
+
+A `.yaml` file next to any `.txt` frame activates rich assertion via `tests/golden/_harness.py`.
+All keys under `expect:` are optional; omit a key to skip that assertion.
+
+```yaml
+meta:
+  source_session: s-b8a30317   # session id the raw came from
+  raw_offset: final            # "final" | byte-offset string
+  cols: 120
+  rows: 40
+  claude_version: "2.1.195"
+
+ctx:                           # forwarded to ObservationCtx
+  last_submitted_text: null    # str | null
+  child_alive: true            # bool (default true)
+  exit_code: null              # int | null
+
+expect:
+  prompt_kind: free_text             # obs.prompt_kind must equal this
+  submitted_echo_present: true       # bool
+  ask_mode: true                     # bool
+  busy_reason: null                  # str | null
+  heartbeat_present: false           # obs.heartbeat.present must equal this
+  options_ids: []                    # [o.id for o in obs.options] must equal this list
+  affordances_include:               # each must be present in obs.affordances
+    - accepts_text_input
+  affordances_exclude:               # each must be absent from obs.affordances
+    - modal_choice
+  semantic_fp_nonempty: true         # if true, obs.semantic_fp must be non-empty
+```
+
+Frames **without** a sidecar still use the legacy path: the directory name (`working`,
+`idle_prompt`, `permission_prompt`) is remapped to the allowed `prompt_kind` set.  Add a sidecar
+to unlock rich assertion for any frame.
+
+## Scope (v1 — legacy)
 
 `observe(frame, ctx).prompt_kind` is asserted, with the old dir names remapped (`working -> none`,
 `idle_prompt -> free_text`, `permission_prompt -> {permission_choice | modal_choice}`) at an
