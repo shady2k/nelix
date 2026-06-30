@@ -218,7 +218,9 @@ def test_decision_answered_logged(monkeypatch, tmp_path):
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._log = log
     sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
     did = sess._decision["decision_id"]
+    sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
     out = sess.respond("1")
     assert out.status == "resumed"
     by = _by_event(buf)

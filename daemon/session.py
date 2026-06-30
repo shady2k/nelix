@@ -802,14 +802,16 @@ class Session:
     def _confirm_submit(self, deadline):
         # Confirm a free-text submit LANDED, read-only (the monitor thread owns pump(), so draining
         # here would race it — we only render() under the lock, exactly as snapshot() does). The
-        # submit is confirmed once our answer has LEFT the input box; it is UNCONFIRMED iff the answer
-        # is still echoed in the box when the window expires (the Enter never advanced the turn).
+        # submit is confirmed ONLY on POSITIVE post-write evidence: the answer echoed then LEFT the
+        # input box, or the turn MOVED to a high-confidence state. Absence of evidence is never a
+        # confirm — a bare "no echo" is UNCONFIRMED whether it's a still-empty box or a stranded echo.
         #
-        # A bare "no echo" is NOT enough on its own: the first render right after _press_enter() can
-        # still be the stale pre-write frame (the monitor may not have rendered our keystrokes yet),
-        # so accepting it would falsely confirm the very dropped-Enter race we are catching. Require
-        # POSITIVE post-write evidence to confirm EARLY — the echo seen then gone, or the turn moved
-        # to a HIGH-CONFIDENCE state; otherwise keep polling and accept "no echo" only at the deadline.
+        # Why "no echo" alone can't confirm: the first render right after _press_enter() can still be
+        # the stale pre-write frame (the monitor may not have rendered our keystrokes yet), and an
+        # empty box that NEVER echoed is indistinguishable from a write that went nowhere (the agent
+        # wasn't at the prompt) — accepting either would falsely confirm the very dropped-submit race
+        # we are catching. So we ONLY return True on the positive early-return below; reaching the
+        # deadline/stop means no such evidence was ever seen -> return False (unconfirmed).
         # The "moved" allowlist is deliberate: a live working spinner (none + heartbeat), a fresh
         # modal/permission question, or a terminal child — NEVER an ambiguous `unknown`/blank repaint
         # frame (a transient redraw dropping the footer would otherwise false-confirm a stranded echo).
@@ -826,7 +828,12 @@ class Session:
             elif saw_echo or moved:
                 return True                          # echo cleared / turn moved -> submit confirmed
             if self._stop.is_set() or time.monotonic() >= deadline:
-                return not obs.submitted_echo_present  # at the deadline: unconfirmed iff still echoed
+                # Reaching the deadline/stop means NO positive post-write evidence was ever seen
+                # (every echo-then-gone / moved case returned True above) -> the submit is UNCONFIRMED.
+                # Confirming on bare "no echo" here would false-confirm a never-delivered answer (the
+                # write went nowhere / blank frame the whole window) — the exact dropped-submit class
+                # this check exists to catch. A still-echoed box is unconfirmed too; both -> False.
+                return False
             time.sleep(min(self._CONFIRM_POLL, max(0.0, deadline - time.monotonic())))
 
     def respond(self, answer, decision_id=None):

@@ -349,10 +349,12 @@ def test_respond_answers_and_appends_user_input(monkeypatch, tmp_path):
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
     pend = ev.pending("s1")
     did = sess._decision["decision_id"]
     assert did.startswith("dec-")
     offset_before = sess._dialog.last_user_input_offset()
+    sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
     out = sess.respond("1")                                # no event_id: binds to current pending
     assert out.status == "resumed" and out.seq == pend.seq and out.decision_id == did
     assert ev.pending("s1") is None                       # answered
@@ -405,7 +407,9 @@ def test_respond_to_free_text_uses_submit_text_not_select(monkeypatch, tmp_path)
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
     assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
+    sess._handle = SubmitLandsHandle("do the next thing")   # submit lands: echoes then leaves the box
     out = sess.respond("do the next thing")
     assert out.status == "resumed"
     # free-text: the text is typed then Enter pressed separately (two writes), not a select_option.
@@ -444,6 +448,8 @@ def test_respond_claims_decision_atomically_no_double_type(monkeypatch, tmp_path
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
+    sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
     assert sess.respond("1").status == "resumed"
     writes_after_first = list(sess._handle.writes)
     assert sess.respond("2").status == "no_pending"       # already claimed
@@ -687,6 +693,69 @@ def test_respond_does_not_falsely_confirm_on_stale_pre_write_frame(tmp_path):
     assert out.status == "respond_failed"            # not a false 'resumed' off the stale first frame
 
 
+class NeverEchoesEmptyBoxHandle:
+    """The dropped-submit class the whole confirm exists to catch: the answer NEVER appears in the
+    box for the entire confirm window (the write went nowhere — agent not at the prompt, or a
+    blank/stale frame the whole time) AND the turn never moves. submitted_echo_present stays False
+    forever and no positive post-write evidence is ever observed: an empty box is NOT a confirmed
+    submit. A confirm that read bare 'no echo' at the deadline as success would falsely resume."""
+    def __init__(self):
+        self.writes = []
+
+    def pump(self, timeout=0.1):
+        return True
+
+    def render(self):
+        return "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"   # empty box, every poll
+
+    def is_alive(self):
+        return True
+
+    def exit_code(self):
+        return None
+
+    def write(self, data, timeout=None, drain_output=False):
+        self.writes.append(data)
+
+    def finalize(self):
+        pass
+
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self): pass
+
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
+
+    def close(self):
+        pass
+
+
+def test_respond_free_text_reports_respond_failed_when_answer_never_echoes(tmp_path):
+    # Codex integration must-fix: the answer never lands in the box (empty frame the WHOLE confirm
+    # window) and the turn never moves -> no positive post-write evidence is ever seen. The deadline
+    # branch must NOT read bare 'no echo' as success; without positive evidence the submit is
+    # UNCONFIRMED -> 'respond_failed' (RPC 503/recover), never a false 'resumed'. A false confirm
+    # here would arm post-submit suppression on a never-delivered answer and silence every wake.
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()                               # a real respond runs while the monitor is live
+    assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
+    armed_before = sess._engine._post_submit_active
+    offset_before = sess._dialog.last_user_input_offset()
+    sess._handle = NeverEchoesEmptyBoxHandle()       # answer never echoes; turn never moves
+    out = sess.respond("do the next thing")
+    assert out.status == "respond_failed"            # NOT a false 'resumed' off the empty box
+    assert out.snapshot is not None                  # carries the snapshot for the recovery path
+    assert sess._decision is None                    # claimed, not left half-pending
+    # an unconfirmed submit must NOT advance the transcript and must NOT arm post-submit suppression
+    # (no on_submit) — otherwise the never-delivered answer would suppress the next idle wake.
+    assert sess._dialog.last_user_input_offset() == offset_before
+    assert sess._engine._post_submit_active == armed_before
+
+
 def test_respond_free_text_resumes_when_answer_leaves_box(tmp_path):
     # The happy path: the submit lands, the answer leaves the box -> confirmed -> 'resumed'.
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
@@ -720,6 +789,8 @@ def test_respond_with_stale_decision_id_is_rejected_and_returns_current(monkeypa
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
+    sess._handle = SubmitLandsHandle("1")             # submit lands once the correct-id respond types
     cur = sess._decision["decision_id"]
     out = sess.respond("1", decision_id="dec-stale99")
     assert out.status == "stale"
@@ -812,13 +883,17 @@ def _seed_pending_decision(sess, decision_id="dec-t"):
 
 
 def test_respond_resumes_to_busy_without_echoed_decision(tmp_path):
-    # "without echoed decision" = the answer is not sitting in the box (the turn moved): respond's
-    # submit-confirm sees no echo and resumes. A clean box frame is provided so the confirm can read.
+    # "without echoed decision" = the answer LEAVES the box (the turn moves to working), so the
+    # submit-confirm observes POSITIVE post-write evidence (echo-then-gone / moved) and resumes to
+    # busy. The corrected contract: a bare empty box that NEVER echoed is NOT a confirmed submit
+    # (that path returns respond_failed) — only positive evidence resumes.
     sess, _ = _session(tmp_path, ["Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"])
     _seed_pending_decision(sess)
+    sess._handle = SubmitLandsHandle("do that")       # submit lands: answer echoes then leaves the box
     out = sess.respond("do that")
     assert out.status == "resumed"
     assert out.answered_decision_id == "dec-t"
+    assert sess._state == "busy"                       # Invariant A: resumed -> working again
     assert out.snapshot["control_state"] == "busy"
     assert out.snapshot["pending"] is False
     assert "decision" not in out.snapshot
@@ -1123,6 +1198,8 @@ def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeyp
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
+    sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
     key = sess._decision["decision_key"]
     real_publish = ev.publish
     deferred = {}
