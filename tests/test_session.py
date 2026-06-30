@@ -577,6 +577,61 @@ def test_respond_free_text_reports_respond_failed_when_submit_unconfirmed(tmp_pa
     assert sess._dialog.last_user_input_offset() == offset_before
 
 
+class StalePreWriteThenStrandedHandle:
+    """The Codex-flagged race: the FIRST render after _press_enter() is the STALE pre-write empty box
+    (the monitor has not rendered our keystrokes yet), then the typed answer appears and STAYS (Enter
+    was dropped). A confirm that trusted the first 'no echo' would falsely resume; it must keep
+    polling, observe the echo appear, and report the unconfirmed submit."""
+    def __init__(self, answer):
+        self._answer = answer
+        self.writes = []
+        self._renders = 0
+
+    def pump(self, timeout=0.1):
+        return True
+
+    def render(self):
+        self._renders += 1
+        if self._renders <= 1:
+            return "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"   # stale, pre-echo
+        return f"Ready — what next?\n❯ {self._answer}\n⏵⏵ ask mode (shift+tab to cycle)"
+
+    def is_alive(self):
+        return True
+
+    def exit_code(self):
+        return None
+
+    def write(self, data, timeout=None, drain_output=False):
+        self.writes.append(data)
+
+    def finalize(self):
+        pass
+
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self): pass
+
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
+
+    def close(self):
+        pass
+
+
+def test_respond_does_not_falsely_confirm_on_stale_pre_write_frame(tmp_path):
+    # Regression for the confirm race: a stale empty frame on the first poll must not be read as
+    # 'answer left the box'. Once the dropped-Enter echo renders and stays, respond reports failure.
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()
+    sess._handle = StalePreWriteThenStrandedHandle("do the next thing")
+    out = sess.respond("do the next thing")
+    assert out.status == "respond_failed"            # not a false 'resumed' off the stale first frame
+
+
 def test_respond_free_text_resumes_when_answer_leaves_box(tmp_path):
     # The happy path: the submit lands, the answer leaves the box -> confirmed -> 'resumed'.
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"

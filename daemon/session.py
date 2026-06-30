@@ -769,17 +769,26 @@ class Session:
     def _confirm_submit(self, deadline):
         # Confirm a free-text submit LANDED, read-only (the monitor thread owns pump(), so draining
         # here would race it — we only render() under the lock, exactly as snapshot() does). The
-        # submit is confirmed once our answer has LEFT the input box (submitted_echo_present clears);
-        # it is UNCONFIRMED iff the answer is still echoed in the box when the window expires — the
-        # Enter never advanced the turn (executor mid-render / misread keystroke). The belief engine's
-        # bounded echo-suppression is the async backstop for any case that slips past this window.
+        # submit is confirmed once our answer has LEFT the input box; it is UNCONFIRMED iff the answer
+        # is still echoed in the box when the window expires (the Enter never advanced the turn).
+        #
+        # A bare "no echo" is NOT enough on its own: the first render right after _press_enter() can
+        # still be the stale pre-write frame (the monitor may not have rendered our keystrokes yet),
+        # so accepting it would falsely confirm the very dropped-Enter race we are catching. Require
+        # POSITIVE post-write evidence to confirm EARLY — the echo seen then gone, or the turn moved
+        # off the free_text prompt; otherwise keep polling and only accept "no echo" at the deadline.
+        # The belief engine's bounded echo-suppression is the async backstop for anything past this.
+        saw_echo = False
         while True:
             with self._lock:
                 frame = self._handle.render() if self._handle is not None else ""
-            if not self._driver.observe(frame, self._obs_ctx()).submitted_echo_present:
-                return True                          # answer left the box -> submit confirmed
+            obs = self._driver.observe(frame, self._obs_ctx())
+            if obs.submitted_echo_present:
+                saw_echo = True
+            elif saw_echo or obs.prompt_kind != "free_text":
+                return True                          # echo cleared / turn moved -> submit confirmed
             if self._stop.is_set() or time.monotonic() >= deadline:
-                return False                         # still echoed at the deadline -> unconfirmed
+                return not obs.submitted_echo_present  # at the deadline: unconfirmed iff still echoed
             time.sleep(min(self._CONFIRM_POLL, max(0.0, deadline - time.monotonic())))
 
     def respond(self, answer, decision_id=None):
