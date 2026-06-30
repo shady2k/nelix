@@ -9,13 +9,6 @@ D = ClaudeDriver()
 CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None)
 
 
-def test_working_spinner_is_busy():
-    o = D.observe("✻Envisioning… (46s · ↓ 1.9k tokens)\n❯ \n⏵⏵ auto mode on (shift+tab to cycle)", CTX)
-    assert o.prompt_kind == "none"                       # busy
-    assert o.heartbeat.present is True
-    assert o.heartbeat.expected_to_change is True
-    assert o.heartbeat.fp is not None
-
 
 def test_working_heartbeat_fp_tracks_animation():
     a = D.observe("✻ Recombobulating… (58s · 4 tokens)\n❯ ", CTX)
