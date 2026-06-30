@@ -234,6 +234,19 @@ class BeliefEngine:
         if self._published_key is not None and obs.prompt_fp != self._published_prompt_fp:
             self._withdraw(actions, "prompt_changed", now)
 
+        # Re-mint backstop (spec §7.2): if a decision is STILL published here, its prompt_fp matched
+        # the published one (else the block above just withdrew it) -> the SAME respondable prompt is
+        # still on screen, unanswered. Do NOT re-publish on semantic_fp churn: the TUI repaints the
+        # scrolled conversation row-by-row, so the whole-frame meaning flickers while the bottom-
+        # anchored ❯ box is held stable. _published_key only persists while Claude sits CONTINUOUSLY
+        # at a prompt (a turn_resumed clears it in _on_busy, on_submit clears it on answer), during
+        # which a single foreground turn cannot change its pending question without an answer first.
+        # So once a respondable prompt is published it holds until its region changes / goes busy /
+        # terminal / is answered. (_refresh_state still reports awaiting_user while it is set.)
+        if self._published_key is not None:
+            self._state.phase = "pause_candidate"
+            return
+
         # Track the contiguous idle/prompt candidate by its prompt fingerprint.
         key = obs.prompt_fp or obs.semantic_fp
         if key != self._candidate_fp:
