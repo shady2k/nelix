@@ -17,6 +17,7 @@ _KNOWN_EXPECT_KEYS = frozenset({
     "busy_reason",
     "heartbeat_present",
     "options_ids",
+    "options",
     "affordances_include",
     "affordances_exclude",
     "semantic_fp_nonempty",
@@ -55,6 +56,8 @@ def assert_observation(obs, expect, *, fixture_id):
       busy_reason            str | null
       heartbeat_present      bool — obs.heartbeat.present must equal this
       options_ids            list[str] — [o.id for o in obs.options] must equal this
+      options                list[{id,label}] — [(o.id,o.label) for o in obs.options] must equal
+                             [(e["id"],e["label"]) for e in expect["options"]]
       affordances_include    list[str] — each must be in obs.affordances
       affordances_exclude    list[str] — each must NOT be in obs.affordances
       semantic_fp_nonempty   bool — if true, obs.semantic_fp must be non-empty
@@ -80,6 +83,11 @@ def assert_observation(obs, expect, *, fixture_id):
         got = [o.id for o in obs.options]
         if got != expect["options_ids"]:
             fail(f"options_ids {got} != {expect['options_ids']}")
+    if "options" in expect:
+        got_pairs = [(o.id, o.label) for o in obs.options]
+        exp_pairs = [(e["id"], e["label"]) for e in expect["options"]]
+        if got_pairs != exp_pairs:
+            fail(f"options (id, label) pairs {got_pairs} != {exp_pairs}")
     for a in expect.get("affordances_include", []):
         if a not in obs.affordances:
             fail(f"affordance {a!r} missing from {set(obs.affordances)}")

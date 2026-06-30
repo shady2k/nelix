@@ -81,6 +81,12 @@ _KEY_TABLE = [
         {"options_ids": ["1"]},
     ),
     (
+        "options",
+        _MODAL_FRAME, {},
+        {"options": [{"id": "1", "label": "Option A"}, {"id": "2", "label": "Option B"}]},
+        {"options": [{"id": "1", "label": "Enrich all three"}, {"id": "2", "label": "Option B"}]},
+    ),
+    (
         "affordances_include",
         _FREE_TEXT_FRAME, {},
         {"affordances_include": ["accepts_text_input"]},
