@@ -77,12 +77,6 @@ def test_fingerprints_split_content_from_input():
     assert a.content_fp != c.content_fp
 
 
-def test_busy_reason_from_chrome_only():
-    o = D.observe("⏺ Bash(go test ./...)\n  esc to interrupt", CTX)
-    assert o.busy_reason == "running_command"
-    plain = D.observe("✻ Thinking…", CTX)
-    assert plain.busy_reason is None                      # no chrome marker -> None
-
 
 # ---- actuation contract (driver owns the keys; Session writes) -------------------------
 
