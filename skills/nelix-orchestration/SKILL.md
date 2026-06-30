@@ -107,7 +107,9 @@ Read the `kind` for each agent and act:
   delivery mechanism). Tell the user plainly: "nelix can't confirm task delivery to `<executor>` — this
   looks like a compatibility bug, not something I can work around," and stop. Never guess from the screen.
 - `kind: "waiting_for_user"` — an agent paused at its prompt. Read the screen: if it asked something,
-  answer or relay per your mandate (permission/destructive → user, always, unless delegated). If the
+  answer or relay per your mandate (permission/destructive → user, always, unless delegated). A routed
+  decision has **no deadline on your side** — wait, never decide it yourself (see **Waiting on the user IS
+  an action**). If the
   decision carries `prompt_kind: "modal_choice"` or `"permission_choice"` (a numbered menu — it lists
   `options: [{id, label}]`; `hint=="needs_permission"` is the permission case), answer with the option
   `id` (a number), NEVER prose — the daemon routes a modal answer to the selector, and a non-id answer
@@ -141,7 +143,26 @@ Report it to the user; the other agents keep working — handle the rest of the 
 - **You**: recovery (crash / wedged / transient errors) within budget; routine progress; companion-side
   bookkeeping (status, labels, relaying) — **never** the code investigation (see **Division of labour**).
 - **The user, always** (unless delegated): permission/destructive prompts, and real product/judgment calls.
+  A routed decision has **no deadline on your side** — wait, never decide it yourself (see **Waiting on the
+  user IS an action**).
 - Report honestly — failures and restarts included. Never claim success you didn't verify.
+
+## Waiting on the user IS an action — never decide for them
+
+A decision you routed to the user (permission, destructive, or a real product/judgment call like "approach A
+or B") has **no deadline on your side**. nelix holds it pending until it is answered. If the user hasn't
+replied yet, that means **keep waiting**, never "I'll decide." Relay the question in plain language, **end
+your turn**, and wait for the user's next message. Do NOT substitute your own choice, and do NOT use any
+ask/clarify tool that auto-picks on a timeout for these — relay as a normal message; there is nothing to time
+out. Picking a user-owned decision yourself because the user is slow is a violation, even if your pick later
+happens to match theirs.
+
+Answer the executor **once**, and only while the decision is still pending. Before `nelix_respond`, the
+decision must be live: if you might have already answered, or you are unsure, call `nelix_status` first. A
+`no_pending_decision` reply means the executor already got an answer — do NOT fire a second `nelix_respond`.
+If the user's answer arrives after the executor moved on, reconcile: tell the user what the executor was told;
+if it differs from their answer you cannot silently override (that needs an interrupt/restart) — surface it,
+never a blind second answer.
 
 ## Rules
 
