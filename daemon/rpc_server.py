@@ -179,6 +179,16 @@ def make_server(manager, transport, logger=None):
                                      "snapshot": outcome.snapshot,
                                      "answered_decision_id": outcome.answered_decision_id,
                                      "next_action": "recover", "error": "write_unconfirmed"})
+                elif outcome.status == "respond_failed":
+                    # nelix-sud: the answer was typed but never LEFT the box (Enter never landed).
+                    # Surface as 503/recover (like write_timeout) so the MCP layer arms no waiter and
+                    # the orchestrator recovers, instead of a false 200/end_turn into infinite silence.
+                    if logger is not None:
+                        logger.warning("rpc", "respond_unconfirmed", session_id=sid, status=503)
+                    self._send(503, {"operation": "respond", "status": "respond_failed", "session_id": sid,
+                                     "snapshot": outcome.snapshot,
+                                     "answered_decision_id": outcome.answered_decision_id,
+                                     "next_action": "recover", "error": "submit_unconfirmed"})
                 elif outcome.status == "stale":
                     if logger is not None:
                         logger.warning("rpc", "respond_stale", session_id=sid, status=409)
