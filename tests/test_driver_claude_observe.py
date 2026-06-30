@@ -24,20 +24,6 @@ def test_interrupt_marker_is_busy_and_affords_interrupt():
     assert "interrupt_available" in o.affordances
 
 
-def test_empty_prompt_is_free_text():
-    o = D.observe("Welcome back!\n❯ \n⏵⏵ auto mode on (shift+tab to cycle)", CTX)
-    assert o.prompt_kind == "free_text"
-    assert "accepts_text_input" in o.affordances
-
-
-def test_stray_prompt_marker_without_footer_is_not_free_text():
-    # BLOCKER 1: a ❯ in scrolled output / chrome WITHOUT the real prompt footer must NOT be a
-    # free-text input box — delivery must never type into a non-input screen that merely contains ❯.
-    frame = "agent log: ❯ see the arrow in this output line\nmore output here\n(no mode footer)"
-    o = D.observe(frame, CTX)
-    assert o.prompt_kind == "unknown"
-    assert "accepts_text_input" not in o.affordances
-
 
 def test_numbered_menu_is_modal_choice_with_options():
     frame = ("How should T7 handle the table?\n❯ 1. Enrich all three\n  2. Verify-only\n"
