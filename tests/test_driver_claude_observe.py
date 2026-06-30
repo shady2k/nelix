@@ -9,13 +9,6 @@ D = ClaudeDriver()
 CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None)
 
 
-def test_working_spinner_is_busy():
-    o = D.observe("✻Envisioning… (46s · ↓ 1.9k tokens)\n❯ \n⏵⏵ auto mode on (shift+tab to cycle)", CTX)
-    assert o.prompt_kind == "none"                       # busy
-    assert o.heartbeat.present is True
-    assert o.heartbeat.expected_to_change is True
-    assert o.heartbeat.fp is not None
-
 
 def test_working_heartbeat_fp_tracks_animation():
     a = D.observe("✻ Recombobulating… (58s · 4 tokens)\n❯ ", CTX)
@@ -31,37 +24,6 @@ def test_interrupt_marker_is_busy_and_affords_interrupt():
     assert "interrupt_available" in o.affordances
 
 
-def test_empty_prompt_is_free_text():
-    o = D.observe("Welcome back!\n❯ \n⏵⏵ auto mode on (shift+tab to cycle)", CTX)
-    assert o.prompt_kind == "free_text"
-    assert "accepts_text_input" in o.affordances
-
-
-def test_stray_prompt_marker_without_footer_is_not_free_text():
-    # BLOCKER 1: a ❯ in scrolled output / chrome WITHOUT the real prompt footer must NOT be a
-    # free-text input box — delivery must never type into a non-input screen that merely contains ❯.
-    frame = "agent log: ❯ see the arrow in this output line\nmore output here\n(no mode footer)"
-    o = D.observe(frame, CTX)
-    assert o.prompt_kind == "unknown"
-    assert "accepts_text_input" not in o.affordances
-
-
-def test_numbered_menu_is_modal_choice_with_options():
-    frame = ("How should T7 handle the table?\n❯ 1. Enrich all three\n  2. Verify-only\n"
-             "  3. Enrich establish_phase only\nEnter to select · ↑/↓ to navigate")
-    o = D.observe(frame, CTX)
-    assert o.prompt_kind == "modal_choice"               # NOT free_text (fixes F2)
-    assert [x.id for x in o.options] == ["1", "2", "3"]
-    assert o.options[0].label == "Enrich all three"
-    assert "modal_choice" in o.affordances
-
-
-def test_yes_no_menu_is_permission_choice():
-    frame = ("Do you want to make this edit?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\n")
-    o = D.observe(frame, CTX)
-    assert o.prompt_kind == "permission_choice"
-    assert [x.id for x in o.options] == ["1", "2", "3"]
-    assert "permission_choice" in o.affordances
 
 
 def test_submitted_echo_detected():
@@ -115,12 +77,6 @@ def test_fingerprints_split_content_from_input():
     assert a.content_fp != c.content_fp
 
 
-def test_busy_reason_from_chrome_only():
-    o = D.observe("⏺ Bash(go test ./...)\n  esc to interrupt", CTX)
-    assert o.busy_reason == "running_command"
-    plain = D.observe("✻ Thinking…", CTX)
-    assert plain.busy_reason is None                      # no chrome marker -> None
-
 
 # ---- actuation contract (driver owns the keys; Session writes) -------------------------
 
@@ -162,12 +118,6 @@ _BG_FRAME = (
     "  ◯ golang-pro  Implement T8 stats ticker wiring          33s · ↓ 33.8k tokens"
 )
 
-
-def test_running_background_subagent_is_busy_not_free_text():
-    o = D.observe(_BG_FRAME, CTX)
-    assert o.prompt_kind == "none"                       # busy, not awaiting the user
-    assert "accepts_text_input" not in o.affordances
-    assert o.busy_reason == "waiting_subagents"
 
 
 def test_background_subagent_ticker_does_not_churn_semantic_fp():

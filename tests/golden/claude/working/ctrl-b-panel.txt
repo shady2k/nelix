@@ -1,0 +1,40 @@
+
+  verify the JSON field names in diagFields actually match the canonical output. Let me read the diag package.
+
+  Read 2 files, listed 1 directory
+
+⏺ The picture is clear. The diagFields struct and extra() helper are already written and the JSON tags correctly match
+  the canonical output. The only missing piece: renderDiag (line 124-125) never calls f.extra(). Let me first confirm
+  the RED state, then apply the one-line wiring fix.
+
+  Ran 1 shell command
+
+⏺ RED confirmed — all 4 fail because the rendered line lacks the extra() suffix. Now the one-line wiring fix: append
+  f.extra() to the table line.
+
+⏺ Update(cmd/meshynet/diag.go)
+  ⎿  Added 2 lines, removed 2 lines
+      121      if t, perr := time.Parse(time.RFC3339Nano, f.WallTime); perr == nil {
+      122        ts = t.UTC().Format("15:04:05.000")
+      123      }
+      124 -    _, _ = fmt.Fprintf(w, "%s %-18s %-11s %-16s peer=%s attempt=%s %s\n",
+      125 -      ts, f.Type, f.Result, f.Reason, short8s(f.Peer), short8s(f.Attempt), f.Remote)
+      124 +    _, _ = fmt.Fprintf(w, "%s %-18s %-11s %-16s peer=%s attempt=%s %s%s\n",
+      125 +      ts, f.Type, f.Result, f.Reason, short8s(f.Peer), short8s(f.Attempt), f.Remote, f.extra())
+      126    }
+      127    return nil
+      128  }
+
+⏺ Now confirm GREEN with the full test run as specified in the task (-race -count=5):
+
+  Running 1 shell command…
+  ⎿  $ go test ./cmd/meshynet/... ./internal/diag/... -race -count=5 2>&1 | tail -30 > /tmp/green.txt; cat
+     /tmp/green.txt (3s)
+     (ctrl+b to run in background)
+
+✶ Choreographing… (58s · ↓ 3.0k tokens)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents

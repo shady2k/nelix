@@ -1,0 +1,3 @@
+meta: {source_session: s-b8a30317-delivery, raw_offset: "marker:[Pasted text", cols: 120, rows: 40}
+ctx: {last_submitted_text: "a task that gets bracketed-pasted and collapsed", child_alive: true, exit_code: null}
+expect: {prompt_kind: free_text, submitted_echo_present: true, semantic_fp_nonempty: true}

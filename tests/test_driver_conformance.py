@@ -61,14 +61,14 @@ def test_every_registered_driver_observes():
         assert isinstance(o, Observation), f"{name}.observe() must return an Observation"
 
 GOLDEN = Path(__file__).resolve().parent / "golden" / "claude"
-CATEGORIES = ("working", "idle_prompt", "permission_prompt")
-
 
 from daemon.observation import ObservationCtx        # noqa: E402
+from tests.golden._harness import load_expectation, build_ctx, assert_observation  # noqa: E402
 
 _CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None)
 
 # The golden directory name (old six-state) maps to the allowed new prompt_kind(s).
+# Used only for the legacy (no-sidecar) path.
 _REMAP = {
     "working": {"none"},
     "idle_prompt": {"free_text"},
@@ -77,24 +77,58 @@ _REMAP = {
 
 
 def _cases():
+    """Discover all golden .txt frames under tests/golden/claude/<category>/.
+
+    For each frame:
+      - if a sibling <name>.yaml sidecar exists  → sidecar-driven case
+      - otherwise                                → legacy prompt-kind-only case
+
+    New category dirs are discovered automatically (no hardcoded CATEGORIES list).
+    """
     cases = []
-    for cat in CATEGORIES:
-        files = sorted((GOLDEN / cat).glob("*.txt"))
-        assert files, f"no golden frames in {GOLDEN / cat} — a category must not silently pass empty"
-        cases.extend((cat, f) for f in files)
+    for cat_dir in sorted(GOLDEN.iterdir()):
+        if not cat_dir.is_dir() or cat_dir.name.startswith("_"):
+            continue  # skip _regression and other non-category dirs
+        txt_files = sorted(cat_dir.glob("*.txt"))
+        assert txt_files, (
+            f"no golden frames in {cat_dir} — a category must not silently pass empty"
+        )
+        for f in txt_files:
+            sidecar = f.with_suffix(".yaml")
+            if sidecar.exists():
+                data = load_expectation(sidecar)
+                cases.append(("sidecar", cat_dir.name, f, data))
+            else:
+                cases.append(("legacy", cat_dir.name, f, None))
     return cases
 
 
 _CASES = _cases()
 
 
-@pytest.mark.parametrize("expected,path", _CASES,
-                         ids=[str(p.relative_to(GOLDEN)) for _, p in _CASES])
-def test_claude_observe_matches_golden(expected, path):
+@pytest.mark.parametrize(
+    "mode,cat,path,sidecar",
+    _CASES,
+    ids=[str(p.relative_to(GOLDEN)) for _, _, p, _ in _CASES],
+)
+def test_claude_observe_matches_golden(mode, cat, path, sidecar):
     frame = path.read_text()
-    o = ClaudeDriver().observe(frame, _CTX)
-    allowed = _REMAP[expected]
-    if o.prompt_kind not in allowed:
-        head = "\n".join(ln for ln in frame.splitlines() if ln.strip())[:400]
-        pytest.fail(f"{path.relative_to(GOLDEN.parent)}: expected prompt_kind in {allowed}, "
-                    f"got {o.prompt_kind!r}\n--- first non-blank lines ---\n{head}")
+    fixture_id = str(path.relative_to(GOLDEN))
+
+    if mode == "sidecar":
+        ctx = build_ctx(sidecar)
+        o = ClaudeDriver().observe(frame, ctx)
+        assert_observation(o, sidecar["expect"], fixture_id=fixture_id)
+    else:
+        # Legacy path: directory name maps to allowed prompt_kind set.
+        # Kept for the 9 existing .txt frames that have no sidecar yet (back-compat).
+        o = ClaudeDriver().observe(frame, _CTX)
+        allowed = _REMAP.get(cat, set())
+        if not allowed:
+            pytest.skip(f"no _REMAP entry for category {cat!r} — add a sidecar to enable assertions")
+        if o.prompt_kind not in allowed:
+            head = "\n".join(ln for ln in frame.splitlines() if ln.strip())[:400]
+            pytest.fail(
+                f"{fixture_id}: expected prompt_kind in {allowed}, "
+                f"got {o.prompt_kind!r}\n--- first non-blank lines ---\n{head}"
+            )

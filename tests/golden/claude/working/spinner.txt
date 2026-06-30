@@ -1,0 +1,40 @@
+
+⏺ Now the design is clear and the spec §6 resolves the ownership question: "The daemon holds the leg set (it built them
+  in EnableConnManager)" → daemon keeps the UDP leg handle; the engine only needs to expose conn.Manager's Stats() +
+  TelemetrySummary(). Default interval = 10s constant (not env-configurable). Let me read the Run function to see the
+  pump-launch/join pattern and ctx wiring.
+
+  Read 1 file, ran 1 shell command
+
+⏺ Now let me read the existing wiring/test patterns (diag_wiring_test.go, statssnapshot_test.go,
+  connmgr_construction_test.go) and confirm the struct name, so the new test follows established conventions.
+
+  Read 1 file
+
+⏺ Now let me read the diag_wiring_test and connmgr_construction_test to understand the integration test patterns for
+  engine/daemon wiring.
+
+  Read 2 files
+
+⏺ Let me confirm the struct name and check the engine's diag.go (candidate home for the new accessors) plus the
+  conn.Manager method signatures.
+
+  Ran 1 shell command
+
+⏺ I now have the complete, API-verified design for T8. Let me confirm where the NetworkInstance literal is constructed
+  (to add the UDP-leg field) and check the engine struct's connMgr/imports before finalizing.
+
+  Running 1 shell command…
+  ⎿  $ cd /Users/shady/Documents/repos/meshynet
+     echo "=== NetworkInstance composite literal in buildNetwork ==="
+     grep -n "&NetworkInstance{\|return &NetworkInstance" internal/daemon/runtime.go
+     echo "=== engine imports conn? ==="
+     grep -n "\"meshynet/internal/conn\"" internal/engine/engine.go internal/eng…
+
+✢ Dilly-dallying…     43       7 3        )
+
+
+
+
+
+

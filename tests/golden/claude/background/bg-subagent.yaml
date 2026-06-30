@@ -1,0 +1,3 @@
+meta: {source_session: s-039a61b4-bg-subagent, raw_offset: "marker:Waiting for", cols: 120, rows: 40}
+ctx: {last_submitted_text: null, child_alive: true, exit_code: null}
+expect: {prompt_kind: none, busy_reason: waiting_subagents, heartbeat_present: true, affordances_exclude: [accepts_text_input]}

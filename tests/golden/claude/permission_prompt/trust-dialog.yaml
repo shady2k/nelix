@@ -1,0 +1,9 @@
+meta: {source_session: s-6e9d8956, raw_offset: "marker:2. No, exit", cols: 120, rows: 40}
+ctx: {last_submitted_text: null, child_alive: true, exit_code: null}
+expect:
+  prompt_kind: modal_choice
+  options_ids: ["1", "2"]
+  options:
+    - {id: "1", label: "Yes, I trust this folder"}
+    - {id: "2", label: "No, exit"}
+  affordances_exclude: [accepts_text_input]

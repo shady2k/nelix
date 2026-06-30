@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from daemon.renderer.ghostty import GhosttyRenderer   # noqa: E402
+from tests._replay import replay_frames               # noqa: E402
 from daemon.drivers.claude import ClaudeDriver         # noqa: E402
 from daemon.observation import ObservationCtx          # noqa: E402
 
@@ -24,14 +24,7 @@ _CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None
 
 def _distinct_frames(raw, cols=120, rows=40):
     drv = ClaudeDriver()
-    r = GhosttyRenderer(cols, rows)
-    seen = None
-    for i in range(0, len(raw), 256):
-        r.feed(raw[i:i + 256])
-        frame = r.render()
-        if frame == seen:
-            continue
-        seen = frame
+    for _, frame in replay_frames(raw, cols=cols, rows=rows, chunk=256):
         yield frame, drv.observe(frame, _CTX)
 
 

@@ -1,0 +1,40 @@
+⏺ Write(/private/tmp/claude-501/-Users-shady-Documents-repos-meshynet/5daa75f0-a1fd-41eb-a03d-9d6e84efb444/scratchpad/t8
+       -brief.md)
+  ⎿  Wrote 277 lines to ../../../../../private/tmp/claude-501/-Users-shady-Documents-repos-meshynet/5daa75f0-a1fd-4
+     1eb-a03d-9d6e84efb444/scratchpad/t8-brief.md
+       1 # Task T8 (meshynet no1.3) — stats_snapshot ticker wiring + ring-pressure review
+       2
+       3 You are an implementer subagent. Follow **strict TDD**: write a failing test, run it, confirm it
+       4 fails for the right reason, implement, confirm it passes, then move to the next piece. Commit ONCE at
+       5 the end (all of T8 in one commit). Work on branch `phase-no1.3` (already checked out). Repo root:
+       6 `/Users/shady/Documents/repos/meshynet`.
+       7
+       8 This is the **last task** of bead `meshynet-no1.3` (transport-phase / packet metadata ring). Tasks
+       9 T1–T7 are committed (HEAD = `02364fb`). T6 already built the *pieces* of the periodic `stats_snapshot`
+      10 (the aggregator helpers + `runStatsTicker`) but explicitly **deferred the live wiring to T8**. Your job
+     … +270 lines
+
+⏺ Now dispatch the golang-pro implementer with the brief (TDD, standard model — this is integration + concurrency wiring
+  with near-complete code provided).
+
+⏺ golang-pro(Implement T8 stats ticker wiring) Sonnet 4.6
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+  ⎿  Allowed by auto mode classifier
+
+⏺ The implementer is running in the background. I'll wait for it to complete (I won't touch the same files meanwhile).
+  I'll report when it's done and then run the review + gates.
+
+  Ran 1 shell command
+
+⏺ Base recorded: 02364fb. The T8 implementer is working in the background. I'll wait for its completion notification
+  before reviewing and gating.
+
+✻ Waiting for 1 background agent to finishctly start a conversation with a subagent
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents · ↓ to manage
+
+  ⏺ main
+  ◯ golang-pro  Implement T8 stats ticker wiring                                                    21s · ↓ 25.3k tokens

@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from daemon.renderer.ghostty import GhosttyRenderer   # noqa: E402
+from tests._replay import replay_frames               # noqa: E402
 from daemon.drivers.claude import ClaudeDriver         # noqa: E402
 from daemon.observation import ObservationCtx          # noqa: E402
 from daemon.belief import BeliefEngine, Publish         # noqa: E402
@@ -40,19 +40,12 @@ def _replay_publishes():
     = the prompt_fp of every waiting_for_user publish in firing order."""
     raw = _CAPTURE.read_bytes()
     drv = ClaudeDriver()
-    r = GhosttyRenderer(120, 40)
     clk = FakeClock(0.0)
     eng = BeliefEngine(BeliefConfig(), clk)
     pubs = defaultdict(int)
     sfps = defaultdict(set)
     order = []
-    seen = None
-    for i in range(0, len(raw), 256):
-        r.feed(raw[i:i + 256])
-        frame = r.render()
-        if frame == seen:
-            continue
-        seen = frame
+    for _, frame in replay_frames(raw, cols=120, rows=40, chunk=256):
         obs = drv.observe(frame, _CTX)
         clk.advance(1.0)               # > idle_confirm_window, so a stable prompt settles & publishes
         if obs.prompt_kind == "free_text":

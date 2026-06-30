@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""One-off harvest script: maps each invariant in tests/golden/invariants.py::INVARIANTS to a
+real session raw in the corpus (or classifies it as already-covered / synthetic / gap).
+
+Usage:
+    .venv/bin/python bin/nelix-inventory > tests/golden/INVENTORY.md
+
+Output: a Markdown manifest — one row per invariant plus an "Unmapped real states" section
+listing corpus screens/markers that no invariant claims.
+
+No production code under daemon/ is touched.
+"""
+import json
+import re
+import sys
+from pathlib import Path
+
+# ── project path setup ────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from daemon.renderer.base import make_renderer          # noqa: E402
+from tests.golden.invariants import INVARIANTS          # noqa: E402
+
+# ── corpus locations ──────────────────────────────────────────────────────────
+SESSIONS_DIR = Path.home() / ".hermes/profiles/local/workspace/nelix/sessions"
+REGRESSION_DIR = ROOT / "tests/golden/claude/_regression"
+
+# Minimum raw size to skip empty/aborted sessions (~1882 bytes = empty startup)
+MIN_RAW_BYTES = 5_000
+
+CHUNK = 64   # replay granularity — same as nelix-capture
+
+
+# ── replay helpers ────────────────────────────────────────────────────────────
+
+def _load_dims(session_dir: Path) -> tuple[int, int]:
+    """Read cols/rows from meta.json, fallback to 120x40."""
+    meta = session_dir / "meta.json"
+    if meta.exists():
+        try:
+            m = json.loads(meta.read_text())
+            return int(m.get("cols", 120)), int(m.get("rows", 40))
+        except (OSError, ValueError, TypeError):
+            pass
+    return 120, 40
+
+
+def _frames(data: bytes, cols: int, rows: int):
+    """Yield rendered frames after each CHUNK of bytes — mirrors nelix-capture._frames()."""
+    r = make_renderer(cols, rows)
+    try:
+        for i in range(0, len(data), CHUNK):
+            r.feed(data[i:i + CHUNK])
+            yield i, r.render()
+    finally:
+        r.close()
+
+
+def first_frame(raw_path: Path, cols: int, rows: int, predicate):
+    """Return (byte_offset, frame) of the first frame satisfying predicate, else (None, None)."""
+    data = raw_path.read_bytes()
+    for offset, frame in _frames(data, cols, rows):
+        if predicate(frame):
+            return offset, frame
+    return None, None
+
+
+def all_frames_match(raw_path: Path, cols: int, rows: int, predicate, limit: int = 10):
+    """Collect up to *limit* frames satisfying predicate."""
+    data = raw_path.read_bytes()
+    results = []
+    for offset, frame in _frames(data, cols, rows):
+        if predicate(frame):
+            results.append((offset, frame))
+            if len(results) >= limit:
+                break
+    return results
+
+
+# ── corpus loading ────────────────────────────────────────────────────────────
+
+def _corpus_sources() -> list[tuple[str, Path, int, int]]:
+    """Return list of (session_id, raw_path, cols, rows) for all usable sessions."""
+    sources: list[tuple[str, Path, int, int]] = []
+    if SESSIONS_DIR.exists():
+        for d in sorted(SESSIONS_DIR.iterdir()):
+            raw = d / "raw"
+            if not raw.exists() or raw.stat().st_size < MIN_RAW_BYTES:
+                continue
+            cols, rows = _load_dims(d)
+            sources.append((d.name, raw, cols, rows))
+    return sources
+
+
+def _regression_sources() -> list[tuple[str, Path, int, int]]:
+    """Return list of (name, raw_path, cols, rows) for committed regression raws."""
+    sources = []
+    if REGRESSION_DIR.exists():
+        for raw in sorted(REGRESSION_DIR.glob("*.raw")):
+            sources.append((raw.stem, raw, 120, 40))
+    return sources
+
+
+# ── invariant-specific predicates ────────────────────────────────────────────
+
+_SPINNERS = "·✢✳✶✻✽✺✦"
+_OPTION = re.compile(r"^\s*[❯>]?\s*\d+\.\s+\S", re.M)
+_SELECTED_OPTION = re.compile(r"^\s*❯\s*\d+\.\s+\S", re.M)
+
+
+def pred_paste(frame: str) -> bool:
+    return "[Pasted text" in frame and "❯" in frame
+
+
+def pred_bg_agent(frame: str) -> bool:
+    return bool(re.search(r"[Ww]aiting for \d+ background agent", frame))
+
+
+def pred_spinner(frame: str) -> bool:
+    """Spinner glyph on its own status line, plus 'esc to interrupt' in same frame."""
+    has_esc = "esc to interrupt" in frame
+    for line in frame.split("\n"):
+        if any(g in line for g in _SPINNERS) and "⏵" not in line:
+            # a non-footer line with a spinner glyph
+            return has_esc
+    return False
+
+
+def pred_bare_prompt_no_footer(frame: str) -> bool:
+    """❯ present but no ⏵⏵ / shift+tab footer."""
+    return "❯" in frame and "⏵⏵" not in frame and "shift+tab" not in frame
+
+
+def pred_ctrl_b_panel(frame: str) -> bool:
+    """Transient (ctrl+b to run in background) line inside a tool panel."""
+    return "(ctrl+b to run in background)" in frame
+
+
+def pred_modal_menu(frame: str) -> bool:
+    """Numbered selection menu (❯ on an option, >=2 option lines)."""
+    return bool(_SELECTED_OPTION.search(frame)) and len(_OPTION.findall(frame)) >= 2
+
+
+def pred_ask_mode_footer(frame: str) -> bool:
+    """Any frame with the interactive footer (shift+tab to cycle) — yields ask_mode=True."""
+    return "shift+tab to cycle" in frame and "❯" in frame and "⏵⏵" in frame
+
+
+def pred_accept_edits_footer(frame: str) -> bool:
+    """Frame with accept-edits / plan-mode / bypass-permissions footer — yields ask_mode=False."""
+    for m in ("accept edits on", "plan mode on", "bypass permissions"):
+        if m in frame:
+            return True
+    return False
+
+
+def pred_bash_panel(frame: str) -> bool:
+    return bool(re.search(r"Bash\(", frame))
+
+
+def pred_trust(frame: str) -> bool:
+    return "Yes, I trust this folder" in frame
+
+
+def pred_free_text_with_footer(frame: str) -> bool:
+    """❯ present WITH footer — free_text candidate."""
+    return "❯" in frame and "⏵⏵" in frame and "shift+tab" in frame
+
+
+# ── scanner ───────────────────────────────────────────────────────────────────
+
+def scan_all(predicate, corpus, regressions, label=""):
+    """Check corpus + regressions; return first hit as (source_id, raw_path, offset, frame)."""
+    for sid, raw_path, cols, rows in regressions:
+        offset, frame = first_frame(raw_path, cols, rows, predicate)
+        if offset is not None:
+            return sid, raw_path, offset, frame
+    for sid, raw_path, cols, rows in corpus:
+        offset, frame = first_frame(raw_path, cols, rows, predicate)
+        if offset is not None:
+            return sid, raw_path, offset, frame
+    return None, None, None, None
+
+
+def scan_specific(sid_list, predicate, corpus, regressions):
+    """Scan only sessions whose id is in sid_list; return first hit."""
+    for sid, raw_path, cols, rows in list(regressions) + list(corpus):
+        if sid not in sid_list:
+            continue
+        offset, frame = first_frame(raw_path, cols, rows, predicate)
+        if offset is not None:
+            return sid, raw_path, offset, frame
+    return None, None, None, None
+
+
+# ── manifest builder ──────────────────────────────────────────────────────────
+
+def _snippet(frame: str, pred_line_hint: str | None = None) -> str:
+    """Return a compact one-line quote from the frame showing the invariant marker."""
+    if pred_line_hint:
+        for line in frame.split("\n"):
+            if pred_line_hint in line and line.strip():
+                return repr(line.strip()[:80])
+    # fallback: last non-empty line
+    for line in reversed(frame.split("\n")):
+        if line.strip():
+            return repr(line.strip()[:80])
+    return ""
+
+
+def _rel(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        try:
+            return "~/" + str(path.relative_to(Path.home()))
+        except ValueError:
+            return str(path)
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    corpus = _corpus_sources()
+    regressions = _regression_sources()
+
+    print("# INVENTORY.md — invariant → real-capture manifest\n")
+    print("Generated by `bin/nelix-inventory`. Do not edit by hand.\n")
+    print(f"Corpus: {len(corpus)} live sessions "
+          f"(≥{MIN_RAW_BYTES // 1000}kB); {len(regressions)} committed regression raws.\n")
+
+    print("## Invariant map\n")
+    print("| ID | status | source_session | dims | offset | visible marker | "
+          "proposed expect-fields |")
+    print("|-----|--------|----------------|------|--------|----------------|"
+          "----------------------|")
+
+    gaps: list[str] = []
+
+    for inv in INVARIANTS:
+        iid = inv.id
+
+        # ── already-covered ─────────────────────────────────────────────────
+        if iid == "I-R1":
+            print(f"| {iid} | already-covered | tests/test_pty_session.py | — | — | "
+                  r"`\x1b[>4` in raw bytes (kitty keyboard CSI) | "
+                  "no stray 'u' in rendered frame |")
+            continue
+
+        if iid == "I-R2":
+            print(f"| {iid} | already-covered | tests/test_render_3p1.py + "
+                  "tests/golden/claude/_regression/3p1_alt_screen.raw | 120x40 | — | "
+                  "40-row viewport, Cyrillic line intact | "
+                  "viewport_rows==40, known content lines |")
+            continue
+
+        if iid == "I6b":
+            print(f"| {iid} | already-covered | tests/test_session.py::"
+                  "test_respond_to_modal_routes_to_select_option | — | — | "
+                  "driver.select_option(id) called with correct id | "
+                  "select_option called once, invalid id raises |")
+            continue
+
+        # ── synthetic ────────────────────────────────────────────────────────
+        if iid == "I9":
+            print(f"| {iid} | synthetic | — | — | — | "
+                  "failure-injection: Enter dropped / pre-write stale / never-echoes | "
+                  "submit_confirmed=False for all negative states |")
+            continue
+
+        # ── frame-level: I1 ─────────────────────────────────────────────────
+        if iid == "I1":
+            _I1_MARKER = "[Pasted text"
+            sid, raw_path, offset, frame = scan_specific(
+                ["s-b8a30317-delivery"], pred_paste, corpus, regressions
+            )
+            if sid:
+                snip = _snippet(frame, _I1_MARKER)
+                print(f"| I1 | found | {sid} | 120x40 | {offset} | "
+                      f"marker: `{_I1_MARKER}` → {snip} | "
+                      "submitted_echo_present=True, "
+                      "prompt_kind=free_text |")
+            else:
+                print("| I1 | gap | — | — | — | `[Pasted text` not found | — |")
+                gaps.append("I1")
+            continue
+
+        # ── frame-level: I2a ────────────────────────────────────────────────
+        if iid == "I2a":
+            # Use 'Waiting for' as the --at-marker string (matches the spinner status line
+            # "✻ Waiting for 1 background agent to finish" more precisely than 'background agent'
+            # which also matches the dispatch frame earlier in the raw).
+            _I2A_MARKER = "Waiting for"
+            sid, raw_path, offset, frame = scan_specific(
+                ["s-039a61b4-bg-subagent"], pred_bg_agent, corpus, regressions
+            )
+            if sid:
+                snip = _snippet(frame, "background agent")
+                print(f"| I2a | found | {sid} | 120x40 | {offset} | "
+                      f"--at-marker `{_I2A_MARKER}` → {snip} | "
+                      "busy_reason=waiting_subagents, "
+                      "prompt_kind=none, accepts_text_input=False |")
+            else:
+                print("| I2a | gap | — | — | — | `Waiting for ... background agent` not found | — |")
+                gaps.append("I2a")
+            continue
+
+        # ── frame-level: I3 ─────────────────────────────────────────────────
+        if iid == "I3":
+            sid, raw_path, offset, frame = scan_specific(
+                ["s-039a61b4-bg-subagent"], pred_spinner, corpus, regressions
+            )
+            if not sid:
+                # try any corpus session
+                sid, raw_path, offset, frame = scan_all(pred_spinner, corpus, regressions)
+            if sid:
+                # find the spinner line
+                snip = ""
+                for line in frame.split("\n"):
+                    if any(g in line for g in _SPINNERS) and "⏵" not in line and line.strip():
+                        snip = repr(line.strip()[:80])
+                        break
+                print(f"| I3 | found | {sid} | 120x40 | {offset} | "
+                      f"{snip} | prompt_kind=none, busy_reason=running |")
+            else:
+                print("| I3 | gap | — | — | — | spinner glyph not found | — |")
+                gaps.append("I3")
+            continue
+
+        # ── frame-level: I4a ────────────────────────────────────────────────
+        if iid == "I4a":
+            # Half 1: bare ❯ no footer (prompt_kind != free_text)
+            sid1, rp1, off1, fr1 = scan_specific(
+                ["s-039a61b4"], pred_bare_prompt_no_footer, corpus, regressions
+            )
+            if not sid1:
+                sid1, rp1, off1, fr1 = scan_all(pred_bare_prompt_no_footer, corpus, regressions)
+            # Half 2: ❯ with footer (prompt_kind == free_text)
+            sid2, rp2, off2, fr2 = scan_specific(
+                ["s-b8a30317-delivery"], pred_free_text_with_footer, corpus, regressions
+            )
+            if not sid2:
+                sid2, rp2, off2, fr2 = scan_all(pred_free_text_with_footer, corpus, regressions)
+
+            if sid1 and sid2:
+                print(f"| I4a | found | bare-❯: {sid1}@{off1} / "
+                      f"with-footer: {sid2}@{off2} | 120x40 | see sources | "
+                      "`❯` no-footer → prompt_kind≠free_text; "
+                      "`❯`+footer → free_text | prompt_kind |")
+            elif sid1:
+                print(f"| I4a | found (half) | bare-❯: {sid1}@{off1} / "
+                      "with-footer: gap | 120x40 | — | — | prompt_kind |")
+                gaps.append("I4a(with-footer)")
+            else:
+                print("| I4a | gap | — | — | — | bare ❯ without footer not found | — |")
+                gaps.append("I4a")
+            continue
+
+        # ── frame-level: I5 ─────────────────────────────────────────────────
+        if iid == "I5":
+            sid, raw_path, offset, frame = scan_specific(
+                ["s-039a61b4"], pred_ctrl_b_panel, corpus, regressions
+            )
+            if not sid:
+                sid, raw_path, offset, frame = scan_all(pred_ctrl_b_panel, corpus, regressions)
+            if sid:
+                print(f"| I5 | found | {sid} | 120x40 | {offset} | "
+                      "`(ctrl+b to run in background)` in tool panel | "
+                      "is_transcript_volatile=True for ctrl+b row; "
+                      "False for settled ⏺ output |")
+            else:
+                print("| I5 | gap | — | — | — | ctrl+b panel not found | — |")
+                gaps.append("I5")
+            continue
+
+        # ── frame-level: I6a ────────────────────────────────────────────────
+        if iid == "I6a":
+            # Trust dialog (modal_choice or permission_choice).
+            # --at-marker 'Yes, I trust this folder' shows the permission_choice modal;
+            # s-beb967e9 has a modal_choice (non-trust) modal too.
+            _I6A_MARKER = "Yes, I trust this folder"
+            sid, raw_path, offset, frame = scan_specific(
+                ["s-6e9d8956", "s-7dbd7358", "s-beb967e9"], pred_modal_menu, corpus, regressions
+            )
+            if not sid:
+                sid, raw_path, offset, frame = scan_all(pred_modal_menu, corpus, regressions)
+            if sid:
+                # find a representative option line
+                snip = ""
+                for line in frame.split("\n"):
+                    if re.search(r"❯\s*\d+\.", line) and line.strip():
+                        snip = repr(line.strip()[:80])
+                        break
+                print(f"| I6a | found | {sid} | 120x40 | {offset} | "
+                      f"--at-marker `{_I6A_MARKER}` → {snip} | "
+                      "prompt_kind∈{modal_choice,permission_choice}, "
+                      "options with ids |")
+            else:
+                print("| I6a | gap | — | — | — | numbered modal menu not found | — |")
+                gaps.append("I6a")
+            continue
+
+        # ── frame-level: I-AM ───────────────────────────────────────────────
+        if iid == "I-AM":
+            # Half 1: ask_mode=True (footer present, no auto-mode markers)
+            sid_true, rp_true, off_true, fr_true = scan_specific(
+                ["s-b8a30317-delivery"], pred_ask_mode_footer, corpus, regressions
+            )
+            if not sid_true:
+                sid_true, rp_true, off_true, fr_true = scan_all(
+                    pred_ask_mode_footer, corpus, regressions
+                )
+            # Half 2: ask_mode=False (accept edits on / plan mode on / bypass permissions)
+            sid_false, rp_false, off_false, fr_false = scan_all(
+                pred_accept_edits_footer, corpus, regressions
+            )
+            if sid_true and sid_false:
+                print(f"| I-AM | found | ask=True:{sid_true}@{off_true} / "
+                      f"ask=False:{sid_false}@{off_false} | 120x40 | see sources | "
+                      "footer → ask_mode=True; accept-edits → ask_mode=False | ask_mode |")
+            elif sid_true:
+                print(f"| I-AM | gap (ask=False half) | ask=True:{sid_true}@{off_true} / "
+                      "ask=False:MISSING | 120x40 | — | "
+                      "`⏵⏵ auto mode on (shift+tab to cycle)` → ask_mode=True; "
+                      "no `accept edits on`/`bypass permissions` frame in corpus | ask_mode |")
+                gaps.append("I-AM(ask_mode=False)")
+            else:
+                print("| I-AM | gap | — | — | — | no footer frame found | — |")
+                gaps.append("I-AM")
+            continue
+
+        # ── frame-level: I-BC ───────────────────────────────────────────────
+        if iid == "I-BC":
+            sid, raw_path, offset, frame = scan_specific(
+                ["s-d719f7b9"], pred_bash_panel, corpus, regressions
+            )
+            if not sid:
+                sid, raw_path, offset, frame = scan_all(pred_bash_panel, corpus, regressions)
+            if sid:
+                snip = _snippet(frame, "Bash(")
+                print(f"| I-BC | found | {sid} | 120x40 | {offset} | "
+                      f"{snip} | busy_reason=running_command |")
+            else:
+                print("| I-BC | gap | — | — | — | Bash( panel not found | — |")
+                gaps.append("I-BC")
+            continue
+
+        # ── sequence: I2b ───────────────────────────────────────────────────
+        if iid == "I2b":
+            # bg-subagent sequence — whole regression raw is the source
+            reg = next(
+                ((sid, rp, 120, 40) for sid, rp, c, r in regressions
+                 if sid == "s-039a61b4-bg-subagent"),
+                None
+            )
+            if reg:
+                sid, rp, _, _ = reg
+                print(f"| I2b | found | {sid} | 120x40 | full sequence | "
+                      "replaying never shows waiting_for_user | "
+                      "waiting_for_user never published across full replay |")
+            else:
+                print("| I2b | gap | — | — | — | s-039a61b4-bg-subagent.raw not found | — |")
+                gaps.append("I2b")
+            continue
+
+        # ── sequence: I4b ───────────────────────────────────────────────────
+        if iid == "I4b":
+            # Echo-region sequence: delivery raw shows paste echo in active input (tail).
+            # For the scrollback (not-echo) half we need a bigger session where the text
+            # appears in Claude's output region — s-2190cfb2-remint has paste submissions
+            # followed by agent output.
+            reg_delivery = next(
+                ((sid, rp) for sid, rp, c, r in regressions if sid == "s-b8a30317-delivery"),
+                None
+            )
+            reg_remint = next(
+                ((sid, rp) for sid, rp, c, r in regressions if sid == "s-2190cfb2-remint"),
+                None
+            )
+            if reg_delivery and reg_remint:
+                print(f"| I4b | found | active-box: s-b8a30317-delivery / "
+                      "scrollback: s-2190cfb2-remint | 120x40 | full sequences | "
+                      "paste placeholder in tail → echo_present=True; "
+                      "text in scrollback → echo_present=False | submitted_echo_present |")
+            elif reg_delivery:
+                print(f"| I4b | found (active-box only) | s-b8a30317-delivery | "
+                      "120x40 | full sequence | paste in tail → echo_present=True | "
+                      "submitted_echo_present |")
+            else:
+                print("| I4b | gap | — | — | — | no delivery raw | — |")
+                gaps.append("I4b")
+            continue
+
+        # ── sequence: I7 ────────────────────────────────────────────────────
+        if iid == "I7":
+            reg = next(
+                ((sid, rp) for sid, rp, c, r in regressions if sid == "s-2190cfb2-remint"),
+                None
+            )
+            if reg:
+                sid, rp = reg
+                print(f"| I7 | found | {sid} | 120x40 | full sequence | "
+                      "re-mint blocked decision replay | "
+                      "decision published exactly once, not N times |")
+            else:
+                print("| I7 | gap | — | — | — | s-2190cfb2-remint.raw not found | — |")
+                gaps.append("I7")
+            continue
+
+        # ── sequence: I8 ────────────────────────────────────────────────────
+        if iid == "I8":
+            # False-idle: delivery raw shows post-submit paste-echo frame.
+            # Replaying it should NOT publish waiting_for_user (the echo is still in the box).
+            reg = next(
+                ((sid, rp) for sid, rp, c, r in regressions if sid == "s-b8a30317-delivery"),
+                None
+            )
+            if reg:
+                sid, rp = reg
+                print(f"| I8 | found | {sid} | 120x40 | full sequence | "
+                      "paste echo visible in input box post-submit | "
+                      "waiting_for_user never published during echo-visible phase |")
+            else:
+                print("| I8 | gap | — | — | — | s-b8a30317-delivery.raw not found | — |")
+                gaps.append("I8")
+            continue
+
+        # fallback — should not reach here
+        print(f"| {iid} | gap | — | — | — | unhandled invariant | — |")
+        gaps.append(iid)
+
+    # ── summary ───────────────────────────────────────────────────────────────
+    print()
+    print("## Zero-recording verdict\n")
+    if not gaps:
+        print("**CONFIRMED: zero new recordings needed.** Every Tier-1/Tier-2 invariant "
+              "maps to an existing corpus capture or is already-covered/synthetic.")
+    else:
+        print(f"**GAPS FOUND — {len(gaps)} invariant(s) need attention:**\n")
+        for g in gaps:
+            print(f"- `{g}`")
+        print()
+        if "I-AM(ask_mode=False)" in gaps:
+            print("### Gap detail: I-AM ask_mode=False\n")
+            print("All corpus sessions use Claude Code v2.1.191+ which renders the footer as\n"
+                  "`⏵⏵ auto mode on (shift+tab to cycle)`. The driver's auto-mode markers\n"
+                  "(`accept edits on`, `plan mode on`, `bypass permissions`) match **older** Claude\n"
+                  "Code footer text (pre-v2.1.191). No corpus session captures an older-style\n"
+                  "`accept edits on` footer. The ask_mode=True half IS found (any current footer\n"
+                  "frame yields True). The ask_mode=False half is currently only verifiable via\n"
+                  "the existing synthetic test (`test_claude_driver.py:45`). A new manual recording\n"
+                  "with an older Claude Code is NOT required — the driver behavior is tested\n"
+                  "synthetically and the current corpus faithfully represents the current CLI.\n"
+                  "**Recommend:** mark I-AM as split: real-capture covers True half; synthetic\n"
+                  "covers False half (no Sasha recording needed).\n")
+
+    # ── trust sessions ────────────────────────────────────────────────────────
+    print()
+    print("## Trust-session verification\n")
+    trust_marker = "Yes, I trust this folder"
+    for sid_candidate in ["s-6e9d8956", "s-7dbd7358"]:
+        raw_path = SESSIONS_DIR / sid_candidate / "raw"
+        if not raw_path.exists():
+            print(f"- `{sid_candidate}`: raw not found")
+            continue
+        offset, frame = first_frame(raw_path, 120, 40, pred_trust)
+        if offset is not None:
+            print(f"- `{sid_candidate}`: `Yes, I trust this folder` found at byte offset {offset} ✓")
+        else:
+            print(f"- `{sid_candidate}`: `Yes, I trust this folder` NOT FOUND ✗")
+
+    # ── corpus overview ───────────────────────────────────────────────────────
+    print()
+    print("## Corpus overview\n")
+    print("### Live sessions (skipped: size < 5kB = empty/aborted)\n")
+    print("| session | size | dims | key markers found |")
+    print("|---------|------|------|------------------|")
+
+    _MARKER_CHECKS: dict[str, callable] = {
+        "paste": pred_paste,
+        "bg-agent": pred_bg_agent,
+        "spinner": pred_spinner,
+        "modal": pred_modal_menu,
+        "ctrl+b": pred_ctrl_b_panel,
+        "trust": pred_trust,
+        "Bash(": pred_bash_panel,
+        "footer": pred_ask_mode_footer,
+    }
+
+    all_sessions_dir = SESSIONS_DIR
+    if all_sessions_dir.exists():
+        for d in sorted(all_sessions_dir.iterdir()):
+            raw = d / "raw"
+            if not raw.exists():
+                continue
+            size = raw.stat().st_size
+            if size < MIN_RAW_BYTES:
+                print(f"| {d.name} | {size}B | — | skipped (empty/aborted) |")
+                continue
+            cols, rows = _load_dims(d)
+            data = raw.read_bytes()
+            r = make_renderer(cols, rows)
+            found_markers: list[str] = []
+            try:
+                for _, frame in _frames(data, cols, rows):
+                    for label, pred in list(_MARKER_CHECKS.items()):
+                        if label not in found_markers and pred(frame):
+                            found_markers.append(label)
+                    if len(found_markers) == len(_MARKER_CHECKS):
+                        break
+            finally:
+                r.close()
+            print(f"| {d.name} | {size // 1024}kB | {cols}x{rows} | "
+                  f"{', '.join(found_markers) if found_markers else '—'} |")
+
+    print()
+    print("### Regression raws\n")
+    print("| file | size | dims |")
+    print("|------|------|------|")
+    for sid, rp, c, r in regressions:
+        print(f"| {sid} | {rp.stat().st_size // 1024}kB | {c}x{r} |")
+
+    # ── unmapped real states ──────────────────────────────────────────────────
+    print()
+    print("## Unmapped real states found\n")
+    print("Corpus screens/markers observed during scanning that no current invariant claims.\n")
+    print("| state/marker | example session | notes |")
+    print("|-------------|-----------------|-------|")
+    print("| `bash denied by auto mode · Classifier unavailable · /permissions` notification | "
+          "s-d719f7b9 | auto-mode permission-denial banner in transcript; no invariant covers "
+          "this specific notification text |")
+    print("| `◯ <agent-name>  <task>` agent-status line in footer | "
+          "s-039a61b4, s-d719f7b9 | sub-agent status lines cycling through agent list; "
+          "not claimed by any current invariant |")
+    print("| Welcome back + Tips panel (initial splash) | "
+          "s-6e9d8956, s-7dbd7358 | the startup welcome modal with Tips column; "
+          "only appears in fresh sessions with no history |")
+    print("| `◉ xhigh · /effort` status badge (top-right) | "
+          "s-b8a30317-delivery, s-6e9d8956 | effort-level indicator; "
+          "no invariant claims this |")
+    print("| Token-usage counter (`↓ N.Nk tokens`) in footer | "
+          "s-039a61b4, s-d719f7b9 | token consumption telemetry appended to spinner status; "
+          "no invariant tracks this field |")
+
+
+if __name__ == "__main__":
+    main()
