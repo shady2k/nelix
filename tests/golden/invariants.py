@@ -1,6 +1,6 @@
 """Machine-checkable registry of spec §4 invariants (nelix-5gc).
 
-Each entry traces to a specific bug-fix commit and drives the real-capture
+Each entry traces to a specific bug-fix or capability commit and drives the real-capture
 harvest in subsequent tasks.  No production code is touched by this module.
 
 Tier meanings:
