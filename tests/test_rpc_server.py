@@ -607,6 +607,25 @@ def test_unauthorized_is_logged():
     assert "unauthorized" in buf.getvalue()
 
 
+def test_status_read_is_logged(tmp_path):
+    # nelix-jwv gap 4: a status/screen/dialog read leaves a light `read` record (which tool, session,
+    # seq) at debug, so "nelix_screen called twice in a turn" is visible without replaying the capture.
+    import io
+    buf = io.StringIO()
+    srv, base = _serve(FakeManager(), buf)
+    try:
+        st, _ = _req("GET", base + "/status?session_id=s1")
+        assert st == 200
+    finally:
+        srv.shutdown()
+    reads = [json.loads(l) for l in buf.getvalue().splitlines()
+             if l.strip() and json.loads(l)["event"] == "read"]
+    assert reads, "a GET /status must emit a read record"
+    r = reads[-1]
+    assert r["level"] == "debug" and r["tool"] == "status" and r["session_id"] == "s1"
+    assert "seq" in r
+
+
 def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import importlib, json, threading, urllib.request, paths
