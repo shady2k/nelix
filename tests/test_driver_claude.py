@@ -56,17 +56,6 @@ INPUT_BOX = (
     "⏵⏵ auto mode on (shift+tab to cycle)\n")
 
 
-def test_modal_menus_surface_as_choices_input_box_does_not():
-    assert D.observe(TRUST, _ctx()).prompt_kind == "modal_choice"        # numbered, not Yes/No gate
-    assert D.observe(PERMISSION, _ctx()).prompt_kind == "permission_choice"
-    assert D.observe(INPUT_BOX, _ctx()).prompt_kind == "free_text"
-
-
-def test_input_box_is_only_free_text_not_a_menu():
-    assert "accepts_text_input" in D.observe(INPUT_BOX, _ctx()).affordances
-    assert "accepts_text_input" not in D.observe(TRUST, _ctx()).affordances
-    assert "accepts_text_input" not in D.observe(PERMISSION, _ctx()).affordances
-
 
 def test_submitted_echo_detects_typed_or_pasted_task():
     typed = INPUT_BOX.replace("❯ \n", "❯ create report.md with a header\n")

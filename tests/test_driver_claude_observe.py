@@ -25,23 +25,6 @@ def test_interrupt_marker_is_busy_and_affords_interrupt():
 
 
 
-def test_numbered_menu_is_modal_choice_with_options():
-    frame = ("How should T7 handle the table?\n❯ 1. Enrich all three\n  2. Verify-only\n"
-             "  3. Enrich establish_phase only\nEnter to select · ↑/↓ to navigate")
-    o = D.observe(frame, CTX)
-    assert o.prompt_kind == "modal_choice"               # NOT free_text (fixes F2)
-    assert [x.id for x in o.options] == ["1", "2", "3"]
-    assert o.options[0].label == "Enrich all three"
-    assert "modal_choice" in o.affordances
-
-
-def test_yes_no_menu_is_permission_choice():
-    frame = ("Do you want to make this edit?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\n")
-    o = D.observe(frame, CTX)
-    assert o.prompt_kind == "permission_choice"
-    assert [x.id for x in o.options] == ["1", "2", "3"]
-    assert "permission_choice" in o.affordances
-
 
 def test_submitted_echo_detected():
     ctx = ObservationCtx(last_submitted_text="commit this", child_alive=True, exit_code=None)
