@@ -1,3 +1,4 @@
+import json
 import threading
 from nelix_cursor import WakeRegistry
 
@@ -208,9 +209,96 @@ def test_respond_rearms_without_prior_status(monkeypatch, tmp_path):
     class C:
         def __init__(self, t): pass
         def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
-        def respond(self, *a, **k): return True, {"next_after_seq": 6}
+        def respond(self, *a, **k): return True, {"status": "resumed", "next_after_seq": 6}
     _, ctx = _setup(monkeypatch, tmp_path, C)
     ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
     ctx.tools["nelix_respond"]["handler"]({"session_id": "s-1", "answer": "1"})
     cmds = _terminal_cmds(ctx)
     assert "--session-id s-1" in cmds[-1] and "--after 6" in cmds[-1]   # armed past answered seq
+
+
+class _EnvelopeClient:
+    def __init__(self, t): pass
+    def start(self, *a):
+        return {"operation": "start", "status": "started", "session_id": "s-1",
+                "snapshot": {"session_id": "s-1", "control_state": "busy"},
+                "next_after_seq": 0, "next_action": "end_turn"}
+    def stop(self, sid):
+        return {"operation": "stop", "status": "stopped", "session_id": sid,
+                "snapshot": {"session_id": sid, "control_state": "terminal",
+                             "terminal_kind": "stopped"}, "next_action": "report"}
+    def status(self, sid=None): return {"sessions": {}}
+
+
+def test_start_envelope_adds_armed_waiter(monkeypatch, tmp_path):
+    _, ctx = _setup(monkeypatch, tmp_path, _EnvelopeClient)
+    body = json.loads(ctx.tools["nelix_start"]["handler"](
+        {"executor": "claude", "task": "go", "cwd": str(tmp_path)}))
+    assert body["operation"] == "start" and body["next_action"] == "end_turn"
+    assert body["waiter"] == {"armed": True, "after_seq": 0}
+
+
+def test_stop_envelope_waiter_not_armed(monkeypatch, tmp_path):
+    _, ctx = _setup(monkeypatch, tmp_path, _EnvelopeClient)
+    body = json.loads(ctx.tools["nelix_stop"]["handler"]({"session_id": "s-1"}))
+    assert body["waiter"]["armed"] is False and body["status"] == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — _with_waiter downgrade: arm skipped (claim_arm dedup) on success body
+# ---------------------------------------------------------------------------
+
+def test_with_waiter_downgrade_when_arm_skipped(monkeypatch, tmp_path):
+    """Legitimate downgrade: second nelix_start on the same session hits claim_arm dedup
+    (waiter already armed at cursor 0); armed_after=None with next_action='end_turn'
+    must be downgraded to 'refresh_status', waiter.armed=False."""
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a):
+            return {"operation": "start", "status": "started", "session_id": "s-1",
+                    "snapshot": {"session_id": "s-1", "control_state": "busy"},
+                    "next_after_seq": 0, "next_action": "end_turn"}
+    _, ctx = _setup(monkeypatch, tmp_path, C)
+    start = ctx.tools["nelix_start"]["handler"]
+    start({"executor": "claude", "task": "t1", "cwd": str(tmp_path)})  # arms at seq 0
+    body = json.loads(start({"executor": "claude", "task": "t2", "cwd": str(tmp_path)}))
+    # second call: claim_arm returns None (already armed at 0) -> downgrade fires
+    assert body["next_action"] == "refresh_status"   # downgraded from end_turn
+    assert body["waiter"]["armed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 plugin — stop_requested: refresh_status + armed wake; stopped: report + no wake
+# ---------------------------------------------------------------------------
+
+class _StopRequestedClient:
+    """Client that returns stop_requested from stop(); start arms the session registry."""
+    def __init__(self, t): pass
+    def start(self, *a):
+        return {"operation": "start", "status": "started", "session_id": "s-1",
+                "snapshot": {"session_id": "s-1", "control_state": "busy"},
+                "next_after_seq": 0, "next_action": "end_turn"}
+    def stop(self, sid):
+        return {"operation": "stop", "status": "stop_requested", "session_id": sid,
+                "snapshot": {"session_id": sid, "control_state": "stopping", "pending": False},
+                "next_action": "refresh_status"}
+    def status(self, sid=None): return {"sessions": {}}
+
+
+def test_stop_requested_refresh_status_and_armed_wake(monkeypatch, tmp_path):
+    """stop_requested: daemon-owned next_action=refresh_status; plugin reports waiter.armed=True
+    because the session is tracked (existing or freshly armed waiter will fire on terminal)."""
+    _, ctx = _setup(monkeypatch, tmp_path, _StopRequestedClient)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    body = json.loads(ctx.tools["nelix_stop"]["handler"]({"session_id": "s-1"}))
+    assert body["next_action"] == "refresh_status"
+    assert body["waiter"]["armed"] is True
+
+
+def test_stop_confirmed_report_and_no_wake(monkeypatch, tmp_path):
+    """stopped: next_action=report, waiter.armed=False (session dropped)."""
+    _, ctx = _setup(monkeypatch, tmp_path, _EnvelopeClient)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    body = json.loads(ctx.tools["nelix_stop"]["handler"]({"session_id": "s-1"}))
+    assert body["next_action"] == "report"
+    assert body["waiter"]["armed"] is False

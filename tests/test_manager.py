@@ -9,12 +9,13 @@ from daemon.manager import SessionManager
 class FakeSession:
     def __init__(self, sid, executor, *a, **k):
         self.sid = sid; self.executor = executor; self.started = None
-        self.started_cwd = None; self.stopped = False
-    def start(self, task, cwd): self.started = task; self.started_cwd = cwd
+        self.started_cwd = None; self.stopped = False; self.task = None; self.cwd = None
+    def start(self, task, cwd): self.started = task; self.started_cwd = cwd; self.task = task; self.cwd = cwd
     def respond(self, answer, decision_id=None):
         from daemon.session import RespondOutcome
         return RespondOutcome("resumed", seq=1, decision_id="dec-1")
-    def snapshot(self): return {"session_id": self.sid, "executor": self.executor, "state": "working"}
+    def snapshot(self): return {"session_id": self.sid, "executor": self.executor,
+                                "control_state": "busy", "task_delivery": "pending"}
     def stop(self): self.stopped = True
 
 
@@ -30,7 +31,7 @@ def _mgr(limit=1):
 
 def test_start_returns_id_and_enforces_limit():
     m, captured = _mgr(limit=1)
-    sid, base_seq = m.start(EXECUTOR, "task A", "/tmp")
+    _out = m.start(EXECUTOR, "task A", "/tmp"); sid = _out.session_id; base_seq = _out.base_seq
     assert captured[0].started == "task A" and m.get(sid) is captured[0]
     assert base_seq == 0                           # daemon-owned cursor: high-water before start
     # session ids are uuid-based (not a per-daemon sequential counter that resets to
@@ -52,7 +53,7 @@ def test_base_seq_skips_a_prior_sessions_event():
     # prior-session event — only this session's future events wake the orchestrator.
     m, _ = _mgr(limit=2)
     prior = m._events.publish("s-old", EXECUTOR, "done", "x", "exited")
-    sid, base_seq = m.start(EXECUTOR, "task", "/tmp")
+    _out = m.start(EXECUTOR, "task", "/tmp"); sid = _out.session_id; base_seq = _out.base_seq
     assert base_seq == prior.seq                              # high-water before the new session
     # nothing for the new session yet -> no wake (the prior event is filtered out by session_id)
     assert m._events.wait_event(after_seq=base_seq, session_id=sid, timeout=0.1) is None
@@ -112,8 +113,8 @@ def test_start_failure_does_not_leak_session():
         m.start(EXECUTOR, "task", "/tmp")
     assert m.status()["sessions"] == {}            # no leaked session
     assert made[0].stopped is True                 # partially-started session was torn down
-    sid, _ = m.start(EXECUTOR, "task2", "/tmp")    # slot freed: a fresh start still works
-    assert sid is not None and m.status()["sessions"][sid]["state"] == "working"
+    _out = m.start(EXECUTOR, "task2", "/tmp"); sid = _out.session_id    # slot freed: a fresh start still works
+    assert sid is not None and m.status()["sessions"][sid]["control_state"] == "busy"
 
 
 def test_operator_stop_publishes_single_stopped_event(tmp_path):
@@ -145,10 +146,10 @@ def test_operator_stop_publishes_single_stopped_event(tmp_path):
     mgr = SessionManager(specs, events, concurrency_limit=2,
                          session_factory=lambda sid, ex, spec, ev: StoppingSession(sid, ex),
                          session_retain=0, session_max_age_days=0)
-    sid, base = mgr.start(EXECUTOR, "t", str(tmp_path))
+    _out = mgr.start(EXECUTOR, "t", str(tmp_path)); sid = _out.session_id; base = _out.base_seq
     before = events.latest_seq(sid)
 
-    assert mgr.stop(sid) is True              # returns, no deadlock
+    assert mgr.stop(sid).status in ("stopped", "stop_requested")   # returns, no deadlock
 
     # exactly one new terminal event for this session, kind == "stopped"
     new = [e for e in events._events if e.session_id == sid and e.seq > before]
@@ -161,10 +162,10 @@ def test_operator_stop_publishes_single_stopped_event(tmp_path):
 
 def test_status_lists_all_and_stop():
     m, captured = _mgr(limit=2)
-    sid, _ = m.start(EXECUTOR, "t", "/tmp")
+    _out = m.start(EXECUTOR, "t", "/tmp"); sid = _out.session_id
     all_status = m.status()
     assert sid in all_status["sessions"]
-    assert m.stop(sid) is True and captured[0].stopped is True
+    assert m.stop(sid).status in ("stopped", "stop_requested") and captured[0].stopped is True
 
 
 import time as _time
@@ -232,7 +233,7 @@ def test_session_created_and_stopped_logged(tmp_path, monkeypatch):
     mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), concurrency_limit=1,
                          logger=Logger(level="debug", stream=buf),
                          session_factory=lambda sid, ex, spec, ev: FakeSession(sid, ex))
-    sid, _ = mgr.start(EXECUTOR, "hi", str(tmp_path))      # real dir for the isdir() check
+    _out = mgr.start(EXECUTOR, "hi", str(tmp_path)); sid = _out.session_id      # real dir for the isdir() check
     mgr.stop(sid)
     events = [json.loads(l)["event"] for l in buf.getvalue().splitlines() if l.strip()]
     assert "session_created" in events and "session_stopped" in events
@@ -253,11 +254,11 @@ def test_unknown_executor_logs_rejected(tmp_path, monkeypatch):
 
 def test_terminal_callback_frees_slot_for_next_start():
     m, captured = _mgr(limit=1)
-    sid, _ = m.start(EXECUTOR, "task A", "/tmp")
+    _out = m.start(EXECUTOR, "task A", "/tmp"); sid = _out.session_id
     # simulate the session reaching a terminal state and invoking its on_terminal callback
     captured[0].on_terminal(sid)
     assert m.get(sid) is None                            # deregistered
-    sid2, _ = m.start(EXECUTOR, "task B", "/tmp")        # slot freed -> next start succeeds
+    _out2 = m.start(EXECUTOR, "task B", "/tmp"); sid2 = _out2.session_id        # slot freed -> next start succeeds
     assert sid2 is not None
 
 
@@ -288,3 +289,58 @@ def test_stop_all_uses_shutdown_reason(tmp_path, monkeypatch):
     rec = [json.loads(l) for l in buf.getvalue().splitlines()
            if json.loads(l)["event"] == "session_stopped"][0]
     assert rec["reason"] == "shutdown"
+
+
+def test_start_returns_outcome_with_snapshot(tmp_path):
+    m, _ = _mgr()
+    out = m.start(EXECUTOR, "do it", "/tmp")
+    assert out.session_id.startswith("s-")
+    assert out.base_seq == 0
+    assert out.snapshot["session_id"] == out.session_id
+    assert out.snapshot["task_delivery"] == "pending"
+    assert out.snapshot["control_state"] == "busy"
+
+
+def test_stop_unknown_session_outcome(tmp_path):
+    m, _ = _mgr()
+    out = m.stop("s-nope")
+    assert out.status == "unknown_session" and out.snapshot is None
+
+
+class _StoppedSession:
+    def __init__(self, sid, executor, *a, **k):
+        self.sid = sid; self.executor = executor; self.on_terminal = None
+        self.reaper_ctx = None; self.lineage_id = sid; self.restarted_from = None
+        self.restart_count = 0; self.stopped = False
+    def start(self, task, cwd): pass
+    def snapshot(self): return {"session_id": self.sid, "control_state": "busy",
+                                "task_delivery": "delivered"}
+    def terminal_snapshot(self):
+        return {"session_id": self.sid, "control_state": "terminal", "terminal_kind": "stopped",
+                "task_delivery": "delivered", "pending": False, "lineage_id": self.sid,
+                "restarted_from": None, "restart_count": 0, "terminal": True}
+    def stop(self):
+        self.stopped = True
+        if self.on_terminal is not None:
+            self.on_terminal(self.sid)        # mimic the monitor finalizing -> _free_slot captures
+
+
+def test_stop_confirmed_terminal_outcome():
+    specs = {EXECUTOR: make_spec()}
+    def factory(sid, executor, spec, events):
+        return _StoppedSession(sid, executor)
+    m = SessionManager(specs, EventQueue(), session_factory=factory, concurrency_limit=1)
+    out0 = m.start(EXECUTOR, "t", "/tmp")
+    out = m.stop(out0.session_id)
+    assert out.status == "stopped"
+    assert out.snapshot["terminal_kind"] == "stopped"
+    assert out.snapshot["control_state"] == "terminal"
+
+
+def test_restart_outcome_carries_new_snapshot(tmp_path):
+    m, _ = _mgr(limit=2)
+    out0 = m.start(EXECUTOR, "do it", "/tmp")
+    out = m.restart(out0.session_id, force=True)
+    assert out.status == "restarted"
+    assert out.snapshot["session_id"] == out.session_id
+    assert out.snapshot["control_state"] == "busy"

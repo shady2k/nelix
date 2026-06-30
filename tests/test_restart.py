@@ -39,7 +39,7 @@ def _mgr(tmp_path, monkeypatch, limit=2, max_restarts=3):
 
 def test_restart_active_session_replaces_at_full_capacity(tmp_path, monkeypatch):
     mgr = _mgr(tmp_path, monkeypatch, limit=1)
-    sid, _ = mgr.start("claude", "task A", str(tmp_path))
+    _out = mgr.start("claude", "task A", str(tmp_path)); sid = _out.session_id
     out = mgr.restart(sid)                                  # at full cap (limit 1)
     assert out.status == "restarted"
     assert out.session_id != sid                            # new id
@@ -52,7 +52,7 @@ def test_restart_active_session_replaces_at_full_capacity(tmp_path, monkeypatch)
 
 def test_restart_gone_session_resolves_from_persisted_meta(tmp_path, monkeypatch):
     mgr = _mgr(tmp_path, monkeypatch, limit=2)
-    sid, _ = mgr.start("claude", "task B", str(tmp_path))
+    _out = mgr.start("claude", "task B", str(tmp_path)); sid = _out.session_id
     # Simulate a crash: write meta to disk (Task 2 does this in real start) and free the slot.
     paths.ensure_private_dir(paths.sessions_root() / sid)
     paths.session_meta(paths.sessions_root() / sid).write_text(json.dumps(
@@ -71,7 +71,7 @@ def test_restart_unknown_session(tmp_path, monkeypatch):
 
 def test_restart_budget_exhausted_then_force_resets(tmp_path, monkeypatch):
     mgr = _mgr(tmp_path, monkeypatch, limit=1, max_restarts=2)
-    sid, _ = mgr.start("claude", "t", str(tmp_path))
+    _out = mgr.start("claude", "t", str(tmp_path)); sid = _out.session_id
     o1 = mgr.restart(sid); assert o1.status == "restarted" and o1.restart_count == 1
     o2 = mgr.restart(o1.session_id); assert o2.status == "restarted" and o2.restart_count == 2
     o3 = mgr.restart(o2.session_id)
@@ -82,8 +82,8 @@ def test_restart_budget_exhausted_then_force_resets(tmp_path, monkeypatch):
 
 def test_restart_budget_is_per_lineage(tmp_path, monkeypatch):
     mgr = _mgr(tmp_path, monkeypatch, limit=2, max_restarts=1)
-    a, _ = mgr.start("claude", "A", str(tmp_path))
-    b, _ = mgr.start("claude", "B", str(tmp_path))
+    _outa = mgr.start("claude", "A", str(tmp_path)); a = _outa.session_id
+    _outb = mgr.start("claude", "B", str(tmp_path)); b = _outb.session_id
     oa = mgr.restart(a); assert oa.status == "restarted"        # lineage A: count 1
     ob = mgr.restart(b); assert ob.status == "restarted"        # lineage B independent: count 1
     assert mgr.restart(oa.session_id).status == "restart_budget_exhausted"
@@ -93,7 +93,7 @@ def test_restart_budget_is_per_lineage(tmp_path, monkeypatch):
 def test_restart_does_not_hold_lock_across_stop(tmp_path, monkeypatch):
     # A stop() that re-enters the manager lock (real Session._free_slot does) must not deadlock.
     mgr = _mgr(tmp_path, monkeypatch, limit=1)
-    sid, _ = mgr.start("claude", "t", str(tmp_path))
+    _out = mgr.start("claude", "t", str(tmp_path)); sid = _out.session_id
     src = mgr.get(sid)
     def reentrant_stop():
         mgr._free_slot(sid)         # takes mgr._lock — would deadlock if restart held it across stop
@@ -107,7 +107,7 @@ def test_restart_outcome_carries_next_after_seq(tmp_path, monkeypatch):
     # The restarted session must report its base seq so the plugin can arm a waiter at exactly the
     # right cursor (symmetric with /start's next_after_seq), not blindly from 0.
     mgr = _mgr(tmp_path, monkeypatch, limit=1)
-    sid, _ = mgr.start("claude", "task A", str(tmp_path))
+    _out = mgr.start("claude", "task A", str(tmp_path)); sid = _out.session_id
     mgr._events.publish(sid, "claude", "waiting_for_user", "?", "idle_prompt")  # bump the high-water
     out = mgr.restart(sid)
     assert out.status == "restarted"
@@ -119,7 +119,7 @@ def test_restart_balances_reserved_counter(tmp_path, monkeypatch):
     # The reservation must return to 0 after a restart (active and already-gone) so it never leaks
     # nor overcounts capacity for concurrent starts. (Guards the overcount/leak fix in _spawn.)
     mgr = _mgr(tmp_path, monkeypatch, limit=1)
-    sid, _ = mgr.start("claude", "t", str(tmp_path))
+    _out = mgr.start("claude", "t", str(tmp_path)); sid = _out.session_id
     out = mgr.restart(sid)                          # active path (reserve)
     assert out.status == "restarted" and mgr._reserved == 0
     # Now a single free slot exists for the lineage; a fresh start at limit 1 must be rejected,

@@ -6,6 +6,7 @@ import pytest
 
 from conftest import EXECUTOR
 from daemon.events import EventQueue
+from daemon.manager import StartOutcome, StopOutcome
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
 from daemon.transport import Transport
@@ -14,12 +15,20 @@ from rpc_client import RpcClient
 
 class FakeManager:
     def __init__(self): self._events = EventQueue(); self.calls = []
-    def start(self, e, t, c): self.calls.append(("start", e, t, c)); return "s1", 0
+    def start(self, e, t, c):
+        self.calls.append(("start", e, t, c))
+        return StartOutcome(session_id="s1", base_seq=0,
+                            snapshot={"session_id": "s1", "control_state": "busy",
+                                      "task_delivery": "pending", "pending": False})
     def respond(self, s, a, decision_id=None):
         self.calls.append(("respond", s, a, decision_id))
         return RespondOutcome("resumed", seq=3, decision_id="dec-x")
     def status(self, sid=None): return {"sessions": {}}
-    def stop(self, s): self.calls.append(("stop", s)); return True
+    def stop(self, s):
+        self.calls.append(("stop", s))
+        return StopOutcome("stopped", snapshot={"session_id": s,
+                                                "control_state": "terminal",
+                                                "terminal_kind": "stopped", "pending": False})
 
 
 @pytest.fixture
@@ -55,7 +64,7 @@ def test_rpc_client_roundtrip():
         ok, body = c.respond("s1", "yes")
         assert ok is True and ("respond", "s1", "yes", None) in m.calls
         assert body["decision_id"] == "dec-x"
-        assert c.stop("s1")["stopped"] is True
+        assert c.stop("s1")["status"] == "stopped"
     finally:
         srv.shutdown()
 

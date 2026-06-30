@@ -47,11 +47,20 @@ def register(ctx):
             return None
 
     def _arm(sid):
-        # Arm/re-arm exactly one waiter for THIS session, scoped to it. claim_arm is atomic
-        # (check + mark) so concurrent reconciles never double-spawn; dispatch outside the lock.
+        # Arm/re-arm exactly one waiter for THIS session. claim_arm is atomic (check + mark);
+        # dispatch outside the lock. Returns the after_seq armed at, or None if no waiter dispatched.
         after = waiters.claim_arm(sid)
         if after is not None:
             arm_waiter(ctx, after_seq=after, state_file=supervisor.state_file(), session_id=sid)
+        return after
+
+    def _with_waiter(body, armed_after):
+        armed = armed_after is not None
+        body["waiter"] = {"armed": armed,
+                          "after_seq": armed_after if armed else int(body.get("next_after_seq", 0))}
+        if not armed and body.get("next_action") == "end_turn":
+            body["next_action"] = "refresh_status"   # success expected an arm but none happened -> reconcile
+        return body
 
     def nelix_start(args, **k):
         # cwd is per-session: caller-supplied project dir, else this orchestrator's own
@@ -69,11 +78,12 @@ def register(ctx):
         body = RpcClient(transport).start(args["executor"], args["task"], cwd)
         # Register this new session's base cursor, then arm one waiter scoped to it. Only arm on a
         # successful start — a failed start (e.g. bad cwd) has no session and must not arm a waiter.
+        armed_after = None
         if body.get("session_id"):
             sid = body["session_id"]
             waiters.on_start(sid, int(body.get("next_after_seq", 0)), daemon_id=_daemon_id())
-            _arm(sid)
-        return _j(body)
+            armed_after = _arm(sid)
+        return _j(_with_waiter(body, armed_after))
 
     def nelix_status(args, **k):
         transport = supervisor.endpoint()
@@ -117,21 +127,35 @@ def register(ctx):
             return _j({"error": "no active nelix daemon"})
         # No event_id: the daemon binds the answer to the session's current pending decision.
         # decision_id (if the model carries it from a status pull) is an optional staleness guard.
+        # RpcClient.respond returns (ok, body) where ok = (st == 200); write_timeout is HTTP 503
+        # → ok=False → no arm.
         ok, body = RpcClient(transport).respond(
             args["session_id"], args["answer"], decision_id=args.get("decision_id"))
-        if ok:
+        armed_after = None
+        if ok and body.get("status") == "resumed":
             waiters.on_respond(args["session_id"], int(body.get("next_after_seq", 0)))
-            _arm(args["session_id"])                                # re-arm this session past its answer
-        return _j(body)
+            armed_after = _arm(args["session_id"])
+        return _j(_with_waiter(body, armed_after))
 
     def nelix_stop(args, **k):
         transport = supervisor.endpoint()
         if transport is None:
-            return _j({"stopped": False})
-        body = RpcClient(transport).stop(args["session_id"])
-        if isinstance(body, dict) and body.get("stopped"):
-            waiters.drop(args["session_id"])   # the daemon's stop event fires the live waiter
-        return _j(body)
+            return _j({"error": "no active nelix daemon"})
+        sid = args["session_id"]
+        body = RpcClient(transport).stop(sid)
+        status = body.get("status") if isinstance(body, dict) else None
+        armed_after = None
+        if status == "stop_requested":
+            # Teardown not yet confirmed: keep the session in the registry so the eventual
+            # terminal event wakes the orchestrator. Arm (or re-arm) the waiter; if
+            # claim_arm returns None, a waiter is already pending — fall back to the
+            # registry's current cursor so waiter.armed is truthfully reported.
+            armed_after = _arm(sid)
+            if armed_after is None:
+                armed_after = waiters.value(sid)   # non-None if session tracked, else None
+        elif status == "stopped":
+            waiters.drop(sid)
+        return _j(_with_waiter(body, armed_after))
 
     def nelix_dialog(args, **k):
         transport = supervisor.endpoint()
@@ -146,13 +170,14 @@ def register(ctx):
         if transport is None:
             return _j({"error": "no active nelix daemon"})
         ok, body = RpcClient(transport).restart(args["session_id"], force=bool(args.get("force", False)))
-        if ok:
-            waiters.drop(args["session_id"])                 # old session is gone
+        armed_after = None
+        if ok and body.get("status") == "restarted":
+            waiters.drop(args["session_id"])                 # old session gone
             new_sid = body.get("session_id")
             if new_sid:
                 waiters.on_start(new_sid, int(body.get("next_after_seq", 0)), daemon_id=_daemon_id())
-                _arm(new_sid)
-        return _j(body)
+                armed_after = _arm(new_sid)
+        return _j(_with_waiter(body, armed_after))
 
     def nelix_screen(args, **k):
         transport = supervisor.endpoint()
@@ -174,7 +199,11 @@ def register(ctx):
             " only for a decision or when done. Returns at once — you're brought back when it needs"
             " you or finishes, and spend nothing meanwhile. 'executor' is the agent's configured"
             " name; 'cwd' is the project dir it runs in (omit = your current dir). Before driving"
-            " it, you MUST call skill_view(\"nelix:nelix-orchestration\")."),
+            " it, you MUST call skill_view(\"nelix:nelix-orchestration\")."
+            " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
+            " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
+            " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."
+            " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ,
                         "properties": {"executor": {"type": "string"}, "task": {"type": "string"},
                                        "cwd": {"type": "string"}},
@@ -195,7 +224,11 @@ def register(ctx):
             "Send the user's answer to a paused agent (e.g. '1' to approve, or free text) so it"
             " continues. It is delivered to the agent's CURRENT pending decision — you do NOT need"
             " an event id. (Optional: pass decision_id from a nelix_status read as a staleness"
-            " guard.) After it succeeds, end your turn — nelix wakes you on the next event."),
+            " guard.) After it succeeds, end your turn — nelix wakes you on the next event."
+            " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
+            " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
+            " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."
+            " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ,
                         "properties": {"session_id": {"type": "string"}, "answer": {"type": "string"},
                                        "decision_id": {"type": "string"}},
@@ -203,7 +236,12 @@ def register(ctx):
         nelix_respond)
     ctx.register_tool(
         "nelix_stop", "nelix",
-        {"description": "Stop a running agent by session_id.",
+        {"description": ("Stop a running agent by session_id."
+                         " The returned result is the COMPLETE outcome of this call — obey its"
+                         " `next_action` (`report` → stop confirmed, relay to the user;"
+                         " `refresh_status` → teardown still in progress, reconcile via status;"
+                         " you will also be woken when the process stops)."
+                         " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
                         "required": ["session_id"]}},
         nelix_stop)
@@ -214,7 +252,11 @@ def register(ctx):
             " project, and agent (you do NOT re-state the task). The daemon counts restarts per agent"
             " and refuses past its max_restarts with 'restart_budget_exhausted'; relay that to the user"
             " and only pass force:true if they explicitly authorize continuing. After it succeeds, end"
-            " your turn — nelix wakes you on the next event."),
+            " your turn — nelix wakes you on the next event."
+            " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
+            " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
+            " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."
+            " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
                                                "force": {"type": "boolean"}},
                         "required": ["session_id"]}},

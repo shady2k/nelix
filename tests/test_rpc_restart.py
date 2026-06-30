@@ -25,13 +25,14 @@ def _serve(manager, port):
 
 def test_restart_route_returns_new_session():
     mgr = _RestartManager(RestartOutcome("restarted", session_id="s-new", lineage_id="s-old",
-                                         restart_count=1, max_restarts=3))
+                                         restart_count=1, max_restarts=3,
+                                         snapshot={"session_id": "s-new", "control_state": "busy"}))
     srv, base = _serve(mgr, 8771)
     try:
         st, b = _req("POST", base + "/restart", body={"session_id": "s-old"})
-        assert st == 200 and b["status"] == "restarted"
+        assert st == 200 and b["operation"] == "restart" and b["status"] == "restarted"
         assert b["session_id"] == "s-new" and b["lineage_id"] == "s-old"
-        assert b["restarted_from"] == "s-old"
+        assert b["restarted_from"] == "s-old" and b["next_action"] == "end_turn"
         assert mgr.calls == [("s-old", False)]
     finally:
         srv.shutdown()
@@ -59,7 +60,8 @@ def test_restart_route_unknown_is_404():
 
 def test_restart_route_force_passed_through():
     mgr = _RestartManager(RestartOutcome("restarted", session_id="s-new", lineage_id="s-old",
-                                         restart_count=1, max_restarts=3))
+                                         restart_count=1, max_restarts=3,
+                                         snapshot={"session_id": "s-new", "control_state": "busy"}))
     srv, base = _serve(mgr, 8774)
     try:
         _req("POST", base + "/restart", body={"session_id": "s-old", "force": True})
@@ -93,7 +95,8 @@ def test_restart_route_includes_next_after_seq():
     # The /restart 200 body must carry next_after_seq so the plugin arms the restarted session's
     # waiter at the daemon-reported base cursor (symmetric with /start).
     mgr = _RestartManager(RestartOutcome("restarted", session_id="s-new", lineage_id="lin",
-                                         restart_count=1, max_restarts=3, next_after_seq=42))
+                                         restart_count=1, max_restarts=3, next_after_seq=42,
+                                         snapshot={"session_id": "s-new", "control_state": "busy"}))
     srv, base = _serve(mgr, 8778)
     try:
         st, b = _req("POST", base + "/restart", body={"session_id": "s-old"})
@@ -105,7 +108,8 @@ def test_restart_route_includes_next_after_seq():
 def test_rpc_client_restart_round_trip():
     from rpc_client import RpcClient
     mgr = _RestartManager(RestartOutcome("restarted", session_id="s-new", lineage_id="s-old",
-                                         restart_count=2, max_restarts=3))
+                                         restart_count=2, max_restarts=3,
+                                         snapshot={"session_id": "s-new", "control_state": "busy"}))
     srv = make_server(mgr, Transport.tcp("127.0.0.1", 8775, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:

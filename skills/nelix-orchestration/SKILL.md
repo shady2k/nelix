@@ -28,6 +28,12 @@ For each agent you're about to start:
 
 Then `nelix_start(executor, task, cwd)` and **end your turn** — you spend nothing while it works.
 
+`nelix_start`, `nelix_respond`, and `nelix_restart` each return the session snapshot and a `next_action`
+field. Obey `next_action` directly: `end_turn` → end your turn immediately; `report` → relay the snapshot
+summary to the user; `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly. You may report the
+launch result (agent name, task, cwd) from the returned snapshot **without** a separate `nelix_status` call.
+Do NOT call `nelix_status` after `nelix_start`, `nelix_respond`, or `nelix_restart`.
+
 - If a `nelix_start` result contains `config_errors`, the executor's `nelix.toml` is misconfigured: relay the `error` message to the user verbatim and stop — do not retry until they fix the config.
 
 ## The board
@@ -128,9 +134,10 @@ Report it to the user; the other agents keep working — handle the rest of the 
 
 ## Rules
 
-- After start / respond / restart → **end your turn** and call no nelix tools. The wake (a doorbell) brings
-  you back; then call `nelix_status()` (no argument) once per turn — the whole board — and act. Never poll
-  while agents work.
+- After start / respond / restart → **end your turn** and call no nelix tools. These calls return the session
+  snapshot and a `next_action` — obey it (`end_turn` → end your turn; `report` → relay to user; others →
+  act accordingly); do NOT call `nelix_status` after them. The wake (a doorbell) brings you back; then call
+  `nelix_status()` (no argument) once per turn — the whole board — and act. Never poll while agents work.
 - Answer with `decision_id` from the status read every time — several decisions can be pending at once.
 - Recover crashes and wedged agents with `nelix_restart` — never your own restart counter.
 - "Done" = process exited **and** goal met — not a mere idle prompt.
