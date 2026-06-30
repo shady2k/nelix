@@ -87,6 +87,14 @@ def make_server(manager, transport, logger=None):
                     logger.error("rpc", "request_exception", path=self.path, exc_info=True)
                 self._send(500, {"error": "internal"})
 
+        def _log_read(self, tool, sid):
+            # nelix-jwv gap 4: a light per-read record (which tool, session, current event seq) at
+            # debug — high-volume, so off the info plane, but it makes "nelix_screen called twice in a
+            # turn" visible from the log instead of only by replaying the raw capture.
+            if logger is not None:
+                logger.debug("rpc", "read", session_id=sid, tool=tool,
+                             seq=manager._events.latest_seq(sid))
+
         def _dispatch_get(self, p):
             if p.path == "/wait":
                 qs = parse_qs(p.query)
@@ -96,12 +104,14 @@ def make_server(manager, transport, logger=None):
                 self._send(200, {"event": _evt_dict(evt) if evt else None})
             elif p.path == "/status":
                 sid = parse_qs(p.query).get("session_id", [None])[0]
+                self._log_read("status", sid)
                 # Stamp the RPC protocol version at the wire layer (always present, regardless of
                 # session_id) so a supervisor can tell our protocol from an old daemon's.
                 self._send(200, {**manager.status(sid), "rpc_protocol": RPC_PROTOCOL_VERSION})
             elif p.path == "/dialog":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
+                self._log_read("dialog", sid)
                 if not sid:
                     self._send(400, {"error": "missing session_id"}); return
                 reader = DialogReader(paths.sessions_root() / sid)
@@ -123,6 +133,7 @@ def make_server(manager, transport, logger=None):
             elif p.path == "/screen":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
+                self._log_read("screen", sid)
                 raw = qs.get("raw", ["0"])[0].lower() in ("1", "true")
                 force = qs.get("force", ["0"])[0].lower() in ("1", "true")
                 self._send(200, manager.screen(sid, raw=raw, force=force))

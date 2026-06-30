@@ -36,6 +36,16 @@ class Actuate:
     arg: Optional[str] = None
 
 
+@dataclass
+class Note:
+    """A pure DIAGNOSTIC the engine surfaces about WHY it did (or did not) act — the suppression
+    rationale and post-submit window edges (spec §7.1). Carried on a side-channel buffer drained by
+    Session (drain_notes), NEVER on tick()'s action list: actuation is unchanged, and the engine's
+    action-equality tests keep asserting `== []`. Session maps it to a structured log record."""
+    event: str
+    fields: dict = field(default_factory=dict)
+
+
 # ---- Read-only state snapshot exposed for /status, the trail, and the test oracle ----
 
 @dataclass
@@ -88,12 +98,31 @@ class BeliefEngine:
         # not land, the echo stays in the box indefinitely; `_echo_since` clocks how long it has held
         # so a never-clearing box surfaces a wake instead of suppressing every wake forever.
         self._echo_since = None
+        # diagnostic note buffer (nelix-jwv): WHY we suppressed / post-submit edges, edge-triggered so
+        # a persistent reason logs once (signal, not per-tick noise). Drained by Session, off `actions`.
+        self._notes = []
+        self._suppress_reason = None     # last emitted suppression reason (edge detection)
         # state snapshot
         self._state = EngineState()
 
     @property
     def state(self):
         return self._state
+
+    # ---- diagnostic notes (nelix-jwv): pure, off the action list; Session drains + logs ----
+    def _note(self, event, **fields):
+        self._notes.append(Note(event, fields))
+
+    def drain_notes(self):
+        notes, self._notes = self._notes, []
+        return notes
+
+    def _suppressed(self, reason):
+        # Edge-triggered: emit one note when the suppression reason CHANGES (a stall that suppresses
+        # for many ticks under the same reason logs exactly once until the reason changes or we act).
+        if reason != self._suppress_reason:
+            self._suppress_reason = reason
+            self._note("belief_suppressed", reason=reason)
 
     # ---- submit edge (post-submit suppression entry, spec §7.1) ----
     def on_submit(self, text):
@@ -113,6 +142,8 @@ class BeliefEngine:
         self._post_submit_grace_until = now + self._cfg.post_submit_grace
         self._post_submit_content_fp = None
         self._echo_since = None                  # a fresh submit: re-clock the stuck-input bound
+        self._suppress_reason = None             # a fresh turn: re-arm the suppression edge
+        self._note("post_submit_armed", grace=self._cfg.post_submit_grace)
 
     # ---- main entry ----
     def tick(self, obs, ctx):
@@ -177,13 +208,16 @@ class BeliefEngine:
             self._post_submit_content_fp = obs.content_fp     # baseline (our echo, not real output)
         if now >= self._post_submit_grace_until:              # (d) bounded grace expired
             self._post_submit_active = False
+            self._note("post_submit_cleared", reason="grace_expired")
             return
         if obs.prompt_kind == "none" and self._liveness(obs, now) == "live":   # (a) busy + live
             self._post_submit_active = False
+            self._note("post_submit_cleared", reason="busy_live")
             return
         if (not obs.submitted_echo_present
                 and obs.content_fp != self._post_submit_content_fp):           # (b) real output
             self._post_submit_active = False
+            self._note("post_submit_cleared", reason="real_output")
             return
         # (c) child exit/crash is handled by the terminal branch in tick().
 
@@ -195,6 +229,7 @@ class BeliefEngine:
         self._candidate_fp = None
         self._candidate_since = None
         self._echo_since = None                  # the box cleared / turn moved: stuck-input bound off
+        self._suppress_reason = None             # turn moved: re-arm the suppression edge
         self._state.phase = "busy"
         self._watchdog(obs, now, actions)
 
@@ -303,19 +338,23 @@ class BeliefEngine:
             if self._echo_since is None:
                 self._echo_since = now
             if (now - self._echo_since) < self._cfg.echo_stuck_after:
+                self._suppressed("submitted_echo_present")
                 return
             self._escalate_stuck_input(obs, now, actions)
             return
         self._echo_since = None                       # echo gone: the submit landed, clear the clock
         if self._post_submit_active and now < self._post_submit_grace_until:
+            self._suppressed("post_submit_grace")
             return
         # anti-flap: do not re-mint the SAME semantic_fp within the cooldown after withdrawing it.
         if (obs.semantic_fp == self._last_withdrawn_fp
                 and self._withdrawn_cooldown_until is not None
                 and now < self._withdrawn_cooldown_until):
+            self._suppressed("anti_flap")
             return
         settled = (now - self._candidate_since) >= self._cfg.idle_confirm_window
         if not settled:
+            self._suppressed("not_settled")
             return
         self._publish_decision(obs, decision_key, actions)
 
@@ -329,6 +368,7 @@ class BeliefEngine:
         self._published_semantic_fp = None
 
     def _publish_decision(self, obs, decision_key, actions):
+        self._suppress_reason = None              # we published: re-arm the suppression edge
         self._published_key = decision_key
         self._published_kind = obs.prompt_kind
         self._published_prompt_fp = obs.prompt_fp
