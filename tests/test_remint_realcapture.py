@@ -33,10 +33,11 @@ _CTX = ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None
 
 
 def _replay_publishes():
-    """Drive the real renderer+driver+engine over the capture; return (pubs, sfps) where
+    """Drive the real renderer+driver+engine over the capture; return (pubs, sfps, order) where
     `pubs[prompt_fp]` = number of waiting_for_user publishes that fired while that prompt region
-    was on screen, and `sfps[prompt_fp]` = the distinct semantic_fp seen at that free_text prompt
-    (used to locate the churn window from the data, without hardcoding a fingerprint)."""
+    was on screen, `sfps[prompt_fp]` = the distinct semantic_fp seen at that free_text prompt
+    (used to locate the churn window from the data, without hardcoding a fingerprint), and `order`
+    = the prompt_fp of every waiting_for_user publish in firing order."""
     raw = _CAPTURE.read_bytes()
     drv = ClaudeDriver()
     r = GhosttyRenderer(120, 40)
@@ -44,6 +45,7 @@ def _replay_publishes():
     eng = BeliefEngine(BeliefConfig(), clk)
     pubs = defaultdict(int)
     sfps = defaultdict(set)
+    order = []
     seen = None
     for i in range(0, len(raw), 256):
         r.feed(raw[i:i + 256])
@@ -58,11 +60,12 @@ def _replay_publishes():
         for a in eng.tick(obs, _CTX):
             if isinstance(a, Publish) and a.kind == "waiting_for_user":
                 pubs[obs.prompt_fp] += 1
-    return pubs, sfps
+                order.append(obs.prompt_fp)
+    return pubs, sfps, order
 
 
 def test_stable_prompt_churn_publishes_waiting_for_user_once():
-    pubs, sfps = _replay_publishes()
+    pubs, sfps, _ = _replay_publishes()
     # The churn window = the free_text prompt region that carried the most distinct semantic_fp
     # (the bottom-anchored ❯ box held stable while the repaint churned the frame meaning).
     churn_fp, churn_sfps = max(sfps.items(), key=lambda kv: len(kv[1]))
@@ -73,12 +76,15 @@ def test_stable_prompt_churn_publishes_waiting_for_user_once():
         f"{pubs[churn_fp]} waiting_for_user wakes for ONE unanswered prompt whose region never changed")
 
 
-def test_a_genuinely_new_prompt_still_publishes():
+def test_a_genuinely_new_prompt_still_publishes_after_the_churn():
     # Faithfulness guard: the backstop suppresses re-minting at a HELD prompt — it must NOT swallow a
-    # real new question. Later in the capture the prompt region CHANGES (a different prompt_fp); that
-    # genuinely new prompt must still publish its own waiting_for_user (so the fix suppresses churn,
-    # not real questions). Passes before AND after the fix; fails if the fix over-suppresses.
-    pubs, _ = _replay_publishes()
-    published_fps = [fp for fp, n in pubs.items() if n >= 1]
-    assert len(published_fps) >= 2, (
-        f"expected a fresh publish at a second, genuinely different prompt_fp; got {dict(pubs)}")
+    # real new question. Assert ORDER, not just presence: AFTER the churn prompt publishes (once),
+    # a genuinely different prompt region (different prompt_fp) appears LATER in the capture and
+    # still publishes its own waiting_for_user. This fails if the fix over-suppresses (swallows the
+    # later prompt) — a `>=2 distinct fps published` check could not tell that apart.
+    pubs, sfps, order = _replay_publishes()
+    churn_fp, _ = max(sfps.items(), key=lambda kv: len(kv[1]))
+    assert churn_fp in order, f"churn prompt never published; got {order!r}"
+    after_churn = order[order.index(churn_fp) + 1:]
+    assert any(fp != churn_fp for fp in after_churn), (
+        f"no fresh publish at a different prompt_fp after the churn prompt; publish order={order!r}")
