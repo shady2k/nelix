@@ -620,6 +620,61 @@ class StalePreWriteThenStrandedHandle:
         pass
 
 
+class AmbiguousThenStrandedHandle:
+    """First post-write poll is an AMBIGUOUS frame (a `❯` with no prompt footer -> prompt_kind
+    'unknown', e.g. a transient redraw that briefly dropped the footer), then the stranded echoed
+    answer renders and STAYS. 'unknown' is NOT a positive turn-start, so it must not confirm."""
+    def __init__(self, answer):
+        self._answer = answer
+        self.writes = []
+        self._renders = 0
+
+    def pump(self, timeout=0.1):
+        return True
+
+    def render(self):
+        self._renders += 1
+        if self._renders <= 1:
+            return "❯ "                              # ambiguous: box marker, no footer -> 'unknown'
+        return f"Ready — what next?\n❯ {self._answer}\n⏵⏵ ask mode (shift+tab to cycle)"
+
+    def is_alive(self):
+        return True
+
+    def exit_code(self):
+        return None
+
+    def write(self, data, timeout=None, drain_output=False):
+        self.writes.append(data)
+
+    def finalize(self):
+        pass
+
+    def leader_pid(self): return 4242
+    def leader_pgid(self): return 4242
+    def assert_leader_is_group_leader(self): pass
+
+    def leader_status(self):
+        from daemon.launchers.base import LeaderStatus
+        return LeaderStatus(alive=True, exit_code=None, signal=None, status_available=False)
+
+    def close(self):
+        pass
+
+
+def test_respond_does_not_confirm_on_ambiguous_unknown_frame(tmp_path):
+    # Regression: an ambiguous 'unknown' redraw frame is not a turn-start signal — confirm must keep
+    # polling, see the stranded echo, and fail. (A broad 'prompt_kind != free_text' check would have
+    # falsely confirmed here.)
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()
+    sess._handle = AmbiguousThenStrandedHandle("do the next thing")
+    out = sess.respond("do the next thing")
+    assert out.status == "respond_failed"
+
+
 def test_respond_does_not_falsely_confirm_on_stale_pre_write_frame(tmp_path):
     # Regression for the confirm race: a stale empty frame on the first poll must not be read as
     # 'answer left the box'. Once the dropped-Enter echo renders and stays, respond reports failure.

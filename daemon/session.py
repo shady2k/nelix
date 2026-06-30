@@ -776,16 +776,21 @@ class Session:
         # still be the stale pre-write frame (the monitor may not have rendered our keystrokes yet),
         # so accepting it would falsely confirm the very dropped-Enter race we are catching. Require
         # POSITIVE post-write evidence to confirm EARLY — the echo seen then gone, or the turn moved
-        # off the free_text prompt; otherwise keep polling and only accept "no echo" at the deadline.
+        # to a HIGH-CONFIDENCE state; otherwise keep polling and accept "no echo" only at the deadline.
+        # The "moved" allowlist is deliberate: a live working spinner (none + heartbeat), a fresh
+        # modal/permission question, or a terminal child — NEVER an ambiguous `unknown`/blank repaint
+        # frame (a transient redraw dropping the footer would otherwise false-confirm a stranded echo).
         # The belief engine's bounded echo-suppression is the async backstop for anything past this.
         saw_echo = False
         while True:
             with self._lock:
                 frame = self._handle.render() if self._handle is not None else ""
             obs = self._driver.observe(frame, self._obs_ctx())
+            moved = ((obs.prompt_kind == "none" and obs.heartbeat.present)
+                     or obs.prompt_kind in ("modal_choice", "permission_choice", "crash", "exit"))
             if obs.submitted_echo_present:
                 saw_echo = True
-            elif saw_echo or obs.prompt_kind != "free_text":
+            elif saw_echo or moved:
                 return True                          # echo cleared / turn moved -> submit confirmed
             if self._stop.is_set() or time.monotonic() >= deadline:
                 return not obs.submitted_echo_present  # at the deadline: unconfirmed iff still echoed
