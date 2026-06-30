@@ -141,10 +141,21 @@ def register(ctx):
         transport = supervisor.endpoint()
         if transport is None:
             return _j({"error": "no active nelix daemon"})
-        body = RpcClient(transport).stop(args["session_id"])
-        if isinstance(body, dict) and body.get("status") in ("stopped", "stop_requested"):
-            waiters.drop(args["session_id"])
-        return _j(_with_waiter(body, None))
+        sid = args["session_id"]
+        body = RpcClient(transport).stop(sid)
+        status = body.get("status") if isinstance(body, dict) else None
+        armed_after = None
+        if status == "stop_requested":
+            # Teardown not yet confirmed: keep the session in the registry so the eventual
+            # terminal event wakes the orchestrator. Arm (or re-arm) the waiter; if
+            # claim_arm returns None, a waiter is already pending — fall back to the
+            # registry's current cursor so waiter.armed is truthfully reported.
+            armed_after = _arm(sid)
+            if armed_after is None:
+                armed_after = waiters.value(sid)   # non-None if session tracked, else None
+        elif status == "stopped":
+            waiters.drop(sid)
+        return _j(_with_waiter(body, armed_after))
 
     def nelix_dialog(args, **k):
         transport = supervisor.endpoint()
@@ -227,9 +238,10 @@ def register(ctx):
         "nelix_stop", "nelix",
         {"description": ("Stop a running agent by session_id."
                          " The returned result is the COMPLETE outcome of this call — obey its"
-                         " `next_action` (`end_turn` → stop and wait to be woken; `report` → relay"
-                         " to the user; `ask_user`/`fix_call`/`recover`/`refresh_status` → act"
-                         " accordingly). Do NOT call nelix_status after this."),
+                         " `next_action` (`report` → stop confirmed, relay to the user;"
+                         " `refresh_status` → teardown still in progress, reconcile via status;"
+                         " you will also be woken when the process stops)."
+                         " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}},
                         "required": ["session_id"]}},
         nelix_stop)

@@ -189,6 +189,29 @@ def test_stop_confirmed_terminal_is_report():
         srv.shutdown()
 
 
+class _StopRequestedManager:
+    """Manager that returns stop_requested from stop() (teardown not confirmed within join)."""
+    def __init__(self):
+        self._events = EventQueue()
+    def stop(self, session_id):
+        return StopOutcome("stop_requested",
+                           snapshot={"session_id": session_id,
+                                     "control_state": "stopping", "pending": False})
+
+
+def test_rpc_stop_requested_is_refresh_status():
+    """/stop returning stop_requested must yield HTTP 200 with next_action='refresh_status'."""
+    srv, base = _serve(_StopRequestedManager(), __import__("io").StringIO())
+    try:
+        st, b = _req("POST", base + "/stop", body={"session_id": "s1"})
+        assert st == 200 and b["operation"] == "stop"
+        assert b["status"] == "stop_requested"
+        assert b["next_action"] == "refresh_status"
+        assert b["snapshot"]["control_state"] == "stopping"
+    finally:
+        srv.shutdown()
+
+
 def test_respond_no_pending_is_409_and_logs_session_id():
     # Regression: the stale/no-pending 409 must log the request's session_id (was null) and the
     # provided decision_id, so this class of failure is a one-line diagnosis from the daemon log.

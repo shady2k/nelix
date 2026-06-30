@@ -216,7 +216,7 @@ def make_server(manager, transport, logger=None):
                 else:
                     self._send(200, {"operation": "stop", "status": outcome.status,
                                      "session_id": body["session_id"], "snapshot": outcome.snapshot,
-                                     "next_action": "report" if outcome.status == "stopped" else "end_turn"})
+                                     "next_action": "report" if outcome.status == "stopped" else "refresh_status"})
             elif p.path == "/restart":
                 try:
                     outcome = manager.restart(body["session_id"], force=bool(body.get("force", False)))
@@ -232,6 +232,11 @@ def make_server(manager, transport, logger=None):
                     self._send(404, {"operation": "restart", "status": "unknown_session",
                                      "error": "unknown session", "next_action": "refresh_status"})
                 elif outcome.status == "restart_budget_exhausted":
+                    if logger is not None:
+                        logger.warning("rpc", "restart_budget_exhausted",
+                                       session_id=body.get("session_id"),
+                                       restart_count=outcome.restart_count,
+                                       max_restarts=outcome.max_restarts, status=409)
                     self._send(409, {"operation": "restart", "status": "restart_budget_exhausted",
                                      "error": "restart_budget_exhausted",
                                      "restart_count": outcome.restart_count,
