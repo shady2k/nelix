@@ -164,6 +164,32 @@ def test_respond_unconfirmed_submit_is_503_recover():
     assert "respond_unconfirmed" in buf.getvalue()
 
 
+class _AtCapacityManager:
+    def __init__(self): self._events = EventQueue()
+    def respond(self, session_id, answer, decision_id=None):
+        # An idle follow-up that can't re-acquire an active slot (concurrency cap full): the manager
+        # routes it through send_turn, which returns at_capacity — an honest backpressure signal.
+        return RespondOutcome("at_capacity")
+
+
+def test_respond_at_capacity_is_503_honest_backpressure():
+    # IMPORTANT 1: an idle follow-up refused for capacity must surface HONESTLY (503 at_capacity with
+    # a retry-shaped next_action), NOT be mislabeled no_pending (409) — the decision exists, the slot
+    # doesn't. The orchestrator can refresh_status / retry once a slot frees.
+    import io
+    buf = io.StringIO()
+    srv, base = _serve(_AtCapacityManager(), buf)
+    try:
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-cap", "answer": "continue"})
+        assert st == 503
+        assert b["operation"] == "respond" and b["status"] == "at_capacity"
+        assert b["status"] != "no_pending" and b.get("error") != "no_pending_decision"
+        assert b["next_action"] in ("refresh_status", "retry")
+    finally:
+        srv.shutdown()
+    assert "respond_at_capacity" in buf.getvalue()
+
+
 def test_start_envelope_shape():
     m = FakeManager()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8790, "t"))

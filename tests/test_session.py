@@ -142,7 +142,7 @@ class DeadHandle:
 
 class _NoopLauncher:
     def __init__(self, handle): self._handle = handle
-    def start(self, spec, cwd, cols, rows, dialog=None, transcript=None): return self._handle
+    def start(self, spec, cwd, cols, rows, dialog=None, transcript=None, **_kw): return self._handle
     def stop(self, handle): handle.close()
 
 
@@ -815,7 +815,7 @@ def test_start_passes_cwd_to_launcher(monkeypatch, tmp_path):
     seen = {}
 
     class FakeLauncher:
-        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None, **_kw):
             seen["cwd"] = cwd
             return FakeHandle(["x"])
 
@@ -832,7 +832,7 @@ def test_start_rejects_command_prefix_task_without_spawning(tmp_path):
     spawned = {"v": False}
 
     class _Launcher:
-        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None, **_kw):
             spawned["v"] = True
             return FakeHandle(["x"])
 
@@ -979,7 +979,7 @@ def make_session(tmp_path, frames, handle_cls=LiveHandle, spec=None):
     handle = handle_cls(list(frames))
 
     class _Launcher:
-        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None, **_kw):
             handle._dialog = dialog
             return handle
 
@@ -1078,6 +1078,20 @@ def test_delivery_wraps_task_in_bracketed_paste(tmp_path):
     assert sess._task_delivery == "delivered"
     assert "\x1b[200~write a big report\x1b[201~" in handle.writes      # one bracketed-paste write
     assert handle.writes[-1] == "\r"                                   # Enter last, OUTSIDE the paste
+    sess.stop()
+
+
+def test_delivery_arms_hook_startup_grace_for_hook_capable(tmp_path):
+    # CRITICAL 1 (wiring): a hook-capable driver's task-delivery must arm the belief engine's hook
+    # startup grace (expect_hooks). hook_mode stays "unknown" and the screen stays conservative about
+    # a screen-derived free-text idle until the first hook arrives or the grace expires (spec §6).
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box])
+    sess.start("do the thing", str(tmp_path))
+    _wait_for(lambda: sess._task_delivery == "delivered", timeout=5)
+    assert sess._task_delivery == "delivered"
+    assert sess._engine.hook_mode == "unknown"                 # no hook yet
+    assert sess._engine._hook_startup_at is not None           # grace armed at delivery (expect_hooks)
     sess.stop()
 
 
@@ -1453,7 +1467,7 @@ def test_delivery_does_not_wedge_when_executor_ignores_stdin(tmp_path, monkeypat
     broker = BrokerClient()                          # real spawn path: PTY fork happens in the broker
 
     class _Launcher:
-        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None, **_kw):
             master, pid, pgid = broker.spawn(child, cwd, dict(os.environ), cols, rows)
             return PtySession(master, pid, pgid, cols=cols, rows=rows,
                               dialog=dialog, transcript=transcript)
@@ -1530,7 +1544,7 @@ def test_delivery_drains_output_so_large_task_reaches_executor(tmp_path, monkeyp
     broker = BrokerClient()                          # real spawn path: PTY fork happens in the broker
 
     class _Launcher:
-        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None):
+        def start(self, spec, cwd, cols, rows, dialog=None, transcript=None, **_kw):
             master, pid, pgid = broker.spawn(child, cwd, dict(os.environ), cols, rows)
             return PtySession(master, pid, pgid, cols=cols, rows=rows,
                               dialog=dialog, transcript=transcript)

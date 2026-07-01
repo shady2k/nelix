@@ -13,9 +13,11 @@ its frames come from a REAL capture (``tests/_replay.replay_frames`` for a ``.ra
 ``tests/test_session.py`` so the real Session is driven over recorded bytes with a ``FakeClock`` —
 deterministically, no real PTY/threads.
 """
+import json
 from pathlib import Path
 
 from daemon.session import Session
+from daemon.hooks import HookEvent
 from daemon.dialog import Dialog
 from daemon.drivers.claude import ClaudeDriver
 from daemon.transcript_builder import TranscriptBuilder
@@ -182,3 +184,31 @@ def delivery_run(tmp_path, frames, *, task, spec=None, step=1.0):
     sess._wait_until_ready = lambda *a, **k: None   # neutralize the real-wall-clock settle wait
     sess._run()
     return sess, ev, handle
+
+
+def replay_hooks(sess, path):
+    """Replay a `.jsonl` of raw Claude hook payloads through the REAL Session (Task 12): enqueue each
+    event via ``sess.on_hook`` then drain it with ``sess._loop_once()`` — the exact ``on_hook`` queue +
+    ``_loop`` drain path a live ``curl`` from a hook drives, in recorded order.
+
+    JSONL has no comment syntax, so lines that begin with ``#`` (each fixture's synthesis-provenance
+    header) and blank lines are skipped. Each payload's keys mirror the daemon ``/hook`` route
+    (``rpc_server`` builds a ``HookEvent`` the same way): ``hook_event_name`` + optional ``tool_name`` /
+    ``tool_input`` / ``is_interrupt`` / (``message``|``matcher``). The session id is the live ``sess``'s
+    (a fixture's ``session_id`` field is documentation only — the daemon takes it from the URL, not the
+    body). Returns a trail of ``(raw_event, control_state)`` after each drained event so a caller can
+    assert the whole state trajectory (e.g. "busy for every mid-flight event, idle only on the Stop")."""
+    trail = []
+    for line in Path(path).read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        body = json.loads(s)
+        ev = HookEvent(session_id=sess._id, event=body["hook_event_name"],
+                       tool_name=body.get("tool_name"), tool_input=body.get("tool_input") or {},
+                       is_interrupt=bool(body.get("is_interrupt")),
+                       notification=body.get("message") or body.get("matcher"))
+        sess.on_hook(ev)
+        sess._loop_once()
+        trail.append((body["hook_event_name"], sess.snapshot()["control_state"]))
+    return trail

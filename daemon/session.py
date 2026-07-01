@@ -1,6 +1,8 @@
 import hashlib
 import json
+import queue
 import re
+import secrets
 import sys
 import threading
 import time
@@ -18,6 +20,7 @@ from daemon.dialog import Dialog
 from daemon.observation import ObservationCtx
 from daemon.transcript_builder import TranscriptBuilder
 from daemon.events import EXTERNAL_OUTPUT_POLICY, RESPONDABLE_KINDS
+from daemon.hooks import normalize_claude_hook
 from daemon.hygiene import prepare_pty_input
 from daemon.errors import PtyWriteTimeout
 
@@ -91,6 +94,11 @@ class Session:
         # directly — so a recorded capture can drive the engine deterministically.
         self._clock = clock if clock is not None else WallClock()
         self._engine = BeliefEngine(self._belief_config(), self._clock)
+        # Hook path (spec §7): a Claude agent reports its own lifecycle via hooks to POST /hook/<id>,
+        # authenticated by this per-session secret. on_hook enqueues each event; the monitor thread
+        # drains the queue every _loop iteration and feeds the (authoritative) belief engine.
+        self.hook_secret = secrets.token_hex(16)
+        self._hook_q = queue.Queue()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -170,8 +178,12 @@ class Session:
                               clock=self._clock)
         self._transcript = TranscriptBuilder(self._dialog, self._driver, self._rows)
         self._write_meta()
+        # Pass the session id + per-session secret so a hook-capable driver's launcher can inject the
+        # additive --settings hook config + NELIX_* env (LocalLauncher.start); a hookless driver
+        # ignores them (fallback screen path). Never touches the user's config.
         self._handle = self._launcher.start(self._spec, cwd, self._cols, self._rows,
-                                            dialog=self._dialog, transcript=self._transcript)
+                                            dialog=self._dialog, transcript=self._transcript,
+                                            session_id=self._id, hook_secret=self.hook_secret)
         self._task_delivery = "pending"
         self._spawn_ts = time.time()
         self._log_spawned(self._spec.argv(), type(self._launcher).__name__)
@@ -233,6 +245,12 @@ class Session:
                 return ""
             frame = self._handle.render() if self._handle is not None else ""
         return frame if raw else _clean_screen(frame)
+
+    def on_hook(self, ev):
+        """Accept one parsed Claude hook event (POST /hook/<id>, secret-authed). Runs on the RPC
+        thread: it ONLY enqueues (thread-safe, never blocks). The monitor thread drains the queue
+        each _loop iteration and feeds the belief engine (_drain_hooks) — all interpretation is core."""
+        self._hook_q.put(ev)
 
     def _wait_until_ready(self, timeout=20.0, stable_for=1.2):
         last = None; stable_since = None
@@ -360,6 +378,12 @@ class Session:
                 with self._lock:
                     self._last_submitted = self._task
                     self._engine.on_submit(self._task)
+                    # A hook-capable driver reports its own lifecycle: arm the hook startup grace at
+                    # task-delivery (spec §6). Until the first hook arrives (or the grace expires) the
+                    # engine stays "unknown" and the screen fallback is conservative about declaring a
+                    # screen-derived free-text idle. A hookless driver never arms it (screen path only).
+                    if getattr(self._driver, "hook_capable", False):
+                        self._engine.expect_hooks(self._clock.now())
                     notes = self._engine.drain_notes()       # post_submit_armed for the first turn
                 if self._log is not None:
                     self._log.audit_task(self._id, self._executor, self._task)
@@ -381,27 +405,71 @@ class Session:
             self._log.warning("session", "delivery_failed", session_id=self._id, reason=reason)
 
     def _loop(self):
-        # Post-delivery monitor loop: observe the screen, feed the pure BeliefEngine, and apply the
-        # actions it emits. ALL detection rules live in the engine (P4); Session only pumps/renders,
-        # calls observe(), and owns every PTY write. The daemon never acts on the agent (passive
-        # bridge): on a no-progress timeout the engine escalates an advisory, it does NOT send ESC.
+        # Post-delivery monitor loop: drain any queued hooks (authoritative ground truth), then
+        # observe the screen and feed the pure BeliefEngine, applying the actions each emits. ALL
+        # detection rules live in the engine (P4); Session only pumps/renders, calls observe(), and
+        # owns every PTY write. The daemon never acts on the agent (passive bridge): on a no-progress
+        # timeout the engine escalates an advisory, it does NOT send ESC.
         while not self._stop.is_set():
-            self._handle.pump(0.1)
-            with self._lock:
-                frame = self._handle.render()
-            ctx = self._obs_ctx()
-            obs = self._driver.observe(frame, ctx)
-            with self._lock:
-                actions = self._engine.tick(obs, ctx)
-                notes = self._engine.drain_notes()
-                cstate = self._engine.state.control_state
-                if cstate != "terminal":
-                    self._state = cstate
-            self._apply_actions(actions, obs)
-            self._log_trail(obs, actions)
-            self._log_notes(notes)
-            if obs.prompt_kind in ("crash", "exit") or not self._handle.is_alive():
+            if self._loop_once():
                 break
+
+    def _loop_once(self):
+        # ONE monitor iteration (also the test seam). Order per spec §hook path + §6 precedence:
+        #   1. drain ALL queued hooks -> engine.on_hook -> apply (hooks are ground truth);
+        #   2. then run the screen path (pump/observe/tick). tick() SELF-GATES on hook_mode
+        #      (belief §6): while hook_mode=="active" it publishes NO screen-derived
+        #      waiting_for_user/idle — it only reconciles a lost Stop and runs the intervention
+        #      watchdog, both of which the spec says sit over BOTH modes. For a hookless/unavailable
+        #      session hook_mode is never "active", so this is exactly today's screen path, untouched.
+        # Returns True when the loop should terminate (crash/exit screen or a dead child).
+        self._drain_hooks()
+        self._handle.pump(0.1)
+        with self._lock:
+            frame = self._handle.render()
+        ctx = self._obs_ctx()
+        obs = self._driver.observe(frame, ctx)
+        with self._lock:
+            actions = self._engine.tick(obs, ctx)
+            notes = self._engine.drain_notes()
+            self._sync_control_state()
+        self._apply_actions(actions, obs)
+        self._log_trail(obs, actions)
+        self._log_notes(notes)
+        return obs.prompt_kind in ("crash", "exit") or not self._handle.is_alive()
+
+    def _drain_hooks(self):
+        # Fold every queued hook into the belief engine and apply the emitted actions. Runs BEFORE
+        # the screen tick each iteration so hooks (ground truth) win the epoch ordering. Non-blocking
+        # (get_nowait); on_hook only enqueues, so this is the sole consumer (single monitor thread).
+        while True:
+            try:
+                ev = self._hook_q.get_nowait()
+            except queue.Empty:
+                return
+            hobs = normalize_claude_hook(ev)
+            with self._lock:
+                actions = self._engine.on_hook(hobs, self._clock.now())
+                notes = self._engine.drain_notes()
+                self._sync_control_state()
+            self._apply_actions(actions, None)
+            self._log_notes(notes)
+            if self._log is not None:
+                self._log.debug("session", "hook_applied", session_id=self._id,
+                                event=hobs.raw_event, kind=hobs.kind, control_state=self._state)
+
+    def _sync_control_state(self):
+        # MUST hold self._lock. Mirror the engine's live control_state onto self._state (a terminal
+        # kind is owned by _finish, never overwritten here) and drop a stale non-respondable `idle`
+        # decision once the engine leaves idle (a new turn opened, or real progress reverted a
+        # reconciled idle) — a respondable decision (kind != "idle") is untouched, so the screen path
+        # is unaffected.
+        cstate = self._engine.state.control_state
+        if cstate != "terminal":
+            self._state = cstate
+        if (self._state != "idle" and self._decision is not None
+                and self._decision.get("kind") == "idle"):
+            self._decision = None
 
     def _log_trail(self, obs, actions):
         # The transition/decision trail (spec §8): one line per emitted action — the same artifact
@@ -455,6 +523,8 @@ class Session:
         p = action.payload
         if action.kind == "intervention_required":
             self._emit_intervention(action.decision_key, p)
+        elif action.kind == "idle":
+            self._emit_idle(action.decision_key, p)
         else:
             # Commit the stable visible tail so the turn tail is in the transcript, then freeze the
             # decision's frozen text/excerpt (mirrors the old emit path).
@@ -463,6 +533,16 @@ class Session:
                           requires_response=True, decision_key=action.decision_key,
                           options=p.get("options", ()), prompt_kind=p.get("prompt_kind"),
                           busy_reason=p.get("busy_reason"))
+
+    def _emit_idle(self, decision_key, payload):
+        # The new NON-respondable `idle` decision (spec §5/§8): the agent finished its turn and is
+        # idle — the session is ALIVE and NOT asking anything. It publishes an idle EVENT (wakes
+        # Hermes to relay the result) and freezes an idle decision in the snapshot, but it does NOT
+        # set _closing and does NOT terminate: a completed session stays alive until nelix_stop, and
+        # a follow-up continues the SAME session (Task 10 send_turn). NOTHING is ever typed here.
+        self._handle.finalize()
+        self._publish("idle", hint=payload.get("hint"), hung=False, requires_response=False,
+                      decision_key=decision_key, busy_reason=payload.get("busy_reason"))
 
     def _apply_withdraw(self, action):
         # Withdraw the current pending decision IF it is still the one the engine published and
@@ -728,6 +808,15 @@ class Session:
                                    requires_response=requires_response, screen_excerpt=screen,
                                    decision_id=(decision.get("decision_id") if respondable else None),
                                    on_publish=_install if respondable else None)
+        if kind == "idle":
+            # A non-respondable idle is not installed via the on_publish hook (that path is
+            # respondable-only). Freeze it as the current decision so /status surfaces "idle" with its
+            # screen_excerpt. It carries NO event_id/decision_id, so respond() treats it as no_pending
+            # (a follow-up flows through send_turn — Task 10 — never respond); snapshot reports
+            # pending=False (requires_response is False). A stale idle is cleared by _sync_control_state
+            # once the engine leaves idle.
+            with self._lock:
+                self._decision = decision
         if self._log is not None:
             self._log.audit_decision(self._id, self._executor, kind, evt.event_id, text)
             # The session/EventQueue decision lifecycle (nelix-jwv gap 3): a newly installed respondable
@@ -777,7 +866,10 @@ class Session:
                 snap["decision"] = dec
             # active-working snapshots are deliberately low-information: no progress bait, just
             # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
-            snap["pending"] = self._decision is not None
+            # `pending` means a RESPONDABLE decision is outstanding: a non-respondable `idle`
+            # (requires_response=False) is surfaced as a decision but is NOT pending (nothing to answer).
+            snap["pending"] = (self._decision is not None
+                               and self._decision.get("requires_response", True))
             if self._decision is None and not terminal and self._state == "busy":
                 snap["message"] = ("Agent is still working. End your turn; nelix will wake "
                                    "you on the next event.")
@@ -944,6 +1036,55 @@ class Session:
         return RespondOutcome("resumed", seq=seq, decision_id=decision.get("decision_id"),
                               answered_decision_id=decision.get("decision_id"),
                               snapshot=self.snapshot())
+
+    def send_turn(self, text):
+        # A follow-up on an IDLE session (spec §send_turn, plan Task 10): the agent finished its turn
+        # and is idle (non-respondable) — this RE-OPENS the turn. Allowed ONLY from control_state
+        # "idle". Types the framed submission + the submit key (mirroring the initial _deliver_task,
+        # NOT a modal selection), tells the engine a submit happened (on_submit arms post-submit TTFT
+        # suppression; the turn formally re-opens on the next UserPromptSubmit hook), and drops the
+        # non-respondable idle decision. It does NOT fabricate a pending decision. The manager
+        # re-acquires an active slot BEFORE calling this (the idle session had freed it).
+        with self._lock:
+            if self._closing:
+                return RespondOutcome("terminal")
+            if self._state != "idle":
+                return RespondOutcome("no_pending")   # not idle -> nothing to resume; type nothing
+        # Clean the follow-up (byte hygiene + command-prefix policy), same discipline as respond(); a
+        # rejected follow-up (e.g. a leading '/') raises PtyInputRejected before anything is typed.
+        clean = prepare_pty_input(text, self._driver.command_prefixes)
+        if self._handle is None:
+            return RespondOutcome("terminal")
+        # Bound the PTY write (this runs on the RPC thread): a wedged executor that stopped draining
+        # its stdin must NOT hang send_turn forever. ONE deadline covers the framed text + the Enter;
+        # non-draining (the monitor owns pump(); draining here would race it).
+        deadline = time.monotonic() + self._spec.respond_write_seconds
+        try:
+            self._type_text(self._driver.format_submission(clean),
+                            timeout=max(0.0, deadline - time.monotonic()))
+            self._press_enter(timeout=max(0.0, deadline - time.monotonic()))
+        except PtyWriteTimeout:
+            if self._log is not None:
+                self._log.warning("session", "send_turn_failed", session_id=self._id,
+                                  reason="write_unconfirmed")
+            return RespondOutcome("write_timeout", snapshot=self.snapshot())
+        with self._lock:
+            self._last_submitted = clean
+            self._dialog.append_user_input(clean)        # the follow-up is a new user turn
+            # A submit: arm post-submit suppression (the echoed follow-up during TTFT is not a fresh
+            # idle) and forget the now-consumed idle decision. control_state -> busy: the session
+            # re-acquired an active slot; the next UserPromptSubmit hook confirms the new turn epoch.
+            self._engine.on_submit(clean)
+            notes = self._engine.drain_notes()
+            self._decision = None
+            self._state = "busy"
+        self._log_notes(notes)
+        if self._log is not None:
+            self._log.info("session", "send_turn_submitted", session_id=self._id)
+        # seq = the event high-water at resume (mirrors /start's base_seq): the waiter arms past
+        # everything already emitted so only the resumed turn's future events wake the orchestrator.
+        # send_turn publishes no event itself, so there is nothing to skip past here.
+        return RespondOutcome("resumed", seq=self._events.latest_seq(), snapshot=self.snapshot())
 
     def stop(self):
         self._stop.set()

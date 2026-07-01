@@ -1,0 +1,14 @@
+# SYNTHESIZED (not a live recording). Reconstructed from the real event ORDER documented in
+# docs/superpowers/specs/2026-07-01-nelix-hook-state-detection-design.md §5 (PreToolUse[AskUserQuestion]
+# -> waiting_for_user) and §1 ("a numbered modal was read as free-text" — the third recurring
+# screen-scraping misdetection). No LIVE hook recording was available to the author, so each payload is
+# hand-authored to the real Claude hook shape in the true turn order for a structured modal:
+#   UserPromptSubmit -> PreToolUse/PostToolUse (tool work) -> PreToolUse[AskUserQuestion] (the modal is
+#   raised and the turn PAUSES — Claude fires NO Stop while the question is pending; PostToolUse would
+#   only fire once the user answers).
+# Expected: PreToolUse[AskUserQuestion] -> control_state `awaiting_user`, decision kind
+# `waiting_for_user` (requires_response=true), prompt_kind `modal_choice`.
+{"session_id":"s-modalask","hook_event_name":"UserPromptSubmit","prompt":"scaffold the config loader"}
+{"session_id":"s-modalask","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"config/schema.py"}}
+{"session_id":"s-modalask","hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"config/schema.py"}}
+{"session_id":"s-modalask","hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"question":"Config format — JSON or YAML?","options":["JSON","YAML"]}}

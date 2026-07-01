@@ -50,7 +50,7 @@ class Note:
 
 @dataclass
 class EngineState:
-    control_state: str = "busy"           # busy | awaiting_user | intervention_required | terminal
+    control_state: str = "busy"           # busy | awaiting_user | idle | intervention_required | terminal
     busy_reason: Optional[str] = None
     liveness: str = "unknown"             # live | stale | unknown
     quiet_elapsed: float = 0.0
@@ -102,12 +102,159 @@ class BeliefEngine:
         # a persistent reason logs once (signal, not per-tick noise). Drained by Session, off `actions`.
         self._notes = []
         self._suppress_reason = None     # last emitted suppression reason (edge detection)
+        # hook path (Task 6): a Claude agent that reports its own lifecycle via hooks is ground
+        # truth. The FIRST hook flips hook_mode "unknown"->"active"; turns are counted so a decision
+        # is scoped to its epoch (idle idempotent within a turn, a fresh UserPromptSubmit re-opens).
+        self._hook_mode = "unknown"       # unknown | active | unavailable
+        self._turn_epoch = 0              # bumped by each opens_turn (UserPromptSubmit)
+        self._turn_open = False           # a turn is running (between open and its close)
+        self._hook_pending_key = None     # currently-published hook waiting_for_user, for withdrawal
+        self._idle_published_epoch = None  # epoch whose Stop already published idle (idempotency)
+        # precedence & lost-hook reconciliation (Task 7): process-exit > hook > bounded screen.
+        self._last_hook_at = None          # clock of the most recent hook (lost-hook deadlines)
+        self._hook_startup_at = None       # task-delivery clock for a hook-capable session (grace)
+        # lost-Stop screen reconciliation state (only consulted while hook_mode == "active", busy):
+        self._hook_progress_fp = None      # last screen meaning seen since the last hook (baseline)
+        self._hook_progress_at = None      # clock at which that meaning last ADVANCED (a moving
+        #                                    spinner is not progress); seeded to the last hook time
+        self._reconcile_fp = None          # the free-text prompt region being watched for stability
+        self._reconcile_since = None       # clock at which that free-text prompt first appeared
         # state snapshot
         self._state = EngineState()
 
     @property
     def state(self):
         return self._state
+
+    @property
+    def hook_mode(self):
+        """"unknown" until the first hook arrives, then "active" (Claude reports its own lifecycle).
+        "unavailable" (hookless agent / hook transport failure) is set by the precedence layer (Task 7)."""
+        return self._hook_mode
+
+    @property
+    def turn_epoch(self):
+        """Monotonic turn counter — bumped on every UserPromptSubmit. A decision is keyed to its epoch
+        so a straggler hook from a closed turn cannot re-open it, and each turn gets a distinct idle."""
+        return self._turn_epoch
+
+    # ---- hook capability (Task 7): a hook-capable session arms the startup grace on task-delivery ----
+    def expect_hooks(self, now):
+        """Declare this session hook-capable and arm the startup grace at task-delivery (spec §6).
+
+        Called by Session for a `hook_capable` driver when a task is delivered. While hook_mode is
+        "unknown" within `hook_startup_grace` of this point the screen fallback stays conservative
+        (it will not declare a screen-derived free-text idle — a hook may still be arriving); if the
+        grace expires with no hook, `tick` flips hook_mode to "unavailable" and the screen path runs
+        exactly as today. A screen-only session never calls this, so its screen path is untouched.
+        """
+        if self._hook_mode == "unknown":
+            self._hook_startup_at = now
+
+    # ---- hook path (Task 6): authoritative ground-truth state from the agent's own hooks ----
+    def on_hook(self, hobs, now):
+        """Fold one normalized hook observation into the belief state (spec §hook path).
+
+        The first hook proves the agent reports its own lifecycle, so `hook_mode` becomes "active".
+        `UserPromptSubmit` opens a new turn epoch (busy); `Stop`/`StopFailure` closes it, withdrawing
+        any pending prompt and publishing the new non-respondable `idle` decision (the session stays
+        alive). A permission/modal hook publishes a respondable `waiting_for_user`; its resolution
+        (PostToolUse[AskUserQuestion]) withdraws it back to busy. A plain tool-lifecycle hook after a
+        close with no intervening open is a straggler and is ignored. Returns the action list Session
+        applies; the screen `tick` path is untouched here (precedence is Task 7).
+        """
+        first_hook = self._hook_mode != "active"
+        self._hook_mode = "active"
+        actions = []
+        # The FIRST hook takes over from the screen fallback (spec §6): withdraw any stale screen-
+        # published respondable decision (e.g. a lingering waiting_for_user) so it does not survive
+        # into the hook-owned snapshot. _withdraw clears the screen path's _published_* bookkeeping.
+        if first_hook and self._published_key is not None:
+            self._withdraw(actions, "superseded", now)
+        # Any hook is a fresh ground-truth signal: record it and re-baseline the lost-hook
+        # reconciliation clocks (a new hook means the agent is alive and communicating).
+        self._last_hook_at = now
+        self._hook_progress_fp = None
+        self._hook_progress_at = None
+        self._reconcile_fp = None
+        self._reconcile_since = None
+
+        # UserPromptSubmit: a fresh user turn -> new epoch, busy, nothing published.
+        if hobs.opens_turn:
+            self._turn_epoch += 1
+            self._turn_open = True
+            self._hook_pending_key = None
+            self._state.control_state = "busy"
+            self._state.phase = "busy"
+            return actions
+
+        # Stop/StopFailure: the turn ended -> idle. Idempotent within an epoch (a duplicate Stop, or a
+        # StopFailure trailing a Stop, is one idle, not two).
+        if hobs.closes_turn:
+            if self._idle_published_epoch == self._turn_epoch:
+                return actions
+            self._turn_open = False
+            self._idle_published_epoch = self._turn_epoch
+            if self._hook_pending_key is not None:               # a pending prompt is moot once idle
+                actions.append(Withdraw(decision_key=self._hook_pending_key, reason="superseded"))
+                self._hook_pending_key = None
+            self._state.control_state = "idle"
+            self._state.phase = "idle"
+            actions.append(Publish(kind="idle", respondable=False,
+                                   decision_key=f"idle:{self._turn_epoch}",
+                                   payload={"interrupted": hobs.interrupted}))
+            return actions
+
+        # PostToolUse[AskUserQuestion]: the modal was answered -> withdraw the pending prompt, resume.
+        # A late/out-of-order clears_pending arriving AFTER Stop closed this turn is a straggler: it
+        # must NOT drag a closed (idle) turn back to busy (spec §5 guards). Ignore it unless a newer
+        # UserPromptSubmit reopened the turn. (A first-hook clears with no close is NOT a straggler.)
+        if hobs.clears_pending:
+            if self._turn_closed():
+                return actions
+            if self._hook_pending_key is not None:
+                actions.append(Withdraw(decision_key=self._hook_pending_key, reason="prompt_left"))
+                self._hook_pending_key = None
+            self._turn_open = True
+            self._state.control_state = "busy"
+            self._state.phase = "busy"
+            return actions
+
+        # PermissionRequest / PreToolUse[AskUserQuestion] / permission Notification: blocked on the user.
+        # Same closed-turn guard as clears_pending/plain-working (spec §5): a late waiting_for_user
+        # arriving AFTER Stop closed this turn is a straggler and must NOT resurrect it into
+        # awaiting_user — ignore it unless a newer UserPromptSubmit reopened the turn.
+        if hobs.kind == "waiting_for_user":
+            if self._turn_closed():
+                return actions
+            decision_key = f"{hobs.prompt_kind}:{self._turn_epoch}"
+            if self._hook_pending_key == decision_key:
+                return actions                                    # same pause already published
+            self._hook_pending_key = decision_key
+            self._turn_open = True
+            self._state.control_state = "awaiting_user"
+            self._state.phase = "pause_candidate"
+            hint = "needs_permission" if hobs.prompt_kind == "permission_choice" else None
+            actions.append(Publish(kind="waiting_for_user", respondable=True,
+                                   decision_key=decision_key,
+                                   payload={"prompt_kind": hobs.prompt_kind, "hint": hint}))
+            return actions
+
+        # A plain working hook (Pre/PostToolUse, PostToolUseFailure, ...) is meaningful only inside an
+        # open turn. After a Stop with no new UserPromptSubmit it is a late straggler -> ignored (the
+        # session must stay idle, not be dragged back to busy by trailing tool events).
+        if self._turn_open:
+            self._state.control_state = "busy"
+            self._state.phase = "busy"
+        return actions
+
+    def _turn_closed(self):
+        """A turn is CLOSED once a Stop/idle published for the CURRENT epoch and no newer
+        UserPromptSubmit reopened it: `_idle_published_epoch == _turn_epoch` (Stop sets them equal;
+        a fresh UserPromptSubmit bumps `_turn_epoch` past `_idle_published_epoch`). A never-opened
+        turn (fresh engine, epoch 0, nothing published) is NOT closed — so a waiting_for_user that
+        arrives as the very first hook still surfaces (it is not a straggler)."""
+        return self._idle_published_epoch == self._turn_epoch
 
     # ---- diagnostic notes (nelix-jwv): pure, off the action list; Session drains + logs ----
     def _note(self, event, **fields):
@@ -152,13 +299,25 @@ class BeliefEngine:
         self._track_semantic(obs, now)
         self._track_heartbeat(obs, now)
 
-        # Terminal: child gone, or the driver read a crash/exit screen.
+        # (1) Process exit / crash ALWAYS wins (spec §6, highest precedence): a dead child, or a
+        # crash/exit screen, is terminal regardless of the last hook.
         if not ctx.child_alive or obs.prompt_kind in ("crash", "exit"):
             self._state.control_state = "terminal"
             self._state.phase = "terminal"
             actions.append(Finalize())
             return actions
 
+        # A hook-capable session that has waited out the startup grace with no hook falls back to
+        # screen-driven "unavailable" — from here it behaves exactly as a hookless agent (today).
+        self._maybe_expire_startup_grace(now)
+
+        # (2) hook_mode == "active": hooks are ground truth. tick() does NOT publish a screen-derived
+        # waiting_for_user/idle; it only runs the watchdog + the bounded lost-hook reconciliation.
+        if self._hook_mode == "active":
+            return self._tick_hook_active(obs, now, actions)
+
+        # (3) hook_mode "unknown"/"unavailable": the screen path (today). During the "unknown"
+        # startup grace _on_prompt stays conservative about a screen-derived free-text idle.
         self._update_post_submit(obs, now)
         if obs.prompt_kind in _PROMPT_KINDS:
             self._on_prompt(obs, now, actions)
@@ -167,6 +326,120 @@ class BeliefEngine:
 
         self._refresh_state(obs, now)
         return actions
+
+    # ---- precedence & lost-hook reconciliation (Task 7): process > hook > bounded screen ----
+    def _maybe_expire_startup_grace(self, now):
+        # A hook-capable session (expect_hooks armed _hook_startup_at) that never received a hook
+        # transitions "unknown" -> "unavailable" once the startup grace elapses (spec §6): the screen
+        # then drives the session for its life, exactly as a hookless agent does today.
+        if (self._hook_startup_at is not None and self._hook_mode == "unknown"
+                and now - self._hook_startup_at >= self._cfg.hook_startup_grace):
+            self._hook_mode = "unavailable"
+
+    def _in_hook_startup_grace(self, now):
+        # True only for a hook-capable session still inside the startup grace with no hook yet. For a
+        # screen-only session (never armed) this is always False -> the screen path is untouched.
+        return (self._hook_startup_at is not None and self._hook_mode == "unknown"
+                and now - self._hook_startup_at < self._cfg.hook_startup_grace)
+
+    def _tick_hook_active(self, obs, now, actions):
+        # Hooks own control_state (busy/awaiting_user/idle set by on_hook). The screen may ONLY
+        # (a) reconcile a lost Stop and (b) escalate a lost-hook stall; it NEVER publishes a
+        # screen-derived waiting_for_user. Reconciliation applies only while hooks say busy (or while
+        # a prior lost-hook intervention is still active — so the ladder nags and can revert to busy).
+        if self._state.control_state not in ("busy", "intervention_required"):
+            self._refresh_hook_fields(obs, now)
+            return actions
+
+        if obs.prompt_kind == "free_text":
+            # A stable free-text prompt after the last hook = the agent finished but its Stop was
+            # lost -> reconcile to a low-confidence idle (reconciled=True), never waiting_for_user.
+            self._reconcile_lost_stop_idle(obs, now, actions)
+            if actions:
+                return actions
+        else:
+            self._reconcile_fp = None
+            self._reconcile_since = None
+            self._track_hook_progress(obs, now)
+            if self._lost_stop_stuck(now):
+                # Return before the watchdog: it resets _intervention_active off SCREEN quiet (which
+                # is 0 on a cold frame), which would clobber the lost-Stop escalation we just made.
+                self._escalate_lost_stop(obs, now, actions)
+                return actions
+        # the frozen-meaning watchdog ladder sits over hook mode too (spec §6); its escalation state
+        # then owns control_state (real semantic progress reverts it to busy via _track_semantic).
+        self._watchdog(obs, now, actions)
+        self._state.control_state = "intervention_required" if self._intervention_active else "busy"
+        self._refresh_hook_fields(obs, now)
+        return actions
+
+    def _track_hook_progress(self, obs, now):
+        # "screen progress" = the screen's MEANING advancing after the last hook (a moving spinner is
+        # not progress). The first screen frame after a hook is the baseline whose clock is the hook
+        # time, so a frozen screen reads as "quiet since the hook", not spuriously fresh.
+        if self._hook_progress_fp is None:
+            self._hook_progress_fp = obs.semantic_fp
+            self._hook_progress_at = self._last_hook_at if self._last_hook_at is not None else now
+        elif obs.semantic_fp != self._hook_progress_fp:
+            self._hook_progress_fp = obs.semantic_fp
+            self._hook_progress_at = now
+
+    def _lost_stop_stuck(self, now):
+        # busy per hooks, but no new hook AND no screen progress for lost_stop_after -> stuck agent.
+        hook_silent = (self._last_hook_at is not None
+                       and now - self._last_hook_at >= self._cfg.lost_stop_after)
+        no_progress = (self._hook_progress_at is not None
+                       and now - self._hook_progress_at >= self._cfg.lost_stop_after)
+        return hook_silent and no_progress
+
+    def _reconcile_lost_stop_idle(self, obs, now, actions):
+        key = obs.prompt_fp or obs.semantic_fp
+        if self._reconcile_fp != key:
+            self._reconcile_fp = key
+            self._reconcile_since = now
+        stable = (now - self._reconcile_since) >= self._cfg.hook_turn_grace
+        since_hook = (self._last_hook_at is None
+                      or (now - self._last_hook_at) >= self._cfg.hook_turn_grace)
+        if not (stable and since_hook):
+            return
+        # supersede the busy hook state with a reconciled idle; mirror on_hook's idle bookkeeping so
+        # a straggler Stop for this epoch stays idempotent and a follow-up re-opens a fresh turn.
+        self._turn_open = False
+        self._idle_published_epoch = self._turn_epoch
+        self._reconcile_fp = None
+        self._reconcile_since = None
+        self._state.control_state = "idle"
+        self._state.phase = "idle"
+        actions.append(Publish(kind="idle", respondable=False,
+                               decision_key=f"idle:{self._turn_epoch}",
+                               payload={"interrupted": False, "reconciled": True}))
+
+    def _escalate_lost_stop(self, obs, now, actions):
+        # Reuse the watchdog nag ladder (shared counter/throttle): a NON-respondable advisory that
+        # re-fires each budget while still stuck. The daemon never acts on the agent; the
+        # orchestrator drives recovery off this wake.
+        self._intervention_active = True
+        budget = self._budget(self._liveness(obs, now), obs.busy_reason)
+        if self._next_nag_at is None or now >= self._next_nag_at:
+            self._escalation_count += 1
+            self._next_nag_at = now + budget
+            self._state.control_state = "intervention_required"
+            self._state.phase = "lost_stop"
+            actions.append(Publish(
+                kind="intervention_required", respondable=False,
+                decision_key=f"intervention:{self._escalation_count}",
+                payload={"escalation_count": self._escalation_count,
+                         "busy_reason": obs.busy_reason,
+                         "liveness": self._liveness(obs, now),
+                         "hint": "lost_stop"}))
+
+    def _refresh_hook_fields(self, obs, now):
+        # Keep the diagnostic fields fresh WITHOUT overwriting the hook-owned control_state.
+        self._state.quiet_elapsed = (0.0 if self._semantic_change_ts is None
+                                     else now - self._semantic_change_ts)
+        self._state.liveness = self._liveness(obs, now)
+        self._state.busy_reason = obs.busy_reason
+        self._state.escalation_count = self._escalation_count
 
     # ---- substrate ----
     def _track_semantic(self, obs, now):
@@ -324,6 +597,12 @@ class BeliefEngine:
         immediate = obs.prompt_kind in ("modal_choice", "permission_choice")
         if immediate:
             self._publish_decision(obs, decision_key, actions)
+            return
+        # hook startup grace (Task 7, spec §6): a hook-capable session whose first hook has not yet
+        # arrived stays conservative — do NOT declare a screen-derived free-text idle while a hook
+        # may still be coming. Modal/permission (blocking, high-confidence) above still publish.
+        if self._in_hook_startup_grace(now):
+            self._suppressed("hook_startup_grace")
             return
         # free_text post-submit suppression (spec §7.1, fixes F1):
         #  - while our submission is STILL in the active input box, suppress — it is not an idle

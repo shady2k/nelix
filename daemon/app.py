@@ -6,8 +6,8 @@ import sys
 import paths
 from daemon import reaper, singleton
 from daemon.broker_client import BrokerClient, set_broker, get_broker
-from daemon.config import (load_executors, load_concurrency_limit, load_retention,
-                           load_log_level, load_kill_grace_seconds)
+from daemon.config import (load_executors, load_concurrency_limit, load_idle_retained_limit,
+                           load_retention, load_log_level, load_kill_grace_seconds)
 from daemon.drivers import get_driver
 from daemon.launchers import get_launcher
 from daemon.events import EventQueue
@@ -107,6 +107,7 @@ def main():
     logger = Logger(level=level_cfg.level)
     specs = load_specs(cfg_path, logger)
     limit = load_concurrency_limit(cfg_path)
+    idle_limit = load_idle_retained_limit(cfg_path, default=limit)
     transport = transport_from_env()
     _LOCK_FD = acquire_singleton(logger, transport=transport)
     if _LOCK_FD is None:
@@ -119,7 +120,7 @@ def main():
     manager = SessionManager(
         specs, events,
         launcher_factory=get_launcher, driver_factory=get_driver,
-        concurrency_limit=limit, logger=logger,
+        concurrency_limit=limit, idle_retained_limit=idle_limit, logger=logger,
         session_retain=retention.session_retain,
         session_max_age_days=retention.session_max_age_days,
         reaper_ctx=reaper_ctx,
