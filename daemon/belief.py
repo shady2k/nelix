@@ -50,7 +50,7 @@ class Note:
 
 @dataclass
 class EngineState:
-    control_state: str = "busy"           # busy | awaiting_user | intervention_required | terminal
+    control_state: str = "busy"           # busy | awaiting_user | idle | intervention_required | terminal
     busy_reason: Optional[str] = None
     liveness: str = "unknown"             # live | stale | unknown
     quiet_elapsed: float = 0.0
@@ -102,12 +102,106 @@ class BeliefEngine:
         # a persistent reason logs once (signal, not per-tick noise). Drained by Session, off `actions`.
         self._notes = []
         self._suppress_reason = None     # last emitted suppression reason (edge detection)
+        # hook path (Task 6): a Claude agent that reports its own lifecycle via hooks is ground
+        # truth. The FIRST hook flips hook_mode "unknown"->"active"; turns are counted so a decision
+        # is scoped to its epoch (idle idempotent within a turn, a fresh UserPromptSubmit re-opens).
+        self._hook_mode = "unknown"       # unknown | active | unavailable
+        self._turn_epoch = 0              # bumped by each opens_turn (UserPromptSubmit)
+        self._turn_open = False           # a turn is running (between open and its close)
+        self._hook_pending_key = None     # currently-published hook waiting_for_user, for withdrawal
+        self._idle_published_epoch = None  # epoch whose Stop already published idle (idempotency)
         # state snapshot
         self._state = EngineState()
 
     @property
     def state(self):
         return self._state
+
+    @property
+    def hook_mode(self):
+        """"unknown" until the first hook arrives, then "active" (Claude reports its own lifecycle).
+        "unavailable" (hookless agent / hook transport failure) is set by the precedence layer (Task 7)."""
+        return self._hook_mode
+
+    @property
+    def turn_epoch(self):
+        """Monotonic turn counter — bumped on every UserPromptSubmit. A decision is keyed to its epoch
+        so a straggler hook from a closed turn cannot re-open it, and each turn gets a distinct idle."""
+        return self._turn_epoch
+
+    # ---- hook path (Task 6): authoritative ground-truth state from the agent's own hooks ----
+    def on_hook(self, hobs, now):
+        """Fold one normalized hook observation into the belief state (spec §hook path).
+
+        The first hook proves the agent reports its own lifecycle, so `hook_mode` becomes "active".
+        `UserPromptSubmit` opens a new turn epoch (busy); `Stop`/`StopFailure` closes it, withdrawing
+        any pending prompt and publishing the new non-respondable `idle` decision (the session stays
+        alive). A permission/modal hook publishes a respondable `waiting_for_user`; its resolution
+        (PostToolUse[AskUserQuestion]) withdraws it back to busy. A plain tool-lifecycle hook after a
+        close with no intervening open is a straggler and is ignored. Returns the action list Session
+        applies; the screen `tick` path is untouched here (precedence is Task 7).
+        """
+        self._hook_mode = "active"
+        actions = []
+
+        # UserPromptSubmit: a fresh user turn -> new epoch, busy, nothing published.
+        if hobs.opens_turn:
+            self._turn_epoch += 1
+            self._turn_open = True
+            self._hook_pending_key = None
+            self._state.control_state = "busy"
+            self._state.phase = "busy"
+            return actions
+
+        # Stop/StopFailure: the turn ended -> idle. Idempotent within an epoch (a duplicate Stop, or a
+        # StopFailure trailing a Stop, is one idle, not two).
+        if hobs.closes_turn:
+            if self._idle_published_epoch == self._turn_epoch:
+                return actions
+            self._turn_open = False
+            self._idle_published_epoch = self._turn_epoch
+            if self._hook_pending_key is not None:               # a pending prompt is moot once idle
+                actions.append(Withdraw(decision_key=self._hook_pending_key, reason="superseded"))
+                self._hook_pending_key = None
+            self._state.control_state = "idle"
+            self._state.phase = "idle"
+            actions.append(Publish(kind="idle", respondable=False,
+                                   decision_key=f"idle:{self._turn_epoch}",
+                                   payload={"interrupted": hobs.interrupted}))
+            return actions
+
+        # PostToolUse[AskUserQuestion]: the modal was answered -> withdraw the pending prompt, resume.
+        if hobs.clears_pending:
+            if self._hook_pending_key is not None:
+                actions.append(Withdraw(decision_key=self._hook_pending_key, reason="prompt_left"))
+                self._hook_pending_key = None
+            self._turn_open = True
+            self._state.control_state = "busy"
+            self._state.phase = "busy"
+            return actions
+
+        # PermissionRequest / PreToolUse[AskUserQuestion] / permission Notification: blocked on the user.
+        if hobs.kind == "waiting_for_user":
+            decision_key = f"{hobs.prompt_kind}:{self._turn_epoch}"
+            if self._hook_pending_key == decision_key:
+                return actions                                    # same pause already published
+            self._hook_pending_key = decision_key
+            self._turn_open = True
+            self._state.control_state = "awaiting_user"
+            self._state.phase = "pause_candidate"
+            hint = "needs_permission" if hobs.prompt_kind == "permission_choice" else None
+            actions.append(Publish(kind="waiting_for_user", respondable=True,
+                                   decision_key=decision_key,
+                                   payload={"prompt_kind": hobs.prompt_kind, "hint": hint}))
+            return actions
+
+        # A plain working hook (Pre/PostToolUse, PostToolUseFailure, ...) is meaningful only inside an
+        # open turn. After a Stop with no new UserPromptSubmit it is a late straggler -> ignored (the
+        # session must stay idle, not be dragged back to busy by trailing tool events).
+        if self._turn_open:
+            self._state.control_state = "busy"
+            self._state.phase = "busy"
+        return actions
 
     # ---- diagnostic notes (nelix-jwv): pure, off the action list; Session drains + logs ----
     def _note(self, event, **fields):
