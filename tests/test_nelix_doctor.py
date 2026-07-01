@@ -156,3 +156,13 @@ def test_collect_adds_new_sections_and_keeps_old_keys(monkeypatch, tmp_path):
         assert key in out
     assert "profiles" in out["hermes_wiring"]
     assert "registered" in out["manifest_drift"]
+
+
+def test_real_manifest_declares_every_registered_tool():
+    """Truthfulness: plugin.yaml provides_tools must match the tools __init__.py registers,
+    with no drift in either direction — including nelix_screen."""
+    doctor = _load_doctor()
+    drift = doctor.manifest_drift()
+    assert drift["missing_from_manifest"] == []
+    assert drift["extra_in_manifest"] == []
+    assert "nelix_screen" in drift["declared"]
