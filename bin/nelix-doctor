@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Read-only nelix operator status: daemon health, singleton-lock holder, live sessions,
-and detected strays (recorded children whose owner daemon is gone but child is alive)."""
+detected strays (recorded children whose owner daemon is gone but child is alive), and the
+Hermes-side wiring — whether each profile actually loads nelix, plus manifest truthfulness."""
+import ast
 import json
 import sys
 from pathlib import Path
+
+import yaml                                    # noqa: E402  (ships with the tooling venv)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import paths                                   # noqa: E402
 import supervisor                              # noqa: E402
 from daemon import reaper, singleton           # noqa: E402
+
+_PLUGIN_ROOT = Path(__file__).resolve().parents[1]   # the plugin dir = repo root
 
 
 def _scan_strays(inspector):
@@ -31,6 +37,83 @@ def _scan_strays(inspector):
     return strays
 
 
+def _enabled_plugins(config_path):
+    """The `plugins.enabled` list from a Hermes config.yaml, or [] when the file is missing,
+    empty, malformed, or has no such list (tolerates `plugins:` being null)."""
+    try:
+        data = yaml.safe_load(Path(config_path).read_text())
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        return []
+    except yaml.YAMLError:
+        return []
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    enabled = plugins.get("enabled") if isinstance(plugins, dict) else None
+    return [str(x) for x in enabled] if isinstance(enabled, list) else []
+
+
+def _inspect_profile(name, profile_dir, config_path):
+    """Wiring verdict for a single Hermes profile: is nelix enabled, installed, configured?"""
+    enabled = "nelix" in _enabled_plugins(config_path)
+    installed = (Path(profile_dir) / "plugins" / "nelix").is_dir()
+    toml_present = (Path(profile_dir) / "workspace" / "nelix" / "nelix.toml").is_file()
+    if enabled and installed:
+        verdict, reason = "wired", None
+    elif not enabled:
+        verdict, reason = "not_wired", "nelix not in plugins.enabled"
+    else:
+        verdict, reason = "not_wired", "plugin dir missing"
+    return {"name": name, "config": str(config_path), "dir": str(profile_dir),
+            "nelix_enabled": enabled, "plugin_installed": installed,
+            "nelix_toml_present": toml_present, "verdict": verdict, "reason": reason}
+
+
+def hermes_wiring(home=None):
+    """Per-profile answer to 'does the profile the user launched actually load nelix?'. Inspects
+    the root/default profile (<home>/config.yaml) plus every <home>/profiles/<name>/config.yaml."""
+    home = Path(home) if home is not None else paths.hermes_home()
+    profiles = [_inspect_profile("(root)", home, home / "config.yaml")]
+    try:
+        named = sorted(p for p in (home / "profiles").iterdir() if (p / "config.yaml").is_file())
+    except (FileNotFoundError, NotADirectoryError):
+        named = []
+    for pdir in named:
+        profiles.append(_inspect_profile(pdir.name, pdir, pdir / "config.yaml"))
+    return {"home": str(home), "profiles": profiles}
+
+
+def _declared_tools(plugin_yaml):
+    """`provides_tools` names from plugin.yaml (the manifest), or [] if absent/malformed."""
+    try:
+        data = yaml.safe_load(Path(plugin_yaml).read_text())
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, yaml.YAMLError):
+        return []
+    tools = data.get("provides_tools") if isinstance(data, dict) else None
+    return [str(t) for t in tools] if isinstance(tools, list) else []
+
+
+def _registered_tools(init_path):
+    """Names passed as the first argument to every ctx.register_tool(...) call in __init__.py —
+    parsed from the AST so it stays truthful without importing the plugin (which needs a ctx)."""
+    tree = ast.parse(Path(init_path).read_text())
+    names = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "register_tool" and node.args):
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                names.append(first.value)
+    return names
+
+
+def manifest_drift(plugin_yaml=None, init_path=None):
+    """Compare the manifest's declared tools against the ones the code actually registers."""
+    declared = set(_declared_tools(plugin_yaml or _PLUGIN_ROOT / "plugin.yaml"))
+    registered = set(_registered_tools(init_path or _PLUGIN_ROOT / "__init__.py"))
+    return {"declared": sorted(declared), "registered": sorted(registered),
+            "missing_from_manifest": sorted(registered - declared),
+            "extra_in_manifest": sorted(declared - registered)}
+
+
 def collect(inspector=None):
     inspector = inspector or reaper.ProcessInspector()
     transport = supervisor.endpoint()
@@ -51,7 +134,9 @@ def collect(inspector=None):
         base_url = None
     return {"daemon": {"alive": transport is not None, "base": base_url},
             "lock_holder": holder, "sessions": sessions,
-            "strays": _scan_strays(inspector)}
+            "strays": _scan_strays(inspector),
+            "hermes_wiring": hermes_wiring(),
+            "manifest_drift": manifest_drift()}
 
 
 def main():
