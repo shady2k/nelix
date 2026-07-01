@@ -4,14 +4,15 @@
 # IMPORTANT — `command` must `exec` INTO the leaf CLI. nelix runs it under a bare PTY with
 # no interactive job-control shell in front, so whatever you name here owns the terminal's
 # FOREGROUND process group. Do NOT use a supervising wrapper that stays alive around the
-# real CLI (`envconsul -- claude`, `vault exec -- ...`, any `foo -- bar` that fork+waits):
-# the live parent keeps the foreground group, the CLI runs in the background, hits
+# real CLI (a secrets/-injection shim like `wrapper -- your-cli`, or any `foo -- bar` that
+# fork+waits and lingers): the live parent keeps the foreground group, the CLI runs in the
+# background, hits
 # SIGTTIN/SIGTTOU on first terminal access and is STOPPED (ps STAT `T`). It then renders
 # nothing and nelix only ever sees a blank screen. Such a wrapper works when YOU run it in
 # a terminal (your shell hands over the foreground) but breaks here. Fix: fetch secrets,
 # then `exec` the CLI so it replaces the wrapper and becomes the foreground leader:
 #   #!/bin/bash
-#   export API_KEY="$(vault kv get -field=key path/to/secret)"   # fetch, then...
+#   export API_KEY="$(your-secret-manager get -field=key path/to/secret)"   # fetch, then...
 #   exec my-agent-cli "$@"                                        # ...exec (no lingering parent)
 [executors.example_cli]
 command = "my-agent-cli"
@@ -22,8 +23,12 @@ env = {}                 # extra env if needed; secrets via your own secret mana
 driver = "claude"        # which classifier to use
 launcher = "local"       # MVP: only "local" is implemented ("auto"/"docker" are post-MVP)
 # Recovery thresholds (optional; defaults shown). The prompt/mandate can override per session.
-# max_idle_seconds = 600   # no meaningful progress for this long -> daemon escalates to you (0 = off)
-# max_restarts     = 3     # consecutive auto-restarts (no progress) before Hermes escalates
+# max_idle_seconds        = 600   # no meaningful progress for this long -> daemon escalates to you (0 = off)
+# startup_timeout_seconds = 60    # pre-delivery deadline: if the CLI never renders a classifiable prompt
+#                                 # within this (e.g. a launcher that broke job control per the note above,
+#                                 # leaving the leaf CLI SIGTTIN-stopped -> blank screen), the daemon
+#                                 # terminal-fails the session with a logged escalation (0 = off)
+# max_restarts            = 3     # consecutive auto-restarts (no progress) before Hermes escalates
 
 # Retention (optional; defaults shown). Applied by the daemon/supervisor.
 daemon_log_retain    = 10    # how many daemon-<ts>-<pid>.log files to keep (min 1)

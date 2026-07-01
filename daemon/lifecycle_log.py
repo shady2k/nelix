@@ -44,6 +44,19 @@ def log_belief_transition(log, *, session_id, prompt_kind, affordances, busy_rea
              heartbeat_fp=heartbeat_fp)
 
 
+def log_startup_no_output(log, *, session_id, executor, elapsed, threshold,
+                          screen_ever_nonempty, terminal_kind):
+    """Forensic record for the pre-delivery startup deadline (fix/startup-no-output-bound): the
+    executor never rendered a classifiable prompt within `threshold`s of the readiness point (the
+    pure case is a launcher that kept the terminal foreground group so the leaf CLI is SIGTTIN-stopped
+    -> 0 bytes -> `screen_ever_nonempty` False). Written at teardown so the failure is diagnosable
+    after the fact. Always a warning (a bounded startup is never the healthy path)."""
+    log.emit("warning", "session", "startup_no_output", session_id, executor=executor,
+             elapsed=round(elapsed, 3), threshold=threshold,
+             screen_ever_nonempty=screen_ever_nonempty, terminal_kind=terminal_kind,
+             reason="startup_no_output")
+
+
 def log_executor_exited(log, *, session_id, reason, leader_exit_code, leader_signal,
                         status_available, alive_for, task_delivery, screen_fingerprint):
     clean = (reason in ("exited", "done") and leader_signal is None

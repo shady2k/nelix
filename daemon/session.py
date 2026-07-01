@@ -295,18 +295,37 @@ class Session:
                                 "cli_ready" if self._handle.is_alive() else "cli_ready_timeout",
                                 session_id=self._id)
             self._last_progress = self._last_byte = time.time()
+            # Unconditional pre-delivery/startup deadline (spec §3.5 exec-chain note, §3.7 bound):
+            # measured on the INJECTED clock from the readiness point, so tests advance it
+            # deterministically. The max_idle nag below
+            # is gated on a published `blocked`; an executor that renders NOTHING classifiable never
+            # reaches that (prompt_kind stays "none" forever -> no blocked), so without this backstop
+            # the loop spins with control_state=busy indefinitely. Root cause in the field: a launcher
+            # that keeps the terminal foreground group leaves the leaf CLI SIGTTIN-stopped (0 bytes).
+            ready_at = self._clock.now()
+            saw_stable = False              # a non-empty NORMALIZED frame ever held steady (sign of life)
+            screen_ever_nonempty = False    # any non-empty normalized frame at all (forensics)
             while not self._stop.is_set() and self._task_delivery == "pending":
                 advanced = self._handle.pump(0.1)
                 now = time.time()
+                clock_now = self._clock.now()
                 if advanced:
                     self._last_byte = now
                 with self._lock:
                     frame = self._handle.render()
                 norm = self._driver.normalize_frame(frame)
-                if norm != self._norm:
+                norm_changed = norm != self._norm
+                if norm_changed:
                     self._norm = norm
                     self._norm_since = now
                     self._last_progress = now
+                # Startup liveness on the NORMALIZED frame: a live working banner/spinner collapses to a
+                # stable non-empty norm (telemetry stripped), so "non-empty + unchanged across a pump" is
+                # a genuine sign of life — churning noise (never twice the same) and a blank screen are not.
+                if norm.strip():
+                    screen_ever_nonempty = True
+                    if not norm_changed:
+                        saw_stable = True
                 self._delivery_tick(frame)
                 # no-progress backstop while blocked (spec §6): re-surface an unanswered blocked with
                 # hung=True so Hermes is reminded; bypass the fingerprint dedup (call _publish directly).
@@ -317,6 +336,14 @@ class Session:
                                   requires_response=True, task_delivery="pending",
                                   decision_key=self._blocked_fp)   # same pause -> reuse decision_id
                     self._last_progress = now              # re-arm so it doesn't re-fire every loop
+                # startup no-output deadline: trip ONLY when nothing classifiable ever appeared — no
+                # `blocked` was ever emitted (a modal/permission/unknown routes through _emit_blocked and
+                # is handled by the nag above) AND the screen never became non-empty+stable (a slow banner
+                # is a sign of life). Delivery/crash/exit already left task_delivery != "pending".
+                if (self._task_delivery == "pending" and self._blocked_fp is None and not saw_stable
+                        and self._spec.startup_timeout_seconds
+                        and clock_now - ready_at > self._spec.startup_timeout_seconds):
+                    self._fail_startup_no_output(clock_now - ready_at, screen_ever_nonempty)
                 if not self._handle.is_alive():
                     break
             if self._task_delivery == "delivered" and not self._stop.is_set():
@@ -403,6 +430,30 @@ class Session:
                       requires_response=False, task_delivery="failed")
         if self._log is not None:
             self._log.warning("session", "delivery_failed", session_id=self._id, reason=reason)
+
+    def _fail_startup_no_output(self, elapsed, screen_ever_nonempty):
+        # Terminal-fail the pre-delivery/startup phase SYMMETRICALLY with crash/exit (mirrors
+        # _fail_delivery): surface ONE non-respondable escalation so the failure reaches the
+        # orchestrator (never silent), mark task_delivery "failed" so the loop exits -> finally ->
+        # _finish reaps the process group + frees the concurrency slot, and write a forensic
+        # lifecycle record so a launcher-foreground bug is diagnosable after the fact. PASSIVE: this
+        # types/signals NOTHING to the child (no SIGCONT/SIGTTIN/tcsetpgrp) — detection + honest
+        # reporting + clean teardown only.
+        threshold = self._spec.startup_timeout_seconds
+        cause = (f"executor produced no output within {threshold:g}s — likely a launcher that kept the "
+                 "terminal foreground group (leaf CLI SIGTTIN-stopped); see the exec-chain note in "
+                 "nelix.toml.example")
+        self._task_delivery = "failed"
+        self._terminal_kind = "delivery_failed"
+        self._dialog.add_agent_line(cause)   # surface the human-readable cause in the decision text/tail
+        self._handle.finalize()
+        self._publish("delivery_failed", hint="startup_no_output", hung=False,
+                      requires_response=False, task_delivery="failed")
+        if self._log is not None:
+            lifecycle_log.log_startup_no_output(
+                self._log, session_id=self._id, executor=self._executor, elapsed=elapsed,
+                threshold=threshold, screen_ever_nonempty=screen_ever_nonempty,
+                terminal_kind=self._terminal_kind)
 
     def _loop(self):
         # Post-delivery monitor loop: drain any queued hooks (authoritative ground truth), then

@@ -36,6 +36,7 @@ class Spec:
     respond_confirm_seconds = 0.3
     delivery_confirm_seconds = 2.0
     max_idle_seconds = 600.0
+    startup_timeout_seconds = 60.0
     tail_lines = 100
     status_tail_chars = 4000
     dialog_page_chars = 8000
@@ -138,12 +139,12 @@ class RawReplayHandle:
         pass
 
 
-def _wire(tmp_path, spec):
+def _wire(tmp_path, spec, logger=None):
     """Build a Session wired exactly like tests/test_session.py: real ClaudeDriver, FakeClock,
     EventQueue, private Dialog. Returns (sess, ev, clock)."""
     ev = EventQueue()
     clock = FakeClock(0.0)
-    sess = Session("s1", "demo", ClaudeDriver(), None, spec, ev, clock=clock)
+    sess = Session("s1", "demo", ClaudeDriver(), None, spec, ev, clock=clock, logger=logger)
     sess._dialog = Dialog(tmp_path / "s1", tail_lines=spec.tail_lines,
                           spool_max_bytes=spec.spool_max_bytes)
     sess._clock = clock
@@ -164,21 +165,28 @@ def replay_session(tmp_path, frames, *, spec=None, step=1.0, pad_last=0):
     return sess, ev
 
 
-def delivery_run(tmp_path, frames, *, task, spec=None, step=1.0):
+def delivery_run(tmp_path, frames, *, task, spec=None, step=1.0, pad_last=0,
+                 logger=None, on_terminal=None):
     """Drive the REAL Session DELIVERY path (Session._run's pre-delivery loop + _deliver_task) over a
     real capture, synchronously and deterministically.
 
     Mirrors Session.start()'s wiring (held task, dialog, transcript, handle, spawn_ts) but runs
     _run() inline on the calling thread. _wait_until_ready (a real-wall-clock settle loop) is
     neutralized so the in-process FakeClock handle drives every frame; callers must also neutralize
-    daemon.session.time.sleep (used by _ensure_ask_mode). Returns (sess, ev, handle)."""
+    daemon.session.time.sleep (used by _ensure_ask_mode). ``pad_last`` repeats the final frame so a
+    silent/held screen persists across enough pumps for the injected clock to cross a startup deadline
+    before the handle sets _stop. ``logger`` captures the lifecycle/forensic trail; ``on_terminal``
+    spies the slot-free callback the manager wires. Returns (sess, ev, handle)."""
     spec = spec or Spec()
-    sess, ev, clock = _wire(tmp_path, spec)
+    sess, ev, clock = _wire(tmp_path, spec, logger=logger)
     sess._task_raw = task
     sess._task = task
     sess._transcript = TranscriptBuilder(sess._dialog, sess._driver, sess._rows)
     sess._spawn_ts = 0.0
-    handle = RawReplayHandle(frames, stop=sess._stop, clock=clock, step=step)
+    if on_terminal is not None:
+        sess.on_terminal = on_terminal
+    seq = list(frames) + [frames[-1]] * pad_last if (frames and pad_last) else list(frames)
+    handle = RawReplayHandle(seq, stop=sess._stop, clock=clock, step=step)
     handle._dialog = sess._dialog
     sess._handle = handle
     sess._wait_until_ready = lambda *a, **k: None   # neutralize the real-wall-clock settle wait

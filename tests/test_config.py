@@ -75,6 +75,28 @@ def test_recovery_thresholds_reject_bad_values(tmp_path):
     assert (a.max_idle_seconds, a.max_restarts) == (600.0, 3)
 
 
+def test_startup_timeout_default_override_and_disable(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text(
+        '[executors.a]\ncommand="x"\ndriver="claude"\n'
+        '[executors.b]\ncommand="y"\ndriver="claude"\nstartup_timeout_seconds=15\n'
+        '[executors.c]\ncommand="z"\ndriver="claude"\nstartup_timeout_seconds=0\n')
+    specs = load_executors(str(cfg)).specs
+    assert specs["a"].startup_timeout_seconds == 60.0     # default
+    assert specs["b"].startup_timeout_seconds == 15.0     # override
+    assert specs["c"].startup_timeout_seconds == 0.0      # 0 disables (valid, not clamped to default)
+
+
+def test_startup_timeout_rejects_bad_values(tmp_path):
+    cfg = tmp_path / "n.toml"
+    # non-numeric / negative / bool -> default 60.0 (never crash the load on a hand-edited typo).
+    cfg.write_text('[executors.a]\ncommand="x"\ndriver="claude"\nstartup_timeout_seconds="nope"\n'
+                   '[executors.b]\ncommand="y"\ndriver="claude"\nstartup_timeout_seconds=-4\n')
+    specs = load_executors(str(cfg)).specs
+    assert specs["a"].startup_timeout_seconds == 60.0
+    assert specs["b"].startup_timeout_seconds == 60.0
+
+
 def test_concurrency_limit(tmp_path):
     cfg = tmp_path / "n.toml"
     cfg.write_text('concurrency_limit = 3\n[executors.demo]\ncommand="t"\n')

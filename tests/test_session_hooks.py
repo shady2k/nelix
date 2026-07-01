@@ -27,6 +27,7 @@ class Spec:
     respond_confirm_seconds = 0.3
     delivery_confirm_seconds = 2.0
     max_idle_seconds = 600.0
+    startup_timeout_seconds = 60.0
     tail_lines = 100
     status_tail_chars = 4000
     dialog_page_chars = 8000
