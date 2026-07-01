@@ -276,7 +276,7 @@ def make_server(manager, transport, logger=None):
                         logger.warning("rpc", "respond_missing_decision_id", session_id=sid, status=409)
                     self._send(409, {"operation": "respond", "status": "missing_decision_id",
                                      "session_id": sid, "error": "missing_decision_id",
-                                     "pending": outcome.pending, "next_action": "refresh_status"})
+                                     "pending": outcome.pending, "next_action": "fix_call"})
                 elif outcome.status == "stale":
                     if logger is not None:
                         logger.warning("rpc", "respond_stale", session_id=sid, status=409)

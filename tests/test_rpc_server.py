@@ -120,7 +120,7 @@ def test_respond_without_decision_id_returns_409_missing():
         assert st == 409 and b["operation"] == "respond"
         assert b["status"] == "missing_decision_id" and b["error"] == "missing_decision_id"
         assert b["pending"]["decision_id"] == "dec-1" and b["pending"]["text"] == "y/n?"
-        assert b["next_action"] == "refresh_status"
+        assert b["next_action"] == "fix_call"
         assert m.responded[-1] == ("s1", "yes", None)
     finally:
         srv.shutdown()
