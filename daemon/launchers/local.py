@@ -49,21 +49,40 @@ def _deep_merge_hooks(base, ours):
     return merged
 
 
+def _split_settings_args(argv):
+    # Strip EVERY user --settings from argv (both "--settings <value>" and "--settings=<value>" forms)
+    # and return (cleaned_argv, effective_user_value). Claude is last-wins among the user's own flags,
+    # so the effective value is the LAST one seen (None if the user supplied none / only a valueless flag).
+    cleaned, value, i, n = [], None, 0, len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "--settings":
+            if i + 1 < n:
+                value = argv[i + 1]
+                i += 2
+                continue
+            i += 1                                  # malformed trailing flag (no value): drop it
+            continue
+        if a.startswith("--settings="):
+            value = a[len("--settings="):]
+            i += 1
+            continue
+        cleaned.append(a)
+        i += 1
+    return cleaned, value
+
+
 def _fold_hook_settings(argv, argv_extra):
     # Fold our ["--settings", <hooks json>] into argv WITHOUT clobbering a user-supplied --settings.
-    # If the user's argv already carries a --settings (Claude is last-wins, so a second flag would
-    # drop theirs), MERGE our hooks additively into their value and keep a SINGLE --settings. If none
-    # is present, append ours as before.
-    if "--settings" not in argv:
-        return [*argv, *argv_extra]
-    i = argv.index("--settings")
-    if i + 1 >= len(argv):
-        return [*argv, *argv_extra]                 # malformed user flag (no value): fall back to append
+    # Claude is last-wins, so a second flag would drop the user's. Detect their --settings in BOTH
+    # forms, take their effective (last) value as the base, MERGE our hooks additively into it, and
+    # emit a SINGLE normalized "--settings <merged>". If the user supplied none, append ours as-is.
     our_json = argv_extra[argv_extra.index("--settings") + 1]
-    merged = _deep_merge_hooks(_load_user_settings(argv[i + 1]), json.loads(our_json))
-    out = list(argv)
-    out[i + 1] = json.dumps(merged)
-    return out
+    cleaned, user_value = _split_settings_args(argv)
+    if user_value is None:
+        return [*cleaned, *argv_extra]
+    merged = _deep_merge_hooks(_load_user_settings(user_value), json.loads(our_json))
+    return [*cleaned, "--settings", json.dumps(merged)]
 
 
 class LocalLauncher:
