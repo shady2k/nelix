@@ -24,8 +24,39 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests._session_replay import (   # noqa: E402
-    replay_session, delivery_run, capture_frames, raw_frames,
+    replay_session, delivery_run, capture_frames, raw_frames, _wire, RawReplayHandle, Spec,
 )
+
+_PERM = Path(__file__).resolve().parent / "golden" / "claude" / "permission_prompt"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pre-delivery modal affordance — a trust/permission interstitial must keep its
+# prompt_kind + options so respond() routes the answer via driver.select_option
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression (live s-9c0b6eeb): a numbered interstitial that appears BEFORE the task is delivered is
+# surfaced by Session._emit_blocked. That path published the `blocked` decision with prompt_kind=None
+# and options=[] even though ClaudeDriver.observe() classified the frame as a modal_choice with parsed
+# options. respond() keys is_modal off prompt_kind, so the modal affordance was lost and the answer was
+# typed as FREE TEXT — a bare "1" leaked into Claude's prompt as a stray follow-up message. Drive the
+# REAL trust-dialog frame through the pre-delivery tick and assert the decision keeps its affordance.
+
+def test_predelivery_modal_keeps_prompt_kind_and_options(tmp_path):
+    trust = (_PERM / "trust-dialog.txt").read_text()
+    # NON-VACUITY: the real frame must actually be a numbered modal the driver can classify.
+    assert "❯ 1. Yes, I trust this folder" in trust and "2. No, exit" in trust
+
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([trust], clock=clock)
+    sess._handle._dialog = sess._dialog
+    sess._handle.pump()                      # advance to the trust frame
+    sess._delivery_tick(trust)               # pre-delivery: observe → _emit_blocked
+
+    dec = sess.snapshot().get("decision")
+    assert dec is not None and dec["kind"] == "blocked"
+    assert dec["task_delivery"] == "pending"                 # still pre-delivery
+    assert dec["prompt_kind"] == "modal_choice"              # RED: was None (affordance dropped)
+    assert [o["id"] for o in dec["options"]] == ["1", "2"]   # RED: was [] (options dropped)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

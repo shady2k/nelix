@@ -338,7 +338,7 @@ class Session:
             self._ensure_ask_mode()
             self._deliver_task()
         else:
-            self._emit_blocked(frame)                # modal / permission / onboarding / unknown
+            self._emit_blocked(frame, obs)           # modal / permission / onboarding / unknown
 
     def _deliver_task(self):
         if self._log is not None:
@@ -714,7 +714,7 @@ class Session:
             alive_for=alive_for, task_delivery=self._task_delivery,
             screen_fingerprint=self._screen_fp())
 
-    def _emit_blocked(self, frame, hint="task_not_delivered"):
+    def _emit_blocked(self, frame, obs=None, hint="task_not_delivered"):
         # Surface a pre-delivery interstitial (modal / onboarding / unknown). Type/press NOTHING.
         # Dedup by normalized-screen fingerprint alone: emit once per distinct screen. A new
         # interstitial (different fingerprint) emits a fresh blocked; the same screen never re-spams,
@@ -724,10 +724,18 @@ class Session:
             return
         self._blocked_fp = fp
         self._handle.finalize()
+        # A pre-delivery interstitial that observe() classified as a numbered menu (trust/permission/
+        # MCP-approval) carries its prompt_kind + options through so respond() routes the answer via
+        # driver.select_option — WITHOUT this, is_modal is False and the answer is typed as free text,
+        # leaking a bare option digit into the prompt (live s-9c0b6eeb). Onboarding/unknown stay generic.
+        prompt_kind = options = None
+        if obs is not None and obs.prompt_kind in ("modal_choice", "permission_choice"):
+            prompt_kind, options = obs.prompt_kind, obs.options
         # decision_key = the normalized-frame fingerprint: a new interstitial (different fp) is a
         # new decision; the no-progress backstop re-emits the SAME fp and reuses the decision_id.
         self._publish("blocked", hint=hint, hung=False, requires_response=True,
-                      task_delivery="pending", decision_key=fp)
+                      task_delivery="pending", decision_key=fp,
+                      prompt_kind=prompt_kind, options=options or ())
 
     def _publish(self, kind, hint, hung, requires_response=None, task_delivery=None,
                  decision_key=None, options=(), prompt_kind=None, busy_reason=None,

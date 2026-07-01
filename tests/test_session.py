@@ -1138,7 +1138,8 @@ def test_respond_to_blocked_does_not_append_user_input(tmp_path):
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
     offset_before = sess._dialog.last_user_input_offset()
     assert sess.respond("1").status == "resumed"     # binds to the current pending decision
-    assert "1" in "".join(handle.writes) and "\r" in handle.writes   # answer injected
+    assert "1\r" in handle.writes                     # answer injected via select_option (digit+CR),
+    assert "1" not in handle.writes                   # NOT free-text ('1' then a bare '\r' leaks a stray digit)
     # A blocked respond must NOT append a user_input marker (flat-log model)
     assert sess._dialog.last_user_input_offset() == offset_before
     sess.stop()
