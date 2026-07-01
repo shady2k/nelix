@@ -25,6 +25,17 @@ class BeliefConfig:
     unknown_budget: float = 60.0
     # §7.4 busy_reason hysteresis: keep a known reason this long after its on-screen marker vanishes.
     reason_ttl: float = 30.0
+    # §6 hook precedence & lost-hook reconciliation (plan Task 7). Times are seconds.
+    # startup grace after task-delivery for a hook-capable session: while hook_mode is "unknown"
+    # within this window the screen stays conservative (no screen-derived free-text idle); grace
+    # expired with no hook -> "unavailable" (screen-driven for the session's life, today's path).
+    hook_startup_grace: float = 12.0
+    # a stable free-text screen persisting this long after the last hook, while hooks say busy, is a
+    # lost Stop -> reconcile to a low-confidence idle (never a respondable waiting_for_user).
+    hook_turn_grace: float = 4.0
+    # busy per hooks with no new hook AND no screen progress for this long -> lost-Stop timeout ->
+    # intervention_required (a stuck agent, never silently idle).
+    lost_stop_after: float = 45.0
 
 
 @dataclass
