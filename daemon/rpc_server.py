@@ -271,6 +271,12 @@ def make_server(manager, transport, logger=None):
                                      "snapshot": outcome.snapshot,
                                      "answered_decision_id": outcome.answered_decision_id,
                                      "next_action": "recover", "error": "submit_unconfirmed"})
+                elif outcome.status == "missing_decision_id":
+                    if logger is not None:
+                        logger.warning("rpc", "respond_missing_decision_id", session_id=sid, status=409)
+                    self._send(409, {"operation": "respond", "status": "missing_decision_id",
+                                     "session_id": sid, "error": "missing_decision_id",
+                                     "pending": outcome.pending, "next_action": "refresh_status"})
                 elif outcome.status == "stale":
                     if logger is not None:
                         logger.warning("rpc", "respond_stale", session_id=sid, status=409)

@@ -356,7 +356,7 @@ def test_respond_answers_and_appends_user_input(monkeypatch, tmp_path):
     assert did.startswith("dec-")
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
-    out = sess.respond("1")                                # no event_id: binds to current pending
+    out = sess.respond("1", decision_id=did)                                # binds to the named pending decision
     assert out.status == "resumed" and out.seq == pend.seq and out.decision_id == did
     assert ev.pending("s1") is None                       # answered
     # respond() must append a user_input marker (flat-log model)
@@ -382,7 +382,7 @@ def test_respond_to_modal_routes_to_select_option(monkeypatch, tmp_path):
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     sess, ev = _session(tmp_path, ["working esc to interrupt", _MODAL, _MODAL])
     sess._loop()
-    out = sess.respond("1")
+    out = sess.respond("1", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     # select_option emits the digit + submit key as ONE sequence (driver owns the keys) — NOT the
     # free-text path of type-then-enter. This is the F2 fix: a selector, not prose.
@@ -396,7 +396,7 @@ def test_respond_to_modal_rejects_unknown_option_keeps_pending(tmp_path):
     sess, ev = _session(tmp_path, ["working esc to interrupt", _MODAL, _MODAL])
     sess._loop()
     writes_before = list(sess._handle.writes)
-    out = sess.respond("9")                              # not an option id
+    out = sess.respond("9", decision_id=sess._decision["decision_id"])   # not an option id
     assert out.status == "invalid_option"
     assert sess._decision is not None                    # decision stays pending
     assert ev.pending("s1") is not None
@@ -411,7 +411,7 @@ def test_respond_to_free_text_uses_submit_text_not_select(monkeypatch, tmp_path)
     sess._stop.clear()                                # a real respond runs while the monitor is live
     assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
     sess._handle = SubmitLandsHandle("do the next thing")   # submit lands: echoes then leaves the box
-    out = sess.respond("do the next thing")
+    out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     # free-text: the text is typed then Enter pressed separately (two writes), not a select_option.
     assert "do the next thing" in sess._handle.writes and "\r" in sess._handle.writes
@@ -451,7 +451,7 @@ def test_respond_claims_decision_atomically_no_double_type(monkeypatch, tmp_path
     sess._loop()
     sess._stop.clear()                                # a real respond runs while the monitor is live
     sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
-    assert sess.respond("1").status == "resumed"
+    assert sess.respond("1", decision_id=sess._decision["decision_id"]).status == "resumed"
     writes_after_first = list(sess._handle.writes)
     assert sess.respond("2").status == "no_pending"       # already claimed
     assert sess._handle.writes == writes_after_first      # nothing typed the second time
@@ -478,7 +478,7 @@ def test_respond_write_is_bounded_and_reports_timeout(monkeypatch, tmp_path):
     sess._loop()
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = WedgedWriteHandle()              # executor stops draining stdin
-    out = sess.respond("1")
+    out = sess.respond("1", decision_id=sess._decision["decision_id"])
     assert out.status == "write_timeout"            # bounded, not a hung RPC thread
     assert sess._decision is None                   # decision was claimed, not left half-pending
     # transcript must NOT have a new user marker when the write timed out
@@ -576,7 +576,7 @@ def test_respond_free_text_reports_respond_failed_when_submit_unconfirmed(tmp_pa
     assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = StrandedAnswerHandle("do the next thing")   # Enter dropped: answer stuck in box
-    out = sess.respond("do the next thing")
+    out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"
     assert out.snapshot is not None                  # carries the snapshot for the recovery path
     assert sess._decision is None                    # claimed, not left half-pending
@@ -678,7 +678,7 @@ def test_respond_does_not_confirm_on_ambiguous_unknown_frame(tmp_path):
     sess._loop()
     sess._stop.clear()
     sess._handle = AmbiguousThenStrandedHandle("do the next thing")
-    out = sess.respond("do the next thing")
+    out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"
 
 
@@ -690,7 +690,7 @@ def test_respond_does_not_falsely_confirm_on_stale_pre_write_frame(tmp_path):
     sess._loop()
     sess._stop.clear()
     sess._handle = StalePreWriteThenStrandedHandle("do the next thing")
-    out = sess.respond("do the next thing")
+    out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"            # not a false 'resumed' off the stale first frame
 
 
@@ -747,7 +747,7 @@ def test_respond_free_text_reports_respond_failed_when_answer_never_echoes(tmp_p
     armed_before = sess._engine._post_submit_active
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = NeverEchoesEmptyBoxHandle()       # answer never echoes; turn never moves
-    out = sess.respond("do the next thing")
+    out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"            # NOT a false 'resumed' off the empty box
     assert out.snapshot is not None                  # carries the snapshot for the recovery path
     assert sess._decision is None                    # claimed, not left half-pending
@@ -765,7 +765,7 @@ def test_respond_free_text_resumes_when_answer_leaves_box(tmp_path):
     sess._stop.clear()                               # a real respond runs while the monitor is live
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = SubmitLandsHandle("do the next thing")
-    out = sess.respond("do the next thing")
+    out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     assert ev.pending("s1") is None
     assert sess._dialog.last_user_input_offset() > offset_before   # confirmed -> marker appended
@@ -778,7 +778,7 @@ def test_answering_reemitted_blocked_clears_pending(tmp_path):
     sess, handle, ev = make_session(tmp_path, frames=[trust], spec=BackstopSpec())
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sum(1 for e in ev._events if e.kind == "blocked") >= 2, timeout=3)
-    assert sess.respond("1").status == "resumed"
+    assert sess.respond("1", decision_id=sess._decision["decision_id"]).status == "resumed"
     assert ev.pending("s1") is None                       # every re-emit answered
     sess.stop()
 
@@ -796,9 +796,39 @@ def test_respond_with_stale_decision_id_is_rejected_and_returns_current(monkeypa
     out = sess.respond("1", decision_id="dec-stale99")
     assert out.status == "stale"
     assert out.pending["decision_id"] == cur and out.pending["kind"] == "waiting_for_user"
+    assert out.pending["text"]                            # frozen question text in the stale body too
     assert ev.pending("s1") is not None                   # NOT answered
     assert not sess._handle.writes                        # nothing typed
     assert sess.respond("1", decision_id=cur).status == "resumed"   # correct id works
+
+
+def test_respond_without_decision_id_is_missing_not_guessed(tmp_path):
+    # A respondable pending decision answered WITHOUT decision_id must be refused as
+    # missing_decision_id — the daemon must NOT guess which question the answer binds to (the
+    # s-9c0b6eeb incident: a bare answer leaked into the agent's prompt). The pending meta comes
+    # back so Hermes can retry with the id, without a separate nelix_status pull.
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    cur = sess._decision["decision_id"]
+    out = sess.respond("1")                                  # NO decision_id
+    assert out.status == "missing_decision_id"               # NOT a guessed bind, NOT stale
+    assert out.pending["decision_id"] == cur
+    assert out.pending["text"]                               # frozen question text -> retry w/o status pull
+    assert ev.pending("s1") is not None                      # still pending — nothing answered
+    assert not sess._handle.writes                           # nothing typed into the PTY
+
+
+def test_respond_with_empty_string_decision_id_is_missing(tmp_path):
+    # An empty-string decision_id is MISSING, not stale — `if not decision_id` catches both None
+    # and "". A stray "" must not be folded onto the pending decision as a guessed bind.
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    out = sess.respond("1", decision_id="")
+    assert out.status == "missing_decision_id"               # NOT stale
+    assert ev.pending("s1") is not None                      # still pending
+    assert not sess._handle.writes
 
 
 def test_snapshot_decision_carries_decision_id_and_policy(tmp_path):
@@ -869,7 +899,7 @@ def test_respond_rejects_command_prefix_answer_keeps_pending(tmp_path):
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
     writes_before = list(handle.writes)
     with pytest.raises(PtyInputRejected):
-        sess.respond("/etc/passwd")                  # leading '/' -> rejected
+        sess.respond("/etc/passwd", decision_id=sess._decision["decision_id"])  # leading '/' -> rejected
     assert ev.pending("s1") is not None              # NOT marked answered: still pending
     assert sess._decision is not None                # decision not cleared
     assert handle.writes == writes_before            # nothing typed
@@ -891,7 +921,7 @@ def test_respond_resumes_to_busy_without_echoed_decision(tmp_path):
     sess, _ = _session(tmp_path, ["Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"])
     _seed_pending_decision(sess)
     sess._handle = SubmitLandsHandle("do that")       # submit lands: answer echoes then leaves the box
-    out = sess.respond("do that")
+    out = sess.respond("do that", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     assert out.answered_decision_id == "dec-t"
     assert sess._state == "busy"                       # Invariant A: resumed -> working again
@@ -1138,7 +1168,7 @@ def test_respond_to_blocked_does_not_append_user_input(tmp_path):
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
     offset_before = sess._dialog.last_user_input_offset()
-    assert sess.respond("1").status == "resumed"     # binds to the current pending decision
+    assert sess.respond("1", decision_id=sess._decision["decision_id"]).status == "resumed"     # binds to the current pending decision
     assert "1\r" in handle.writes                     # answer injected via select_option (digit+CR),
     assert "1" not in handle.writes                   # NOT free-text ('1' then a bare '\r' leaks a stray digit)
     # A blocked respond must NOT append a user_input marker (flat-log model)
@@ -1168,7 +1198,7 @@ def test_respond_to_blocked_does_not_re_emit_same_frame(tmp_path):
     sess, handle, ev = make_session(tmp_path, frames=[trust])
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
-    assert sess.respond("1").status == "resumed"    # binds to the current pending decision
+    assert sess.respond("1", decision_id=sess._decision["decision_id"]).status == "resumed"    # binds to the current pending decision
     time.sleep(0.3)                                # monitor keeps seeing the same trust frame
     blocked = [e for e in ev._events if e.kind == "blocked"]
     assert len(blocked) == 1                        # no duplicate for the unchanged frame
@@ -1226,7 +1256,7 @@ def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeyp
     monkeypatch.setattr(ev, "publish", defer)
     sess._publish("waiting_for_user", hint=None, hung=True, requires_response=True, decision_key=key)
     monkeypatch.setattr(ev, "publish", real_publish)
-    assert sess.respond("1").status == "resumed"   # claim+answer BEFORE the re-emit is published
+    assert sess.respond("1", decision_id=sess._decision["decision_id"]).status == "resumed"   # claim+answer BEFORE the re-emit is published
     assert sess._decision is None
     real_publish(*deferred["a"], **deferred["k"])   # now run the deferred re-emit + its install hook
     assert sess._decision is None                   # NOT resurrected

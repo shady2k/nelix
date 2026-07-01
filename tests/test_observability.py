@@ -49,7 +49,7 @@ def test_respond_success_logs_attempt_submitted_confirmed(tmp_path):
     did = sess._decision["decision_id"]
     sess._stop.clear()                                # a real respond runs while the monitor is live
     sess._handle = SubmitLandsHandle("do the next thing")
-    out = sess.respond("do the next thing")
+    out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     by = _by_event(buf)
     assert "respond_attempt" in by
@@ -72,7 +72,7 @@ def test_respond_submit_unconfirmed_logs_respond_failed(tmp_path):
     sess._loop()
     sess._stop.clear()
     sess._handle = StrandedAnswerHandle("do the next thing")
-    out = sess.respond("do the next thing")
+    out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"
     by = _by_event(buf)
     assert "respond_failed" in by
@@ -90,7 +90,7 @@ def test_respond_write_timeout_logs_respond_failed(tmp_path):
     sess._loop()
     sess._stop.clear()
     sess._handle = WedgedWriteHandle()
-    out = sess.respond("1")
+    out = sess.respond("1", decision_id=sess._decision["decision_id"])
     assert out.status == "write_timeout"
     by = _by_event(buf)
     assert "respond_attempt" in by                            # the attempt is recorded before the write
@@ -221,7 +221,7 @@ def test_decision_answered_logged(monkeypatch, tmp_path):
     sess._stop.clear()                                # a real respond runs while the monitor is live
     did = sess._decision["decision_id"]
     sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
-    out = sess.respond("1")
+    out = sess.respond("1", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     by = _by_event(buf)
     assert "decision_answered" in by

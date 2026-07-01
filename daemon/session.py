@@ -45,6 +45,9 @@ def _pending_meta(decision):
     return {"decision_id": decision.get("decision_id"), "kind": decision["kind"],
             "requires_response": decision.get("requires_response", True),
             "hint": decision.get("hint"), "hung": decision.get("hung", False),
+            # the frozen question text so a rejected/stale responder can retry WITHOUT a separate
+            # nelix_status pull (bounded — no full snapshot/screen here).
+            "text": decision.get("text"),
             # affordance metadata so a rejected/stale responder can reconcile (answer with an id).
             "prompt_kind": decision.get("prompt_kind"),
             "options": decision.get("options", [])}
@@ -988,15 +991,21 @@ class Session:
             time.sleep(min(self._CONFIRM_POLL, max(0.0, deadline - time.monotonic())))
 
     def respond(self, answer, decision_id=None):
-        # Bind to the session's CURRENT pending decision (server owns identity). decision_id is an
-        # OPTIONAL staleness guard sourced from the status pull, never required from the wake.
+        # Bind to the session's CURRENT pending decision (server owns identity). An answer to a
+        # pending decision MUST name it: decision_id (sourced from a status pull) is REQUIRED to
+        # bind — the daemon never guesses which question an answer belongs to (the dumb-bridge
+        # principle; the s-9c0b6eeb incident leaked a bare answer into the prompt this way). A
+        # wrong id is stale; an absent/empty id is missing_decision_id. Idle follow-ups (no
+        # pending decision) never reach here — manager.respond routes them to send_turn.
         with self._lock:
             if self._closing:
                 return RespondOutcome("terminal")
             decision = self._decision
             if decision is None or "event_id" not in decision:
                 return RespondOutcome("no_pending")
-            if decision_id is not None and decision.get("decision_id") != decision_id:
+            if not decision_id:                       # None OR "" -> missing, NOT a guessed bind
+                return RespondOutcome("missing_decision_id", pending=_pending_meta(decision))
+            if decision.get("decision_id") != decision_id:
                 return RespondOutcome("stale", pending=_pending_meta(decision))
         # Clean the answer BEFORE claiming: a rejected answer (command prefix / empty after
         # sanitization) leaves the decision pending and nothing typed, so the caller can retry.

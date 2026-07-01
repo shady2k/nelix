@@ -29,7 +29,11 @@ class FakeManager:
                                   snapshot={"session_id": session_id, "control_state": "busy", "pending": False})
         if s == "unknown_session":
             return RespondOutcome("unknown_session")
-        return RespondOutcome("stale", pending={"decision_id": "dec-1", "kind": "waiting_for_user"})
+        if s == "missing_decision_id":
+            return RespondOutcome("missing_decision_id",
+                                  pending={"decision_id": "dec-1", "kind": "waiting_for_user", "text": "y/n?"})
+        return RespondOutcome("stale", pending={"decision_id": "dec-1", "kind": "waiting_for_user",
+                                                "text": "y/n?"})
     def status(self, session_id=None): return {"sessions": {}} if session_id is None else {"state": "working"}
     def stop(self, session_id):
         self.stopped.append(session_id)
@@ -86,8 +90,8 @@ def test_rpc_session_scoped_roundtrip():
         _, wb = _req("GET", base + "/wait?after_seq=0")
         assert wb["event"]["session_id"] == "s1"
         st, rb = _req("POST", base + "/respond",
-                      body={"session_id": "s1", "answer": "yes"})       # no event_id needed
-        assert st == 200 and m.responded[-1] == ("s1", "yes", None)
+                      body={"session_id": "s1", "answer": "yes", "decision_id": "dec-1"})  # names the decision
+        assert st == 200 and m.responded[-1] == ("s1", "yes", "dec-1")
         assert rb["operation"] == "respond" and rb["status"] == "resumed"
         assert rb["next_after_seq"] == 7 and rb["next_action"] == "end_turn"
         m.respond_status = "stale"
@@ -98,6 +102,26 @@ def test_rpc_session_scoped_roundtrip():
         assert sb["next_action"] == "fix_call"
         st, _ = _req("POST", base + "/stop", body={"session_id": "s1"})
         assert st == 200 and m.stopped == ["s1"]
+    finally:
+        srv.shutdown()
+
+
+def test_respond_without_decision_id_returns_409_missing():
+    # A respond whose outcome is missing_decision_id surfaces as HTTP 409 with the pending
+    # decision meta (incl. its text) so the orchestrator retries with the id — NOT a guessed 200.
+    m = FakeManager()
+    m.respond_status = "missing_decision_id"
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8788, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:8788"
+    try:
+        st, b = _req("POST", base + "/respond",
+                     body={"session_id": "s1", "answer": "yes"})       # no decision_id
+        assert st == 409 and b["operation"] == "respond"
+        assert b["status"] == "missing_decision_id" and b["error"] == "missing_decision_id"
+        assert b["pending"]["decision_id"] == "dec-1" and b["pending"]["text"] == "y/n?"
+        assert b["next_action"] == "refresh_status"
+        assert m.responded[-1] == ("s1", "yes", None)
     finally:
         srv.shutdown()
 

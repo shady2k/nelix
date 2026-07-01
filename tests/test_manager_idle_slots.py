@@ -191,12 +191,15 @@ def test_send_turn_refused_when_active_cap_full(tmp_path):
 
 
 def test_respond_on_idle_routes_to_send_turn(tmp_path):
-    # A follow-up (nelix_respond) on an IDLE session resumes it via send_turn, not respond().
+    # A follow-up (nelix_respond) on an IDLE session resumes it via send_turn, not respond() — so
+    # the missing_decision_id guard in Session.respond (which now REQUIRES decision_id) can never
+    # fire for an idle follow-up: there is no pending decision to name, and manager never calls
+    # Session.respond for an idle session. No decision_id is needed or sent.
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=2)
     mgr.start("claude", "t1", cwd)
     created[0].control_state = "idle"
-    out = mgr.respond(created[0]._id, "next task")
+    out = mgr.respond(created[0]._id, "next task")     # NO decision_id — legitimate idle follow-up
     assert out.status == "resumed"
     assert created[0].sent == ["next task"]           # routed through send_turn
     assert created[0].responded == []                 # respond() NOT used for an idle session

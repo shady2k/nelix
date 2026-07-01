@@ -125,8 +125,11 @@ def register(ctx):
         transport = supervisor.endpoint()
         if transport is None:
             return _j({"error": "no active nelix daemon"})
-        # No event_id: the daemon binds the answer to the session's current pending decision.
-        # decision_id (if the model carries it from a status pull) is an optional staleness guard.
+        # The daemon binds the answer to the session's CURRENT pending decision, but ONLY if the
+        # caller names it: decision_id (from a nelix_status read) is REQUIRED to answer a pending
+        # question — omit it solely for an idle follow-up (manager.respond routes idle → send_turn,
+        # which never reaches the missing_decision_id guard). On missing_decision_id the daemon
+        # returns 409 with the pending decision so the caller retries without another status pull.
         # RpcClient.respond returns (ok, body) where ok = (st == 200); write_timeout is HTTP 503
         # → ok=False → no arm.
         ok, body = RpcClient(transport).respond(
@@ -222,9 +225,12 @@ def register(ctx):
         "nelix_respond", "nelix",
         {"description": (
             "Send the user's answer to a paused agent (e.g. '1' to approve, or free text) so it"
-            " continues. It is delivered to the agent's CURRENT pending decision — you do NOT need"
-            " an event id. (Optional: pass decision_id from a nelix_status read as a staleness"
-            " guard.) After it succeeds, end your turn — nelix wakes you on the next event."
+            " continues. To answer a pending question you MUST pass `decision_id` (from your"
+            " nelix_status read): it names the decision this answer binds to. Omit `decision_id`"
+            " ONLY for an idle follow-up (a new instruction to an already-idle agent). If you omit"
+            " it on a pending question the daemon returns `missing_decision_id` with that pending"
+            " decision — retry using it (no separate nelix_status call). After it succeeds, end your"
+            " turn — nelix wakes you on the next event."
             " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
             " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
             " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."
