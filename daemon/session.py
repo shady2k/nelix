@@ -456,7 +456,7 @@ class Session:
             self._log_notes(notes)
             if self._log is not None:
                 self._log.debug("session", "hook_applied", session_id=self._id,
-                                event=hobs.raw_event, kind=hobs.kind, control_state=self._state)
+                                raw_event=hobs.raw_event, kind=hobs.kind, control_state=self._state)
 
     def _sync_control_state(self):
         # MUST hold self._lock. Mirror the engine's live control_state onto self._state (a terminal

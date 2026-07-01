@@ -16,6 +16,8 @@ from daemon.drivers.claude import ClaudeDriver   # noqa: E402
 from daemon.events import EventQueue             # noqa: E402
 from daemon.hooks import HookEvent               # noqa: E402
 from daemon.clock import FakeClock               # noqa: E402
+from daemon.obs import Logger                     # noqa: E402
+import io                                          # noqa: E402
 
 
 class Spec:
@@ -81,10 +83,10 @@ class HookFakeHandle:
         pass
 
 
-def _hook_session(tmp_path, frame="✦ Working… (esc to interrupt)", step=1.0):
+def _hook_session(tmp_path, frame="✦ Working… (esc to interrupt)", step=1.0, logger=None):
     ev = EventQueue()
     clock = FakeClock(0.0)
-    sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), ev, clock=clock)
+    sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), ev, logger=logger, clock=clock)
     sess._handle = HookFakeHandle(frame, clock=clock, step=step)
     sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
                           spool_max_bytes=Spec.spool_max_bytes)
@@ -92,6 +94,20 @@ def _hook_session(tmp_path, frame="✦ Working… (esc to interrupt)", step=1.0)
     sess._task_delivery = "delivered"
     sess._clock = clock
     return sess, ev
+
+
+def test_drain_hooks_with_real_logger_does_not_crash(tmp_path):
+    # Regression (s-6a4e8c61): the production monitor thread runs with a real Logger, and _drain_hooks
+    # logs a `hook_applied` line per drained hook. Every other hook test wires logger=None, so that
+    # log call — the one line that fires on the FIRST hook in prod — was dead code under test. A
+    # positional/keyword `event=` collision (session.py) made Logger.debug() raise TypeError, killing
+    # the monitor on the first hook. Drive the drain path with a real Logger so the call is exercised.
+    buf = io.StringIO()
+    log = Logger(level="debug", stream=buf)
+    sess, _ = _hook_session(tmp_path, logger=log)
+    sess.on_hook(HookEvent("s1", "UserPromptSubmit"))
+    sess._loop_once()                                  # drains the hook → _drain_hooks logs hook_applied
+    assert '"event": "hook_applied"' in buf.getvalue()  # the log line was actually emitted, no crash
 
 
 def test_hook_secret_generated_per_session(tmp_path):
