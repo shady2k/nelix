@@ -163,6 +163,23 @@ def load_concurrency_limit(path, default=5):
     return v
 
 
+def load_idle_retained_limit(path, default=5):
+    """Max number of retained `idle` sessions (a completed turn that stays alive awaiting a
+    follow-up). An idle session does NOT occupy an active concurrency slot but is bounded here so
+    completed-but-unclosed sessions cannot accumulate without bound. Defaults to the concurrency
+    limit (pass it as `default`). Malformed TOML/IO or a non-int / bool / below-1 value falls back
+    to `default` (mirrors load_concurrency_limit) — never crash the load."""
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        return default
+    v = data.get("idle_retained_limit", default)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return default
+    return v
+
+
 def load_kill_grace_seconds(path, default=5.0):
     """Seconds between SIGTERM and SIGKILL when reaping a process group. Top-level (not
     per-executor): startup reconcile has only a child.json record, not an ExecutorSpec."""

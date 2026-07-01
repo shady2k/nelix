@@ -89,12 +89,15 @@ class SessionManager:
     """Registry of sessions. Holds <= concurrency_limit (config-driven, default 5)."""
 
     def __init__(self, specs, events, launcher_factory=None, driver_factory=None,
-                 concurrency_limit=5, logger=None, session_factory=None,
+                 concurrency_limit=5, idle_retained_limit=None, logger=None, session_factory=None,
                  session_retain=20, session_max_age_days=7, reaper_ctx=None,
                  terminal_snapshot_ttl=300.0, clock=time.time):
         self._specs = specs
         self._events = events
         self._limit = concurrency_limit
+        # An `idle` session frees its active slot but is retained alive; this bounds how many such
+        # completed-but-unclosed sessions we keep. Defaults to the active concurrency limit.
+        self._idle_limit = idle_retained_limit if idle_retained_limit is not None else concurrency_limit
         self._logger = logger
         self._session_retain = session_retain
         self._session_max_age_days = session_max_age_days
@@ -136,13 +139,24 @@ class SessionManager:
                                          reason="bad_cwd", executor=executor_name)
                 raise ValueError(f"cwd does not exist or is not a directory: {cwd!r}")
             with self._lock:
-                if not reserve and len(self._sessions) + self._reserved >= self._limit:
+                # Split accounting (spec §slots): the active cap counts only sessions occupying an
+                # active slot (everything except `idle`) + in-flight restart reservations; a retained
+                # `idle` session frees its active slot but is bounded by idle_retained_limit. A restart
+                # (reserve=True) reuses its own net-zero slot and skips both caps.
+                if not reserve and self._active_count() + self._reserved >= self._limit:
                     if self._logger is not None:
                         self._logger.warning("manager", "session_start_rejected",
                                              reason="concurrency_limit", executor=executor_name)
                     raise RuntimeError(
                         f"concurrency_limit={self._limit} reached "
                         f"(active: {sorted(self._sessions)})")
+                if not reserve and self._idle_count() >= self._idle_limit:
+                    if self._logger is not None:
+                        self._logger.warning("manager", "session_start_rejected",
+                                             reason="idle_retained_limit", executor=executor_name)
+                    raise RuntimeError(
+                        f"idle_retained_limit={self._idle_limit} reached "
+                        f"(close a completed session with nelix_stop before starting more)")
                 sid = f"s-{uuid.uuid4().hex[:8]}"
                 base_seq = self._events.latest_seq()  # waiter arms past anything already emitted
                 sess = self._make(sid, executor_name, spec)
@@ -251,6 +265,20 @@ class SessionManager:
         return RestartOutcome("restarted", session_id=new_sid, lineage_id=lineage_id,
                               restart_count=count, max_restarts=max_restarts,
                               next_after_seq=base_seq, snapshot=started.snapshot)
+
+    def _active_count(self):
+        # MUST hold self._lock. Sessions occupying an ACTIVE concurrency slot: every live session
+        # EXCEPT an `idle` one (turn complete, alive, awaiting a follow-up — it holds a PTY but not
+        # an active slot). busy / awaiting_user / intervention_required / starting all still count:
+        # the rule is exclude-idle, NOT a positive busy-only allowlist (which would wrongly free the
+        # slot for a stuck/blocked/starting session that still owns a real process).
+        return sum(1 for s in self._sessions.values()
+                   if s.snapshot().get("control_state") != "idle")
+
+    def _idle_count(self):
+        # MUST hold self._lock. Retained `idle` sessions (completed, alive), bounded by idle_retained_limit.
+        return sum(1 for s in self._sessions.values()
+                   if s.snapshot().get("control_state") == "idle")
 
     def _free_slot(self, session_id):
         with self._lock:
