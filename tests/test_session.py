@@ -1081,6 +1081,20 @@ def test_delivery_wraps_task_in_bracketed_paste(tmp_path):
     sess.stop()
 
 
+def test_delivery_arms_hook_startup_grace_for_hook_capable(tmp_path):
+    # CRITICAL 1 (wiring): a hook-capable driver's task-delivery must arm the belief engine's hook
+    # startup grace (expect_hooks). hook_mode stays "unknown" and the screen stays conservative about
+    # a screen-derived free-text idle until the first hook arrives or the grace expires (spec §6).
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box])
+    sess.start("do the thing", str(tmp_path))
+    _wait_for(lambda: sess._task_delivery == "delivered", timeout=5)
+    assert sess._task_delivery == "delivered"
+    assert sess._engine.hook_mode == "unknown"                 # no hook yet
+    assert sess._engine._hook_startup_at is not None           # grace armed at delivery (expect_hooks)
+    sess.stop()
+
+
 def test_delivery_timeout_marks_failed_and_wakes(tmp_path):
     # The typed task never confirms (no echo, no placeholder). After the confirm window, delivery is
     # marked failed and a non-respondable delivery_failed event wakes Hermes — nothing is re-typed.

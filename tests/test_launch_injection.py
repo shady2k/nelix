@@ -51,6 +51,45 @@ def test_local_launcher_injects_hooks_for_claude(monkeypatch):
     assert cap["env"]["NELIX_HOOK_SOCK"] == str(paths.rpc_sock())
 
 
+def test_merges_user_supplied_settings_instead_of_clobbering(monkeypatch):
+    # IMPORTANT 2: the user's nelix.toml executor args already carry a --settings (their own config).
+    # nelix must NOT append a second --settings (Claude is last-wins, which would clobber the user's);
+    # it merges our hooks ADDITIVELY into the user's settings value and passes ONE merged --settings.
+    user_settings = json.dumps({
+        "permissions": {"allow": ["Bash"]},
+        "hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "user-stop"}]}]},
+    })
+    spec = make_spec(command="claude", args=["--settings", user_settings], driver="claude")
+    cap = _run(monkeypatch, spec, session_id="s-1", hook_secret="sek")
+    argv = cap["argv"]
+    assert argv.count("--settings") == 1                       # exactly ONE flag (no clobbering second)
+    merged = json.loads(argv[argv.index("--settings") + 1])
+    assert merged["permissions"] == {"allow": ["Bash"]}        # the user's non-hook keys preserved
+    # our hooks are ADDITIVE: the user's Stop hook is KEPT and ours is appended alongside it.
+    stop_cmds = [h["command"] for g in merged["hooks"]["Stop"] for h in g["hooks"]]
+    assert "user-stop" in stop_cmds
+    assert any("NELIX_HOOK_SECRET" in c for c in stop_cmds)    # our hook merged into the same event
+    assert "UserPromptSubmit" in merged["hooks"]               # our other events are present too
+    assert cap["env"]["NELIX_SESSION"] == "s-1"                # env still injected
+
+
+def test_merges_user_settings_from_file_path(monkeypatch, tmp_path):
+    # The user's --settings value may be a FILE PATH (Claude accepts inline JSON or a path). nelix
+    # loads it, merges our hooks additively, and passes a single inline merged --settings.
+    p = tmp_path / "user-settings.json"
+    p.write_text(json.dumps({"model": "opus", "hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": "user-pre"}]}]}}))
+    spec = make_spec(command="claude", args=["--settings", str(p)], driver="claude")
+    cap = _run(monkeypatch, spec, session_id="s-1", hook_secret="sek")
+    argv = cap["argv"]
+    assert argv.count("--settings") == 1
+    merged = json.loads(argv[argv.index("--settings") + 1])
+    assert merged["model"] == "opus"                           # user's non-hook keys preserved
+    pre_cmds = [h["command"] for g in merged["hooks"]["PreToolUse"] for h in g["hooks"]]
+    assert "user-pre" in pre_cmds                              # user's PreToolUse hook kept
+    assert any("NELIX_HOOK_SECRET" in c for c in pre_cmds)     # our PreToolUse hook merged alongside
+
+
 def test_no_injection_for_non_hook_driver(monkeypatch):
     # codex is not a hook-capable (or even registered) driver -> nothing injected.
     spec = make_spec(command="codex", args=[], driver="codex")

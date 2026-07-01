@@ -1,3 +1,6 @@
+import json
+import os
+
 import paths
 from daemon.broker_client import get_broker
 from daemon.drivers import DRIVERS
@@ -12,6 +15,55 @@ def _driver_hook_capable(driver_name):
     # only injects for a driver that opted in (ClaudeDriver.hook_capable = True).
     cls = DRIVERS.get(driver_name)
     return bool(getattr(cls, "hook_capable", False))
+
+
+def _load_user_settings(value):
+    # The user's --settings value (from nelix.toml executor args) is either inline JSON or a path to
+    # a settings file — Claude accepts both. Try JSON first, then a file. On any failure return {} so
+    # we merge our hooks onto an empty base rather than clobber or crash the launch.
+    try:
+        obj = json.loads(value)
+        if isinstance(obj, dict):
+            return obj
+    except (ValueError, TypeError):
+        pass
+    try:
+        with open(os.path.expanduser(value)) as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return obj
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _deep_merge_hooks(base, ours):
+    # ADDITIVE merge of our hooks into the user's settings (spec §3: our hooks run ALONGSIDE the
+    # user's, never replacing them). Every user key is preserved untouched; only "hooks" is extended:
+    # for each hook event, our matcher-groups are APPENDED to the user's existing list for that event.
+    merged = dict(base)
+    hooks = {k: list(v) if isinstance(v, list) else v for k, v in (base.get("hooks") or {}).items()}
+    for event, entries in (ours.get("hooks") or {}).items():
+        hooks[event] = [*(hooks.get(event) or []), *entries]
+    merged["hooks"] = hooks
+    return merged
+
+
+def _fold_hook_settings(argv, argv_extra):
+    # Fold our ["--settings", <hooks json>] into argv WITHOUT clobbering a user-supplied --settings.
+    # If the user's argv already carries a --settings (Claude is last-wins, so a second flag would
+    # drop theirs), MERGE our hooks additively into their value and keep a SINGLE --settings. If none
+    # is present, append ours as before.
+    if "--settings" not in argv:
+        return [*argv, *argv_extra]
+    i = argv.index("--settings")
+    if i + 1 >= len(argv):
+        return [*argv, *argv_extra]                 # malformed user flag (no value): fall back to append
+    our_json = argv_extra[argv_extra.index("--settings") + 1]
+    merged = _deep_merge_hooks(_load_user_settings(argv[i + 1]), json.loads(our_json))
+    out = list(argv)
+    out[i + 1] = json.dumps(merged)
+    return out
 
 
 class LocalLauncher:
@@ -29,7 +81,7 @@ class LocalLauncher:
         # Never touches the user's config; injection is skipped for hookless drivers (fallback path).
         if session_id and hook_secret and _driver_hook_capable(spec.driver):
             inj = hook_launch(session_id, str(paths.rpc_sock()), hook_secret)
-            argv = [*argv, *inj["argv_extra"]]
+            argv = _fold_hook_settings(argv, inj["argv_extra"])
             env = {**env, **inj["env"]}
         master_fd, pid, pgid = get_broker().spawn(argv, cwd, env, cols, rows)
         return PtySession(master_fd, pid, pgid, cols=cols, rows=rows,

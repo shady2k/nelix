@@ -193,6 +193,26 @@ def test_send_turn_appends_followup_to_transcript(tmp_path):
     assert "do the next thing" in page["text"]
 
 
+def test_first_hook_withdraws_stale_screen_waiting(tmp_path):
+    # CRITICAL 1: the screen fallback published a respondable waiting_for_user BEFORE any hook. The
+    # first hook (UserPromptSubmit) takes over -> the stale screen decision must be WITHDRAWN (gone
+    # from the snapshot) and the session goes busy. A lingering waiting_for_user must not survive.
+    perm_box = "Proceed with the edit?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\n"
+    sess, ev = _hook_session(tmp_path, frame=perm_box)
+    sess._loop_once()                                        # screen publishes waiting_for_user (no hooks)
+    assert sess._engine.hook_mode == "unknown"
+    assert sess.snapshot()["decision"]["kind"] == "waiting_for_user"
+    assert sess.snapshot()["pending"] is True
+    sess.on_hook(HookEvent("s1", "UserPromptSubmit"))        # first hook: hooks take over
+    sess._loop_once()
+    snap = sess.snapshot()
+    assert sess._engine.hook_mode == "active"
+    assert snap["control_state"] == "busy"
+    assert snap["pending"] is False
+    assert "decision" not in snap                            # the stale screen decision was withdrawn
+    assert ev.pending("s1") is None                          # no longer in the respondable queue
+
+
 def test_hook_mode_active_suppresses_screen_decision(tmp_path):
     # A real permission menu WOULD publish a screen-derived waiting_for_user in screen mode. While
     # hooks are active (ground truth), the screen must NOT publish it — hooks own the state.

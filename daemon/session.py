@@ -378,6 +378,12 @@ class Session:
                 with self._lock:
                     self._last_submitted = self._task
                     self._engine.on_submit(self._task)
+                    # A hook-capable driver reports its own lifecycle: arm the hook startup grace at
+                    # task-delivery (spec §6). Until the first hook arrives (or the grace expires) the
+                    # engine stays "unknown" and the screen fallback is conservative about declaring a
+                    # screen-derived free-text idle. A hookless driver never arms it (screen path only).
+                    if getattr(self._driver, "hook_capable", False):
+                        self._engine.expect_hooks(self._clock.now())
                     notes = self._engine.drain_notes()       # post_submit_armed for the first turn
                 if self._log is not None:
                     self._log.audit_task(self._id, self._executor, self._task)

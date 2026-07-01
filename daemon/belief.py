@@ -163,8 +163,14 @@ class BeliefEngine:
         close with no intervening open is a straggler and is ignored. Returns the action list Session
         applies; the screen `tick` path is untouched here (precedence is Task 7).
         """
+        first_hook = self._hook_mode != "active"
         self._hook_mode = "active"
         actions = []
+        # The FIRST hook takes over from the screen fallback (spec §6): withdraw any stale screen-
+        # published respondable decision (e.g. a lingering waiting_for_user) so it does not survive
+        # into the hook-owned snapshot. _withdraw clears the screen path's _published_* bookkeeping.
+        if first_hook and self._published_key is not None:
+            self._withdraw(actions, "superseded", now)
         # Any hook is a fresh ground-truth signal: record it and re-baseline the lost-hook
         # reconciliation clocks (a new hook means the agent is alive and communicating).
         self._last_hook_at = now
@@ -200,7 +206,12 @@ class BeliefEngine:
             return actions
 
         # PostToolUse[AskUserQuestion]: the modal was answered -> withdraw the pending prompt, resume.
+        # A late/out-of-order clears_pending arriving AFTER Stop closed this turn is a straggler: it
+        # must NOT drag a closed (idle) turn back to busy (spec §5 guards). Ignore it unless a newer
+        # UserPromptSubmit reopened the turn. (A first-hook clears with no close is NOT a straggler.)
         if hobs.clears_pending:
+            if self._turn_closed():
+                return actions
             if self._hook_pending_key is not None:
                 actions.append(Withdraw(decision_key=self._hook_pending_key, reason="prompt_left"))
                 self._hook_pending_key = None
@@ -210,7 +221,12 @@ class BeliefEngine:
             return actions
 
         # PermissionRequest / PreToolUse[AskUserQuestion] / permission Notification: blocked on the user.
+        # Same closed-turn guard as clears_pending/plain-working (spec §5): a late waiting_for_user
+        # arriving AFTER Stop closed this turn is a straggler and must NOT resurrect it into
+        # awaiting_user — ignore it unless a newer UserPromptSubmit reopened the turn.
         if hobs.kind == "waiting_for_user":
+            if self._turn_closed():
+                return actions
             decision_key = f"{hobs.prompt_kind}:{self._turn_epoch}"
             if self._hook_pending_key == decision_key:
                 return actions                                    # same pause already published
@@ -231,6 +247,14 @@ class BeliefEngine:
             self._state.control_state = "busy"
             self._state.phase = "busy"
         return actions
+
+    def _turn_closed(self):
+        """A turn is CLOSED once a Stop/idle published for the CURRENT epoch and no newer
+        UserPromptSubmit reopened it: `_idle_published_epoch == _turn_epoch` (Stop sets them equal;
+        a fresh UserPromptSubmit bumps `_turn_epoch` past `_idle_published_epoch`). A never-opened
+        turn (fresh engine, epoch 0, nothing published) is NOT closed — so a waiting_for_user that
+        arrives as the very first hook still surfaces (it is not a straggler)."""
+        return self._idle_published_epoch == self._turn_epoch
 
     # ---- diagnostic notes (nelix-jwv): pure, off the action list; Session drains + logs ----
     def _note(self, event, **fields):

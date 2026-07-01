@@ -122,3 +122,16 @@ def test_hook_malformed_json_400(server):
     st = _post(base, "/hook/s-1", raw=b"{not json",
                headers={"X-Nelix-Hook-Secret": "sek"})
     assert st == 400
+
+
+def test_hook_rate_limit_drops_flood(server):
+    # MINOR (spec §7: rate-limit alongside the body cap): a per-session flood must be dropped. A sane
+    # single hook is accepted (204); a burst well past the per-session bucket yields 429s (dropped),
+    # so a same-uid process cannot flood forged lifecycle events unbounded.
+    base, session = server
+    hdr = {"X-Nelix-Hook-Secret": "sek"}
+    codes = [_post(base, "/hook/s-1", body={"hook_event_name": "PostToolUse"}, headers=hdr)
+             for _ in range(400)]
+    assert codes[0] == 204                                # a normal single hook is accepted
+    assert 429 in codes                                  # the flood is rate-limited (dropped)
+    assert len(session.hooks) < 400                      # dropped hooks never reached on_hook

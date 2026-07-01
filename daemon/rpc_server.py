@@ -3,6 +3,8 @@ import json
 import os
 import socket
 import socketserver
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -16,6 +18,34 @@ from daemon.transport import peer_is_self
 
 _MAX_BODY = 4 * 1024 * 1024   # 4 MiB body cap (post-auth memory hygiene; generous for tasks)
 _HOOK_MAX_BODY = 256 * 1024   # tight cap for hook payloads: they are small lifecycle events
+_HOOK_RATE_CAPACITY = 60      # per-session token-bucket burst (generous for a busy turn's tool events)
+_HOOK_RATE_REFILL = 30.0      # tokens/sec sustained; a genuine flood/forge attempt is dropped
+
+
+class _HookRateLimiter:
+    """Minimal per-session token bucket for the /hook route (spec §7: rate-limit alongside the body
+    cap). A same-uid process (or a flapping agent — the bg-subagent flap fired ~35 in a window) could
+    otherwise POST an unbounded flood of lifecycle events; a sane per-session rate drops the excess.
+    Buckets are created only AFTER secret auth, so a wrong-secret caller never grows the map. Hooks
+    are best-effort (`curl … || true`), so a dropped POST just doesn't advance the belief engine."""
+
+    def __init__(self, capacity=_HOOK_RATE_CAPACITY, refill=_HOOK_RATE_REFILL, clock=time.monotonic):
+        self._capacity = capacity
+        self._refill = refill
+        self._clock = clock
+        self._buckets = {}                 # sid -> [tokens, last_ts]
+        self._lock = threading.Lock()
+
+    def allow(self, sid):
+        now = self._clock()
+        with self._lock:
+            tokens, last = self._buckets.get(sid, (self._capacity, now))
+            tokens = min(self._capacity, tokens + (now - last) * self._refill)
+            if tokens < 1.0:
+                self._buckets[sid] = (tokens, now)
+                return False
+            self._buckets[sid] = (tokens - 1.0, now)
+            return True
 
 
 class _BadRequest(Exception):
@@ -30,6 +60,7 @@ class _BadRequest(Exception):
 def make_server(manager, transport, logger=None):
     is_unix = transport.kind == "unix"
     token = transport.token
+    hook_limiter = _HookRateLimiter()      # per-session flood guard for /hook (shared across threads)
 
     class Handler(BaseHTTPRequestHandler):
         def _auth(self):
@@ -176,6 +207,12 @@ def make_server(manager, transport, logger=None):
                 if logger is not None:
                     logger.warning("rpc", "hook_unauthorized", session_id=sid, status=401)
                 self._send(401, {"error": "unauthorized"}); return
+            # Per-session flood guard (spec §7): drop hook POSTs past the sane per-session rate. After
+            # auth, so only real sessions create buckets; best-effort hooks ignore the 429.
+            if not hook_limiter.allow(sid):
+                if logger is not None:
+                    logger.warning("rpc", "hook_rate_limited", session_id=sid, status=429)
+                self._send(429, {"error": "rate_limited"}); return
             if not isinstance(body, dict) or "hook_event_name" not in body:
                 raise _BadRequest(400, "missing hook_event_name")
             ev = HookEvent(session_id=sid, event=body["hook_event_name"],
@@ -253,6 +290,14 @@ def make_server(manager, transport, logger=None):
                     self._send(404, {"operation": "respond", "status": "unknown_session",
                                      "session_id": sid, "error": "unknown session",
                                      "next_action": "refresh_status"})
+                elif outcome.status == "at_capacity":
+                    # An idle follow-up that could not re-acquire an active slot (concurrency cap
+                    # full). Surface HONEST backpressure (503), NOT no_pending — the decision exists,
+                    # the slot doesn't. The orchestrator refreshes/retries once a slot frees.
+                    if logger is not None:
+                        logger.warning("rpc", "respond_at_capacity", session_id=sid, status=503)
+                    self._send(503, {"operation": "respond", "status": "at_capacity", "session_id": sid,
+                                     "error": "at_capacity", "next_action": "refresh_status"})
                 else:   # no_pending
                     if logger is not None:
                         logger.warning("rpc", "respond_no_pending", session_id=sid, status=409,

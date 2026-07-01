@@ -37,11 +37,65 @@ def test_hook_askquestion_publishes_waiting():
     assert p.kind == "waiting_for_user" and p.respondable
 
 
+def test_first_hook_withdraws_stale_screen_decision():
+    # CRITICAL 1: the screen fallback published a respondable waiting_for_user; then the FIRST hook
+    # (unknown->active) takes over. It MUST Withdraw the stale screen decision so a lingering
+    # waiting_for_user does not survive into the hook-owned snapshot, and go busy.
+    clk = FakeClock(0.0)
+    e = BeliefEngine(BeliefConfig(), clk)
+    modal = Observation(prompt_kind="modal_choice", semantic_fp="ask", prompt_fp="box",
+                        affordances=frozenset({"accepts_text_input"}), options=("1", "2"))
+    acts = e.tick(modal, CTX)                                 # modal publishes immediately (screen path)
+    assert any(isinstance(a, Publish) and a.kind == "waiting_for_user" for a in acts)
+    assert e.hook_mode == "unknown"
+    acts = e.on_hook(H("working", opens=True), 0.0)          # first hook: UserPromptSubmit
+    assert any(isinstance(a, Withdraw) for a in acts)         # the stale screen decision is withdrawn
+    assert e.state.control_state == "busy" and e.hook_mode == "active"
+
+
 def test_late_posttooluse_after_stop_is_ignored():
     e = eng()
     e.on_hook(H("idle", closes=True), 0.0)
     assert e.on_hook(H("working"), 0.1) == []            # no new turn -> ignored, stays idle
     assert e.state.control_state == "idle"
+
+
+def test_late_waiting_for_user_after_stop_is_ignored():
+    # CRITICAL 2: after Stop closes the turn (idle), a late/out-of-order waiting_for_user hook
+    # (PreToolUse[AskUserQuestion]/PermissionRequest straggler) must NOT resurrect the closed turn —
+    # it is ignored (stays idle, no actions), UNLESS a newer UserPromptSubmit reopened the turn.
+    e = eng()
+    e.on_hook(H("working", opens=True), 0.0)
+    e.on_hook(H("idle", closes=True), 0.1)
+    assert e.state.control_state == "idle"
+    acts = e.on_hook(H("waiting_for_user", prompt_kind="modal_choice"), 0.2)
+    assert acts == []                                     # late ask after close -> ignored
+    assert e.state.control_state == "idle"                # stays idle, not awaiting_user
+
+
+def test_late_clears_pending_after_stop_is_ignored():
+    # CRITICAL 2: after Stop closes the turn, a late clears_pending hook (PostToolUse[AskUserQuestion]
+    # straggler) must NOT drag the session back to busy — it is ignored (stays idle, no actions).
+    e = eng()
+    e.on_hook(H("working", opens=True), 0.0)
+    e.on_hook(H("idle", closes=True), 0.1)
+    assert e.state.control_state == "idle"
+    acts = e.on_hook(H("working", clears=True), 0.2)
+    assert acts == []                                     # late clear after close -> ignored
+    assert e.state.control_state == "idle"                # stays idle, not busy
+
+
+def test_ask_reopened_by_userpromptsubmit_still_publishes():
+    # CRITICAL 2 (complement): once a NEWER UserPromptSubmit reopens the turn, a waiting_for_user is
+    # NOT a straggler — it must publish again (the closed-turn guard only silences a genuinely closed
+    # turn, never a freshly reopened one).
+    e = eng()
+    e.on_hook(H("working", opens=True), 0.0)
+    e.on_hook(H("idle", closes=True), 0.1)
+    e.on_hook(H("working", opens=True), 0.2)             # reopen the turn
+    acts = e.on_hook(H("waiting_for_user", prompt_kind="modal_choice"), 0.3)
+    assert any(isinstance(a, Publish) and a.kind == "waiting_for_user" for a in acts)
+    assert e.state.control_state == "awaiting_user"
 
 
 def test_userpromptsubmit_opens_new_turn_from_idle():
