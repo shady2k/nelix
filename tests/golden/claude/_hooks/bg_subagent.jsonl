@@ -1,0 +1,23 @@
+# SYNTHESIZED (not a live recording). Reconstructed from the real event ORDER documented in
+# docs/superpowers/specs/2026-07-01-nelix-hook-state-detection-design.md §1 and the sibling capture
+# tests/test_bg_subagent_realcapture.py (session s-039a61b4: a `golang-pro` BACKGROUND subagent ran for
+# ~8 min while the daemon flapped publish:waiting_for_user / withdraw:prompt_changed ~35x — the SCREEN
+# showed a live `❯` box + a "Waiting for N background agent(s) to finish" line, misread as free_text).
+# No LIVE hook recording was available to the author, so each payload is hand-authored to the real
+# Claude hook shape in the true turn order:
+#   UserPromptSubmit -> PreToolUse[Task] (spawn subagent) -> many PreToolUse/PostToolUse (main agent +
+#   subagent tool work) -> PostToolUse[Task] (subagent finished) -> Stop (only NOW -> idle).
+# The whole point: NO Stop and NO AskUserQuestion fire mid-flight, so the state stays `busy` for every
+# event until the final Stop. Locks out the bg-subagent flap by construction.
+{"session_id":"s-039a61b4","hook_event_name":"UserPromptSubmit","prompt":"optimize the hot path and run the go benchmarks"}
+{"session_id":"s-039a61b4","hook_event_name":"PreToolUse","tool_name":"Task","tool_input":{"subagent_type":"golang-pro","description":"profile + optimize the hot path"}}
+{"session_id":"s-039a61b4","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"go test -bench=. ./..."}}
+{"session_id":"s-039a61b4","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"go test -bench=. ./..."}}
+{"session_id":"s-039a61b4","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"internal/hotpath.go"}}
+{"session_id":"s-039a61b4","hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"internal/hotpath.go"}}
+{"session_id":"s-039a61b4","hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"internal/hotpath.go"}}
+{"session_id":"s-039a61b4","hook_event_name":"PostToolUse","tool_name":"Edit","tool_input":{"file_path":"internal/hotpath.go"}}
+{"session_id":"s-039a61b4","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"go test -bench=. ./..."}}
+{"session_id":"s-039a61b4","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"go test -bench=. ./..."}}
+{"session_id":"s-039a61b4","hook_event_name":"PostToolUse","tool_name":"Task","tool_input":{"subagent_type":"golang-pro","description":"profile + optimize the hot path"}}
+{"session_id":"s-039a61b4","hook_event_name":"Stop","is_interrupt":false}

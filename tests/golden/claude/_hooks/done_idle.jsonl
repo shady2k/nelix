@@ -1,0 +1,16 @@
+# SYNTHESIZED (not a live recording). Reconstructed from the real event ORDER documented in
+# docs/superpowers/specs/2026-07-01-nelix-hook-state-detection-design.md §5 (Hook -> state map) and
+# §1 (session s-326ae16b: the agent FINISHED a task and sat idle, and the orchestrator — seeing a
+# waiting_for_user/free_text screen decision — typed `exit` into the box, killing the session).
+# No LIVE hook recording was available to the author, so each payload is hand-authored to the real
+# Claude hook shape (hook_event_name / tool_name / tool_input) in the true turn order:
+#   UserPromptSubmit -> PreToolUse/PostToolUse (tool work) -> Stop (natural close, is_interrupt=false).
+# Expected: Stop -> control_state `idle` (requires_response=false); Session types NOTHING.
+{"session_id":"s-326ae16b","hook_event_name":"UserPromptSubmit","prompt":"fix the failing test in auth.py"}
+{"session_id":"s-326ae16b","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"auth.py"}}
+{"session_id":"s-326ae16b","hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"auth.py"}}
+{"session_id":"s-326ae16b","hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"auth.py","old_string":"assert x","new_string":"assert x == 1"}}
+{"session_id":"s-326ae16b","hook_event_name":"PostToolUse","tool_name":"Edit","tool_input":{"file_path":"auth.py"}}
+{"session_id":"s-326ae16b","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"pytest -q tests/test_auth.py"}}
+{"session_id":"s-326ae16b","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"pytest -q tests/test_auth.py"}}
+{"session_id":"s-326ae16b","hook_event_name":"Stop","is_interrupt":false}
