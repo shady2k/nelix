@@ -1,3 +1,4 @@
+import hmac
 import json
 import os
 import socket
@@ -8,11 +9,13 @@ from urllib.parse import urlparse, parse_qs
 import paths
 from daemon.dialog import DialogReader
 from daemon.events import EXTERNAL_OUTPUT_POLICY
+from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.transport import peer_is_self
 
 _MAX_BODY = 4 * 1024 * 1024   # 4 MiB body cap (post-auth memory hygiene; generous for tasks)
+_HOOK_MAX_BODY = 256 * 1024   # tight cap for hook payloads: they are small lifecycle events
 
 
 class _BadRequest(Exception):
@@ -45,20 +48,24 @@ def make_server(manager, transport, logger=None):
             return True
 
         def _send(self, code, obj):
+            if obj is None:                       # explicit empty response (e.g. 204 No Content)
+                self.send_response(code)
+                self.send_header("Content-Length", "0")
+                self.end_headers(); return
             body = json.dumps(obj, ensure_ascii=False).encode()  # UTF-8 out, not \uXXXX
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers(); self.wfile.write(body)
 
-        def _read_json(self):
+        def _read_json(self, max_body=_MAX_BODY):
             try:
                 n = int(self.headers.get("Content-Length", 0))
             except (TypeError, ValueError):
                 raise _BadRequest(400, "invalid Content-Length")
             if n < 0:
                 raise _BadRequest(400, "invalid Content-Length")
-            if n > _MAX_BODY:
+            if n > max_body:
                 raise _BadRequest(413, "request body too large")
             try:
                 return json.loads(self.rfile.read(n) or b"{}")
@@ -154,7 +161,34 @@ def make_server(manager, transport, logger=None):
                     logger.error("rpc", "request_exception", path=self.path, exc_info=True)
                 self._send(500, {"error": "internal"})
 
+        def _dispatch_hook(self, p):
+            # POST /hook/<sid>: a hook-capable agent reports one lifecycle event. Authenticated by
+            # the per-session secret (X-Nelix-Hook-Secret), IN ADDITION to the transport's
+            # peercred/token in _auth. Tight body cap; hands a typed HookEvent to Session.on_hook.
+            sid = p.path[len("/hook/"):]
+            body = self._read_json(max_body=_HOOK_MAX_BODY)      # 413 (too large) / 400 (malformed)
+            sess = manager.get(sid)
+            secret = getattr(sess, "hook_secret", None) if sess is not None else None
+            provided = self.headers.get("X-Nelix-Hook-Secret", "")
+            # Fail closed and identically for unknown session, missing secret, and bad secret — no
+            # existence oracle. compare_digest keeps the check constant-time.
+            if not secret or not hmac.compare_digest(provided, secret):
+                if logger is not None:
+                    logger.warning("rpc", "hook_unauthorized", session_id=sid, status=401)
+                self._send(401, {"error": "unauthorized"}); return
+            if not isinstance(body, dict) or "hook_event_name" not in body:
+                raise _BadRequest(400, "missing hook_event_name")
+            ev = HookEvent(session_id=sid, event=body["hook_event_name"],
+                           tool_name=body.get("tool_name"),
+                           tool_input=body.get("tool_input") or {},
+                           is_interrupt=bool(body.get("is_interrupt")),
+                           notification=body.get("message") or body.get("matcher"))
+            sess.on_hook(ev)
+            self._send(204, None)
+
         def _dispatch_post(self, p):
+            if p.path.startswith("/hook/"):
+                self._dispatch_hook(p); return
             body = self._read_json()
             if p.path == "/start":
                 try:
