@@ -1031,6 +1031,55 @@ class Session:
                               answered_decision_id=decision.get("decision_id"),
                               snapshot=self.snapshot())
 
+    def send_turn(self, text):
+        # A follow-up on an IDLE session (spec §send_turn, plan Task 10): the agent finished its turn
+        # and is idle (non-respondable) — this RE-OPENS the turn. Allowed ONLY from control_state
+        # "idle". Types the framed submission + the submit key (mirroring the initial _deliver_task,
+        # NOT a modal selection), tells the engine a submit happened (on_submit arms post-submit TTFT
+        # suppression; the turn formally re-opens on the next UserPromptSubmit hook), and drops the
+        # non-respondable idle decision. It does NOT fabricate a pending decision. The manager
+        # re-acquires an active slot BEFORE calling this (the idle session had freed it).
+        with self._lock:
+            if self._closing:
+                return RespondOutcome("terminal")
+            if self._state != "idle":
+                return RespondOutcome("no_pending")   # not idle -> nothing to resume; type nothing
+        # Clean the follow-up (byte hygiene + command-prefix policy), same discipline as respond(); a
+        # rejected follow-up (e.g. a leading '/') raises PtyInputRejected before anything is typed.
+        clean = prepare_pty_input(text, self._driver.command_prefixes)
+        if self._handle is None:
+            return RespondOutcome("terminal")
+        # Bound the PTY write (this runs on the RPC thread): a wedged executor that stopped draining
+        # its stdin must NOT hang send_turn forever. ONE deadline covers the framed text + the Enter;
+        # non-draining (the monitor owns pump(); draining here would race it).
+        deadline = time.monotonic() + self._spec.respond_write_seconds
+        try:
+            self._type_text(self._driver.format_submission(clean),
+                            timeout=max(0.0, deadline - time.monotonic()))
+            self._press_enter(timeout=max(0.0, deadline - time.monotonic()))
+        except PtyWriteTimeout:
+            if self._log is not None:
+                self._log.warning("session", "send_turn_failed", session_id=self._id,
+                                  reason="write_unconfirmed")
+            return RespondOutcome("write_timeout", snapshot=self.snapshot())
+        with self._lock:
+            self._last_submitted = clean
+            self._dialog.append_user_input(clean)        # the follow-up is a new user turn
+            # A submit: arm post-submit suppression (the echoed follow-up during TTFT is not a fresh
+            # idle) and forget the now-consumed idle decision. control_state -> busy: the session
+            # re-acquired an active slot; the next UserPromptSubmit hook confirms the new turn epoch.
+            self._engine.on_submit(clean)
+            notes = self._engine.drain_notes()
+            self._decision = None
+            self._state = "busy"
+        self._log_notes(notes)
+        if self._log is not None:
+            self._log.info("session", "send_turn_submitted", session_id=self._id)
+        # seq = the event high-water at resume (mirrors /start's base_seq): the waiter arms past
+        # everything already emitted so only the resumed turn's future events wake the orchestrator.
+        # send_turn publishes no event itself, so there is nothing to skip past here.
+        return RespondOutcome("resumed", seq=self._events.latest_seq(), snapshot=self.snapshot())
+
     def stop(self):
         self._stop.set()
         # Join the monitor thread before closing the dialog so an in-flight delivery/emit

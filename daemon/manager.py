@@ -324,7 +324,33 @@ class SessionManager:
             sess = self._sessions.get(session_id)
         if sess is None:
             return RespondOutcome("unknown_session")
+        # A follow-up on an IDLE session (turn complete, alive, no respondable decision) is a NEW
+        # turn: route it through send_turn (re-acquire an active slot + re-open the turn) — never
+        # respond(), whose no_pending path can't drive a non-respondable idle decision (plan Task 10).
+        if sess.snapshot().get("control_state") == "idle":
+            return self.send_turn(session_id, answer)
         return sess.respond(answer, decision_id=decision_id)
+
+    def send_turn(self, session_id, text):
+        # Idle follow-up entry: RE-ACQUIRE an active slot before resuming. An idle session freed its
+        # active slot, so resuming it must not push active+reserved past concurrency_limit; a capacity
+        # refusal types nothing (mirrors start's honest cap). The reservation is held across the
+        # (lockless) PTY write so a concurrent start cannot claim the same slot mid-resume.
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                return RespondOutcome("unknown_session")
+            if self._active_count() + self._reserved >= self._limit:
+                if self._logger is not None:
+                    self._logger.warning("manager", "send_turn_rejected",
+                                         reason="concurrency_limit", session_id=session_id)
+                return RespondOutcome("at_capacity")
+            self._reserved += 1
+        try:
+            return sess.send_turn(text)
+        finally:
+            with self._lock:
+                self._reserved -= 1
 
     def status(self, session_id=None):
         if session_id is not None:

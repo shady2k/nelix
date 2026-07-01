@@ -151,6 +151,48 @@ def test_askquestion_hook_publishes_waiting(tmp_path):
     assert sess._handle.writes == []                  # a pause never types anything
 
 
+def _drive_to_idle(sess):
+    sess.on_hook(HookEvent("s1", "UserPromptSubmit"))
+    sess.on_hook(HookEvent("s1", "Stop"))
+    sess._loop_once()
+
+
+def test_send_turn_on_idle_types_submission_and_resumes(tmp_path):
+    # Task 10: a follow-up on an idle session re-opens the turn — type the framed submission + the
+    # submit key (nothing else, never `exit`), return resumed, and leave control_state active again.
+    sess, ev = _hook_session(tmp_path)
+    _drive_to_idle(sess)
+    assert sess.snapshot()["control_state"] == "idle"
+    out = sess.send_turn("please continue")
+    assert out.status == "resumed"
+    # bracketed-paste framed text, THEN CR — the exact pair _deliver_task types, and NOTHING else.
+    assert sess._handle.writes == ["\x1b[200~please continue\x1b[201~", "\r"]
+    snap = sess.snapshot()
+    assert snap["control_state"] == "busy"            # re-acquired an active slot (turn resuming)
+    assert snap["pending"] is False                   # did NOT fabricate a pending decision
+    assert "decision" not in snap                      # the non-respondable idle decision was dropped
+
+
+def test_send_turn_rejected_when_not_idle(tmp_path):
+    # send_turn is allowed ONLY from idle: a busy session must reject it and type nothing.
+    sess, ev = _hook_session(tmp_path)
+    sess.on_hook(HookEvent("s1", "UserPromptSubmit"))
+    sess._loop_once()                                 # busy (no Stop)
+    assert sess.snapshot()["control_state"] == "busy"
+    out = sess.send_turn("too soon")
+    assert out.status != "resumed"
+    assert sess._handle.writes == []                  # nothing typed when not idle
+
+
+def test_send_turn_appends_followup_to_transcript(tmp_path):
+    # The follow-up is a new user turn -> it must land in the transcript (like the initial task).
+    sess, ev = _hook_session(tmp_path)
+    _drive_to_idle(sess)
+    sess.send_turn("do the next thing")
+    page = sess._dialog.page(0)
+    assert "do the next thing" in page["text"]
+
+
 def test_hook_mode_active_suppresses_screen_decision(tmp_path):
     # A real permission menu WOULD publish a screen-derived waiting_for_user in screen mode. While
     # hooks are active (ground truth), the screen must NOT publish it — hooks own the state.
