@@ -13,6 +13,7 @@ from daemon.dialog import DialogReader
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
+from daemon.messages import parse_message_body
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.transport import peer_is_self
 
@@ -20,6 +21,10 @@ _MAX_BODY = 4 * 1024 * 1024   # 4 MiB body cap (post-auth memory hygiene; genero
 _HOOK_MAX_BODY = 256 * 1024   # tight cap for hook payloads: they are small lifecycle events
 _HOOK_RATE_CAPACITY = 60      # per-session token-bucket burst (generous for a busy turn's tool events)
 _HOOK_RATE_REFILL = 30.0      # tokens/sec sustained; a genuine flood/forge attempt is dropped
+# /message payloads carry a few free-text fields (question/continuation_plan/details, each capped at
+# MAX_BODY_LEN by parse_message_body) — comfortably smaller than a hook event, so the same tight cap
+# as /hook applies.
+_MSG_MAX_BODY = 256 * 1024
 
 
 class _HookRateLimiter:
@@ -61,6 +66,10 @@ def make_server(manager, transport, logger=None):
     is_unix = transport.kind == "unix"
     token = transport.token
     hook_limiter = _HookRateLimiter()      # per-session flood guard for /hook (shared across threads)
+    # A SEPARATE instance (same class/config) for /message: distinct bucket per sid so an executor
+    # flooding questions/notes can never starve /hook delivery (spec — see
+    # test_message_limiter_separate_from_hooks).
+    msg_limiter = _HookRateLimiter()
 
     class Handler(BaseHTTPRequestHandler):
         def _auth(self):
@@ -223,9 +232,57 @@ def make_server(manager, transport, logger=None):
             sess.on_hook(ev)
             self._send(204, None)
 
+        def _dispatch_message(self, p):
+            # POST /message/<sid>: the executor-facing async message channel — a `question` it
+            # doesn't want to block on, or a non-waking `note`. Authenticated identically to /hook
+            # (same per-session secret, X-Nelix-Hook-Secret) but rate-limited from a SEPARATE bucket
+            # (msg_limiter) so message spam can never starve hook delivery. Never touches the PTY
+            # (single-writer PTY invariant): only manager state methods are called here.
+            sid = p.path[len("/message/"):]
+            body = self._read_json(max_body=_MSG_MAX_BODY)   # 413 (too large) / 400 (malformed)
+            sess = manager.get(sid)
+            secret = getattr(sess, "hook_secret", None) if sess is not None else None
+            provided = self.headers.get("X-Nelix-Hook-Secret", "")
+            # Fail closed and identically for unknown session, missing secret, and bad secret — no
+            # existence oracle (mirrors _dispatch_hook exactly). compare_digest keeps it constant-time.
+            if not secret or not hmac.compare_digest(provided, secret):
+                if logger is not None:
+                    logger.warning("rpc", "message_unauthorized", session_id=sid, status=401)
+                self._send(401, {"error": "unauthorized"}); return
+            # Per-session flood guard, SEPARATE bucket from /hook's — see msg_limiter above.
+            if not msg_limiter.allow(sid):
+                if logger is not None:
+                    logger.warning("rpc", "message_rate_limited", session_id=sid, status=429)
+                self._send(429, {"error": "rate_limited"}); return
+            if not isinstance(body, dict):
+                raise _BadRequest(400, "malformed JSON body")
+            kind = body.get("kind")
+            obj, err = parse_message_body(kind, body)
+            if err is not None:
+                status, msg = err
+                self._send(status, {"error": msg}); return
+            if kind == "question":
+                qid, qerr = manager.record_async_question(sid, obj)
+                if qerr is not None:
+                    if "id" in qerr:      # already pending — not an error, a conflicting state
+                        self._send(409, {"status": "already_pending",
+                                         "pending": {"id": qerr["id"],
+                                                      "question": qerr["question"]}}); return
+                    # {"error": "unknown_session"} — the rare post-auth race (session freed between
+                    # the auth lookup above and this call); auth already 401s a truly-unknown sid.
+                    self._send(404, {"error": "unknown_session"}); return
+                self._send(200, {"status": "queued", "id": qid}); return
+            # kind == "note" (the only other value parse_message_body accepts)
+            seq = manager.append_progress_note(sid, obj)
+            if seq is None:
+                self._send(404, {"error": "unknown_session"}); return
+            self._send(200, {"status": "recorded", "progress_seq": seq})
+
         def _dispatch_post(self, p):
             if p.path.startswith("/hook/"):
                 self._dispatch_hook(p); return
+            if p.path.startswith("/message/"):
+                self._dispatch_message(p); return
             body = self._read_json()
             if p.path == "/start":
                 try:
