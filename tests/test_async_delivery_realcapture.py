@@ -197,6 +197,36 @@ def test_terminal_before_answer_is_not_delivered(tmp_path):
     assert sess._handle.writes == []                   # nothing typed into a dead session
 
 
+def test_respond_after_finish_returns_not_delivered(tmp_path):
+    # The MANAGER-freed-session sub-case (Task 6): the executor exits WHILE its async question is
+    # still outstanding. Terminal cleanup (on_terminal -> Manager._free_slot, wire_free_slot=True is
+    # the default here) auto-resolves the question (executor_finished) into a manager-level
+    # recent-terminal async store (same key/expiry as self._terminal). A subsequent respond() naming
+    # that decision_id must get a clean not_delivered/executor_finished, never a bare unknown_session
+    # (which would look like a typo'd/unrelated session id to the orchestrator).
+    sess, mgr, _ = _manager_session(tmp_path)             # wire_free_slot=True (default)
+    _drive_busy(sess)
+    qid, _ = sess.record_async_question(_Q)
+    sess._stop.set()
+    sess._finish()                                        # real terminal funnel -> _free_slot runs
+    assert mgr.get(_SID) is None                          # deregistered: the slot was freed
+    out = mgr.respond(_SID, "use a", decision_id=qid)
+    assert out.status == "not_delivered" and out.reason == "executor_finished"
+    assert sess._handle.writes == []                      # nothing typed — the executor is gone
+
+
+def test_respond_after_finish_wrong_id_is_unknown_session(tmp_path):
+    # The terminal-survival fallback is narrowly scoped to the id that was actually auto-resolved;
+    # any other decision_id for the same freed session still falls through to unknown_session.
+    sess, mgr, _ = _manager_session(tmp_path)
+    _drive_busy(sess)
+    sess.record_async_question(_Q)
+    sess._stop.set()
+    sess._finish()
+    out = mgr.respond(_SID, "use a", decision_id="q_999")
+    assert out.status == "unknown_session"
+
+
 # ---- resolution / dispatch invariants ----
 
 def test_resolve_marks_the_async_event_answered(tmp_path):

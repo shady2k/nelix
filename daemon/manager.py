@@ -106,6 +106,11 @@ class SessionManager:
         self._lineages = {}            # lineage_id -> restart count (durable across session removal)
         self._reserved = 0             # in-flight restart slot reservations (cap accounting)
         self._terminal = {}            # sid -> (snapshot_dict, expires_at): disappeared-session relay
+        # sid -> ({"id":..., "reason":"executor_finished"}, expires_at): Task 6 terminal survival for
+        # an async question still outstanding when the executor exits. Written ALONGSIDE self._terminal
+        # in _free_slot with the SAME expires_at (one lifetime policy, not two) — never write this
+        # without also having just computed self._terminal's expiry for the same session.
+        self._terminal_async = {}
         self._terminal_ttl = terminal_snapshot_ttl
         self._clock = clock
         self._lock = threading.Lock()
@@ -288,24 +293,67 @@ class SessionManager:
         with self._lock:
             sess = self._sessions.get(session_id)
             snap = None
+            qid = None
             if sess is not None:
                 try:
                     snap = sess.terminal_snapshot()
                 except Exception:
                     snap = None
+                try:
+                    qid = sess.pending_async_id()
+                except Exception:
+                    qid = None
+                if qid is not None:
+                    # Terminal survival (Task 6): an async question was still outstanding when the
+                    # executor exited. Auto-resolve it now — CORRELATION only (mark the async event
+                    # answered + clear the slot). resolve_async_question is closing-aware (session._finish
+                    # already set _closing before on_terminal ever fires) so this always returns
+                    # not_delivered and types NOTHING — the executor is gone, there is no PTY to write to.
+                    try:
+                        sess.resolve_async_question(qid, None)
+                    except Exception:
+                        pass
             # a CLEAN terminal (terminal_kind="done") ends the lineage; a crash/stop keeps it for a
             # possible restart. Keyed on terminal_kind, not a state string (NIT-16).
             if snap is not None and snap.get("terminal_kind") == "done":
                 self._lineages.pop(snap.get("lineage_id"), None)
             existed = self._sessions.pop(session_id, None) is not None
-            if snap is not None and self._terminal_ttl > 0:
-                self._terminal[session_id] = (snap, self._clock() + self._terminal_ttl)
+            if self._terminal_ttl > 0:
+                # ONE expiry computed here, reused for BOTH stores below: the recent-terminal async
+                # record must share self._terminal's exact retention policy, never a second one.
+                expires_at = self._clock() + self._terminal_ttl
+                if snap is not None:
+                    self._terminal[session_id] = (snap, expires_at)
+                if qid is not None:
+                    self._terminal_async[session_id] = (
+                        {"id": qid, "reason": "executor_finished"}, expires_at)
         if existed and self._logger is not None:
             self._logger.info("manager", "slot_freed", session_id=session_id)
 
     def get(self, session_id):
         with self._lock:
             return self._sessions.get(session_id)
+
+    def record_async_question(self, session_id, q):
+        """Manager-level entry for the message-plane `question` route (Task 5): look up the LIVE
+        session and delegate to Session.record_async_question. An absent/already-freed session
+        returns the same unknown_session-equivalent shape as the in-Session already-pending error
+        ((None, {"error": ...})), so the route can map either failure to an HTTP error the same way."""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+        if sess is None:
+            return None, {"error": "unknown_session"}
+        return sess.record_async_question(q)
+
+    def append_progress_note(self, session_id, note):
+        """Manager-level entry for the message-plane `note` route (Task 5): look up the LIVE session
+        and delegate to Session.append_progress_note. An absent/already-freed session returns None
+        (no progress_seq to report)."""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+        if sess is None:
+            return None
+        return sess.append_progress_note(note)
 
     def screen(self, session_id, raw=False, force=False):
         with self._lock:
@@ -326,8 +374,18 @@ class SessionManager:
     def respond(self, session_id, answer, decision_id=None):
         with self._lock:
             sess = self._sessions.get(session_id)
-        if sess is None:
-            return RespondOutcome("unknown_session")
+            if sess is None:
+                # Terminal survival (Task 6): the session already exited (its slot freed by
+                # _free_slot) but it had an OUTSTANDING async question when it did — terminal cleanup
+                # auto-resolved that into self._terminal_async (same key + expiry as self._terminal).
+                # A caller whose decision_id names THAT question gets a clean
+                # not_delivered/executor_finished, never a bare unknown_session (which reads like a
+                # typo'd/unrelated session id rather than "your question's answer arrived too late").
+                entry = self._terminal_async.get(session_id)
+                if (entry is not None and decision_id is not None
+                        and entry[1] > self._clock() and entry[0].get("id") == decision_id):
+                    return RespondOutcome("not_delivered", reason=entry[0].get("reason"))
+                return RespondOutcome("unknown_session")
         # Async-reply id-dispatch (Task 4): a decision_id that names an OUTSTANDING ASYNC QUESTION (not
         # a blocking decision) is answered by delivering a FRESH user turn, NOT by typing into a modal
         # (the executor never paused — there is no modal). Correlation (mark_answered + clear the slot)
@@ -396,6 +454,11 @@ class SessionManager:
             now = self._clock()
             self._terminal = {sid: (snap, exp) for sid, (snap, exp) in self._terminal.items()
                               if exp > now}
+            # Same expiry sweep, same policy, as self._terminal (Task 6): opportunistic purge here
+            # keeps both stores from growing unbounded; respond()'s own lookup also re-checks
+            # exp > now at read time, so a missed sweep is never a correctness issue, only bookkeeping.
+            self._terminal_async = {sid: (rec, exp) for sid, (rec, exp) in self._terminal_async.items()
+                                    if exp > now}
             recent = {sid: snap for sid, (snap, exp) in self._terminal.items()}
         return {"sessions": {sid: {**s.snapshot(), "seq": per_seq.get(sid, 0)}
                              for sid, s in snapshot.items()},

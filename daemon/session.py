@@ -33,17 +33,21 @@ class RespondOutcome:
     'resumed' | 'respond_failed' | 'no_pending' | 'stale' | 'invalid_option' | 'write_timeout' |
     'terminal' | 'missing_decision_id' | 'unknown_session' | 'at_capacity' (manager: no active slot to
     re-acquire), or, for an async-question answer (Task 4): 'queued' (busy — the monitor delivers the
-    reply at the next idle) | 'not_delivered' (session closing/terminal — nothing typed);
+    reply at the next idle) | 'not_delivered' (session closing/terminal, or — manager-level, Task 6 —
+    the session already exited with its async question auto-resolved: `reason='executor_finished'`);
     `pending` carries current decision metadata on a pre-claim guard mismatch;
     `snapshot` is the post-respond session snapshot on resumed/write_timeout/respond_failed;
     `respond_failed` means the answer was typed but never LEFT the box (submit unconfirmed) so the
-    caller must recover; `answered_decision_id` names the decision this answer was bound to."""
+    caller must recover; `answered_decision_id` names the decision this answer was bound to;
+    `reason` is set only on the manager-level not_delivered/executor_finished terminal-survival
+    outcome (None everywhere else — the in-Session not_delivered path predates this field)."""
     status: str
     seq: int = None
     decision_id: str = None
     pending: dict = None
     snapshot: dict = None
     answered_decision_id: str = None
+    reason: str = None
 
 
 def _pending_meta(decision):
@@ -1120,6 +1124,13 @@ class Session:
             if self._async_question is None:
                 return False
             return id is None or self._async_question["id"] == id
+
+    def pending_async_id(self):
+        """The id of the outstanding async question, if any, else None. A lightweight peek (mirrors
+        has_pending_async) used by the manager at terminal cleanup (Task 6) to learn WHICH question
+        to auto-resolve without guessing/enumerating it."""
+        with self._lock:
+            return None if self._async_question is None else self._async_question["id"]
 
     def resolve_async_question(self, id, answer):
         """Resolve an outstanding async question (message-plane) by id and prepare its answer as a

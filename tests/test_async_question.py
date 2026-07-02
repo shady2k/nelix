@@ -15,9 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 
 from daemon.clock import FakeClock              # noqa: E402
+from daemon.config import ExecutorSpec          # noqa: E402
 from daemon.dialog import Dialog                # noqa: E402
 from daemon.drivers.claude import ClaudeDriver  # noqa: E402
 from daemon.events import EventQueue, RESPONDABLE_KINDS  # noqa: E402
+from daemon.manager import SessionManager       # noqa: E402
 from daemon.messages import AsyncQuestion, ProgressNote  # noqa: E402
 from daemon.session import Session              # noqa: E402
 
@@ -197,3 +199,41 @@ def test_still_working_message_suppressed_by_async_question(session_busy):
     session_busy.record_async_question(AsyncQuestion("q", "c", None, None))
     snap = session_busy.snapshot()
     assert "message" not in snap     # an outstanding question already woke the orchestrator
+
+
+# ---- Manager-level entry points (Task 6): the HTTP route (Task 5) calls THESE, never the Session
+# methods directly. Both look up the LIVE session and delegate; an absent/already-freed session
+# gets an unknown_session-equivalent, never an AttributeError/KeyError. ----
+
+def _demo_specs():
+    return {"demo": ExecutorSpec(command="demo", args=[], env={}, driver="claude")}
+
+
+@pytest.fixture
+def manager_with_busy_session(tmp_path):
+    sess, ev = _make_session(tmp_path, ["compiling…", "compiling…"])
+    sess._loop()
+    assert sess._decision is None and sess._state == "busy"
+    mgr = SessionManager(_demo_specs(), ev, concurrency_limit=3,
+                         session_retain=0, session_max_age_days=0)
+    with mgr._lock:
+        mgr._sessions[sess._id] = sess
+    return mgr
+
+
+def test_manager_record_and_note(manager_with_busy_session):
+    mgr = manager_with_busy_session
+    qid, err = mgr.record_async_question("s1", AsyncQuestion("a?", "c", None, None))
+    assert err is None and qid == "q_1"
+    assert mgr.append_progress_note("s1", ProgressNote("done step", None)) == 1
+
+
+def test_manager_record_async_question_unknown_session():
+    mgr = SessionManager(_demo_specs(), EventQueue(), concurrency_limit=1)
+    qid, err = mgr.record_async_question("nope", AsyncQuestion("a?", "c", None, None))
+    assert qid is None and err == {"error": "unknown_session"}
+
+
+def test_manager_append_progress_note_unknown_session():
+    mgr = SessionManager(_demo_specs(), EventQueue(), concurrency_limit=1)
+    assert mgr.append_progress_note("nope", ProgressNote("x", None)) is None
