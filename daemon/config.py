@@ -3,6 +3,13 @@ import tomllib
 from dataclasses import dataclass
 
 
+# Message-plane caps (executor -> orchestrator async messages; consumed by daemon/messages.py).
+MSG_MAX_BODY = 8192      # max raw HTTP request body bytes accepted by the message route
+MAX_PROGRESS_NOTES = 50  # max progress notes retained per session
+MAX_SUMMARY_LEN = 280    # ProgressNote.summary cap (short, tweet-length)
+MAX_BODY_LEN = 4000      # cap for longer free-text fields (question, continuation_plan, details)
+
+
 @dataclass
 class BeliefConfig:
     """Tunables for the pure BeliefEngine (spec §7). All durations are seconds; the engine reads
