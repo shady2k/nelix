@@ -159,7 +159,7 @@ def test_delivery_confirms_once_and_publishes_terminal_over_real_capture(tmp_pat
     assert any("❯\xa0[Pasted text" in f for f in frames), (
         "s-b8a30317-delivery must contain the real '❯\\xa0[Pasted text #1]' placeholder frame")
 
-    # _ensure_ask_mode sleeps between toggle attempts; neutralize so the in-process drive is fast and
+    # used by the delivery confirm-poll loop; neutralize so the in-process drive is fast and
     # deterministic (mirrors the synthetic respond/delivery tests patching daemon.session.time.sleep).
     monkeypatch.setattr("daemon.session.time.sleep", lambda *a, **k: None)
     sess, ev, handle = delivery_run(tmp_path, frames, task="create a util logging.py")

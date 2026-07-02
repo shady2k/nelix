@@ -175,10 +175,11 @@ def delivery_run(tmp_path, frames, *, task, spec=None, step=1.0, pad_last=0,
     Mirrors Session.start()'s wiring (held task, dialog, transcript, handle, spawn_ts) but runs
     _run() inline on the calling thread. _wait_until_ready (a real-wall-clock settle loop) is
     neutralized so the in-process FakeClock handle drives every frame; callers must also neutralize
-    daemon.session.time.sleep (used by _ensure_ask_mode). ``pad_last`` repeats the final frame so a
-    silent/held screen persists across enough pumps for the injected clock to cross a startup deadline
-    before the handle sets _stop. ``logger`` captures the lifecycle/forensic trail; ``on_terminal``
-    spies the slot-free callback the manager wires. Returns (sess, ev, handle)."""
+    daemon.session.time.sleep (used by the delivery confirm-poll loop). ``pad_last`` repeats the
+    final frame so a silent/held screen persists across enough pumps for the injected clock to
+    cross a startup deadline before the handle sets _stop. ``logger`` captures the
+    lifecycle/forensic trail; ``on_terminal`` spies the slot-free callback the manager wires.
+    Returns (sess, ev, handle)."""
     spec = spec or Spec()
     sess, ev, clock = _wire(tmp_path, spec, logger=logger)
     sess._task_raw = task
@@ -252,8 +253,8 @@ def delivery_drive(tmp_path, frames, *, task, spec=None, step=1.0, respond=None,
     the helper routes it through ``respond_via_monitor`` — the C1 monitor-is-sole-writer path — so a
     pre-delivery blocked answer is written by THIS (monitor) thread against the current frame, not by
     respond() on the RPC thread. As in delivery_run, _wait_until_ready (a real-wall-clock settle) is
-    neutralized and callers must neutralize daemon.session.time.sleep (used by _ensure_ask_mode).
-    Returns (sess, ev, handle)."""
+    neutralized and callers must neutralize daemon.session.time.sleep (used by the delivery
+    confirm-poll loop). Returns (sess, ev, handle)."""
     spec = spec or Spec()
     sess, ev, clock = _wire(tmp_path, spec, logger=logger)
     sess._task_raw = task

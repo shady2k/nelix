@@ -934,11 +934,21 @@ def test_respond_resumes_to_busy_without_echoed_decision(tmp_path):
     assert "still working" in out.snapshot["message"].lower()
 
 
-def test_ensure_ask_mode_writes_driver_toggle(monkeypatch, tmp_path):
+def test_delivery_never_forces_permission_mode(monkeypatch, tmp_path):
+    # Dumb-bridge invariant (nelix-zl9): the daemon must not toggle the executor's
+    # permission mode. Even when the executor sits in an auto/accept-edits footer
+    # (which the old _ensure_ask_mode treated as "not ask mode" and tried to cycle),
+    # delivery must send ZERO Shift+Tab (\x1b[Z) sequences.
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
-    sess, _ = _session(tmp_path, ["normal mode, no askmode marker"])
-    sess._ensure_ask_mode(attempts=2)
-    assert sess._driver.ask_mode_toggle in "".join(sess._handle.writes)
+    # A ready free-text prompt whose footer is an AUTO mode (would have triggered the toggle).
+    # No real capture reaches delivery while in auto/accept-edits mode (the whole golden corpus
+    # is captured in ask mode), so this drives the in-process replay harness with a realistic
+    # synthetic auto-mode footer frame instead (nelix-wtx documented-gap precedent).
+    frame = "Here is my answer.\n❯ \n⏵⏵ accept edits on (shift+tab to cycle)"
+    sess, _ = _session(tmp_path, [frame])
+    monkeypatch.setattr(sess, "_deliver_task", lambda: None)   # isolate: no confirm-wait needed
+    sess._delivery_tick(frame)
+    assert "\x1b[Z" not in "".join(sess._handle.writes)
 
 
 # ---- live (real-thread) start/delivery harness -------------------------------
