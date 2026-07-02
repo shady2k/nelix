@@ -167,6 +167,15 @@ def test_second_question_already_pending(session_busy):
     assert qid is None and err["id"] == "q_1"
 
 
+def test_already_pending_error_truncates_question(session_busy):
+    long_q = "x" * 500
+    session_busy.record_async_question(AsyncQuestion(long_q, "c", None, None))
+    _, err = session_busy.record_async_question(AsyncQuestion("q2", "c", None, None))
+    assert err["question"] == long_q[:200]
+    # the slot + snapshot themselves keep the FULL question, only the error preview is capped
+    assert session_busy.snapshot()["async_question"]["question"] == long_q
+
+
 def test_has_pending_async(session_busy):
     assert session_busy.has_pending_async() is False
     qid, _ = session_busy.record_async_question(AsyncQuestion("q", "c", None, None))

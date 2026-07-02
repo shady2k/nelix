@@ -1062,8 +1062,11 @@ class Session:
         (None, {"id":..., "question":...}) if a question is already pending."""
         with self._lock:
             if self._async_question is not None:
+                # Truncated the same way _publish caps an event summary (text[:200], ~line 984):
+                # this is an error-payload preview, not the record itself (the slot and the
+                # snapshot both keep the untruncated question).
                 return None, {"id": self._async_question["id"],
-                              "question": self._async_question["question"]}
+                              "question": self._async_question["question"][:200]}
             self._next_qseq += 1
             qid = f"q_{self._next_qseq}"
             state = self._state
