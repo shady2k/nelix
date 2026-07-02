@@ -1,7 +1,7 @@
 # MIGRATION.md — fabricated observe() assertion migration table
 
 Generated for Task 4 (nelix-5gc).  One row per **assertion** in the two source files.
-Verdict: **convert** (→ real frame + sidecar), **keep** (actuation / pure-helper / ask_mode / negative-only), **delete** (dead/dup), **superseded** (already covered by Tier-2 real-capture test).
+Verdict: **convert** (→ real frame + sidecar), **keep** (actuation / pure-helper / negative-only), **delete** (dead/dup), **superseded** (already covered by Tier-2 real-capture test).
 
 ## tests/test_driver_claude_observe.py
 
@@ -80,7 +80,7 @@ Verdict: **convert** (→ real frame + sidecar), **keep** (actuation / pure-help
 ### test_ask_mode_reflected
 | assertion | verdict | invariant | source/notes |
 |-----------|---------|-----------|-------------|
-| `ask_mode == True / False` | keep | I-AM | DEFERRED by scope: ask_mode is out-of-scope for this task |
+| `ask_mode == True / False` | removed (nelix-zl9) | ~~I-AM~~ | the entire ask-mode read path (Observation.ask_mode, ClaudeDriver.ask_mode_toggle/_ask_mode, the I-AM invariant) was deleted — the daemon is a dumb bridge and no longer classifies ask/auto mode; this test and I-AM are retired, not migrated |
 
 ### test_fingerprints_split_content_from_input
 | assertion | verdict | invariant | source/notes |
@@ -186,7 +186,8 @@ Verdict: **convert** (→ real frame + sidecar), **keep** (actuation / pure-help
 ## Summary
 
 - **convert**: 19 assertions (→ 7 real frame fixtures: I1/I2a/I3/I4a/I5/I6a/I-BC)
-- **keep**: 29 assertions (actuation × 8, structural × 1, ask_mode-deferred × 1, pair/negative/hybrid × 19)
+- **keep**: 28 assertions (actuation × 8, structural × 1, pair/negative/hybrid × 19)
+- **removed (nelix-zl9)**: 1 assertion (`ask_mode == True / False` — the ask-mode read path was deleted outright, not migrated; see `test_ask_mode_reflected` above and the retired I-AM invariant)
 - **NOT COVERED after Task-4**: 4 assertions — `test_yes_no_menu_is_permission_choice` option labels (Yes, Yes-and-dont-ask-again, No) and `test_input_box_is_only_free_text_not_a_menu` permission_choice affordances_exclude — all stem from edit-menu.txt being a 4-line trimmed excerpt unfit for rich assertions; a real 40-row permission_choice frame harvest would close these gaps.
 - **delete**: 0 (none found dead/dup)
 - **superseded**: 0 (Tier-2 sequence tests not yet landed in this task)

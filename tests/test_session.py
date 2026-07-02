@@ -937,7 +937,7 @@ def test_respond_resumes_to_busy_without_echoed_decision(tmp_path):
 def test_delivery_never_forces_permission_mode(monkeypatch, tmp_path):
     # Dumb-bridge invariant (nelix-zl9): the daemon must not toggle the executor's
     # permission mode. Even when the executor sits in an auto/accept-edits footer
-    # (which the old _ensure_ask_mode treated as "not ask mode" and tried to cycle),
+    # (which the old pre-nelix-zl9 code treated as needing correction and tried to cycle),
     # delivery must send ZERO Shift+Tab (\x1b[Z) sequences.
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     # A ready free-text prompt whose footer is an AUTO mode (would have triggered the toggle).

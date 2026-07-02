@@ -10,11 +10,10 @@ class Driver(Protocol):
 
     The legacy single-verdict classifier and its folded screen predicates are gone — their logic now
     lives entirely in `observe()` as Observation fields (prompt_kind / affordances / options /
-    submitted_echo_present / ask_mode).
+    submitted_echo_present).
     """
     hook_capable: bool = False   # True if this CLI reports its own lifecycle via nelix hooks
                                  # (launcher injects --settings + NELIX_* env); else screen-only.
-    ask_mode_toggle: str
     command_prefixes: tuple      # leading tokens the CLI reads as a command, not a prompt
     submit_key: str              # the key that submits a line (CR for most TUIs)
 

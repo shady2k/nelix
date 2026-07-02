@@ -108,16 +108,6 @@ INVARIANTS: tuple[Invariant, ...] = (
         ),
     ),
     Invariant(
-        id="I-AM",
-        tier=1,
-        kind="frame",
-        bug_commit="d874852",
-        description=(
-            "Ask/auto mode — a real ask-mode frame → ask_mode true; "
-            "a real auto/accept frame → ask_mode false (claude.py:199)."
-        ),
-    ),
-    Invariant(
         id="I-BC",
         tier=1,
         kind="frame",

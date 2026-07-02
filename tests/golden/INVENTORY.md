@@ -16,7 +16,7 @@ Corpus: 13 live sessions (≥5kB); 4 committed regression raws.
 | I6a | found | s-6e9d8956 | 120x40 | 1216 | --at-marker `Yes, I trust this folder` → '❯ 1. Yes, I trust this folder' | prompt_kind∈{modal_choice,permission_choice}, options with ids |
 | I-R1 | already-covered | tests/test_pty_session.py | — | — | `\x1b[>4` in raw bytes (kitty keyboard CSI) | no stray 'u' in rendered frame |
 | I-R2 | already-covered | tests/test_render_3p1.py + tests/golden/claude/_regression/3p1_alt_screen.raw | 120x40 | — | 40-row viewport, Cyrillic line intact | viewport_rows==40, known content lines |
-| I-AM | gap (ask=False half) | ask=True:s-b8a30317-delivery@1408 / ask=False:MISSING | 120x40 | — | `⏵⏵ auto mode on (shift+tab to cycle)` → ask_mode=True; no `accept edits on`/`bypass permissions` frame in corpus | ask_mode |
+| I-AM | **removed (nelix-zl9)** | — | — | — | the ask-mode read path (Observation.ask_mode, ClaudeDriver.ask_mode_toggle/_ask_mode) was deleted outright — the daemon is a dumb bridge and no longer classifies ask/auto mode; invariant retired, not a live gap | — |
 | I-BC | found | s-d719f7b9 | 120x40 | 799104 | 'Bash(docs/superpowers/specs/2026-06-25-meshynet-transport-phase-metadata-ring-de' | busy_reason=running_command |
 | I2b | found | s-039a61b4-bg-subagent | 120x40 | full sequence | replaying never shows waiting_for_user | waiting_for_user never published across full replay |
 | I4b | found | active-box: s-b8a30317-delivery / scrollback: s-2190cfb2-remint | 120x40 | full sequences | paste placeholder in tail → echo_present=True; text in scrollback → echo_present=False | submitted_echo_present |
@@ -27,24 +27,12 @@ Corpus: 13 live sessions (≥5kB); 4 committed regression raws.
 
 ## Zero-recording verdict
 
-**GAPS FOUND — 1 invariant(s) need attention:**
+**GAPS FOUND — 0 invariant(s) need attention.**
 
-- `I-AM(ask_mode=False)`
-
-### Gap detail: I-AM ask_mode=False
-
-All corpus sessions use Claude Code v2.1.191+ which renders the footer as
-`⏵⏵ auto mode on (shift+tab to cycle)`. The driver's auto-mode markers
-(`accept edits on`, `plan mode on`, `bypass permissions`) match **older** Claude
-Code footer text (pre-v2.1.191). No corpus session captures an older-style
-`accept edits on` footer. The ask_mode=True half IS found (any current footer
-frame yields True). The ask_mode=False half is currently only verifiable via
-the existing synthetic test (`test_claude_driver.py:45`). A new manual recording
-with an older Claude Code is NOT required — the driver behavior is tested
-synthetically and the current corpus faithfully represents the current CLI.
-**Recommend:** mark I-AM as split: real-capture covers True half; synthetic
-covers False half (no Sasha recording needed).
-
+(I-AM's prior "gap (ask=False half)" is moot: nelix-zl9 deleted the ask-mode read path
+entirely — `Observation.ask_mode`, `ClaudeDriver.ask_mode_toggle`/`_ask_mode`, and the I-AM
+invariant are all removed. The daemon is a dumb bridge and no longer classifies ask/auto mode,
+so there is nothing left to capture.)
 
 ## Trust-session verification
 

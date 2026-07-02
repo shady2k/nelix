@@ -15,7 +15,7 @@ from daemon.drivers.claude import ClaudeDriver
 def test_assert_observation_passes_on_matching_expect(tmp_path):
     frame = "Here is my answer.\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     expect = {"prompt_kind": "free_text", "affordances_include": ["accepts_text_input"],
-              "ask_mode": True, "semantic_fp_nonempty": True}
+              "semantic_fp_nonempty": True}
     obs = ClaudeDriver().observe(frame, build_ctx({}))
     assert_observation(obs, expect, fixture_id="smoke")  # must not raise
 
@@ -55,12 +55,6 @@ _KEY_TABLE = [
         _ECHO_FRAME, {"last_submitted_text": "hello world"},
         {"submitted_echo_present": True},
         {"submitted_echo_present": False},
-    ),
-    (
-        "ask_mode",
-        _FREE_TEXT_FRAME, {},
-        {"ask_mode": True},
-        {"ask_mode": False},
     ),
     (
         "busy_reason",
@@ -137,7 +131,7 @@ def test_load_expectation_round_trips(tmp_path):
     """load_expectation must parse the YAML sidecar and return the matching dict."""
     data = {
         "ctx": {"last_submitted_text": None, "child_alive": True},
-        "expect": {"prompt_kind": "free_text", "ask_mode": True},
+        "expect": {"prompt_kind": "free_text"},
     }
     p = tmp_path / "fixture.yaml"
     p.write_text(yaml.safe_dump(data))
