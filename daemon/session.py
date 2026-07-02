@@ -286,17 +286,6 @@ class Session:
             elif grid.strip() and stable_since is not None and time.time() - stable_since >= stable_for:
                 return
 
-    def _ensure_ask_mode(self, attempts=4):
-        # Cycle the driver's mode toggle until observe() reports ask-mode (not auto/plan).
-        for _ in range(attempts):
-            self._handle.pump(0.1)
-            if self._driver.observe(self._handle.render(), self._obs_ctx()).ask_mode:
-                return
-            self._handle.write(self._driver.ask_mode_toggle)
-            time.sleep(0.3)
-        if self._log is not None:
-            self._log.warning("session", "ask_mode_failed", session_id=self._id)
-
     # ---- loop ----
     def _obs_ctx(self):
         # The non-screen facts observe() needs. Timing/liveness are core-owned (the engine reads
@@ -390,7 +379,6 @@ class Session:
             self._task_delivery = "failed"            # loop exits -> finally -> _finish
             return
         if "accepts_text_input" in obs.affordances:   # the real free-text prompt
-            self._ensure_ask_mode()
             self._deliver_task()
         else:
             self._emit_blocked(frame, obs)           # modal / permission / onboarding / unknown

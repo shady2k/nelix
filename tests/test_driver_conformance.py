@@ -39,7 +39,6 @@ def test_registry_fails_closed_for_unmigrated_driver():
 
     @register("_stub_no_observe")
     class _Stub:
-        ask_mode_toggle = ""
         command_prefixes = ()
         submit_key = "\r"
         # no observe()

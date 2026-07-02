@@ -934,11 +934,21 @@ def test_respond_resumes_to_busy_without_echoed_decision(tmp_path):
     assert "still working" in out.snapshot["message"].lower()
 
 
-def test_ensure_ask_mode_writes_driver_toggle(monkeypatch, tmp_path):
+def test_delivery_never_forces_permission_mode(monkeypatch, tmp_path):
+    # Dumb-bridge invariant (nelix-zl9): the daemon must not toggle the executor's
+    # permission mode. Even when the executor sits in an auto/accept-edits footer
+    # (which the old pre-nelix-zl9 code treated as needing correction and tried to cycle),
+    # delivery must send ZERO Shift+Tab (\x1b[Z) sequences.
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
-    sess, _ = _session(tmp_path, ["normal mode, no askmode marker"])
-    sess._ensure_ask_mode(attempts=2)
-    assert sess._driver.ask_mode_toggle in "".join(sess._handle.writes)
+    # A ready free-text prompt whose footer is an AUTO mode (would have triggered the toggle).
+    # No real capture reaches delivery while in auto/accept-edits mode (the whole golden corpus
+    # is captured in ask mode), so this drives the in-process replay harness with a realistic
+    # synthetic auto-mode footer frame instead (nelix-wtx documented-gap precedent).
+    frame = "Here is my answer.\n❯ \n⏵⏵ accept edits on (shift+tab to cycle)"
+    sess, _ = _session(tmp_path, [frame])
+    monkeypatch.setattr(sess, "_deliver_task", lambda: None)   # isolate: no confirm-wait needed
+    sess._delivery_tick(frame)
+    assert "\x1b[Z" not in "".join(sess._handle.writes)
 
 
 # ---- live (real-thread) start/delivery harness -------------------------------
@@ -1072,8 +1082,8 @@ def test_blocked_on_trust_menu_types_nothing(tmp_path):
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision is not None and sess._decision["kind"] == "blocked")
     assert sess._task_delivery == "pending"
-    # no task text, no Enter — only ask-mode toggles are permitted (none expected on a modal)
-    assert handle.writes == [] or all(w in ("\x1b[Z", "\x1b") for w in handle.writes)
+    # nothing is typed on a modal: no task text, no Enter, no mode-toggle bytes
+    assert handle.writes == []
     sess.stop()
 
 

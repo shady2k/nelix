@@ -114,7 +114,8 @@ def test_noise_without_classifiable_prompt_fails_terminally(tmp_path):
 # ---- 3a. guard: a real input box within budget delivers normally (no false trip) -----------------
 
 def test_real_input_box_delivers_and_does_not_trip(monkeypatch, tmp_path):
-    # _ensure_ask_mode may sleep between toggle attempts; neutralize for a fast, deterministic drive.
+    # daemon.session.time.sleep is used by the delivery confirm-poll loop; neutralize for a
+    # fast, deterministic drive.
     monkeypatch.setattr("daemon.session.time.sleep", lambda *a, **k: None)
     frames = raw_frames("s-b8a30317-delivery.raw")       # a REAL Claude delivery capture
     sess, ev, handle = delivery_run(tmp_path, frames, task="create a util logging.py")

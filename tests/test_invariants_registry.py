@@ -6,7 +6,7 @@ from tests.golden.invariants import INVARIANTS, Invariant
 
 _EXPECTED_IDS = {
     "I1", "I2a", "I2b", "I3", "I4a", "I4b", "I5", "I6a", "I6b",
-    "I7", "I8", "I9", "I-R1", "I-R2", "I-AM", "I-BC",
+    "I7", "I8", "I9", "I-R1", "I-R2", "I-BC",
 }
 
 _EXPECTED = {
@@ -19,7 +19,6 @@ _EXPECTED = {
     "I6a": (1, "frame", "8ecb2f5"),
     "I-R1": (1, "frame", "9164bf6"),
     "I-R2": (1, "frame", "f24dd9e"),
-    "I-AM": (1, "frame", "d874852"),
     "I-BC": (1, "frame", "c52c5cc"),
     "I2b": (2, "sequence", "cd3352d"),
     "I4b": (2, "sequence", "68d6c7c"),

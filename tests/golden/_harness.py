@@ -13,7 +13,6 @@ from daemon.observation import ObservationCtx
 _KNOWN_EXPECT_KEYS = frozenset({
     "prompt_kind",
     "submitted_echo_present",
-    "ask_mode",
     "busy_reason",
     "heartbeat_present",
     "options_ids",
@@ -52,7 +51,6 @@ def assert_observation(obs, expect, *, fixture_id):
     Recognised keys (all optional):
       prompt_kind            str — obs.prompt_kind must equal this
       submitted_echo_present bool
-      ask_mode               bool
       busy_reason            str | null
       heartbeat_present      bool — obs.heartbeat.present must equal this
       options_ids            list[str] — [o.id for o in obs.options] must equal this
@@ -73,8 +71,6 @@ def assert_observation(obs, expect, *, fixture_id):
         fail(f"prompt_kind {obs.prompt_kind!r} != {expect['prompt_kind']!r}")
     if "submitted_echo_present" in expect and obs.submitted_echo_present != expect["submitted_echo_present"]:
         fail(f"submitted_echo_present {obs.submitted_echo_present} != {expect['submitted_echo_present']}")
-    if "ask_mode" in expect and obs.ask_mode != expect["ask_mode"]:
-        fail(f"ask_mode {obs.ask_mode} != {expect['ask_mode']}")
     if "busy_reason" in expect and obs.busy_reason != expect["busy_reason"]:
         fail(f"busy_reason {obs.busy_reason!r} != {expect['busy_reason']!r}")
     if "heartbeat_present" in expect and obs.heartbeat.present != expect["heartbeat_present"]:

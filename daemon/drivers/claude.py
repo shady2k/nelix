@@ -15,7 +15,6 @@ _WORKING_STATUS = re.compile(r"(?m)^[ \t]*[·✢✳✶✻✽✺✦][ \t]*[A-Z][A
 CRASH_MARKERS = ("Traceback (most recent call last)", "command not found",
                  "Invalid API key", "authentication_error")
 INPUT_BOX_MARKERS = ("❯",)
-_AUTO_MODE_MARKERS = ("accept edits on", "plan mode on", "bypass permissions")
 
 # Volatile regions to zero out before measuring semantic stability:
 #   braille spinners, "<n.n>s", "<n> tokens", standalone changing counters.
@@ -65,7 +64,6 @@ def _is_choice_prompt(frame):
 @register("claude")
 class ClaudeDriver:
     hook_capable = True         # Claude reports its lifecycle via nelix hooks (--settings injection)
-    ask_mode_toggle = "\x1b[Z"  # Shift+Tab cycles the permission mode in the TUI
     command_prefixes = ("/",)   # a leading '/' opens a TUI slash-command, not a prompt
     submit_key = "\r"           # the TUI treats CR (not LF) as Enter
 
@@ -104,7 +102,6 @@ class ClaudeDriver:
             content_fp=self._content_fp(norm),
             prompt_fp=self._prompt_fp(norm),
             submitted_echo_present=self._echo_present(frame, ctx.last_submitted_text),
-            ask_mode=self._ask_mode(frame),
         )
 
         # 1. terminal, derived from the child (not the screen): crash/exit prompt_kind.
@@ -196,13 +193,6 @@ class ClaudeDriver:
     def _parse_options(self, frame):
         return tuple(Option(m.group(1), m.group(2).strip())
                      for m in _OPTION_PARSE.finditer(frame))
-
-    def _ask_mode(self, frame):
-        # Ask-mode = a known mode footer is present but none of the auto markers are (so the agent
-        # will surface permission prompts rather than auto-approving).
-        if _PROMPT_FOOTER not in frame:
-            return False
-        return not any(m in frame for m in _AUTO_MODE_MARKERS)
 
     def _echo_present(self, frame, text):
         # Our submission is in the ACTIVE input region — either the typed text echoes verbatim, or

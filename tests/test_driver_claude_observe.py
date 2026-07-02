@@ -60,13 +60,6 @@ def test_crash_banner_in_frame():
     assert o.prompt_kind == "crash"
 
 
-def test_ask_mode_reflected():
-    ask = D.observe("Welcome\n❯ \n⏵⏵ ask mode (shift+tab to cycle)", CTX)
-    assert ask.ask_mode is True
-    auto = D.observe("Welcome\n❯ \n⏵⏵ accept edits on (shift+tab to cycle)", CTX)
-    assert auto.ask_mode is False
-
-
 def test_fingerprints_split_content_from_input():
     # content_fp excludes the active input row: our echo in the box must not move content_fp.
     a = D.observe("agent output line\n❯ \n⏵⏵ ask mode (shift+tab to cycle)", CTX)
@@ -100,6 +93,17 @@ def test_classify_and_folded_predicates_are_gone():
     for gone in ("classify", "is_accepting_input", "is_modal_choice", "is_ask_mode",
                  "input_submission_present"):
         assert not hasattr(D, gone), f"{gone} must be removed (folded into observe)"
+
+
+def test_ask_mode_read_path_removed():
+    # nelix-zl9: the daemon is a dumb bridge — the whole ask-mode read path is deleted.
+    from daemon.observation import Observation
+    from daemon.drivers.claude import ClaudeDriver
+    from daemon.drivers.base import Driver
+    assert "ask_mode" not in Observation.__dataclass_fields__
+    assert not hasattr(ClaudeDriver, "ask_mode_toggle")
+    assert not hasattr(ClaudeDriver, "_ask_mode")
+    assert "ask_mode_toggle" not in Driver.__annotations__
 
 
 # ---- background subagent: a running subagent is BUSY, never waiting_for_user ----

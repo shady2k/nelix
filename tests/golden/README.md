@@ -69,7 +69,6 @@ ctx:                           # forwarded to ObservationCtx
 expect:
   prompt_kind: free_text             # obs.prompt_kind must equal this
   submitted_echo_present: true       # bool
-  ask_mode: true                     # bool
   busy_reason: null                  # str | null
   heartbeat_present: false           # obs.heartbeat.present must equal this
   options_ids: []                    # [o.id for o in obs.options] must equal this list
