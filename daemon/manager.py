@@ -337,7 +337,16 @@ class SessionManager:
         if decision_id and sess.has_pending_async(decision_id):
             disposition, text = sess.resolve_async_question(decision_id, answer)
             if disposition == "deliver_now":
-                return self.send_turn(session_id, text)      # idle now -> re-acquire slot + fresh turn
+                out = self.send_turn(session_id, text)       # idle now -> re-acquire slot + fresh turn
+                # resolve_async_question already cleared the slot + marked the event answered, so if
+                # send_turn DECLINES WITHOUT typing (at_capacity: other sessions saturate the limit;
+                # no_pending: the state flipped busy in this RPC->monitor window) the framed reply would
+                # be lost and an orchestrator retry would deliver a BARE answer. Re-queue it (nothing
+                # typed here) so the monitor re-delivers the full frame at the next idle — symmetric
+                # with drain_async_reply's re-queue.
+                if out.status in ("at_capacity", "no_pending"):
+                    sess.requeue_async_reply(text)
+                return out
             if disposition == "queued_busy":
                 # busy -> the monitor delivers at the next idle (drain_async_reply). Nothing typed yet.
                 return RespondOutcome("queued", snapshot=sess.snapshot())

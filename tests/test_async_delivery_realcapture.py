@@ -229,6 +229,39 @@ def test_wrong_id_does_not_resolve(tmp_path):
     assert sess.has_pending_async()                    # the real question is untouched
 
 
+class _BusyStub:
+    """Minimal manager-facing session double that occupies an ACTIVE slot (control_state=busy), so a
+    test can saturate the concurrency limit and force an idle resume to be refused at_capacity."""
+    def snapshot(self):
+        return {"control_state": "busy"}
+
+
+def test_idle_now_at_capacity_requeues_full_frame_not_lost(tmp_path):
+    # Important-fix regression: an async question answered while the session is idle-now but the
+    # concurrency limit is saturated -> send_turn refuses at_capacity. The slot was already cleared +
+    # the event marked answered, so the FRAMED reply must be re-queued (not lost, not later delivered
+    # as a bare answer) and delivered with the full frame once capacity frees at the next idle.
+    sess, mgr, _ = _manager_session(tmp_path, limit=1)
+    _drive_busy(sess)
+    qid, _ = sess.record_async_question(_Q)
+    _drive_idle(sess)                                    # sess idle (freed its own active slot)
+    assert sess.snapshot()["control_state"] == "idle"
+    with mgr._lock:
+        mgr._sessions["other"] = _BusyStub()            # a second busy session saturates limit=1
+    out = mgr.respond(_SID, "use a", decision_id=qid)
+    assert out.status == "at_capacity"
+    assert sess._handle.writes == []                     # nothing typed on the refusal
+    assert sess._async_reply_pending is not None          # re-queued, NOT lost
+    assert "You asked: a or b?" in sess._async_reply_pending   # the FULL frame, not a bare answer
+    assert "Hermes: use a" in sess._async_reply_pending
+    with mgr._lock:
+        del mgr._sessions["other"]                       # capacity frees
+    sess._loop_once()                                    # still idle -> monitor drain retries -> delivers
+    w = "".join(sess._handle.writes)
+    assert "You asked: a or b?" in w and "Hermes: use a" in w
+    assert sess._async_reply_pending is None
+
+
 def test_busy_reply_requeued_when_delivery_declines(tmp_path):
     # If send_turn declines at the idle edge WITHOUT typing (no free slot now, or a concurrent idle
     # follow-up already resumed the session), the queued reply is retried at the next idle — never

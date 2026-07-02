@@ -31,7 +31,10 @@ from daemon.errors import PtyWriteTimeout
 class RespondOutcome:
     """Result of binding an answer to a session's current pending decision. `status` is one of
     'resumed' | 'respond_failed' | 'no_pending' | 'stale' | 'invalid_option' | 'write_timeout' |
-    'terminal'; `pending` carries current decision metadata on a pre-claim guard mismatch;
+    'terminal' | 'missing_decision_id' | 'unknown_session' | 'at_capacity' (manager: no active slot to
+    re-acquire), or, for an async-question answer (Task 4): 'queued' (busy — the monitor delivers the
+    reply at the next idle) | 'not_delivered' (session closing/terminal — nothing typed);
+    `pending` carries current decision metadata on a pre-claim guard mismatch;
     `snapshot` is the post-respond session snapshot on resumed/write_timeout/respond_failed;
     `respond_failed` means the answer was typed but never LEFT the box (submit unconfirmed) so the
     caller must recover; `answered_decision_id` names the decision this answer was bound to."""
@@ -1182,10 +1185,7 @@ class Session:
             self._async_reply_pending = None          # claim it: exactly one delivery
             deliver = self.deliver_turn
         if deliver is None:
-            # No manager wiring (a session-only unit path): re-stash so the reply is not silently lost.
-            with self._lock:
-                if self._async_reply_pending is None:
-                    self._async_reply_pending = text
+            self.requeue_async_reply(text)   # no manager wiring (session-only unit path): keep queued
             return
         outcome = deliver(text)
         # Best-effort at THIS idle: send_turn can decline WITHOUT typing anything if no active slot is
@@ -1195,10 +1195,19 @@ class Session:
         # terminal outcome is deliberately NOT retried — re-typing a partial write or chasing a dead
         # session would be worse than the miss.
         if getattr(outcome, "status", None) in ("at_capacity", "no_pending"):
-            with self._lock:
-                if (self._async_reply_pending is None and not self._closing
-                        and self._terminal_kind is None):
-                    self._async_reply_pending = text
+            self.requeue_async_reply(text)
+
+    def requeue_async_reply(self, text):
+        """Re-queue an async reply whose delivery attempt DECLINED WITHOUT typing (send_turn returned
+        at_capacity / no_pending), so the monitor retries the FRAMED reply block at the next
+        working->idle edge instead of dropping it — and an orchestrator retry never falls through to
+        delivering a bare, unframed answer. Shared by BOTH the monitor's drain and the RPC-thread
+        idle-now path (Manager.respond). Guarded: never clobber a newer queued reply, never re-queue
+        into a closing/terminal session. Types NOTHING (single-writer PTY intact)."""
+        with self._lock:
+            if (self._async_reply_pending is None and not self._closing
+                    and self._terminal_kind is None):
+                self._async_reply_pending = text
 
     def snapshot(self):
         with self._lock:
