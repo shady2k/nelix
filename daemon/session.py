@@ -8,6 +8,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import deque
 from dataclasses import dataclass
 
 import paths
@@ -15,7 +16,7 @@ from daemon import lifecycle_log
 from daemon import reaper
 from daemon.belief import BeliefEngine, Publish, Withdraw, Actuate
 from daemon.clock import WallClock
-from daemon.config import BeliefConfig
+from daemon.config import BeliefConfig, MAX_PROGRESS_NOTES
 from daemon.dialog import Dialog
 from daemon.observation import ObservationCtx
 from daemon.transcript_builder import TranscriptBuilder
@@ -139,6 +140,12 @@ class Session:
         #                                is mid-flight. Drained by _drain_pending_answer (each pre-delivery
         #                                tick + the delivery transition) so the answer write and the
         #                                delivery decision are serialized on ONE thread and cannot race.
+        # Progress notes (message-plane, executor -> orchestrator): a bounded, NON-waking log an
+        # executor appends to via append_progress_note. Deliberately separate from _decision/_events
+        # — appending one must NEVER publish (that would trip an armed nelix-wait waiter and wake
+        # the orchestrator, the exact phantom-pre-delivery class of bug 92a0dc6 closed elsewhere).
+        self._progress = deque(maxlen=MAX_PROGRESS_NOTES)  # last N {progress_seq,ts,summary,details}
+        self._progress_total = 0       # monotonic count of ALL notes ever appended (never reset)
         self._finalized = False        # _finish ran (idempotency guard, under self._lock)
         self._exc = None               # sys.exc_info() if the monitor body raised
         self._exc_text = None          # formatted traceback captured at catch time
@@ -998,6 +1005,34 @@ class Session:
         with self._lock:
             return self._decision is None and self._state == "busy"
 
+    def append_progress_note(self, note):
+        """Append a non-waking progress note (message-plane, executor -> orchestrator). This is a
+        passive log entry ONLY: it MUST NOT call self._events.publish (or anything that advances
+        the EventQueue seq / notifies a waiter) — doing so would trip an armed nelix-wait long-poll
+        and wake the orchestrator, exactly the phantom pre-delivery class of bug closed in 92a0dc6.
+        A progress note is read lazily on the next status/decision pull, never delivered as a wake.
+        Returns the new (session-lifetime-monotonic) progress_seq."""
+        with self._lock:
+            self._progress_total += 1
+            seq = self._progress_total
+            # Use the injected clock (spec §5.7), never time.time() directly, so a recorded capture
+            # can still drive this deterministically.
+            self._progress.append({"progress_seq": seq, "ts": self._clock.now(),
+                                    "summary": note.summary, "details": note.details})
+            return seq
+
+    def _progress_view_locked(self):
+        # Caller must hold self._lock (the Lock is not reentrant) — shared by progress_view() and
+        # the gated snapshot() addition below.
+        return {"progress": list(self._progress), "progress_total": self._progress_total,
+                "progress_retained": len(self._progress)}
+
+    def progress_view(self):
+        """Explicit progress detail surface (Task 8): the full retained list + counters,
+        independent of snapshot's wake-point gating."""
+        with self._lock:
+            return self._progress_view_locked()
+
     def snapshot(self):
         with self._lock:
             # control_state is the orchestrator-visible plane (spec §6/§8): busy | awaiting_user |
@@ -1028,6 +1063,11 @@ class Session:
                 dec = {k: v for k, v in self._decision.items()
                        if k not in ("decision_key", "modal_dedup")}
                 snap["decision"] = dec
+            # Progress notes surface ONLY at a wake point (a pending decision, or terminal) — the
+            # gate mirrors the decision/terminal check above, deliberately NOT extended to the plain
+            # active-working branch below (anti-poll: see that branch's comment).
+            if self._decision is not None or terminal:
+                snap.update(self._progress_view_locked())
             # active-working snapshots are deliberately low-information: no progress bait, just
             # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
             # `pending` means a RESPONDABLE decision is outstanding: a non-respondable `idle`
