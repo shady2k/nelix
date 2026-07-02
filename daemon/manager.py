@@ -161,6 +161,10 @@ class SessionManager:
                 base_seq = self._events.latest_seq()  # waiter arms past anything already emitted
                 sess = self._make(sid, executor_name, spec)
                 sess.on_terminal = self._free_slot
+                # Task 4: the monitor delivers a queued async reply as a fresh turn but has no manager
+                # handle of its own — give it one that re-acquires an active slot (send_turn), so the
+                # slot accounting an idle-freed session needs is preserved on the monitor-driven write.
+                sess.deliver_turn = lambda text, _sid=sid: self.send_turn(_sid, text)
                 sess.reaper_ctx = self._reaper_ctx
                 sess.lineage_id = lineage_id or sid          # first in chain -> lineage = own id
                 sess.restarted_from = restarted_from
@@ -324,6 +328,20 @@ class SessionManager:
             sess = self._sessions.get(session_id)
         if sess is None:
             return RespondOutcome("unknown_session")
+        # Async-reply id-dispatch (Task 4): a decision_id that names an OUTSTANDING ASYNC QUESTION (not
+        # a blocking decision) is answered by delivering a FRESH user turn, NOT by typing into a modal
+        # (the executor never paused — there is no modal). Correlation (mark_answered + clear the slot)
+        # and delivery (the fresh-turn write) are separate: the session resolves + decides disposition,
+        # the manager owns the slot-reacquiring write. This is checked BEFORE the idle branch because a
+        # session can be idle AND hold a pending async question at once (asked, then finished the turn).
+        if decision_id and sess.has_pending_async(decision_id):
+            disposition, text = sess.resolve_async_question(decision_id, answer)
+            if disposition == "deliver_now":
+                return self.send_turn(session_id, text)      # idle now -> re-acquire slot + fresh turn
+            if disposition == "queued_busy":
+                # busy -> the monitor delivers at the next idle (drain_async_reply). Nothing typed yet.
+                return RespondOutcome("queued", snapshot=sess.snapshot())
+            return RespondOutcome("not_delivered", snapshot=sess.snapshot())  # closing/terminal
         # A follow-up on an IDLE session (turn complete, alive, no respondable decision) is a NEW
         # turn: route it through send_turn (re-acquire an active slot + re-open the turn) — never
         # respond(), whose no_pending path can't drive a non-respondable idle decision (plan Task 10).

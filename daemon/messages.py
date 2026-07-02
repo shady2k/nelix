@@ -76,3 +76,24 @@ def parse_message_body(kind, body):
         ), None
 
     return None, (400, "bad kind")
+
+
+def format_async_reply(question, assumption, answer):
+    """The single source of the self-contained reply block delivered as a FRESH user turn when the
+    orchestrator answers an executor's earlier async question. Because the executor kept working (there
+    is no modal to type into), the answer must stand alone in the transcript: it restates the QUESTION,
+    the ASSUMPTION the executor proceeded under while waiting (if any), the ANSWER, and the IMPLICATION
+    (reconcile the answer with the work already done). A bare answer would be meaningless out of context.
+    Pure (stdlib only): the Session/Manager own the actual delivery + PTY write.
+    """
+    lines = [
+        "[nelix] Answer to a question you asked earlier and kept working past — reconcile it with "
+        "whatever you have done since:",
+        f"You asked: {question}",
+    ]
+    if assumption:
+        lines.append(f"You said you would proceed assuming: {assumption}")
+    lines.append(f"Hermes: {answer}")
+    lines.append("If this answer differs from that assumption, revise the affected work before "
+                 "continuing; otherwise carry on.")
+    return "\n".join(lines)

@@ -23,6 +23,7 @@ from daemon.transcript_builder import TranscriptBuilder
 from daemon.events import EXTERNAL_OUTPUT_POLICY, RESPONDABLE_KINDS
 from daemon.hooks import normalize_claude_hook
 from daemon.hygiene import prepare_pty_input
+from daemon.messages import format_async_reply
 from daemon.errors import PtyWriteTimeout
 
 
@@ -155,6 +156,13 @@ class Session:
         # nelix-wait waiter; the question itself is served out of this slot, not resolved via the
         # queue. {id, question, assumption, continuation_plan, event_id, executor_blocked} or None.
         self._async_question = None
+        # Async REPLY delivery (Task 4): when the orchestrator answers an async question while the
+        # executor is still BUSY, the answer cannot be typed on the RPC thread (single-writer PTY) —
+        # resolve_async_question stores the self-contained reply-block text HERE and the MONITOR (sole
+        # writer) delivers it as a fresh turn at the next working->idle transition (drain_async_reply).
+        # None unless an answer landed while busy. An idle-at-answer-time reply never uses this slot
+        # (the manager delivers it immediately via the slot-reacquiring send_turn path).
+        self._async_reply_pending = None
         self._next_qseq = 0            # monotonic per-session counter for q_<n> ids
         self._finalized = False        # _finish ran (idempotency guard, under self._lock)
         self._exc = None               # sys.exc_info() if the monitor body raised
@@ -170,6 +178,11 @@ class Session:
         #                                keep working unchanged.
         self._sessions_dir = _sessions_root()
         self.on_terminal = None        # manager-set: free the slot on terminal state
+        self.deliver_turn = None       # manager-set (Task 4): deliver a queued async reply as a FRESH
+        #                                turn via the manager's slot-reacquiring send_turn. The monitor
+        #                                has no manager handle of its own, so it calls back through this
+        #                                (mirrors on_terminal/reaper_ctx wiring). None until the manager
+        #                                assigns it; a session-only unit test leaves it None.
         self.reaper_ctx = None         # daemon-set reaper.ReaperContext (None => no reaping)
         self._closing = False          # terminal cleanup started: respond/screen must not write
 
@@ -557,6 +570,10 @@ class Session:
         self._apply_actions(actions, obs)
         self._log_trail(obs, actions)
         self._log_notes(notes)
+        # Task 4: at the working->idle transition (state now idle, set by the hooks/screen path above),
+        # deliver any async reply that landed while the executor was busy. The monitor is the sole PTY
+        # writer, so this busy-case delivery happens HERE (never on the RPC thread that enqueued it).
+        self.drain_async_reply()
         return obs.prompt_kind in ("crash", "exit") or not self._handle.is_alive()
 
     def _drain_hooks(self):
@@ -1100,6 +1117,88 @@ class Session:
             if self._async_question is None:
                 return False
             return id is None or self._async_question["id"] == id
+
+    def resolve_async_question(self, id, answer):
+        """Resolve an outstanding async question (message-plane) by id and prepare its answer as a
+        self-contained FRESH user turn. Correlation and delivery are SEPARATE (spec): this does the
+        CORRELATION — mark the async-question event answered + clear the slot — and builds the reply
+        block, but it NEVER writes the PTY itself. It returns a (disposition, reply_text) the caller
+        (the manager) acts on:
+          - ("deliver_now", text): the executor is IDLE now -> the manager writes `text` as a fresh
+            turn via its slot-reacquiring send_turn (that path already runs on the RPC thread for idle
+            follow-ups; nothing is typed HERE).
+          - ("queued_busy", text): the executor is BUSY -> `text` is stored as self._async_reply_pending
+            and the MONITOR (the sole PTY writer) delivers it at the next working->idle transition
+            (drain_async_reply). Single-writer PTY is preserved: an answer that lands while busy is
+            NEVER typed off the monitor thread.
+          - ("not_delivered", None): the session is CLOSING/TERMINAL -> nothing enqueued, nothing typed
+            (the executor is gone). The slot is still cleared + the event marked answered (the answer
+            WAS correlated), so no dangling question survives.
+        An unknown / mismatched id is ("not_delivered", None) with the outstanding question untouched.
+        """
+        with self._lock:
+            q = self._async_question
+            if q is None or q.get("id") != id:
+                return ("not_delivered", None)       # no such outstanding question (wrong/absent id)
+            event_id = q.get("event_id")
+            text = format_async_reply(q.get("question"), q.get("assumption"), answer)
+            # CLEAR the slot under the lock: a second respond for the same id then sees
+            # has_pending_async False and can never double-deliver.
+            self._async_question = None
+            closing = self._closing or self._terminal_kind is not None
+            idle = self._state == "idle"
+            if not closing and not idle:
+                # BUSY: enqueue for the monitor (sole writer) to deliver at the next idle. Set under the
+                # lock so the monitor's drain (also under the lock) sees a consistent value.
+                self._async_reply_pending = text
+        # Correlation resolve runs OUTSIDE self._lock (never hold it across an EventQueue op).
+        if event_id is not None:
+            self._events.mark_answered(event_id)
+        if self._log is not None:
+            self._log.info("session", "async_question_resolved", session_id=self._id,
+                           question_id=id,
+                           disposition="not_delivered" if closing else ("deliver_now" if idle
+                                                                        else "queued_busy"))
+        if closing:
+            return ("not_delivered", None)
+        if idle:
+            return ("deliver_now", text)
+        return ("queued_busy", text)
+
+    def drain_async_reply(self):
+        """Monitor-thread hook at the working->idle transition (Task 4): if an async reply was enqueued
+        while the executor was busy, deliver it now as a FRESH turn. The monitor is the SOLE PTY writer,
+        so a busy-case async reply is written HERE, never on the RPC thread. Delivery goes through the
+        manager's slot-reacquiring send_turn (self.deliver_turn) — the now-idle session freed its active
+        slot, so resuming it must re-acquire one (mirrors an idle follow-up). CLAIM the pending text
+        under the lock (a duplicate drain is then a no-op) and call the callback OUTSIDE the lock
+        (deliver_turn re-enters via send_turn -> self._lock; never hold the lock across it). Only drains
+        when genuinely idle and not tearing down — err toward leaving the reply queued.
+        """
+        with self._lock:
+            text = self._async_reply_pending
+            if text is None or self._state != "idle" or self._closing:
+                return
+            self._async_reply_pending = None          # claim it: exactly one delivery
+            deliver = self.deliver_turn
+        if deliver is None:
+            # No manager wiring (a session-only unit path): re-stash so the reply is not silently lost.
+            with self._lock:
+                if self._async_reply_pending is None:
+                    self._async_reply_pending = text
+            return
+        outcome = deliver(text)
+        # Best-effort at THIS idle: send_turn can decline WITHOUT typing anything if no active slot is
+        # free right now (at_capacity) or a concurrent idle follow-up already resumed the session
+        # (no_pending). Re-queue those so the monitor retries at the next idle instead of dropping a
+        # Hermes answer. A confirmed 'resumed' consumed it; a write_timeout (partial/wedged write) or a
+        # terminal outcome is deliberately NOT retried — re-typing a partial write or chasing a dead
+        # session would be worse than the miss.
+        if getattr(outcome, "status", None) in ("at_capacity", "no_pending"):
+            with self._lock:
+                if (self._async_reply_pending is None and not self._closing
+                        and self._terminal_kind is None):
+                    self._async_reply_pending = text
 
     def snapshot(self):
         with self._lock:
