@@ -103,7 +103,7 @@ def test_ask_mode_read_path_removed():
     assert "ask_mode" not in Observation.__dataclass_fields__
     assert not hasattr(ClaudeDriver, "ask_mode_toggle")
     assert not hasattr(ClaudeDriver, "_ask_mode")
-    assert not hasattr(Driver, "ask_mode_toggle")
+    assert "ask_mode_toggle" not in Driver.__annotations__
 
 
 # ---- background subagent: a running subagent is BUSY, never waiting_for_user ----
