@@ -1082,8 +1082,8 @@ def test_blocked_on_trust_menu_types_nothing(tmp_path):
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision is not None and sess._decision["kind"] == "blocked")
     assert sess._task_delivery == "pending"
-    # no task text, no Enter — only ask-mode toggles are permitted (none expected on a modal)
-    assert handle.writes == [] or all(w in ("\x1b[Z", "\x1b") for w in handle.writes)
+    # nothing is typed on a modal: no task text, no Enter, no mode-toggle bytes
+    assert handle.writes == []
     sess.stop()
 
 

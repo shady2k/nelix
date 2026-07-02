@@ -142,19 +142,6 @@ def pred_modal_menu(frame: str) -> bool:
     return bool(_SELECTED_OPTION.search(frame)) and len(_OPTION.findall(frame)) >= 2
 
 
-def pred_ask_mode_footer(frame: str) -> bool:
-    """Any frame with the interactive footer (shift+tab to cycle) — yields ask_mode=True."""
-    return "shift+tab to cycle" in frame and "❯" in frame and "⏵⏵" in frame
-
-
-def pred_accept_edits_footer(frame: str) -> bool:
-    """Frame with accept-edits / plan-mode / bypass-permissions footer — yields ask_mode=False."""
-    for m in ("accept edits on", "plan mode on", "bypass permissions"):
-        if m in frame:
-            return True
-    return False
-
-
 def pred_bash_panel(frame: str) -> bool:
     return bool(re.search(r"Bash\(", frame))
 
@@ -401,35 +388,6 @@ def main():
                 gaps.append("I6a")
             continue
 
-        # ── frame-level: I-AM ───────────────────────────────────────────────
-        if iid == "I-AM":
-            # Half 1: ask_mode=True (footer present, no auto-mode markers)
-            sid_true, rp_true, off_true, fr_true = scan_specific(
-                ["s-b8a30317-delivery"], pred_ask_mode_footer, corpus, regressions
-            )
-            if not sid_true:
-                sid_true, rp_true, off_true, fr_true = scan_all(
-                    pred_ask_mode_footer, corpus, regressions
-                )
-            # Half 2: ask_mode=False (accept edits on / plan mode on / bypass permissions)
-            sid_false, rp_false, off_false, fr_false = scan_all(
-                pred_accept_edits_footer, corpus, regressions
-            )
-            if sid_true and sid_false:
-                print(f"| I-AM | found | ask=True:{sid_true}@{off_true} / "
-                      f"ask=False:{sid_false}@{off_false} | 120x40 | see sources | "
-                      "footer → ask_mode=True; accept-edits → ask_mode=False | ask_mode |")
-            elif sid_true:
-                print(f"| I-AM | gap (ask=False half) | ask=True:{sid_true}@{off_true} / "
-                      "ask=False:MISSING | 120x40 | — | "
-                      "`⏵⏵ auto mode on (shift+tab to cycle)` → ask_mode=True; "
-                      "no `accept edits on`/`bypass permissions` frame in corpus | ask_mode |")
-                gaps.append("I-AM(ask_mode=False)")
-            else:
-                print("| I-AM | gap | — | — | — | no footer frame found | — |")
-                gaps.append("I-AM")
-            continue
-
         # ── frame-level: I-BC ───────────────────────────────────────────────
         if iid == "I-BC":
             sid, raw_path, offset, frame = scan_specific(
@@ -541,19 +499,6 @@ def main():
         for g in gaps:
             print(f"- `{g}`")
         print()
-        if "I-AM(ask_mode=False)" in gaps:
-            print("### Gap detail: I-AM ask_mode=False\n")
-            print("All corpus sessions use Claude Code v2.1.191+ which renders the footer as\n"
-                  "`⏵⏵ auto mode on (shift+tab to cycle)`. The driver's auto-mode markers\n"
-                  "(`accept edits on`, `plan mode on`, `bypass permissions`) match **older** Claude\n"
-                  "Code footer text (pre-v2.1.191). No corpus session captures an older-style\n"
-                  "`accept edits on` footer. The ask_mode=True half IS found (any current footer\n"
-                  "frame yields True). The ask_mode=False half is currently only verifiable via\n"
-                  "the existing synthetic test (`test_claude_driver.py:45`). A new manual recording\n"
-                  "with an older Claude Code is NOT required — the driver behavior is tested\n"
-                  "synthetically and the current corpus faithfully represents the current CLI.\n"
-                  "**Recommend:** mark I-AM as split: real-capture covers True half; synthetic\n"
-                  "covers False half (no Sasha recording needed).\n")
 
     # ── trust sessions ────────────────────────────────────────────────────────
     print()
@@ -585,7 +530,6 @@ def main():
         "ctrl+b": pred_ctrl_b_panel,
         "trust": pred_trust,
         "Bash(": pred_bash_panel,
-        "footer": pred_ask_mode_footer,
     }
 
     all_sessions_dir = SESSIONS_DIR
