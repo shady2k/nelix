@@ -257,3 +257,35 @@ class ClaudeDriver:
         if idx is None:
             return region_fp(norm)
         return region_fp(norm, keep=(idx, len(rows)))
+
+    def modal_body_fp(self, norm):
+        # A STABLE fingerprint of a choice modal's QUESTION BLOCK — the contiguous nonblank question
+        # rows immediately above the option block, bounded above by a blank, the modal's top rule
+        # border, or the bound (<=8 rows). Used by _emit_blocked to dedup a flickering modal across
+        # repaints while keeping two same-option different-question modals distinct. The region is
+        # ANCHORED to the options (walk up from the option block) and BOUNDED, so it stays put across
+        # a repaint AND excludes the volatile streaming scrollback ABOVE the modal: the gopls flicker
+        # repaints the streaming diff above the modal (even overwriting the modal's own top border as
+        # it pushes down), but the bottom question row(s) right above the options hold still, so the
+        # SAME modal collapses while a multi-line question that differs does not false-collapse.
+        # Returns None if there is no option row or no question row above it.
+        rows = norm.split("\n")
+        first_opt = next((i for i, r in enumerate(rows) if _OPTION.search(r)), None)
+        if first_opt is None or first_opt == 0:
+            return None
+        end = first_opt - 1
+        while end >= 0 and not rows[end].strip():          # skip spacer blanks directly above options
+            end -= 1
+        if end < 0:
+            return None
+        start = end
+        while (start > max(-1, first_opt - 9)              # bounded: never reach past modal into scrollback
+               and rows[start].strip()                      # contiguous nonblank question rows
+               and not _RULE_ROW.match(rows[start])):       # stop at the modal's top rule border
+            start -= 1
+        # `start` landed on the boundary (blank / rule) or the bound edge; the block starts just after.
+        if start < 0 or not rows[start].strip() or _RULE_ROW.match(rows[start]):
+            start += 1
+        if start > end:
+            return None
+        return region_fp(norm, keep=(start, end + 1))

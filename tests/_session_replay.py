@@ -14,6 +14,8 @@ its frames come from a REAL capture (``tests/_replay.replay_frames`` for a ``.ra
 deterministically, no real PTY/threads.
 """
 import json
+import threading
+import time
 from pathlib import Path
 
 from daemon.session import Session
@@ -191,6 +193,104 @@ def delivery_run(tmp_path, frames, *, task, spec=None, step=1.0, pad_last=0,
     sess._handle = handle
     sess._wait_until_ready = lambda *a, **k: None   # neutralize the real-wall-clock settle wait
     sess._run()
+    return sess, ev, handle
+
+
+def respond_via_monitor(sess, answer, decision_id, frame, *, timeout=10.0, before_drain=None):
+    """Deterministic single-process model of the REAL two-thread pre-delivery blocked answer
+    (C1: monitor is the sole writer). ``respond()`` runs on a worker (RPC) thread: it ENQUEUES the
+    answer and blocks on the monitor. THIS thread IS the monitor: once the enqueue is visible it
+    drains the answer against ``frame`` — SUBMIT (write the keystrokes) when the modal is still on
+    screen + delivery pending, ABORT (nothing typed) otherwise — then joins the worker and returns
+    its RespondOutcome. The spin on ``_pending_answer`` models the monitor noticing the answer on its
+    next tick (deterministic: the enqueue is immediate).
+
+    ``before_drain`` (optional) runs on THIS (monitor) thread in the enqueue→drain window — after
+    respond() has committed the answer but before the monitor re-observes the screen to drain it.
+    It models a monitor-side transition that lands in that exact window (e.g. delivery confirming
+    pending->delivered, the TOCTOU the single-writer drain's _task_delivery re-check closes)."""
+    box = {}
+
+    def rpc():
+        try:
+            box["out"] = sess.respond(answer, decision_id=decision_id)
+        except BaseException as exc:        # pragma: no cover - surfaced via the assert below
+            box["err"] = exc
+
+    t = threading.Thread(target=rpc, daemon=True)
+    t.start()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with sess._lock:
+            enqueued = sess._pending_answer is not None
+        if enqueued:
+            break
+        time.sleep(0)
+    else:
+        t.join(timeout=1.0)
+        raise AssertionError(box.get("err") or "respond() never enqueued a pending answer")
+    if before_drain is not None:
+        before_drain(sess)            # monitor-side transition in the enqueue→drain window
+    sess._drain_pending_answer(frame)
+    t.join(timeout=timeout)
+    if "err" in box:
+        raise box["err"]
+    return box["out"]
+
+
+def delivery_drive(tmp_path, frames, *, task, spec=None, step=1.0, respond=None,
+                   max_iters=None, logger=None):
+    """Drive Session._run's PRE-DELIVERY loop body frame-by-frame over a REAL capture — the
+    deterministic, single-threaded equivalent of the monitor's delivery phase, with one injection
+    point ``respond`` a test uses to answer a modal at exactly the moment the orchestrator would
+    (right after the blocked decision is published), reproducing the pre-delivery phantom-blocked
+    race.
+
+    Mirrors Session._run's loop body (pump -> render -> normalized-frame tracking -> _delivery_tick)
+    and stops once ``task_delivery`` leaves 'pending'. ``respond``, if given, is called AFTER each
+    tick with the current pending decision dict (or None); when it returns a non-None answer string
+    the helper routes it through ``respond_via_monitor`` — the C1 monitor-is-sole-writer path — so a
+    pre-delivery blocked answer is written by THIS (monitor) thread against the current frame, not by
+    respond() on the RPC thread. As in delivery_run, _wait_until_ready (a real-wall-clock settle) is
+    neutralized and callers must neutralize daemon.session.time.sleep (used by _ensure_ask_mode).
+    Returns (sess, ev, handle)."""
+    spec = spec or Spec()
+    sess, ev, clock = _wire(tmp_path, spec, logger=logger)
+    sess._task_raw = task
+    sess._task = task
+    sess._transcript = TranscriptBuilder(sess._dialog, sess._driver, sess._rows)
+    sess._spawn_ts = 0.0
+    handle = RawReplayHandle(list(frames), stop=sess._stop, clock=clock, step=step)
+    handle._dialog = sess._dialog
+    sess._handle = handle
+    sess._wait_until_ready = lambda *a, **k: None   # neutralize the real-wall-clock settle wait
+    drv = sess._driver
+    it = 0
+    while not sess._stop.is_set() and sess._task_delivery == "pending":
+        handle.pump(0.1)
+        sess._last_byte = 0.0
+        with sess._lock:
+            frame = handle.render()
+        norm = drv.normalize_frame(frame)
+        if norm != sess._norm:
+            sess._norm = norm
+            sess._norm_since = 0.0
+            sess._last_progress = 0.0
+        # C1: drain a previously-enqueued blocked answer on the current frame BEFORE the tick (the
+        # monitor is the sole writer; this mirrors _run calling _drain_pending_answer each tick).
+        sess._drain_pending_answer(frame)
+        sess._delivery_tick(frame)
+        if respond is not None:
+            dec = sess._decision
+            if dec is not None and "event_id" in dec:
+                ans = respond(dec, sess)
+                if ans is not None:
+                    respond_via_monitor(sess, ans, dec["decision_id"], frame)
+        if not handle.is_alive():
+            break
+        it += 1
+        if max_iters is not None and it >= max_iters:
+            break
     return sess, ev, handle
 
 

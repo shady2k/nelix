@@ -125,12 +125,32 @@ class Session:
         self.restart_count = 0         # manager-set snapshot of the lineage count (display only)
         self._last_screen_excerpt = "" # last published screen excerpt (for the terminal snapshot)
         self._terminal_kind = None     # done | crashed | delivery_failed (set at each terminal point)
+        # _task_delivery synchronization (I1): the ONLY genuinely cross-thread transition is the
+        # monitor's pending->"delivered" write, which the RPC-thread respond() reads to gate a
+        # pre-delivery blocked answer — that write and that read are both made under self._lock, so
+        # respond observes a consistent value. Every OTHER access is MONITOR-thread-local and
+        # single-thread-safe (the "failed" writes and the _run/_delivery_tick reads all happen on the
+        # monitor thread; snapshot reads take their own lock) — they are deliberately NOT locked, so
+        # do not claim the field is "consistently synchronized" (it is not, and need not be).
         self._task_delivery = "pending"  # pending | delivered | failed
+        self._pending_answer = None    # C1: a pre-delivery blocked answer enqueued by respond() for the
+        #                                MONITOR thread to write (sole writer): {decision_id, keystrokes,
+        #                                clean, event, outcome, deadline}. None unless a blocked respond()
+        #                                is mid-flight. Drained by _drain_pending_answer (each pre-delivery
+        #                                tick + the delivery transition) so the answer write and the
+        #                                delivery decision are serialized on ONE thread and cannot race.
         self._finalized = False        # _finish ran (idempotency guard, under self._lock)
         self._exc = None               # sys.exc_info() if the monitor body raised
         self._exc_text = None          # formatted traceback captured at catch time
         self._spawn_ts = None          # ts the PTY leader was spawned (for alive_for)
         self._blocked_fp = None        # normalized screen of the last emitted blocked event
+        self._blocked_dedup = None     # dedup key of the current blocked: a modal/permission prompt
+        #                                -> (prompt_kind, option ids/labels); else the raw normalized
+        #                                frame. Kept SEPARATE from _blocked_fp, which stays the raw
+        #                                frame so the startup-no-output backstop's "ever emitted?"
+        #                                signal (self._blocked_fp is None) and the no-progress hung
+        #                                re-emit's decision_key reuse (decision_key=self._blocked_fp)
+        #                                keep working unchanged.
         self._sessions_dir = _sessions_root()
         self.on_terminal = None        # manager-set: free the slot on terminal state
         self.reaper_ctx = None         # daemon-set reaper.ReaperContext (None => no reaping)
@@ -329,6 +349,11 @@ class Session:
                     screen_ever_nonempty = True
                     if not norm_changed:
                         saw_stable = True
+                # C1: if respond() enqueued a pre-delivery blocked answer, the MONITOR (this thread)
+                # drains it on the current frame — it is the SOLE writer, so the answer write and the
+                # delivery decision (also this thread) cannot interleave. Drained before _delivery_tick
+                # so an answer lands before delivery can proceed past the modal.
+                self._drain_pending_answer(frame)
                 self._delivery_tick(frame)
                 # no-progress backstop while blocked (spec §6): re-surface an unanswered blocked with
                 # hung=True so Hermes is reminded; bypass the fingerprint dedup (call _publish directly).
@@ -402,10 +427,12 @@ class Session:
             if self._driver.observe(frame, confirm_ctx).submitted_echo_present:
                 self._press_enter()
                 self._dialog.append_user_input(self._task_raw)   # first user marker
-                self._task_delivery = "delivered"
                 # The initial task is a submit: arm post-submit suppression for the first turn so the
                 # echoed task lingering in the box during TTFT is not read as a fresh idle prompt (F1).
                 with self._lock:
+                    # The pending->delivered transition is the one cross-thread write respond() reads
+                    # (I1); made UNDER the lock so respond's under-lock read observes a consistent value.
+                    self._task_delivery = "delivered"
                     self._last_submitted = self._task
                     self._engine.on_submit(self._task)
                     # A hook-capable driver reports its own lifecycle: arm the hook startup grace at
@@ -415,6 +442,41 @@ class Session:
                     if getattr(self._driver, "hook_capable", False):
                         self._engine.expect_hooks(self._clock.now())
                     notes = self._engine.drain_notes()       # post_submit_armed for the first turn
+                    # Phantom-blocked closer (invariant: `blocked` exists ONLY pre-delivery). A
+                    # pre-delivery interstitial (trust/permission) was surfaced as a `blocked`
+                    # decision; delivery means its modal is gone. A legitimately-answered blocked was
+                    # already drained (submitted) by the monitor; what can still be pending here is an
+                    # ORPHAN minted on a transitional repaint frame just before the input box appeared.
+                    # Retire it so the wake layer (pending()) does not resurrect it and draw a
+                    # stray-digit answer into the now-live session. Capture the id under the lock;
+                    # resolve OUTSIDE it (never hold self._lock across a queue resolve — mirrors
+                    # _apply_withdraw, else clearing _decision alone leaves pending() pointing at it).
+                    orphan_blocked_id = None
+                    if self._decision is not None and self._decision.get("kind") == "blocked":
+                        orphan_blocked_id = self._decision.get("decision_id")
+                        self._decision = None
+                    # C1: if a pre-delivery blocked answer is still enqueued (respond() claimed it but
+                    # the monitor never drained — delivery won the race), ABORT it here: the modal it
+                    # answered is gone, so typing would leak a stray digit. Capture under the lock;
+                    # release the waiter + resolve OUTSIDE it (mirrors the orphan resolve below).
+                    aborted_answer = self._pending_answer
+                    if aborted_answer is not None:
+                        self._pending_answer = None
+                if orphan_blocked_id is not None:
+                    self._events.resolve_decision(orphan_blocked_id, "superseded")
+                    if self._log is not None:
+                        self._log.info("session", "blocked_withdrawn_at_delivery",
+                                       session_id=self._id, decision_id=orphan_blocked_id)
+                if aborted_answer is not None:
+                    # M1: delivery won -> the blocked answer never landed (nothing typed), so resolve
+                    # it honestly as 'superseded' (NOT 'answered'); resolve_decision is idempotent, so
+                    # if the orphan withdraw above already resolved the same id this is a no-op.
+                    self._events.resolve_decision(aborted_answer["decision_id"], "superseded")
+                    aborted_answer["outcome"] = "stale"
+                    aborted_answer["event"].set()
+                    if self._log is not None:
+                        self._log.info("session", "blocked_answer_aborted_at_delivery",
+                                       session_id=self._id, decision_id=aborted_answer["decision_id"])
                 if self._log is not None:
                     self._log.audit_task(self._id, self._executor, self._task)
                     self._log.info("session", "delivery_confirmed", session_id=self._id)
@@ -655,6 +717,17 @@ class Session:
             if self._finalized:
                 return
             self._finalized = True
+            # E1: raise the terminal gate BEFORE the abort window opens. _abort_pending_answer and
+            # respond()'s enqueue-rejection now share ONE lock-guarded gate: once teardown begins, no
+            # _pending_answer can be enqueued that no monitor path will drain. (Was raised last, in
+            # _finish_cleanup, AFTER the abort — so a respond() racing into the post-abort / pre-closing
+            # window passed its _closing guard, enqueued an answer the abort had already missed, and
+            # stalled the full respond_write_seconds with nothing left to drain it.)
+            self._closing = True
+        # I3: every monitor-thread exit funnels through here — release a respond() still waiting on a
+        # pre-delivery blocked answer BEFORE the rest of teardown, so it wakes promptly (well under
+        # respond_write_seconds) with a non-answered outcome instead of stalling the full window.
+        self._abort_pending_answer("terminal")
         status = self._handle.leader_status() if self._handle is not None else None
         alive = bool(status and status.alive)
         try:
@@ -722,9 +795,9 @@ class Session:
 
     def _finish_cleanup(self, alive):
         # Terminal cleanup for ANY exit reason: reap survivors (monitor-dead-child-alive, or
-        # stragglers in the group), forget the durable record, free the concurrency slot.
-        with self._lock:
-            self._closing = True
+        # stragglers in the group), forget the durable record, free the concurrency slot. (_closing —
+        # the shared teardown gate respond()/screen/send_turn check — is already raised at _finish
+        # entry, before the abort, so it is not set again here.)
         ctx = self.reaper_ctx
         if ctx is not None and self._handle is not None:
             pid, pgid = self._handle.leader_pid(), self._handle.leader_pgid()
@@ -768,14 +841,46 @@ class Session:
             alive_for=alive_for, task_delivery=self._task_delivery,
             screen_fingerprint=self._screen_fp())
 
+    def _modal_dedup(self, fp, obs):
+        # F2 semantic identity of a numbered modal/permission interstitial: prompt_kind + option
+        # ids/labels + the modal's stable QUESTION body (modal_body_fp). Returns None when the frame is
+        # not a numbered choice modal with options (onboarding/unknown interstitials have no stable
+        # option set to key on -> _emit_blocked falls back to the raw frame for those).
+        #
+        # Why this key (and not the raw frame / labels alone): option labels alone are too coarse (F2:
+        # two generic "1. Yes / 2. No" prompts asking different questions collapse -> the second is never
+        # published, orchestrator stuck). The raw normalized frame is too volatile (the gopls flicker
+        # repaints the streaming scrollback ABOVE the modal, so content_fp/semantic_fp vary across
+        # repaints of the SAME modal). The modal body — its title/question rows bounded above by the
+        # modal's top border and below by the option block — is stable across a repaint AND distinguishes
+        # two same-option prompts. obs.semantic_fp / obs.prompt_fp are NOT usable (in the claude driver
+        # the former is the whole normalized frame and the latter still includes the selected-option
+        # region); the driver's modal_body_fp isolates the modal's own body, excluding that scrollback.
+        #
+        # This is the SAME key _emit_blocked dedups on; it is ALSO frozen onto the published decision so
+        # _drain_pending_answer can verify a pending answer targets THIS modal, not merely "a modal"
+        # (C2: a stale answer for modal A must not be typed into a different modal B now on screen).
+        if obs is not None and obs.prompt_kind in ("modal_choice", "permission_choice") and obs.options:
+            return (obs.prompt_kind, tuple((o.id, o.label) for o in obs.options),
+                    self._driver.modal_body_fp(fp))
+        return None
+
     def _emit_blocked(self, frame, obs=None, hint="task_not_delivered"):
         # Surface a pre-delivery interstitial (modal / onboarding / unknown). Type/press NOTHING.
-        # Dedup by normalized-screen fingerprint alone: emit once per distinct screen. A new
-        # interstitial (different fingerprint) emits a fresh blocked; the same screen never re-spams,
-        # including after the prior one is answered (the answer changes the screen anyway).
+        # Dedup: a numbered modal/permission interstitial can repaint across several raw frames for the
+        # SAME logical prompt; a raw-frame dedup sees a new fingerprint each repaint and mints a FRESH
+        # blocked (new decision_id) for an already-published — or already-answered — modal, a phantom
+        # the wake layer (pending()) then re-surfaces. Dedup on the SEMANTIC key (_modal_dedup) so one
+        # logical prompt = one blocked; onboarding/unknown interstitials keep the raw-frame fallback.
         fp = self._driver.normalize_frame(frame)
-        if fp == self._blocked_fp:
+        modal_dedup = self._modal_dedup(fp, obs)          # semantic identity (None for non-modal)
+        dedup = modal_dedup if modal_dedup is not None else fp
+        if dedup == self._blocked_dedup:
             return
+        self._blocked_dedup = dedup
+        # _blocked_fp stays the RAW frame so its two consumers keep working unchanged: the startup
+        # no-output backstop ("has any blocked ever been emitted?" == self._blocked_fp is None) and the
+        # no-progress hung re-emit (decision_key=self._blocked_fp to reuse the decision_id).
         self._blocked_fp = fp
         self._handle.finalize()
         # A pre-delivery interstitial that observe() classified as a numbered menu (trust/permission/
@@ -787,13 +892,16 @@ class Session:
             prompt_kind, options = obs.prompt_kind, obs.options
         # decision_key = the normalized-frame fingerprint: a new interstitial (different fp) is a
         # new decision; the no-progress backstop re-emits the SAME fp and reuses the decision_id.
+        # modal_dedup = the semantic identity frozen onto the decision so _drain_pending_answer can
+        # re-verify the on-screen modal is the SAME logical prompt a pending answer targets (C2).
         self._publish("blocked", hint=hint, hung=False, requires_response=True,
                       task_delivery="pending", decision_key=fp,
-                      prompt_kind=prompt_kind, options=options or ())
+                      prompt_kind=prompt_kind, options=options or (),
+                      modal_dedup=modal_dedup)
 
     def _publish(self, kind, hint, hung, requires_response=None, task_delivery=None,
                  decision_key=None, options=(), prompt_kind=None, busy_reason=None,
-                 escalation_count=None):
+                 escalation_count=None, modal_dedup=None):
         respondable = kind in RESPONDABLE_KINDS
         with self._lock:
             tail = self._dialog.tail(self._spec.status_tail_chars)
@@ -828,6 +936,11 @@ class Session:
                 decision_id = cur["decision_id"] if is_reemit else f"dec-{uuid.uuid4().hex[:8]}"
                 decision["decision_key"] = decision_key
                 decision["decision_id"] = decision_id
+                # C2: freeze the on-screen modal's semantic identity onto the decision so a later
+                # _drain_pending_answer can prove the modal it drains against is the SAME logical prompt
+                # this answer targets (not merely "a modal"). Internal identity (never exposed), like
+                # decision_key; None for any non-modal decision.
+                decision["modal_dedup"] = modal_dedup
 
         # _install records what it actually did here (off the lock) so the decision lifecycle (nelix-jwv:
         # published / superseded) is logged AFTER the publish, never holding a lock across log I/O.
@@ -922,9 +1035,10 @@ class Session:
                 snap["restarted_from"] = self.restarted_from
                 snap["restart_count"] = self.restart_count
             if self._decision is not None:
-                # decision_key is internal identity (never exposed); decision_id is the public
-                # guard token.  The text was captured at publish time via tail() and is frozen.
-                dec = {k: v for k, v in self._decision.items() if k != "decision_key"}
+                # decision_key + modal_dedup are internal identity (never exposed); decision_id is the
+                # public guard token.  The text was captured at publish time via tail() and is frozen.
+                dec = {k: v for k, v in self._decision.items()
+                       if k not in ("decision_key", "modal_dedup")}
                 snap["decision"] = dec
             # active-working snapshots are deliberately low-information: no progress bait, just
             # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
@@ -990,6 +1104,185 @@ class Session:
                 return False
             time.sleep(min(self._CONFIRM_POLL, max(0.0, deadline - time.monotonic())))
 
+    def _respond_blocked(self, decision, did, clean):
+        # C1: a PRE-DELIVERY blocked answer is routed through the MONITOR thread — the SOLE writer of a
+        # pre-delivery answer. respond() ENQUEUES the answer (under the lock, WITHOUT writing and WITHOUT
+        # clearing _decision) and waits for the monitor's _drain_pending_answer to act; the monitor
+        # re-observes the current frame and either WRITES the keystrokes (the modal is still on screen
+        # and delivery has not won) or ABORTS (modal gone / delivery happening) so a stale answer can
+        # NEVER be typed into the now-working session. Because the monitor also owns the delivery write,
+        # the answer write and the delivery decision are serialized on ONE thread: there is no
+        # check-then-write gap to race — F1 is closed for real, not just narrowed.
+        with self._lock:
+            if self._closing:
+                return RespondOutcome("terminal")
+            if self._decision is not decision:
+                return RespondOutcome("no_pending")        # superseded by a new pause mid-respond
+            if self._pending_answer is not None:
+                # an answer is already enqueued (a duplicate respond) -> exactly one writer
+                return RespondOutcome("no_pending")
+            if self._task_delivery != "pending":
+                # delivery already won (the modal is gone) -> refuse BEFORE enqueueing: NOTHING typed.
+                # M1: resolve 'superseded' (NOT 'answered') so the decision stays honestly un-answered.
+                already_delivered = True
+            else:
+                already_delivered = False
+                done = threading.Event()
+                pa = {"decision_id": did,
+                      "keystrokes": self._driver.select_option(clean),  # digit + submit key
+                      "clean": clean, "event": done, "outcome": None,
+                      "deadline": time.monotonic() + self._spec.respond_write_seconds,
+                      # C2: freeze the modal identity this answer targets (from the decision), so the
+                      # monitor's drain can prove it drains against the SAME modal, not merely "a modal".
+                      "target_dedup": decision.get("modal_dedup")}
+                self._pending_answer = pa
+        if already_delivered:
+            self._events.resolve_decision(did, "superseded")
+            if self._log is not None:
+                self._log.info("session", "blocked_respond_after_delivery",
+                               session_id=self._id, decision_id=did)
+            return RespondOutcome("stale", decision_id=did)
+        if self._log is not None:
+            self._log.debug("session", "respond_attempt", session_id=self._id, decision_id=did,
+                            prompt_kind=decision.get("prompt_kind"), is_modal=True,
+                            is_blocked=True, answer_chars=len(clean), writer="monitor")
+        # Wait (bounded) for the monitor to drain; it sets pa["outcome"] + done. The monitor owns the
+        # write, so this RPC thread types NOTHING — it only relays the outcome the monitor set.
+        remaining = max(0.0, pa["deadline"] - time.monotonic())
+        if not done.wait(remaining):
+            with self._lock:
+                reclaimed = self._pending_answer is pa
+                if reclaimed:
+                    self._pending_answer = None      # monitor never drained -> reclaim, nothing typed
+            if reclaimed:
+                self._events.resolve_decision(did, "superseded")
+                if self._log is not None:
+                    self._log.warning("session", "respond_failed", session_id=self._id,
+                                      decision_id=did, reason="monitor_drain_timeout")
+                return RespondOutcome("write_timeout", decision_id=did,
+                                      answered_decision_id=did, snapshot=self.snapshot())
+            # the monitor claimed it in the timeout window -> it is about to set `done`; wait for it.
+            done.wait(self._spec.respond_write_seconds)
+        outcome = pa["outcome"]
+        if outcome == "submitted":
+            return RespondOutcome("resumed", seq=pa.get("seq"), decision_id=did,
+                                  answered_decision_id=did, snapshot=self.snapshot())
+        if outcome == "write_timeout":
+            return RespondOutcome("write_timeout", decision_id=did,
+                                  answered_decision_id=did, snapshot=self.snapshot())
+        if outcome == "terminal":
+            # I3: the session went terminal (fail/stop/teardown) while respond() waited on the drain ->
+            # _finish aborted the answer, nothing typed. 'terminal' (not 'stale'): the session is gone,
+            # so the caller refreshes status rather than retrying the bind.
+            return RespondOutcome("terminal", decision_id=did)
+        # "stale": the monitor aborted (delivery won / modal gone) -> NOTHING typed.
+        return RespondOutcome("stale", decision_id=did)
+
+    def _drain_pending_answer(self, frame):
+        # C1 SOLE-writer drain of a pre-delivery blocked answer (runs on the MONITOR thread). If
+        # respond() enqueued an answer, re-observe the current frame and SUBMIT it (write the
+        # keystrokes) when the modal it answers is STILL the pending blocked decision, delivery has
+        # NOT won, and the frame still shows that choice modal — the screen re-verify that kills a
+        # phantom answer once the modal is gone. Otherwise ABORT (nothing typed). The monitor owns
+        # BOTH this write and the delivery write, so they can never interleave. The PTY write and the
+        # EventQueue resolve run OUTSIDE self._lock (mirrors _deliver_task / _apply_withdraw); the
+        # enqueuing respond() is released via the answer's event either way.
+        with self._lock:
+            pa = self._pending_answer
+            if pa is None:
+                return
+            # CLAIM it under the lock (exactly one drain acts; a timing-out respond() can tell it was
+            # taken rather than reclaimed by itself).
+            self._pending_answer = None
+            did = pa["decision_id"]
+            decision = self._decision
+            # C2: re-observe the CURRENT frame and submit ONLY if the on-screen modal is the SAME
+            # logical prompt this answer targets (the modal_dedup frozen on the pending answer at
+            # enqueue), not merely "a modal". _drain_pending_answer runs BEFORE _delivery_tick, so when
+            # the answer for modal A is enqueued but the screen now shows a DIFFERENT modal B (A
+            # superseded before B's _emit_blocked re-published -> self._decision is STILL A), the old
+            # prompt_kind-only check could not tell A from B and would type A's keystrokes into B. The
+            # semantic-identity compare closes that: a repaint of the SAME modal keeps the same key
+            # (submit); a different modal, or any uncertainty (current frame not a numbered modal / no
+            # target identity), ABORTS — nothing typed. Err toward abort on any mismatch.
+            obs = self._driver.observe(frame, self._obs_ctx())
+            current_dedup = self._modal_dedup(self._driver.normalize_frame(frame), obs)
+            target_dedup = pa.get("target_dedup")
+            # E2: a None modal_body_fp is an identity hole — two distinct bodyless modals with
+            # identical option labels collapse onto one (prompt_kind, options, None) key and the
+            # answer could be typed into the wrong one. Require a NON-None body fingerprint (the last
+            # element of the dedup tuple) on BOTH the frozen target and the freshly-observed frame
+            # for a SUBMIT; the equality above means the two bodies match, so one non-None check
+            # covers both — a None body on either side is uncertainty -> ABORT (nothing typed).
+            submit = (decision is not None
+                      and decision.get("decision_id") == did
+                      and decision.get("kind") == "blocked"
+                      and self._task_delivery == "pending"
+                      and current_dedup is not None
+                      and current_dedup == target_dedup
+                      and current_dedup[-1] is not None)
+            if submit:
+                keystrokes = pa["keystrokes"]
+                clean = pa["clean"]
+                self._decision = None          # claimed by the write (claim-before-write: one writer)
+        if submit:
+            try:
+                self._type_text(keystrokes, timeout=max(0.0, pa["deadline"] - time.monotonic()))
+            except PtyWriteTimeout:
+                # write never confirmed (executor wedged): resolve honestly + relay the timeout.
+                self._events.resolve_decision(did, "superseded")
+                if self._log is not None:
+                    self._log.warning("session", "respond_failed", session_id=self._id,
+                                      decision_id=did, reason="write_unconfirmed")
+                pa["outcome"] = "write_timeout"
+                pa["event"].set()
+                return
+            seq = self._events.resolve_decision(did, "answered")
+            with self._lock:
+                self._last_submitted = clean
+                self._engine.on_submit(clean)        # arm post-submit suppression for the answered turn
+                notes = self._engine.drain_notes()
+                self._state = "busy"
+            self._log_notes(notes)
+            if self._log is not None:
+                self._log.info("session", "decision_answered", session_id=self._id, decision_id=did, seq=seq)
+                self._log.info("session", "respond_confirmed", session_id=self._id,
+                               decision_id=did, seq=seq, writer="monitor")
+            pa["seq"] = seq
+            pa["outcome"] = "submitted"
+            pa["event"].set()
+        else:
+            # ABORT: the modal is gone / delivery won -> NOTHING typed. M1: resolve 'superseded'
+            # (NOT 'answered'); resolve_decision is idempotent if the delivery transition already did.
+            self._events.resolve_decision(did, "superseded")
+            if self._log is not None:
+                self._log.info("session", "blocked_answer_aborted", session_id=self._id, decision_id=did)
+            pa["outcome"] = "stale"
+            pa["event"].set()
+
+    def _abort_pending_answer(self, reason):
+        # I3: release a respond() waiting on a pre-delivery blocked answer on EVERY monitor-thread exit
+        # (fail/stop/teardown), not only the normal delivery/drain paths. Without this a respond()
+        # blocked on the monitor's drain waits the FULL respond_write_seconds when the session is already
+        # terminal. Centralized in _finish (the single monitor-thread exit) so every exit — _fail_delivery,
+        # _fail_startup_no_output, the child-death break, _stop set, a monitor exception — drains a
+        # pending answer exactly once. CLAIM under the lock (mirrors _drain_pending_answer /
+        # _deliver_task) so a drain already mid-flight owns it and this is a no-op; resolve + signal
+        # OUTSIDE the lock (never hold self._lock across an EventQueue resolve). NOTHING is typed — the
+        # modal is gone either way once the session is tearing down.
+        with self._lock:
+            pa = self._pending_answer
+            if pa is None:
+                return
+            self._pending_answer = None
+            did = pa["decision_id"]
+        self._events.resolve_decision(did, "superseded")
+        pa["outcome"] = "terminal"
+        pa["event"].set()
+        if self._log is not None:
+            self._log.info("session", "blocked_answer_aborted", session_id=self._id,
+                           decision_id=did, reason=reason)
+
     def respond(self, answer, decision_id=None):
         # Bind to the session's CURRENT pending decision (server owns identity). An answer to a
         # pending decision MUST name it: decision_id (sourced from a status pull) is REQUIRED to
@@ -1018,14 +1311,23 @@ class Session:
         options = decision.get("options") or []
         if is_modal and clean not in {o["id"] for o in options}:
             return RespondOutcome("invalid_option", pending=_pending_meta(decision))
+        is_blocked = decision["kind"] == "blocked"
+        did = decision.get("decision_id")
+        # C1: a PRE-DELIVERY blocked answer is routed through the MONITOR thread (the SOLE writer of a
+        # pre-delivery answer) so the answer write and the delivery decision — both on that one thread —
+        # cannot interleave. respond() only ENQUEUES the answer and waits; it NEVER writes a
+        # pre-delivery blocked answer itself, so there is no check-then-write gap to race. The monitor
+        # re-verifies the modal on screen before writing, so a phantom/stale answer (modal gone,
+        # delivery won) is ABORTED and NOTHING is typed (M1: resolved 'superseded', never 'answered').
+        # POST-delivery free-text/modal answers keep the direct write below — no delivery race then.
+        if is_blocked:
+            return self._respond_blocked(decision, did, clean)
         # Atomically CLAIM the decision: exactly one responder clears it and goes on to type, so
         # concurrent duplicate responds can never both write to the PTY (which is non-idempotent).
         with self._lock:
             if self._decision is not decision:
                 return RespondOutcome("no_pending")    # already claimed, or superseded by a new pause
             self._decision = None
-        is_blocked = decision["kind"] == "blocked"
-        did = decision.get("decision_id")
         # Respond lifecycle (nelix-jwv): mirror START's delivery_attempt -> delivery_confirmed |
         # delivery_failed. attempt/submitted are debug (granular steps); confirmed is info and failed
         # is warning, so a successful resume and a respond-fail are both legible from the log alone.

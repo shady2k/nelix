@@ -774,7 +774,10 @@ def test_respond_free_text_resumes_when_answer_leaves_box(tmp_path):
 def test_answering_reemitted_blocked_clears_pending(tmp_path):
     # Answering a decision the backstop re-emitted must clear pending() for ALL its events, not just
     # the latest — otherwise pending() surfaces a stale earlier event for the resolved decision.
-    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    # The trust modal carries a question row (a NON-None modal_body_fp) so the blocked answer is
+    # submitted — a bodyless modal is identity-ambiguous and the drain aborts it (E2).
+    trust = ("Quick safety check: Is this a project you trust?\n"
+             "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n")
     sess, handle, ev = make_session(tmp_path, frames=[trust], spec=BackstopSpec())
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sum(1 for e in ev._events if e.kind == "blocked") >= 2, timeout=3)
@@ -1163,7 +1166,10 @@ def test_blocked_is_not_respammed_while_screen_unchanged(tmp_path):
 
 
 def test_respond_to_blocked_does_not_append_user_input(tmp_path):
-    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    # The trust modal carries a question row (a NON-None modal_body_fp) so the blocked answer is
+    # submitted — a bodyless modal is identity-ambiguous and the drain aborts it (E2).
+    trust = ("Quick safety check: Is this a project you trust?\n"
+             "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n")
     sess, handle, _ = make_session(tmp_path, frames=[trust])
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
@@ -1194,7 +1200,10 @@ def test_idle_prompt_with_footer_below_input_is_waiting_for_user(monkeypatch, tm
 def test_respond_to_blocked_does_not_re_emit_same_frame(tmp_path):
     # After respond, the SAME interstitial frame must NOT spawn a second blocked event
     # (fingerprint dedup alone). A genuinely different frame still emits.
-    trust = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n"
+    # The trust modal carries a question row (a NON-None modal_body_fp) so the blocked answer is
+    # submitted — a bodyless modal is identity-ambiguous and the drain aborts it (E2).
+    trust = ("Quick safety check: Is this a project you trust?\n"
+             "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm\n")
     sess, handle, ev = make_session(tmp_path, frames=[trust])
     sess.start("do work", str(tmp_path))
     _wait_for(lambda: sess._decision and sess._decision["kind"] == "blocked")
