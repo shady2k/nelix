@@ -1070,6 +1070,21 @@ class Session:
             self._next_qseq += 1
             qid = f"q_{self._next_qseq}"
             state = self._state
+        # INSTALL RACE — CALLER (route layer, Task 5) MUST serialize `question` posts per session.
+        # The publish runs lock-free (lock-order rule above) and the slot store is a SECOND lock
+        # acquisition below, so this method is NOT self-synchronizing across concurrent same-session
+        # callers. Two windows exist, both closed today only because ONE executor posts serially and
+        # /wait vs /status are separate round-trips (never concurrent for one session):
+        #   (1) DOUBLE-STORE: two callers can both pass the already-pending check (slot still None)
+        #       before either reaches the store -> both mint a qid, both publish, both store, and the
+        #       later store CLOBBERS the earlier question (both callers still see (qid, None)).
+        #   (2) EVENT-WITHOUT-PAYLOAD: publish() below runs _cv.notify_all() BEFORE self._async_question
+        #       is set, so a woken /status puller can observe the wake event with the slot still None
+        #       (no async_question in the snapshot yet). The _decision path closes the analogous window
+        #       via _publish's on_publish/_install hook (installs the slot UNDER the EventQueue lock,
+        #       before waiters are notified); this method intentionally does NOT replicate that.
+        # RESOLUTION: the HTTP route layer serializes `question` posts per session (or, if it must fan
+        # out concurrently, adopts the on_publish install pattern) — do not rely on this method alone.
         evt = self._events.publish(self._id, self._executor, "async_question", q.question[:200],
                                    state, requires_response=True, decision_id=qid)
         with self._lock:
