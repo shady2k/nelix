@@ -146,6 +146,16 @@ class Session:
         # the orchestrator, the exact phantom-pre-delivery class of bug 92a0dc6 closed elsewhere).
         self._progress = deque(maxlen=MAX_PROGRESS_NOTES)  # last N {progress_seq,ts,summary,details}
         self._progress_total = 0       # monotonic count of ALL notes ever appended (never reset)
+        # Async question (message-plane, executor -> orchestrator): a NON-blocking question the
+        # executor keeps working around. Lives in its OWN slot, deliberately never installed into
+        # self._decision — that slot's supersede logic (in _publish) is built for the single
+        # blocking pause and would clobber/mask a real decision (or be masked by one). Publishing
+        # is wake-only (kind="async_question" is NOT in RESPONDABLE_KINDS, so EventQueue.pending()
+        # keeps meaning "blocking decision only"): it exists purely to trip the already-armed
+        # nelix-wait waiter; the question itself is served out of this slot, not resolved via the
+        # queue. {id, question, assumption, continuation_plan, event_id, executor_blocked} or None.
+        self._async_question = None
+        self._next_qseq = 0            # monotonic per-session counter for q_<n> ids
         self._finalized = False        # _finish ran (idempotency guard, under self._lock)
         self._exc = None               # sys.exc_info() if the monitor body raised
         self._exc_text = None          # formatted traceback captured at catch time
@@ -1033,6 +1043,46 @@ class Session:
         with self._lock:
             return self._progress_view_locked()
 
+    def record_async_question(self, q):
+        """Record an executor's non-blocking `question` (message-plane, executor -> orchestrator)
+        in its OWN slot — self._async_question, NEVER self._decision. _decision's supersede logic
+        (in _publish) exists for the single blocking pause; installing a question there would let
+        it clobber a real decision, or a real decision clobber it. Only one question may be
+        outstanding per session at a time: a caller that already has one pending gets the existing
+        id back (never a fresh mint), so a retried/duplicate `question` call is a no-op wake.
+
+        The EventQueue publish below is wake-only — kind="async_question" is deliberately absent
+        from RESPONDABLE_KINDS, so it can never become EventQueue.pending()'s answer and never
+        collides with a real blocking decision's decision_id space. It exists purely to trip the
+        already-armed nelix-wait waiter; the question is served out of this slot on the next
+        status/decision pull, not resolved through the queue.
+
+        Published OUTSIDE self._lock (lock order: never hold it across a queue publish — mirrors
+        _publish's own discipline, session.py ~975). Returns (id, None) on success, or
+        (None, {"id":..., "question":...}) if a question is already pending."""
+        with self._lock:
+            if self._async_question is not None:
+                return None, {"id": self._async_question["id"],
+                              "question": self._async_question["question"]}
+            self._next_qseq += 1
+            qid = f"q_{self._next_qseq}"
+            state = self._state
+        evt = self._events.publish(self._id, self._executor, "async_question", q.question[:200],
+                                   state, requires_response=True, decision_id=qid)
+        with self._lock:
+            self._async_question = {"id": qid, "question": q.question,
+                                     "assumption": q.assumption,
+                                     "continuation_plan": q.continuation_plan,
+                                     "event_id": evt.event_id, "executor_blocked": False}
+        return qid, None
+
+    def has_pending_async(self, id=None):
+        """True iff a question is outstanding (optionally: iff it's THIS id)."""
+        with self._lock:
+            if self._async_question is None:
+                return False
+            return id is None or self._async_question["id"] == id
+
     def snapshot(self):
         with self._lock:
             # control_state is the orchestrator-visible plane (spec §6/§8): busy | awaiting_user |
@@ -1063,18 +1113,34 @@ class Session:
                 dec = {k: v for k, v in self._decision.items()
                        if k not in ("decision_key", "modal_dedup")}
                 snap["decision"] = dec
-            # Progress notes surface ONLY at a wake point (a pending decision, or terminal) — the
-            # gate mirrors the decision/terminal check above, deliberately NOT extended to the plain
-            # active-working branch below (anti-poll: see that branch's comment).
-            if self._decision is not None or terminal:
+            # async_question is its OWN field, entirely independent of decision above: an executor
+            # can be mid-question AND mid-blocking-decision at once (own slot, own supersede-free
+            # lifecycle — see record_async_question). event_id is internal (the EventQueue-side
+            # resolution handle), never exposed.
+            if self._async_question is not None:
+                snap["async_question"] = {k: v for k, v in self._async_question.items()
+                                          if k != "event_id"}
+            # Progress notes surface ONLY at a wake point (a pending decision, an outstanding async
+            # question, or terminal) — the gate mirrors the decision/terminal check above,
+            # deliberately NOT extended to the plain active-working branch below (anti-poll: see
+            # that branch's comment).
+            if self._decision is not None or self._async_question is not None or terminal:
                 snap.update(self._progress_view_locked())
             # active-working snapshots are deliberately low-information: no progress bait, just
             # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
             # `pending` means a RESPONDABLE decision is outstanding: a non-respondable `idle`
-            # (requires_response=False) is surfaced as a decision but is NOT pending (nothing to answer).
+            # (requires_response=False) is surfaced as a decision but is NOT pending (nothing to
+            # answer). async_question is deliberately NOT folded into `pending` (it never blocks;
+            # RESPONDABLE_KINDS/pending() must keep meaning "blocking decision only").
             snap["pending"] = (self._decision is not None
                                and self._decision.get("requires_response", True))
-            if self._decision is None and not terminal and self._state == "busy":
+            # The "still working, nelix will wake you" message is only accurate when NOTHING has
+            # woken the orchestrator yet. An outstanding async_question already tripped the waiter
+            # (record_async_question's publish) and is surfaced above via its own field, so this
+            # low-info filler would be stale/misleading here — suppress it whenever a question is
+            # outstanding, even with no _decision and the executor otherwise busy.
+            if (self._decision is None and self._async_question is None
+                    and not terminal and self._state == "busy"):
                 snap["message"] = ("Agent is still working. End your turn; nelix will wake "
                                    "you on the next event.")
             return snap
