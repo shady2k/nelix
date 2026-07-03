@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 
 import paths
 from daemon.drivers import get_driver
+from daemon.env_resolver import EnvResolveError
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.session import RespondOutcome, Session
 
@@ -195,6 +196,19 @@ class SessionManager:
                               model=model, driver=spec.driver)
         return replace(spec, args=[*cleaned, flag, model]), model
 
+    def _log_spawn_failure(self, event, session_id, exc):
+        """Log a spawn/restart failure. An EnvResolveError (nelix-c5o) is logged REDACTED — only
+        {var, reason}, WITHOUT exc_info: the exception is raised `from None` and stores no command /
+        stdout / stderr (so even a traceback could not leak the secret; spec §5), and a structured
+        record is cleaner. Every other error keeps the exc_info traceback for diagnosis."""
+        if self._logger is None:
+            return
+        if isinstance(exc, EnvResolveError):
+            self._logger.error("manager", event, session_id=session_id,
+                               reason="env_resolve_failed", var=exc.var, resolve_reason=exc.reason)
+        else:
+            self._logger.error("manager", event, session_id=session_id, exc_info=True)
+
     def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, reserve=False,
                model=None):
         # reserve=True: a slot reservation was made for us by restart() (old session popped +
@@ -272,15 +286,14 @@ class SessionManager:
         gc_sessions(keep, self._session_retain, self._session_max_age_days, logger=self._logger)
         try:
             sess.start(task, cwd)
-        except Exception:
+        except Exception as e:
             try:
                 sess.stop()                       # tear down any partially-spawned PTY / open dialog
             except Exception:
                 pass
             with self._lock:                      # don't leak a registered-but-unstarted session
                 self._sessions.pop(sid, None)     # reservation already consumed: slot frees cleanly
-            if self._logger is not None:
-                self._logger.error("manager", "session_start_failed", session_id=sid, exc_info=True)
+            self._log_spawn_failure("session_start_failed", sid, e)
             raise
         return StartOutcome(session_id=sid, base_seq=base_seq, snapshot=sess.snapshot())
 
@@ -346,10 +359,8 @@ class SessionManager:
             started = self._spawn(executor, task, cwd, lineage_id=lineage_id,
                                   restarted_from=session_id, reserve=reserve, model=model)
             new_sid, base_seq = started.session_id, started.base_seq
-        except Exception:
-            if self._logger is not None:
-                self._logger.error("manager", "restart_spawn_failed", session_id=session_id,
-                                   exc_info=True)
+        except Exception as e:
+            self._log_spawn_failure("restart_spawn_failed", session_id, e)
             return RestartOutcome("start_failed", lineage_id=lineage_id,
                                   restart_count=count, max_restarts=max_restarts)
         if self._logger is not None:
