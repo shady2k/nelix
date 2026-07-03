@@ -8,11 +8,13 @@ from dataclasses import dataclass, replace
 
 import paths
 from daemon.drivers import get_driver
-from daemon.env_resolver import EnvResolveError
+from daemon.env_resolver import EnvResolveError, resolve_env_cmds, _run_capture
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.session import RespondOutcome, Session
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
+_MODELS_MAX_BYTES = 65536  # nelix-g9k: bounded-capture cap for models_cmd stdout (a model list is
+                           # small; a producer past this is misconfigured -> output_too_large -> 502)
 
 
 class ModelRejected(ValueError):
@@ -20,6 +22,26 @@ class ModelRejected(ValueError):
     (empty / control chars / oversized) or a driver that cannot express a model override. A
     ValueError subclass (like PtyInputRejected) so /start maps it to 400 — caught ahead of the
     generic ValueError->409 branch (client input error, not daemon-full)."""
+
+
+class ModelsNotConfigured(Exception):
+    """nelix-g9k: the executor has no `models_cmd` configured. A distinct type (NOT a ValueError)
+    so the /models route maps it to a clean 400 'not configured' — relayable, so the orchestrator
+    learns not to retry — separate from an unknown-executor ValueError (404)."""
+
+    def __init__(self, executor):
+        super().__init__(f"executor {executor!r} has no models_cmd configured")
+        self.executor = executor
+
+
+class ModelsCmdError(Exception):
+    """nelix-g9k: `models_cmd` failed to produce output. Carries ONLY `reason` (∈ the _run_capture
+    reason set) — never the command, stdout, or stderr — so the route/manager can log/relay {reason}
+    without leaking a secret the command may have referenced (spec §5). Maps to a redacted 502."""
+
+    def __init__(self, reason):
+        super().__init__(f"models_cmd failed: {reason}")
+        self.reason = reason
 
 
 def _validate_model_shape(model):
@@ -584,6 +606,39 @@ class SessionManager:
                 "limit": self._limit,
                 "cursor": cursor,
                 "recent_terminal": recent}
+
+    def models(self, executor):
+        """nelix-g9k: read-only model discovery. LOCKLESS — reads the immutable `_specs` and runs
+        the executor's configured `models_cmd` with its RESOLVED env, relaying stdout. Never holds
+        `self._lock` across the subprocess and touches no session / capacity state. Returns
+        `(text, truncated)`.
+
+        Raises (each mapped to a distinct HTTP code by the /models route, never a generic 500):
+          - ValueError           unknown executor              -> 404
+          - ModelsNotConfigured  no `models_cmd` configured     -> 400 (relayable; don't retry)
+          - EnvResolveError      an `env_cmd` failed to resolve -> 502 (redacted)
+          - ModelsCmdError       `models_cmd` failed/oversized  -> 502 (redacted: only the reason)
+        """
+        spec = self._specs.get(executor)
+        if spec is None:
+            raise ValueError(f"unknown executor: {executor!r} (configured: {sorted(self._specs)})")
+        if spec.models_cmd is None:
+            raise ModelsNotConfigured(executor)
+        # The SAME env the child would get at spawn (minus hook injection): resolved_env() (os.environ
+        # + expanded static [env]) with env_cmd merged OVER it, so models_cmd can reference a
+        # c5o-resolved secret. Re-runs env_cmd per call (no caching) — a fresh secret-backend fetch,
+        # always current. An env_cmd failure raises EnvResolveError here (before models_cmd runs).
+        env = {**spec.resolved_env(),
+               **resolve_env_cmds(spec.env_cmd, os.environ, spec.env_cmd_timeout_seconds)}
+        value, reason = _run_capture(spec.models_cmd, env, spec.models_cmd_timeout_seconds,
+                                     _MODELS_MAX_BYTES)
+        if reason is not None:
+            # Redacted: only the reason crosses the boundary (never the command / stdout / stderr).
+            raise ModelsCmdError(reason)
+        # `truncated` is False under this fail-closed policy: an over-cap model list surfaces as a
+        # redacted output_too_large (502) above, never a silent truncation. The flag is kept in the
+        # return contract (and on the wire) so a future soft-truncate policy stays shape-compatible.
+        return value, False
 
     def stop(self, session_id, reason="user_stop"):
         with self._lock:
