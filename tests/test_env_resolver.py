@@ -125,6 +125,8 @@ def test_error_is_not_a_value_error():
 # resolve_env_cmds (above) is now rewritten on top of run_capture; these drive the helper
 # directly (real /bin/sh, no mocking except the OSError case) and assert it RAISES NOTHING —
 # every outcome is a (value, reason) tuple.
+import subprocess
+import threading
 import time
 
 from daemon.env_resolver import run_capture
@@ -233,3 +235,37 @@ def test_run_capture_captures_output_before_a_backgrounded_child():
     out = run_capture("echo hi; sleep 30 &", {}, 5.0, _CAP)
     assert out == ("hi", None)
     assert time.monotonic() - t0 < 5.0
+
+
+# ---- FIX 2: run_capture is TOTAL — no exception escapes after Popen -----------------------
+def test_run_capture_total_on_thread_start_failure(monkeypatch):
+    # A post-spawn failure (here Thread.start raising) must map to a redacted reason, never escape:
+    # an escaping exception could hit the /models generic 500 (embedding the argv in a traceback) or
+    # be misclassified by the route's broad `except ValueError` as a wrong 404. Cleanup still reaps
+    # the spawned child (bounded), so nothing leaks.
+    def boom(self):
+        raise RuntimeError("cannot start thread")
+    monkeypatch.setattr(threading.Thread, "start", boom)
+    value, reason = run_capture("echo hi", {}, 5.0, _CAP)
+    assert value is None and reason == "run_failed"
+
+
+def test_run_capture_total_on_proc_wait_failure(monkeypatch):
+    # A proc.wait() failure (any non-TimeoutExpired exception) is also caught -> run_failed, not an
+    # escaping exception.
+    def boom(self, timeout=None):
+        raise RuntimeError("wait blew up")
+    monkeypatch.setattr(subprocess.Popen, "wait", boom)
+    value, reason = run_capture("echo hi", {}, 5.0, _CAP)
+    assert value is None and reason == "run_failed"
+
+
+def test_run_capture_total_on_non_oserror_popen_failure(monkeypatch):
+    # A NON-OSError failure AT Popen (e.g. a bad arg -> ValueError) must also be caught, not escape
+    # and get misclassified by the /models route's broad `except ValueError` as a 404.
+    import daemon.env_resolver as er
+
+    def boom(*a, **k):
+        raise ValueError("bad Popen arg")
+    monkeypatch.setattr(er.subprocess, "Popen", boom)
+    assert run_capture("echo hi", {}, 5.0, _CAP) == (None, "spawn_failed")

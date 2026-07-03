@@ -36,8 +36,9 @@ _CLEANUP_GRACE = 2.0
 
 class EnvResolveError(Exception):
     """A `[executors.X.env_cmd]` command failed to produce a usable value. Carries ONLY `var` +
-    `reason` (∈ {non_zero_exit, timeout, empty_output, spawn_failed, decode_failed, output_too_large})
-    — never the command, stdout, or stderr — so no sink can leak the secret via this exception."""
+    `reason` (∈ {non_zero_exit, timeout, empty_output, spawn_failed, decode_failed, output_too_large,
+    run_failed}) — never the command, stdout, or stderr — so no sink can leak the secret via this
+    exception."""
 
     def __init__(self, var, reason):
         super().__init__(f"env_cmd for {var!r} failed: {reason}")
@@ -99,6 +100,7 @@ def run_capture(command, base_env, timeout, max_bytes):
       - OSError / spawn failure -> `(None, "spawn_failed")`
       - non-UTF-8 stdout        -> `(None, "decode_failed")`
       - stdout past `max_bytes` -> `(None, "output_too_large")` (child killed; memory stays bounded)
+      - any other post-spawn failure (Thread.start / proc.wait / ...) -> `(None, "run_failed")`
 
     Bounded capture (NOT `subprocess.run(capture_output=True)`, which buffers the WHOLE output in
     memory until the child exits — a fast producer would balloon memory within the timeout window):
@@ -123,7 +125,9 @@ def run_capture(command, base_env, timeout, max_bytes):
             env=base_env,                      # close_fds=True is the default: no PTY/socket FD leak
             start_new_session=True,            # own process group -> cleanup can kill backgrounded grandchildren
         )
-    except OSError:
+    except Exception:
+        # OSError (exec failed) or ANY other spawn-time failure (a bad env value -> ValueError, ...):
+        # map to a redacted reason. No proc exists to clean up (Popen closes its own fds on failure).
         return (None, "spawn_failed")
 
     chunks = []
@@ -147,19 +151,31 @@ def run_capture(command, base_env, timeout, max_bytes):
         except (OSError, ValueError):
             pass                               # pipe closed under us (timeout/overflow kill) -> stop
 
-    reader = threading.Thread(target=_drain, daemon=True)
-    reader.start()
+    reader = None
     timed_out = False
+    failed = False
     try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        reader = threading.Thread(target=_drain, daemon=True)
+        reader.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    except Exception:
+        # TOTAL after Popen: a Thread.start() / proc.wait() / reader-setup failure maps to a redacted
+        # reason instead of ESCAPING — an escaping exception could hit the /models generic 500
+        # (embedding the ['/bin/sh','-c',<command>] argv in a traceback) or be misclassified by the
+        # route's broad `except ValueError` as a wrong 404. Cleanup below still reaps the child.
+        failed = True
     finally:
-        # Bounded teardown on EVERY path (success / timeout / overflow): kill the group so a
-        # backgrounded grandchild holding the pipe can't wedge reader.join for its lifetime.
+        # Bounded teardown on EVERY path (success / timeout / overflow / failure): kill the group so a
+        # backgrounded grandchild holding the pipe can't wedge reader.join for its lifetime, and reap
+        # the child even when the body failed (no leaked child/thread).
         _cleanup(proc, reader)
     # Result derived AFTER cleanup: the reader has been joined (or bounded-abandoned), so `chunks`
     # and `exceeded` are final and stable.
+    if failed:
+        return (None, "run_failed")
     if timed_out:
         return (None, "timeout")
     if exceeded:
