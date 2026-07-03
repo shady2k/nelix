@@ -1,3 +1,4 @@
+import math
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -104,6 +105,20 @@ def _spec_num(spec, key, default, *, cast, floor=0):
     return cast(v)
 
 
+def _spec_timeout(spec, key, default):
+    """A per-executor timeout that must be a FINITE, strictly-positive number, else `default`.
+    Unlike `_spec_num`, TOML `inf`/`nan` are rejected here (they make `subprocess.run(timeout=...)`
+    never fire -> a hung /start, defeating the fail-closed contract) and 0/negatives are rejected
+    (a non-positive timeout is meaningless). Bad value -> default (lenient), never skips the executor."""
+    v = spec.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return default
+    v = float(v)
+    if not math.isfinite(v) or v <= 0:
+        return default
+    return v
+
+
 @dataclass
 class ExecutorLoad:
     specs: dict                  # name -> ExecutorSpec (valid only)
@@ -146,7 +161,7 @@ def _build_spec(name, spec):
         driver=spec["driver"],
         launcher=spec.get("launcher", "auto"),
         env_cmd=_build_env_cmd(name, spec),
-        env_cmd_timeout_seconds=_spec_num(spec, "env_cmd_timeout_seconds", 15.0, cast=float),
+        env_cmd_timeout_seconds=_spec_timeout(spec, "env_cmd_timeout_seconds", 15.0),
         settle_seconds=float(spec.get("settle_seconds", 1.5)),
         delivery_confirm_seconds=_spec_num(spec, "delivery_confirm_seconds", 10.0, cast=float),
         respond_write_seconds=_spec_num(spec, "respond_write_seconds", 5.0, cast=float),

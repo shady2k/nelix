@@ -293,6 +293,30 @@ def test_env_cmd_bad_timeout_falls_back_to_default(tmp_path):
     assert a.env_cmd_timeout_seconds == 15.0     # non-numeric -> default, no crash
 
 
+import pytest
+
+
+@pytest.mark.parametrize("val", ["inf", "-inf", "nan", "0", "0.0", "-3"])
+def test_env_cmd_timeout_non_finite_or_nonpositive_falls_back_to_default(tmp_path, val):
+    # inf/nan would make subprocess.run(timeout=...) never fire -> a stdin-less sleep hangs /start
+    # forever, defeating fail-closed; <=0 is meaningless. All fall back to the finite 15.0 default,
+    # and (unlike an int field) the executor still LOADS — this is a lenient per-field guard.
+    cfg = tmp_path / "n.toml"
+    cfg.write_text(f'[executors.a]\ncommand="x"\ndriver="claude"\nenv_cmd_timeout_seconds={val}\n')
+    load = load_executors(str(cfg))
+    assert "a" in load.specs                      # not skipped — bad timeout is defaulted, not fatal
+    a = load.specs["a"]
+    assert a.env_cmd_timeout_seconds == 15.0
+    import math
+    assert math.isfinite(a.env_cmd_timeout_seconds) and a.env_cmd_timeout_seconds > 0
+
+
+def test_env_cmd_timeout_positive_value_passes_through(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.a]\ncommand="x"\ndriver="claude"\nenv_cmd_timeout_seconds=0.5\n')
+    assert load_executors(str(cfg)).specs["a"].env_cmd_timeout_seconds == 0.5
+
+
 def test_env_cmd_empty_value_is_per_executor_error(tmp_path):
     cfg = tmp_path / "n.toml"
     cfg.write_text('[executors.bad]\ncommand="x"\ndriver="claude"\n'
