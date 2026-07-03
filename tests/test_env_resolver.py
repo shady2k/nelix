@@ -119,3 +119,93 @@ def test_error_is_not_a_value_error():
     # EnvResolveError must be distinguishable from a client ValueError so /start maps it to 502,
     # not the generic (RuntimeError, ValueError) -> 409.
     assert not issubclass(EnvResolveError, (ValueError, RuntimeError))
+
+
+# ---- nelix-g9k: _run_capture (bounded, TOTAL subprocess helper) ---------------------------
+# resolve_env_cmds (above) is now rewritten on top of _run_capture; these drive the helper
+# directly (real /bin/sh, no mocking except the OSError case) and assert it RAISES NOTHING —
+# every outcome is a (value, reason) tuple.
+import time
+
+from daemon.env_resolver import _run_capture
+
+_CAP = 65536
+
+
+def test_run_capture_success_strips_trailing_newline():
+    assert _run_capture("echo hi", {}, 5.0, _CAP) == ("hi", None)
+
+
+def test_run_capture_interior_whitespace_preserved():
+    assert _run_capture(r"printf 'a b\n\n'", {}, 5.0, _CAP) == ("a b", None)
+
+
+def test_run_capture_empty_output():
+    assert _run_capture("true", {}, 5.0, _CAP) == (None, "empty_output")
+
+
+def test_run_capture_whitespace_only_is_empty_output():
+    assert _run_capture(r"printf '\n\n'", {}, 5.0, _CAP) == (None, "empty_output")
+
+
+def test_run_capture_non_zero_exit():
+    # stdout present but a non-zero exit -> non_zero_exit (the value is discarded, never returned).
+    assert _run_capture("echo out; exit 3", {}, 5.0, _CAP) == (None, "non_zero_exit")
+
+
+def test_run_capture_timeout_kills_child_and_returns_promptly():
+    t0 = time.monotonic()
+    assert _run_capture("sleep 5", {}, 0.2, _CAP) == (None, "timeout")
+    assert time.monotonic() - t0 < 4.0        # returned on the 0.2s deadline, child killed (not 5s)
+
+
+def test_run_capture_spawn_failed_on_oserror(monkeypatch):
+    import daemon.env_resolver as er
+
+    def boom(*a, **k):
+        raise OSError("cannot exec")
+    monkeypatch.setattr(er.subprocess, "Popen", boom)
+    assert _run_capture("echo hi", {}, 5.0, _CAP) == (None, "spawn_failed")
+
+
+def test_run_capture_decode_failed_on_non_utf8_stdout():
+    # printf octal escapes emit raw bytes; 0xFF is never a valid UTF-8 byte -> decode_failed.
+    assert _run_capture(r"printf '\377\376'", {}, 5.0, _CAP) == (None, "decode_failed")
+
+
+def test_run_capture_output_too_large_kills_producer_and_bounds_memory():
+    # An UNBOUNDED producer past the cap must be KILLED (return promptly), NOT buffered until the
+    # timeout — this is the bounded-capture guarantee subprocess.run(capture_output=True) lacks. A
+    # generous 10s timeout: had we returned via timeout instead of the cap-kill, the call would take
+    # ~10s; it returns in well under a second, proving the child was killed at the cap.
+    t0 = time.monotonic()
+    value, reason = _run_capture("while :; do printf 'xxxxxxxxxxxxxxxx'; done", {}, 10.0, 1024)
+    assert (value, reason) == (None, "output_too_large")
+    assert time.monotonic() - t0 < 5.0        # killed on the cap, did NOT run to the 10s timeout
+
+
+def test_run_capture_exactly_at_cap_is_accepted():
+    # output length == max_bytes is at the boundary (not OVER it) -> success, not output_too_large.
+    assert _run_capture("printf 'abcde'", {}, 5.0, 5) == ("abcde", None)
+
+
+def test_run_capture_one_byte_over_cap_is_too_large():
+    assert _run_capture("printf 'abcdef'", {}, 5.0, 5) == (None, "output_too_large")
+
+
+def test_run_capture_ambient_env_visible_to_command():
+    out = _run_capture('printf %s "$SEED"', {"SEED": "amb", "PATH": "/usr/bin:/bin"}, 5.0, _CAP)
+    assert out == ("amb", None)
+
+
+def test_run_capture_stdin_is_devnull_not_inherited():
+    # stdin=DEVNULL: a command that reads stdin sees immediate EOF, never blocks on the daemon's fd 0.
+    r_fd, w_fd = os.pipe()                     # never written, write end held open -> no EOF if inherited
+    saved0 = os.dup(0)
+    try:
+        os.dup2(r_fd, 0)
+        assert _run_capture("read x; echo ok", {}, 3.0, _CAP) == ("ok", None)   # must NOT time out
+    finally:
+        os.dup2(saved0, 0)
+        for fd in (saved0, r_fd, w_fd):
+            os.close(fd)

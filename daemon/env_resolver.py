@@ -1,27 +1,36 @@
-"""nelix-c5o: resolve runtime env values by running a command and using its stdout.
+"""nelix-c5o / nelix-g9k: run a command and use its stdout — the shared, bounded subprocess helper.
 
 A `[executors.X.env_cmd]` entry maps an env var to a shell command; at spawn nelix runs the command
 and uses its trimmed stdout as the var's value in the child env. This retires the per-service wrapper
 (nelix builds the full launch env and spawns the leaf CLI directly) and lets nelix own the launch env.
+nelix-g9k reuses the SAME helper (`_run_capture`) for `models_cmd` (read-only model discovery) so
+both paths share one `close_fds`/`stdin=DEVNULL`/timeout/bounded-capture/leak discipline.
 
 Fork-safety (spec §4.2): the daemon routes PTY spawns through the single-threaded pty_broker because
 `os.forkpty()` runs Python after the fork (deadlock hazard). This is a DIFFERENT mechanism:
-`subprocess.run` uses `_posixsubprocess`'s C `_fork_exec`, which does an immediate C-level exec with
+`subprocess.Popen` uses `_posixsubprocess`'s C `_fork_exec`, which does an immediate C-level exec with
 only async-signal-safe work between fork and exec (no Python post-fork) — the standard, thread-safe
 way to run a subprocess. `close_fds=True` (the default) is kept so the child never inherits the PTY
 master / control-socket FDs. So this runs on the RPC handler thread, NOT through the broker.
 
-Secret-leak guard (spec §5): on failure we raise EnvResolveError(var, reason) **from None**, storing
-NEITHER the command NOR stdout/stderr — a chained CalledProcessError / TimeoutExpired traceback embeds
-the ['/bin/sh','-c',<command>] argv, which exc_info logging would then write out (a command can carry
-a secret path). The message names only the VAR and a generic reason.
+Secret-leak guard (spec §5): `_run_capture` is TOTAL — it returns `(value, reason)` and RAISES
+NOTHING, so no subprocess exception (a `CalledProcessError` / `TimeoutExpired` traceback embeds the
+`['/bin/sh','-c',<command>]` argv, which exc_info logging would then write out) can cross the
+boundary. The command / stdout / stderr are never stored or returned. Callers turn a non-None reason
+into their OWN typed error, raised OUTSIDE any except so `__context__` stays clean.
 """
 import subprocess
+import threading
+
+# Bounded-capture cap for env_cmd stdout: a runtime env value (auth token, backend addr) is tiny, so
+# 1 MiB is a generous anti-runaway ceiling, not a tuning knob. models_cmd passes its own cap.
+_ENV_CMD_MAX_BYTES = 1 << 20
+_READ_CHUNK = 65536
 
 
 class EnvResolveError(Exception):
-    """A `[executors.X.env_cmd]` command failed to produce a usable value: non-zero exit, timeout, or
-    empty (post-strip) stdout. Carries ONLY `var` + `reason` (∈ {non_zero_exit, timeout, empty_output})
+    """A `[executors.X.env_cmd]` command failed to produce a usable value. Carries ONLY `var` +
+    `reason` (∈ {non_zero_exit, timeout, empty_output, spawn_failed, decode_failed, output_too_large})
     — never the command, stdout, or stderr — so no sink can leak the secret via this exception."""
 
     def __init__(self, var, reason):
@@ -30,36 +39,106 @@ class EnvResolveError(Exception):
         self.reason = reason
 
 
+def _close(f):
+    try:
+        f.close()
+    except OSError:
+        pass
+
+
+def _run_capture(command, base_env, timeout, max_bytes):
+    """Run `/bin/sh -c command` and capture up to `max_bytes` of stdout, BOUNDED. TOTAL: returns
+    `(value, reason)` and RAISES NOTHING — no subprocess exception can drag the command / argv /
+    stdout / stderr into a traceback (spec §4.2, §5).
+
+    Success -> `(stdout.rstrip("\\n"), None)` (mirrors shell `$(...)`). Every expected failure maps
+    to a redacted reason, never re-raised:
+      - non-zero exit           -> `(None, "non_zero_exit")`
+      - timeout (child killed)  -> `(None, "timeout")`
+      - empty post-strip stdout -> `(None, "empty_output")`
+      - OSError / spawn failure -> `(None, "spawn_failed")`
+      - non-UTF-8 stdout        -> `(None, "decode_failed")`
+      - stdout past `max_bytes` -> `(None, "output_too_large")` (child killed; memory stays bounded)
+
+    Bounded capture (NOT `subprocess.run(capture_output=True)`, which buffers the WHOLE output in
+    memory until the child exits — a fast producer would balloon memory within the timeout window):
+    a background reader drains stdout so a large producer can't wedge the child on a full pipe, reads
+    at most `max_bytes + 1` bytes total, and kills the child the moment it exceeds the cap.
+    stderr -> DEVNULL (never captured — it is redacted anyway — and a full stderr pipe can't deadlock
+    the child). stdin=DEVNULL + close_fds default: never inherit the daemon's stdin / PTY / socket FDs.
+    """
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", command],
+            stdin=subprocess.DEVNULL,          # command reading stdin sees EOF, never the daemon's fd 0
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,         # redacted + a full stderr pipe can't deadlock the child
+            env=base_env,                      # close_fds=True is the default: no PTY/socket FD leak
+        )
+    except OSError:
+        return (None, "spawn_failed")
+
+    chunks = []
+    total = 0
+    exceeded = False
+
+    def _drain():
+        # Read AT MOST max_bytes + 1 bytes; one byte over the cap is enough to prove the producer
+        # exceeded it. read1() returns the bytes already available in a single underlying read (it
+        # does NOT block for a full `n` like read()), so a slow producer still drains promptly.
+        nonlocal total, exceeded
+        try:
+            while total <= max_bytes:
+                b = proc.stdout.read1(min(_READ_CHUNK, max_bytes + 1 - total))
+                if not b:
+                    return                     # EOF: the child closed stdout
+                chunks.append(b)
+                total += len(b)
+            exceeded = True
+            proc.kill()                        # over the cap: kill so proc.wait() returns at once
+        except (OSError, ValueError):
+            pass                               # pipe closed under us (timeout/overflow kill) -> stop
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        reader.join()
+        _close(proc.stdout)
+        return (None, "timeout")
+    reader.join()
+    _close(proc.stdout)
+    if exceeded:
+        return (None, "output_too_large")
+    if proc.returncode != 0:
+        return (None, "non_zero_exit")
+    try:
+        text = b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        return (None, "decode_failed")
+    value = text.rstrip("\n")
+    if value == "":
+        return (None, "empty_output")
+    return (value, None)
+
+
 def resolve_env_cmds(env_cmd, base_env, timeout):
     """Run each `{var: command}` and return `{var: value}` where value = the command's stdout with
     trailing newlines stripped (mirroring shell `$(...)`). Each command runs via `/bin/sh -c` with
-    `env=base_env` (the daemon's ambient env) so whatever the command needs is available. A non-zero
-    exit, a timeout (the child is killed), or empty post-strip stdout raises EnvResolveError from None
-    (no command/stdout/stderr retained). An empty `env_cmd` is a no-op ({})."""
+    `env=base_env` (the daemon's ambient env) so whatever the command needs is available. Any failure
+    (non-zero exit, timeout, empty/oversized/undecodable stdout, spawn failure) raises
+    EnvResolveError(var, reason). An empty `env_cmd` is a no-op ({})."""
     resolved = {}
     for var, command in env_cmd.items():
-        # Capture the failure reason INSIDE the handler but raise OUTSIDE it: once control leaves the
-        # except block Python has cleared the handled exception, so EnvResolveError.__context__ is
-        # genuinely None (not merely display-suppressed). Nothing that could carry the command / argv
-        # / stderr is ever referenced by the raised exception — a structural leak guard (spec §5).
-        reason = None
-        try:
-            proc = subprocess.run(
-                ["/bin/sh", "-c", command],
-                capture_output=True, text=True, timeout=timeout, env=base_env,
-                stdin=subprocess.DEVNULL,         # never inherit/consume the daemon's stdin: a
-                                                  # stdin-reading command sees EOF, not a hang
-                                                  # (mirrors reaper.py's subprocess discipline)
-                check=True,                       # non-zero exit -> CalledProcessError
-            )
-        except subprocess.TimeoutExpired:
-            reason = "timeout"                    # child already killed by subprocess.run
-        except subprocess.CalledProcessError:
-            reason = "non_zero_exit"
+        value, reason = _run_capture(command, base_env, timeout, _ENV_CMD_MAX_BYTES)
+        # Raise OUTSIDE any except (there is none — _run_capture returned a tuple, no exception is in
+        # flight) so EnvResolveError.__context__ / __cause__ are genuinely None (not merely
+        # display-suppressed). _run_capture already stripped every command / argv / stdout / stderr,
+        # so the ONLY thing crossing this boundary is (var, reason) — a structural leak guard (§5).
         if reason is not None:
-            raise EnvResolveError(var, reason) from None
-        value = proc.stdout.rstrip("\n")
-        if value == "":
-            raise EnvResolveError(var, "empty_output") from None
+            raise EnvResolveError(var, reason)
         resolved[var] = value
     return resolved
