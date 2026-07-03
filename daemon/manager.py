@@ -23,17 +23,21 @@ class ModelRejected(ValueError):
 
 def _validate_model_shape(model):
     """Shape-only validation (spec §5): pass-through — nelix keeps no allowlist, the CLI is the
-    authority on model validity. Returns the stripped value, or raises ModelRejected."""
+    authority on model validity. A clean value is forwarded VERBATIM; the checks run on the ORIGINAL
+    string (never a normalized copy) so an edge control char or surrounding whitespace is REJECTED,
+    not silently trimmed-and-accepted. `.strip()` is used ONLY to detect the empty/whitespace-only
+    case. Returns the value unchanged, or raises ModelRejected."""
     if not isinstance(model, str):
         raise ModelRejected(f"model must be a string, got {type(model).__name__}")
-    s = model.strip()
-    if not s:
-        raise ModelRejected("model is empty after stripping whitespace")
-    if len(s) > _MODEL_MAX_LEN:
+    if not model.strip():
+        raise ModelRejected("model is empty or whitespace-only")
+    if len(model) > _MODEL_MAX_LEN:
         raise ModelRejected(f"model is too long (max {_MODEL_MAX_LEN} chars)")
-    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in s):
-        raise ModelRejected("model contains ASCII control characters")
-    return s
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in model):
+        raise ModelRejected("model contains ASCII control characters (incl newline/tab)")
+    if model != model.strip():
+        raise ModelRejected("model has leading or trailing whitespace")
+    return model
 
 
 def _strip_model_flag(args, flag):

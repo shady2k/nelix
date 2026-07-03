@@ -62,10 +62,12 @@ def test_duplicate_model_flags_collapse_to_single_injected():
     assert cap[0].spec.args.count("--model") == 1
 
 
-def test_model_value_is_stripped_of_surrounding_whitespace():
+@pytest.mark.parametrize("clean", ["haiku", "claude-fable-5", "GLM-4.7", "us.anthropic.claude-opus"])
+def test_clean_model_is_forwarded_verbatim(clean):
+    # A clean value is forwarded EXACTLY (no silent normalization) — the CLI is the authority.
     m, cap = _mgr(make_spec(args=[], driver="claude"))
-    m.start(EXECUTOR, "t", "/tmp", model="  sonnet  ")
-    assert cap[0].spec.args == ["--model", "sonnet"]
+    m.start(EXECUTOR, "t", "/tmp", model=clean)
+    assert cap[0].spec.args == ["--model", clean]
 
 
 def test_no_model_leaves_args_byte_identical():
@@ -77,8 +79,15 @@ def test_no_model_leaves_args_byte_identical():
     assert cap[0].spec is spec                      # SAME spec object: broker argv identical to pre-feature
 
 
-# ---- shape validation (pass-through: shape only, no allowlist) -------------------------
-@pytest.mark.parametrize("bad", ["", "   ", "\t", "\n", "hai\nku", "mo\x00del", "a\x1bb", "x" * 129])
+# ---- shape validation (pass-through: shape only, no allowlist; verbatim, never normalized) ---------
+# Leading/trailing whitespace and ANY ASCII control char (incl edge newline/tab) are REJECTED, not
+# silently trimmed — a value that would need normalization to be safe is refused (spec §5).
+@pytest.mark.parametrize("bad", [
+    "", "   ", "\t", "\n",                 # empty / whitespace-only
+    "hai\nku", "mo\x00del", "a\x1bb",      # interior control chars
+    "haiku\n", "haiku\t", "\thaiku", "\nhaiku",   # EDGE control chars (were silently trimmed before)
+    " haiku", "haiku ", " haiku ",         # leading/trailing space
+    "x" * 129])                            # oversized
 def test_bad_shape_rejected(bad):
     m, _ = _mgr(make_spec(driver="claude"))
     with pytest.raises(ModelRejected):
