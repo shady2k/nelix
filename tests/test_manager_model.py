@@ -163,3 +163,90 @@ def test_no_preexisting_flag_does_not_emit_override_applied():
                 logger=Logger(level="debug", stream=buf))
     m.start(EXECUTOR, "t", "/tmp", model="haiku")     # nothing pre-existing was overridden
     assert "model_override_applied" not in _events(buf)
+
+
+# ---- restart / recovery carries the per-session override (FIX 1) ------------------------
+# The start-time override is same-lineage RECOVERY state (not runtime switching): an auto-restart
+# (crash / delivery-failure) MUST come back on the SAME model, never a silent downgrade to default.
+class _RestartCapSession:
+    """A restartable session double that captures the ExecutorSpec it was built with and does NOT
+    auto-terminate (stays in _sessions so restart() takes the active-session source path)."""
+    instances = []
+    def __init__(self, sid, executor, spec):
+        self._id = sid; self._executor = executor; self.spec = spec
+        self.on_terminal = None; self.reaper_ctx = None
+        self.lineage_id = None; self.restarted_from = None; self.restart_count = 0
+        self.model = None; self._task = None; self._cwd = None; self.stopped = False
+        _RestartCapSession.instances.append(self)
+    @property
+    def executor(self): return self._executor
+    @property
+    def task(self): return self._task
+    @property
+    def cwd(self): return self._cwd
+    def start(self, task, cwd): self._task = task; self._cwd = cwd
+    def stop(self): self.stopped = True
+    def snapshot(self): return {"session_id": self._id, "control_state": "busy"}
+    def terminal_snapshot(self):
+        return {"session_id": self._id, "terminal": True, "terminal_kind": "crashed",
+                "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
+                "restart_count": 0}
+
+
+def _restart_mgr(tmp_path, monkeypatch, spec=None, limit=2):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _RestartCapSession.instances = []
+    specs = {EXECUTOR: spec or make_spec(command="claude", args=["--foo"], driver="claude",
+                                         max_restarts=3)}
+    m = SessionManager(specs, EventQueue(), concurrency_limit=limit,
+                       session_factory=lambda sid, ex, sp, ev: _RestartCapSession(sid, ex, sp),
+                       session_retain=0, session_max_age_days=0)
+    return m
+
+
+def test_restart_active_session_reinjects_same_model(tmp_path, monkeypatch):
+    m = _restart_mgr(tmp_path, monkeypatch)
+    out = m.start(EXECUTOR, "task A", str(tmp_path), model="haiku")
+    assert _RestartCapSession.instances[0].spec.args == ["--foo", "--model", "haiku"]
+    r = m.restart(out.session_id)                          # active-session source path
+    assert r.status == "restarted"
+    assert _RestartCapSession.instances[1].spec.args == ["--foo", "--model", "haiku"]
+
+
+def test_restart_from_persisted_meta_reinjects_same_model(tmp_path, monkeypatch):
+    import paths
+    m = _restart_mgr(tmp_path, monkeypatch)
+    out = m.start(EXECUTOR, "task B", str(tmp_path), model="sonnet"); sid = out.session_id
+    # Simulate a crash: persist meta WITH the model (real _write_meta does this) and free the slot.
+    paths.ensure_private_dir(paths.sessions_root() / sid)
+    paths.session_meta(paths.sessions_root() / sid).write_text(
+        __import__("json").dumps({"executor": EXECUTOR, "task": "task B", "cwd": str(tmp_path),
+                                  "lineage_id": sid, "restarted_from": None, "model": "sonnet"}))
+    m._free_slot(sid)                                      # gone from _sessions -> meta source path
+    r = m.restart(sid)
+    assert r.status == "restarted"
+    assert _RestartCapSession.instances[-1].spec.args == ["--foo", "--model", "sonnet"]
+
+
+def test_restart_without_model_argv_matches_no_model_baseline(tmp_path, monkeypatch):
+    m = _restart_mgr(tmp_path, monkeypatch)
+    out = m.start(EXECUTOR, "task C", str(tmp_path))       # NO model
+    assert _RestartCapSession.instances[0].spec.args == ["--foo"]
+    r = m.restart(out.session_id)
+    assert r.status == "restarted"
+    assert _RestartCapSession.instances[1].spec.args == ["--foo"]     # byte-identical, no --model
+
+
+def test_restart_from_old_meta_without_model_key_is_clean(tmp_path, monkeypatch):
+    import paths
+    m = _restart_mgr(tmp_path, monkeypatch)
+    out = m.start(EXECUTOR, "task D", str(tmp_path)); sid = out.session_id
+    # OLD meta shape: no "model" key at all -> restart must default to None (no override, no crash).
+    paths.ensure_private_dir(paths.sessions_root() / sid)
+    paths.session_meta(paths.sessions_root() / sid).write_text(
+        __import__("json").dumps({"executor": EXECUTOR, "task": "task D", "cwd": str(tmp_path),
+                                  "lineage_id": sid, "restarted_from": None}))
+    m._free_slot(sid)
+    r = m.restart(sid)
+    assert r.status == "restarted"
+    assert _RestartCapSession.instances[-1].spec.args == ["--foo"]    # no override

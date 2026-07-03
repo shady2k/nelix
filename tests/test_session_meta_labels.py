@@ -66,6 +66,27 @@ def test_meta_file_persists_task_cwd_lineage(tmp_path, monkeypatch):
     assert meta["executor"] == "claude"
 
 
+def test_meta_persists_model_override(tmp_path, monkeypatch):
+    # nelix-9k0 FIX 1: the manager-set per-session model override is persisted so a from-crash
+    # restart (which reads meta off disk) re-injects the SAME model instead of the executor default.
+    sess = _session(tmp_path, monkeypatch)
+    sess.lineage_id = "s-aaaa0001"
+    sess.model = "haiku"
+    sess.start("do the thing", str(tmp_path))
+    sess.stop()
+    meta = json.loads(paths.session_meta(paths.sessions_root() / "s-aaaa0001").read_text())
+    assert meta["model"] == "haiku"
+
+
+def test_meta_model_defaults_to_none_when_unset(tmp_path, monkeypatch):
+    sess = _session(tmp_path, monkeypatch)
+    sess.lineage_id = "s-aaaa0001"
+    sess.start("do the thing", str(tmp_path))         # no model set -> None (no override)
+    sess.stop()
+    meta = json.loads(paths.session_meta(paths.sessions_root() / "s-aaaa0001").read_text())
+    assert meta["model"] is None
+
+
 def test_properties_expose_executor_task_cwd(tmp_path, monkeypatch):
     sess = _session(tmp_path, monkeypatch)
     sess.start("a task", str(tmp_path))
