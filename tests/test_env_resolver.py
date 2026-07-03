@@ -269,3 +269,56 @@ def test_run_capture_total_on_non_oserror_popen_failure(monkeypatch):
         raise ValueError("bad Popen arg")
     monkeypatch.setattr(er.subprocess, "Popen", boom)
     assert run_capture("echo hi", {}, 5.0, _CAP) == (None, "spawn_failed")
+
+
+# ---- FIX A: the group-kill must run while proc.pid is still OWNED (unreaped) --------------
+def test_run_capture_group_kill_happens_before_reap(monkeypatch):
+    # PID-reuse safety: teardown must SIGKILL the child's process group BEFORE reaping the child.
+    # Once reaped, proc.pid is released and can be reused as an unrelated pgid, so a later
+    # killpg(proc.pid) could hit the WRONG group. Assert the order structurally (killpg strictly
+    # before the reaping wait) and that the child is NOT reaped when killpg fires.
+    import daemon.env_resolver as er
+    order = []
+    real_killpg = os.killpg
+    real_reap = er._reap
+
+    def spy_killpg(pgid, sig):
+        assert "reap" not in order, "child was reaped BEFORE the group-kill (pid-reuse race)"
+        order.append("killpg")
+        return real_killpg(pgid, sig)
+
+    def spy_reap(proc):
+        order.append("reap")
+        return real_reap(proc)
+    monkeypatch.setattr(er.os, "killpg", spy_killpg)
+    monkeypatch.setattr(er, "_reap", spy_reap)
+    assert run_capture("echo hi", {}, 5.0, _CAP) == ("hi", None)
+    assert order == ["killpg", "reap"]            # group-kill strictly before the reaping wait
+
+
+def test_run_capture_primary_wait_is_non_reaping_wnowait(monkeypatch):
+    # The primary wait must observe the child's exit WITHOUT reaping it (os.waitid WNOWAIT), so the
+    # pid stays owned until the group-kill. Assert every primary-wait call carries WNOWAIT.
+    import daemon.env_resolver as er
+    seen = []
+    real_waitid = os.waitid
+
+    def spy_waitid(idtype, id, options):
+        seen.append(options)
+        return real_waitid(idtype, id, options)
+    monkeypatch.setattr(er.os, "waitid", spy_waitid)
+    assert run_capture("echo hi", {}, 5.0, _CAP) == ("hi", None)
+    assert seen, "primary wait must use os.waitid"
+    assert all(o & os.WNOWAIT for o in seen), "primary wait must be WNOWAIT (must not reap)"
+
+
+def test_run_capture_total_on_primary_wait_failure(monkeypatch):
+    # The primary wait is now os.waitid; an UNEXPECTED error there must be caught -> run_failed, never
+    # an escaping exception (total guarantee preserved after the FIX A restructure).
+    import daemon.env_resolver as er
+
+    def boom(*a, **k):
+        raise RuntimeError("waitid blew up")
+    monkeypatch.setattr(er.os, "waitid", boom)
+    value, reason = run_capture("echo hi", {}, 5.0, _CAP)
+    assert value is None and reason == "run_failed"

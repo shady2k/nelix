@@ -23,6 +23,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 
 # Bounded-capture cap for env_cmd stdout: a runtime env value (auth token, backend addr) is tiny, so
 # 1 MiB is a generous anti-runaway ceiling, not a tuning knob. models_cmd passes its own cap.
@@ -32,6 +33,10 @@ _READ_CHUNK = 65536
 # process group has been SIGKILLed. Killing the group frees any grandchild-held pipe, so the reader
 # hits EOF and the join returns near-instantly; this is only the backstop if that ever stalls.
 _CLEANUP_GRACE = 2.0
+# Granularity of the non-reaping exit poll (os.waitid WNOHANG loop). A fast command is caught within
+# one interval; a bounded busy-ish poll is the pragmatic POSIX way to "wait with a timeout WITHOUT
+# reaping" (there is no timeout arg to waitid, and proc.wait would reap).
+_EXIT_POLL_INTERVAL = 0.01
 
 
 class EnvResolveError(Exception):
@@ -71,6 +76,27 @@ def _reap(proc):
         proc.wait(timeout=_CLEANUP_GRACE)
     except Exception:
         pass                                   # bounded; a stuck reap must not wedge the call
+
+
+def _wait_exit_no_reap(proc, timeout):
+    """Wait up to `timeout`s for the child to exit WITHOUT reaping it, so proc.pid stays OWNED and a
+    later killpg can't hit a REUSED pid (FIX A). Uses os.waitid(WEXITED | WNOWAIT | WNOHANG): WNOWAIT
+    observes the exit while leaving the child waitable (a subsequent proc.wait still reaps it); WNOHANG
+    keeps the poll non-blocking against a monotonic deadline. Returns True if the child exited within
+    the deadline, False if it is still running (timed out). A gone/reaped child (ChildProcessError /
+    ECHILD) is treated as exited; ANY other error propagates so the caller maps it to run_failed."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            info = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        except ChildProcessError:
+            return True                        # no such child -> already gone; treat as exited
+        if info is not None:
+            return True                        # exited (still a zombie -> pid owned, still reapable)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False                       # still running at the deadline -> timed out
+        time.sleep(min(_EXIT_POLL_INTERVAL, remaining))
 
 
 def _cleanup(proc, reader):
@@ -157,12 +183,12 @@ def run_capture(command, base_env, timeout, max_bytes):
     try:
         reader = threading.Thread(target=_drain, daemon=True)
         reader.start()
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        # FIX A: observe the child's exit WITHOUT reaping it (WNOWAIT), so proc.pid stays owned until
+        # the group-kill in _cleanup. Reaping here (the old proc.wait) then killing the group later
+        # could SIGKILL a REUSED pid's group on a high-churn daemon.
+        timed_out = not _wait_exit_no_reap(proc, timeout)
     except Exception:
-        # TOTAL after Popen: a Thread.start() / proc.wait() / reader-setup failure maps to a redacted
+        # TOTAL after Popen: a Thread.start() / waitid / reader-setup failure maps to a redacted
         # reason instead of ESCAPING — an escaping exception could hit the /models generic 500
         # (embedding the ['/bin/sh','-c',<command>] argv in a traceback) or be misclassified by the
         # route's broad `except ValueError` as a wrong 404. Cleanup below still reaps the child.
@@ -180,6 +206,8 @@ def run_capture(command, base_env, timeout, max_bytes):
         return (None, "timeout")
     if exceeded:
         return (None, "output_too_large")
+    if proc.returncode is None:
+        return (None, "run_failed")            # reap did not complete -> exit status unknown
     if proc.returncode != 0:
         return (None, "non_zero_exit")
     try:
