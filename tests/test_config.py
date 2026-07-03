@@ -352,3 +352,61 @@ def test_env_cmd_key_with_equals_is_per_executor_error(tmp_path):
     load = load_executors(str(cfg))
     assert "bad" not in load.specs
     assert any(e["name"] == "bad" and "env_cmd" in e["problem"] for e in load.executor_errors)
+
+
+# ---- nelix-g9k: models_cmd (read-only model discovery command) -----------------------------
+def test_models_cmd_defaults_none_and_timeout_default(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.a]\ncommand="x"\ndriver="claude"\n')
+    a = load_executors(str(cfg)).specs["a"]
+    assert a.models_cmd is None                      # absent -> None (executor exposes no model list)
+    assert a.models_cmd_timeout_seconds == 15.0      # default
+
+
+def test_models_cmd_parsed_and_timeout_override(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text(
+        '[executors.a]\ncommand="x"\ndriver="claude"\n'
+        'models_cmd="list-the-models"\nmodels_cmd_timeout_seconds=30\n')
+    a = load_executors(str(cfg)).specs["a"]
+    assert a.models_cmd == "list-the-models"
+    assert a.models_cmd_timeout_seconds == 30.0
+
+
+def test_models_cmd_bad_timeout_falls_back_to_default(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.a]\ncommand="x"\ndriver="claude"\n'
+                   'models_cmd="x"\nmodels_cmd_timeout_seconds="oops"\n')
+    a = load_executors(str(cfg)).specs["a"]
+    assert a.models_cmd_timeout_seconds == 15.0      # non-numeric -> default (mirrors env_cmd timeout)
+
+
+def test_models_cmd_non_string_is_per_executor_error(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.bad]\ncommand="x"\ndriver="claude"\nmodels_cmd=123\n'
+                   '[executors.good]\ncommand="y"\ndriver="claude"\n')
+    load = load_executors(str(cfg))
+    assert set(load.specs) == {"good"}               # bad skipped, good still loads (resilient)
+    assert any(e["name"] == "bad" and "models_cmd" in e["problem"] for e in load.executor_errors)
+
+
+def test_models_cmd_empty_string_is_per_executor_error(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.bad]\ncommand="x"\ndriver="claude"\nmodels_cmd=""\n'
+                   '[executors.good]\ncommand="y"\ndriver="claude"\n')
+    load = load_executors(str(cfg))
+    assert set(load.specs) == {"good"}
+    assert any(e["name"] == "bad" and "models_cmd" in e["problem"] for e in load.executor_errors)
+
+
+def test_models_cmd_load_error_omits_the_command_value(tmp_path):
+    # The command can carry a secret path; the per-executor load error names the field/problem but
+    # NEVER echoes the models_cmd value (mirrors _build_env_cmd, which echoes only the var name). A
+    # non-string value carrying a secret marker proves the message doesn't interpolate the value.
+    secret = "fetch-SECRETMARKER-token"
+    cfg = tmp_path / "n.toml"
+    cfg.write_text(f'[executors.bad]\ncommand="x"\ndriver="claude"\nmodels_cmd=["{secret}"]\n')
+    load = load_executors(str(cfg))
+    err = [e for e in load.executor_errors if e["name"] == "bad"]
+    assert err and "models_cmd" in err[0]["problem"]
+    assert secret not in err[0]["problem"]           # the value is never echoed into the message
