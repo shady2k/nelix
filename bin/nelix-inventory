@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""One-off harvest script: maps each invariant in tests/golden/invariants.py::INVARIANTS to a
-real session raw in the corpus (or classifies it as already-covered / synthetic / gap).
+"""Harvest script: maps each invariant in tests/golden/invariants.py::INVARIANTS to a real capture
+in the COMMITTED corpus (or classifies it as already-covered / synthetic / gap).
 
 Usage:
     .venv/bin/python bin/nelix-inventory > tests/golden/INVENTORY.md
 
-Output: a Markdown manifest — one row per invariant plus an "Unmapped real states" section
-listing corpus screens/markers that no invariant claims.
+Corpus = the checked-in captures under tests/golden/claude/_regression/ ONLY — both raw PTY dumps
+(`*.raw`) and timed captures (`*.capture`, read via daemon.capture.read_capture). There is NO
+per-machine / live sessions source, so the manifest regenerates deterministically from tracked
+inputs (nelix-puf).
+
+Output: a Markdown manifest — one row per invariant plus a committed-corpus listing.
 
 No production code under daemon/ is touched.
 """
-import json
 import re
 import sys
 from pathlib import Path
@@ -19,31 +22,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from daemon.capture import read_capture                 # noqa: E402
 from daemon.renderer.base import make_renderer          # noqa: E402
 from tests.golden.invariants import INVARIANTS          # noqa: E402
 
-# ── corpus locations ──────────────────────────────────────────────────────────
-SESSIONS_DIR = Path.home() / ".hermes/profiles/local/workspace/nelix/sessions"
+# ── corpus location ───────────────────────────────────────────────────────────
 REGRESSION_DIR = ROOT / "tests/golden/claude/_regression"
-
-# Minimum raw size to skip empty/aborted sessions (~1882 bytes = empty startup)
-MIN_RAW_BYTES = 5_000
 
 CHUNK = 64   # replay granularity — same as nelix-capture
 
 
 # ── replay helpers ────────────────────────────────────────────────────────────
 
-def _load_dims(session_dir: Path) -> tuple[int, int]:
-    """Read cols/rows from meta.json, fallback to 120x40."""
-    meta = session_dir / "meta.json"
-    if meta.exists():
-        try:
-            m = json.loads(meta.read_text())
-            return int(m.get("cols", 120)), int(m.get("rows", 40))
-        except (OSError, ValueError, TypeError):
-            pass
-    return 120, 40
+def _source_bytes(path: Path) -> bytes:
+    """Raw PTY byte stream for a committed source. `*.raw` is the byte stream as-is; `*.capture`
+    is the timed format (daemon.capture) whose concatenated record payloads reproduce the raw
+    stream exactly (see daemon.capture.synthesize_capture)."""
+    if path.suffix == ".capture":
+        return b"".join(chunk for _, chunk in read_capture(path))
+    return path.read_bytes()
 
 
 def _frames(data: bytes, cols: int, rows: int):
@@ -59,46 +56,24 @@ def _frames(data: bytes, cols: int, rows: int):
 
 def first_frame(raw_path: Path, cols: int, rows: int, predicate):
     """Return (byte_offset, frame) of the first frame satisfying predicate, else (None, None)."""
-    data = raw_path.read_bytes()
+    data = _source_bytes(raw_path)
     for offset, frame in _frames(data, cols, rows):
         if predicate(frame):
             return offset, frame
     return None, None
 
 
-def all_frames_match(raw_path: Path, cols: int, rows: int, predicate, limit: int = 10):
-    """Collect up to *limit* frames satisfying predicate."""
-    data = raw_path.read_bytes()
-    results = []
-    for offset, frame in _frames(data, cols, rows):
-        if predicate(frame):
-            results.append((offset, frame))
-            if len(results) >= limit:
-                break
-    return results
-
-
 # ── corpus loading ────────────────────────────────────────────────────────────
 
-def _corpus_sources() -> list[tuple[str, Path, int, int]]:
-    """Return list of (session_id, raw_path, cols, rows) for all usable sessions."""
+def _committed_sources() -> list[tuple[str, Path, int, int]]:
+    """(name, path, cols, rows) for every committed capture under _regression/ — both raw PTY
+    dumps (`*.raw`) and timed captures (`*.capture`). All captured at 120x40. Sorted by filename
+    so the scan order (and therefore the manifest) is deterministic."""
     sources: list[tuple[str, Path, int, int]] = []
-    if SESSIONS_DIR.exists():
-        for d in sorted(SESSIONS_DIR.iterdir()):
-            raw = d / "raw"
-            if not raw.exists() or raw.stat().st_size < MIN_RAW_BYTES:
-                continue
-            cols, rows = _load_dims(d)
-            sources.append((d.name, raw, cols, rows))
-    return sources
-
-
-def _regression_sources() -> list[tuple[str, Path, int, int]]:
-    """Return list of (name, raw_path, cols, rows) for committed regression raws."""
-    sources = []
     if REGRESSION_DIR.exists():
-        for raw in sorted(REGRESSION_DIR.glob("*.raw")):
-            sources.append((raw.stem, raw, 120, 40))
+        paths = sorted(p for p in REGRESSION_DIR.iterdir() if p.suffix in (".raw", ".capture"))
+        for path in paths:
+            sources.append((path.stem, path, 120, 40))
     return sources
 
 
@@ -146,10 +121,6 @@ def pred_bash_panel(frame: str) -> bool:
     return bool(re.search(r"Bash\(", frame))
 
 
-def pred_trust(frame: str) -> bool:
-    return "Yes, I trust this folder" in frame
-
-
 def pred_free_text_with_footer(frame: str) -> bool:
     """❯ present WITH footer — free_text candidate."""
     return "❯" in frame and "⏵⏵" in frame and "shift+tab" in frame
@@ -157,27 +128,23 @@ def pred_free_text_with_footer(frame: str) -> bool:
 
 # ── scanner ───────────────────────────────────────────────────────────────────
 
-def scan_all(predicate, corpus, regressions, label=""):
-    """Check corpus + regressions; return first hit as (source_id, raw_path, offset, frame)."""
-    for sid, raw_path, cols, rows in regressions:
-        offset, frame = first_frame(raw_path, cols, rows, predicate)
+def scan_all(predicate, sources, label=""):
+    """Check the committed corpus; return first hit as (source_id, path, offset, frame)."""
+    for sid, path, cols, rows in sources:
+        offset, frame = first_frame(path, cols, rows, predicate)
         if offset is not None:
-            return sid, raw_path, offset, frame
-    for sid, raw_path, cols, rows in corpus:
-        offset, frame = first_frame(raw_path, cols, rows, predicate)
-        if offset is not None:
-            return sid, raw_path, offset, frame
+            return sid, path, offset, frame
     return None, None, None, None
 
 
-def scan_specific(sid_list, predicate, corpus, regressions):
-    """Scan only sessions whose id is in sid_list; return first hit."""
-    for sid, raw_path, cols, rows in list(regressions) + list(corpus):
+def scan_specific(sid_list, predicate, sources):
+    """Scan only captures whose id is in sid_list; return first hit."""
+    for sid, path, cols, rows in sources:
         if sid not in sid_list:
             continue
-        offset, frame = first_frame(raw_path, cols, rows, predicate)
+        offset, frame = first_frame(path, cols, rows, predicate)
         if offset is not None:
-            return sid, raw_path, offset, frame
+            return sid, path, offset, frame
     return None, None, None, None
 
 
@@ -196,26 +163,16 @@ def _snippet(frame: str, pred_line_hint: str | None = None) -> str:
     return ""
 
 
-def _rel(path: Path) -> str:
-    try:
-        return str(path.relative_to(ROOT))
-    except ValueError:
-        try:
-            return "~/" + str(path.relative_to(Path.home()))
-        except ValueError:
-            return str(path)
-
-
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    corpus = _corpus_sources()
-    regressions = _regression_sources()
+    sources = _committed_sources()
 
     print("# INVENTORY.md — invariant → real-capture manifest\n")
     print("Generated by `bin/nelix-inventory`. Do not edit by hand.\n")
-    print(f"Corpus: {len(corpus)} live sessions "
-          f"(≥{MIN_RAW_BYTES // 1000}kB); {len(regressions)} committed regression raws.\n")
+    print(f"Corpus: {len(sources)} committed captures under "
+          "`tests/golden/claude/_regression/` (`*.raw` + `*.capture`). "
+          "No live/per-machine source — regenerates deterministically from tracked inputs.\n")
 
     print("## Invariant map\n")
     print("| ID | status | source_session | dims | offset | visible marker | "
@@ -260,7 +217,7 @@ def main():
         if iid == "I1":
             _I1_MARKER = "[Pasted text"
             sid, raw_path, offset, frame = scan_specific(
-                ["s-b8a30317-delivery"], pred_paste, corpus, regressions
+                ["s-b8a30317-delivery"], pred_paste, sources
             )
             if sid:
                 snip = _snippet(frame, _I1_MARKER)
@@ -280,7 +237,7 @@ def main():
             # which also matches the dispatch frame earlier in the raw).
             _I2A_MARKER = "Waiting for"
             sid, raw_path, offset, frame = scan_specific(
-                ["s-039a61b4-bg-subagent"], pred_bg_agent, corpus, regressions
+                ["s-039a61b4-bg-subagent"], pred_bg_agent, sources
             )
             if sid:
                 snip = _snippet(frame, "background agent")
@@ -296,11 +253,10 @@ def main():
         # ── frame-level: I3 ─────────────────────────────────────────────────
         if iid == "I3":
             sid, raw_path, offset, frame = scan_specific(
-                ["s-039a61b4-bg-subagent"], pred_spinner, corpus, regressions
+                ["s-039a61b4-bg-subagent"], pred_spinner, sources
             )
             if not sid:
-                # try any corpus session
-                sid, raw_path, offset, frame = scan_all(pred_spinner, corpus, regressions)
+                sid, raw_path, offset, frame = scan_all(pred_spinner, sources)
             if sid:
                 # find the spinner line
                 snip = ""
@@ -319,16 +275,16 @@ def main():
         if iid == "I4a":
             # Half 1: bare ❯ no footer (prompt_kind != free_text)
             sid1, rp1, off1, fr1 = scan_specific(
-                ["s-039a61b4"], pred_bare_prompt_no_footer, corpus, regressions
+                ["s-039a61b4"], pred_bare_prompt_no_footer, sources
             )
             if not sid1:
-                sid1, rp1, off1, fr1 = scan_all(pred_bare_prompt_no_footer, corpus, regressions)
+                sid1, rp1, off1, fr1 = scan_all(pred_bare_prompt_no_footer, sources)
             # Half 2: ❯ with footer (prompt_kind == free_text)
             sid2, rp2, off2, fr2 = scan_specific(
-                ["s-b8a30317-delivery"], pred_free_text_with_footer, corpus, regressions
+                ["s-b8a30317-delivery"], pred_free_text_with_footer, sources
             )
             if not sid2:
-                sid2, rp2, off2, fr2 = scan_all(pred_free_text_with_footer, corpus, regressions)
+                sid2, rp2, off2, fr2 = scan_all(pred_free_text_with_footer, sources)
 
             if sid1 and sid2:
                 print(f"| I4a | found | bare-❯: {sid1}@{off1} / "
@@ -347,10 +303,10 @@ def main():
         # ── frame-level: I5 ─────────────────────────────────────────────────
         if iid == "I5":
             sid, raw_path, offset, frame = scan_specific(
-                ["s-039a61b4"], pred_ctrl_b_panel, corpus, regressions
+                ["s-039a61b4"], pred_ctrl_b_panel, sources
             )
             if not sid:
-                sid, raw_path, offset, frame = scan_all(pred_ctrl_b_panel, corpus, regressions)
+                sid, raw_path, offset, frame = scan_all(pred_ctrl_b_panel, sources)
             if sid:
                 print(f"| I5 | found | {sid} | 120x40 | {offset} | "
                       "`(ctrl+b to run in background)` in tool panel | "
@@ -363,15 +319,14 @@ def main():
 
         # ── frame-level: I6a ────────────────────────────────────────────────
         if iid == "I6a":
-            # Trust dialog (modal_choice or permission_choice).
-            # --at-marker 'Yes, I trust this folder' shows the permission_choice modal;
-            # s-beb967e9 has a modal_choice (non-trust) modal too.
+            # Trust dialog (modal_choice or permission_choice). The committed s-beb967e9.capture is
+            # a real claude run stopped ON a numbered "ask the user" menu.
             _I6A_MARKER = "Yes, I trust this folder"
             sid, raw_path, offset, frame = scan_specific(
-                ["s-6e9d8956", "s-7dbd7358", "s-beb967e9"], pred_modal_menu, corpus, regressions
+                ["s-6e9d8956", "s-7dbd7358", "s-beb967e9"], pred_modal_menu, sources
             )
             if not sid:
-                sid, raw_path, offset, frame = scan_all(pred_modal_menu, corpus, regressions)
+                sid, raw_path, offset, frame = scan_all(pred_modal_menu, sources)
             if sid:
                 # find a representative option line
                 snip = ""
@@ -391,16 +346,18 @@ def main():
         # ── frame-level: I-BC ───────────────────────────────────────────────
         if iid == "I-BC":
             sid, raw_path, offset, frame = scan_specific(
-                ["s-d719f7b9"], pred_bash_panel, corpus, regressions
+                ["s-d719f7b9"], pred_bash_panel, sources
             )
             if not sid:
-                sid, raw_path, offset, frame = scan_all(pred_bash_panel, corpus, regressions)
+                sid, raw_path, offset, frame = scan_all(pred_bash_panel, sources)
             if sid:
                 snip = _snippet(frame, "Bash(")
                 print(f"| I-BC | found | {sid} | 120x40 | {offset} | "
                       f"{snip} | busy_reason=running_command |")
             else:
-                print("| I-BC | gap | — | — | — | Bash( panel not found | — |")
+                print("| I-BC | gap | — | — | — | "
+                      "Bash( panel — source capture (s-d719f7b9) is deleted and no Bash-panel "
+                      "capture exists in the tracked corpus; accepted gap (nelix-puf) | — |")
                 gaps.append("I-BC")
             continue
 
@@ -408,12 +365,12 @@ def main():
         if iid == "I2b":
             # bg-subagent sequence — whole regression raw is the source
             reg = next(
-                ((sid, rp, 120, 40) for sid, rp, c, r in regressions
+                ((sid, path) for sid, path, c, r in sources
                  if sid == "s-039a61b4-bg-subagent"),
                 None
             )
             if reg:
-                sid, rp, _, _ = reg
+                sid, path = reg
                 print(f"| I2b | found | {sid} | 120x40 | full sequence | "
                       "replaying never shows waiting_for_user | "
                       "waiting_for_user never published across full replay |")
@@ -429,11 +386,11 @@ def main():
             # appears in Claude's output region — s-2190cfb2-remint has paste submissions
             # followed by agent output.
             reg_delivery = next(
-                ((sid, rp) for sid, rp, c, r in regressions if sid == "s-b8a30317-delivery"),
+                ((sid, path) for sid, path, c, r in sources if sid == "s-b8a30317-delivery"),
                 None
             )
             reg_remint = next(
-                ((sid, rp) for sid, rp, c, r in regressions if sid == "s-2190cfb2-remint"),
+                ((sid, path) for sid, path, c, r in sources if sid == "s-2190cfb2-remint"),
                 None
             )
             if reg_delivery and reg_remint:
@@ -453,11 +410,11 @@ def main():
         # ── sequence: I7 ────────────────────────────────────────────────────
         if iid == "I7":
             reg = next(
-                ((sid, rp) for sid, rp, c, r in regressions if sid == "s-2190cfb2-remint"),
+                ((sid, path) for sid, path, c, r in sources if sid == "s-2190cfb2-remint"),
                 None
             )
             if reg:
-                sid, rp = reg
+                sid, path = reg
                 print(f"| I7 | found | {sid} | 120x40 | full sequence | "
                       "re-mint blocked decision replay | "
                       "decision published exactly once, not N times |")
@@ -471,11 +428,11 @@ def main():
             # False-idle: delivery raw shows post-submit paste-echo frame.
             # Replaying it should NOT publish waiting_for_user (the echo is still in the box).
             reg = next(
-                ((sid, rp) for sid, rp, c, r in regressions if sid == "s-b8a30317-delivery"),
+                ((sid, path) for sid, path, c, r in sources if sid == "s-b8a30317-delivery"),
                 None
             )
             if reg:
-                sid, rp = reg
+                sid, path = reg
                 print(f"| I8 | found | {sid} | 120x40 | full sequence | "
                       "paste echo visible in input box post-submit | "
                       "waiting_for_user never published during echo-visible phase |")
@@ -495,97 +452,22 @@ def main():
         print("**CONFIRMED: zero new recordings needed.** Every Tier-1/Tier-2 invariant "
               "maps to an existing corpus capture or is already-covered/synthetic.")
     else:
-        print(f"**GAPS FOUND — {len(gaps)} invariant(s) need attention:**\n")
+        print(f"**GAPS — {len(gaps)} invariant(s) have no committed source:**\n")
         for g in gaps:
             print(f"- `{g}`")
         print()
+        print("I-BC (Bash-command chrome) is an accepted gap: its only capture (s-d719f7b9) was "
+              "deleted and no committed capture contains a `Bash(` tool panel. Re-capturing a "
+              "Bash-panel session is out of scope for nelix-puf (fabricated frames are forbidden).")
 
-    # ── trust sessions ────────────────────────────────────────────────────────
+    # ── committed corpus ────────────────────────────────────────────────────────
     print()
-    print("## Trust-session verification\n")
-    trust_marker = "Yes, I trust this folder"
-    for sid_candidate in ["s-6e9d8956", "s-7dbd7358"]:
-        raw_path = SESSIONS_DIR / sid_candidate / "raw"
-        if not raw_path.exists():
-            print(f"- `{sid_candidate}`: raw not found")
-            continue
-        offset, frame = first_frame(raw_path, 120, 40, pred_trust)
-        if offset is not None:
-            print(f"- `{sid_candidate}`: `Yes, I trust this folder` found at byte offset {offset} ✓")
-        else:
-            print(f"- `{sid_candidate}`: `Yes, I trust this folder` NOT FOUND ✗")
-
-    # ── corpus overview ───────────────────────────────────────────────────────
-    print()
-    print("## Corpus overview\n")
-    print("### Live sessions (skipped: size < 5kB = empty/aborted)\n")
-    print("| session | size | dims | key markers found |")
-    print("|---------|------|------|------------------|")
-
-    _MARKER_CHECKS: dict[str, callable] = {
-        "paste": pred_paste,
-        "bg-agent": pred_bg_agent,
-        "spinner": pred_spinner,
-        "modal": pred_modal_menu,
-        "ctrl+b": pred_ctrl_b_panel,
-        "trust": pred_trust,
-        "Bash(": pred_bash_panel,
-    }
-
-    all_sessions_dir = SESSIONS_DIR
-    if all_sessions_dir.exists():
-        for d in sorted(all_sessions_dir.iterdir()):
-            raw = d / "raw"
-            if not raw.exists():
-                continue
-            size = raw.stat().st_size
-            if size < MIN_RAW_BYTES:
-                print(f"| {d.name} | {size}B | — | skipped (empty/aborted) |")
-                continue
-            cols, rows = _load_dims(d)
-            data = raw.read_bytes()
-            r = make_renderer(cols, rows)
-            found_markers: list[str] = []
-            try:
-                for _, frame in _frames(data, cols, rows):
-                    for label, pred in list(_MARKER_CHECKS.items()):
-                        if label not in found_markers and pred(frame):
-                            found_markers.append(label)
-                    if len(found_markers) == len(_MARKER_CHECKS):
-                        break
-            finally:
-                r.close()
-            print(f"| {d.name} | {size // 1024}kB | {cols}x{rows} | "
-                  f"{', '.join(found_markers) if found_markers else '—'} |")
-
-    print()
-    print("### Regression raws\n")
-    print("| file | size | dims |")
-    print("|------|------|------|")
-    for sid, rp, c, r in regressions:
-        print(f"| {sid} | {rp.stat().st_size // 1024}kB | {c}x{r} |")
-
-    # ── unmapped real states ──────────────────────────────────────────────────
-    print()
-    print("## Unmapped real states found\n")
-    print("Corpus screens/markers observed during scanning that no current invariant claims.\n")
-    print("| state/marker | example session | notes |")
-    print("|-------------|-----------------|-------|")
-    print("| `bash denied by auto mode · Classifier unavailable · /permissions` notification | "
-          "s-d719f7b9 | auto-mode permission-denial banner in transcript; no invariant covers "
-          "this specific notification text |")
-    print("| `◯ <agent-name>  <task>` agent-status line in footer | "
-          "s-039a61b4, s-d719f7b9 | sub-agent status lines cycling through agent list; "
-          "not claimed by any current invariant |")
-    print("| Welcome back + Tips panel (initial splash) | "
-          "s-6e9d8956, s-7dbd7358 | the startup welcome modal with Tips column; "
-          "only appears in fresh sessions with no history |")
-    print("| `◉ xhigh · /effort` status badge (top-right) | "
-          "s-b8a30317-delivery, s-6e9d8956 | effort-level indicator; "
-          "no invariant claims this |")
-    print("| Token-usage counter (`↓ N.Nk tokens`) in footer | "
-          "s-039a61b4, s-d719f7b9 | token consumption telemetry appended to spinner status; "
-          "no invariant tracks this field |")
+    print("## Committed corpus\n")
+    print("The only inputs this manifest is derived from — all tracked under version control.\n")
+    print("| capture | size | dims |")
+    print("|---------|------|------|")
+    for sid, path, c, r in sources:
+        print(f"| {path.name} | {path.stat().st_size // 1024}kB | {c}x{r} |")
 
 
 if __name__ == "__main__":
