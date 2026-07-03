@@ -106,6 +106,28 @@ def test_rpc_client_dialog(monkeypatch, tmp_path):
         srv.shutdown()
 
 
+def test_client_start_omits_model_when_not_provided(monkeypatch):
+    # nelix-9k0: a default (no-model) call is byte-for-byte the same POST body as before this
+    # feature — "model" is only added when provided (mirrors status(include_progress=...)).
+    c = RpcClient(Transport.tcp("x", 80, "t"))
+    seen = {}
+    monkeypatch.setattr(c, "_call",
+                        lambda m, p, body=None: seen.update(m=m, p=p, body=body) or (200, {}))
+    c.start(EXECUTOR, "go", "/repo")
+    assert seen["m"] == "POST" and seen["p"] == "/start"
+    assert seen["body"] == {"executor": EXECUTOR, "task": "go", "cwd": "/repo"}
+    assert "model" not in seen["body"]
+
+
+def test_client_start_includes_model_when_provided(monkeypatch):
+    c = RpcClient(Transport.tcp("x", 80, "t"))
+    seen = {}
+    monkeypatch.setattr(c, "_call",
+                        lambda m, p, body=None: seen.update(body=body) or (200, {}))
+    c.start(EXECUTOR, "go", "/repo", model="haiku")
+    assert seen["body"] == {"executor": EXECUTOR, "task": "go", "cwd": "/repo", "model": "haiku"}
+
+
 def test_client_screen_calls_get_screen(monkeypatch):
     from rpc_client import RpcClient
     c = RpcClient(Transport.tcp("x", 80, "t"))
