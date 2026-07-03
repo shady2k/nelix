@@ -9,19 +9,28 @@
 # background, hits
 # SIGTTIN/SIGTTOU on first terminal access and is STOPPED (ps STAT `T`). It then renders
 # nothing and nelix only ever sees a blank screen. Such a wrapper works when YOU run it in
-# a terminal (your shell hands over the foreground) but breaks here. Fix: fetch secrets,
-# then `exec` the CLI so it replaces the wrapper and becomes the foreground leader:
+# a terminal (your shell hands over the foreground) but breaks here.
+#
+# You usually do NOT need a wrapper at all: name the leaf CLI directly as `command` and inject
+# any runtime secret via `[executors.<name>.env_cmd]` below — nelix runs each command at spawn,
+# uses its trimmed stdout as the env value, and launches the CLI itself as the foreground leaf.
+# If you DO keep a script (e.g. for logic env_cmd can't express), it must `exec` the CLI so it
+# replaces the script and becomes the foreground leader (no lingering parent):
 #   #!/bin/bash
 #   export API_KEY="$(your-secret-manager get -field=key path/to/secret)"   # fetch, then...
 #   exec my-agent-cli "$@"                                        # ...exec (no lingering parent)
 [executors.example_cli]
 command = "my-agent-cli"
 args = ["--interactive"]
-env = {}                 # extra env if needed; secrets via your own secret manager
+env = { SERVICE_BASE_URL = "https://api.example.com" }   # STATIC values only (no secrets in plaintext)
 # no cwd here: the working dir is per-session — passed to nelix_start (defaults to the
 # orchestrator's own cwd), so one executor entry serves any project.
 driver = "claude"        # which classifier to use
 launcher = "local"       # MVP: only "local" is implemented ("auto"/"docker" are post-MVP)
+# Inject a runtime-resolved SECRET (e.g. an auth token) via [executors.example_cli.env_cmd] at the
+# BOTTOM of this file — nelix runs a command and uses its stdout as the value. (Defined last because
+# a TOML sub-table header captures every bare key after it.) Optional per-command deadline:
+# env_cmd_timeout_seconds = 15   # seconds; a bare key on THIS table (default 15).
 # Recovery thresholds (optional; defaults shown). The prompt/mandate can override per session.
 # max_idle_seconds        = 600   # no meaningful progress for this long -> daemon escalates to you (0 = off)
 # startup_timeout_seconds = 60    # pre-delivery deadline: if the CLI never renders a classifiable prompt
@@ -42,3 +51,17 @@ kill_grace_seconds = 5
 # Daemon log verbosity: debug | info | warning | error (default: info).
 # Env NELIX_LOG_LEVEL overrides this. Audit records (decisions, delivered task) are always written.
 log_level = "info"
+
+# ---------------------------------------------------------------------------------------------
+# Runtime-resolved env values (optional). Each  VAR = "<command>"  is run at spawn; the command's
+# stdout (trailing newlines stripped, like shell $(...)) becomes VAR in the CLI's environment.
+# This is how a SECRET enters the env without a plaintext literal or a wrapper script — the command
+# fetches it from wherever you keep secrets and prints it to stdout. It runs with the daemon's own
+# environment, so anything it needs (a backend address, a login token, PATH) is available. A
+# non-zero exit, a timeout, or empty stdout fails the start cleanly (the daemon stays up). nelix
+# never logs or persists the resolved value or the command. Resolution runs on EVERY spawn (incl.
+# restart), so a rotated secret is picked up. An env_cmd value overrides a same-key static [env].
+# This sub-table MUST be the last thing in the [executors.example_cli] section (a sub-table header
+# captures every bare key that follows it).
+# [executors.example_cli.env_cmd]
+# SERVICE_AUTH_TOKEN = "a command that prints the secret to stdout"
