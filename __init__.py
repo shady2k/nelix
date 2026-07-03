@@ -193,6 +193,22 @@ def register(ctx):
         return _j(RpcClient(transport).screen(
             args["session_id"], raw=bool(args.get("raw")), force=bool(args.get("force"))))
 
+    def nelix_models(args, **k):
+        # nelix-g9k: read-only model discovery. Config-first (mirrors nelix_start): a broken
+        # nelix.toml or a disabled executor is a relayable message, not a spawned daemon + traceback.
+        executor = args["executor"]
+        _log.info("nelix_models executor=%s", executor)
+        cfg_err = registry.config_error_for(registry.validate(), executor)
+        if cfg_err:
+            _log.warning("nelix_models config error executor=%s", executor)
+            return _j(cfg_err)
+        # The executor specs + resolver live in the daemon, so ensure it's running (mirrors
+        # nelix_start). RpcClient.models returns (status, body); the tool RELAYS the body — a model
+        # list on 200, or the clean {error} on 400/404/502 — so the status itself is not needed here.
+        transport = supervisor.ensure_running()
+        _, body = RpcClient(transport).models(executor)
+        return _j(body)
+
     names = ", ".join(registry.names()) or "a configured agent"
     # Hermes builds the LLM tool spec as {"type":"function","function":{**schema,"name":name}}
     # (tools/registry.py), so `schema` MUST be the full function schema with `description`
@@ -322,6 +338,19 @@ def register(ctx):
                                                "force": {"type": "boolean"}},
                         "required": ["session_id"]}},
         nelix_screen)
+    ctx.register_tool(
+        "nelix_models", "nelix",
+        {"description": (
+            f"List a named agent's ({names}) available models by running its configured"
+            " model-discovery command; returns the raw text the command prints (typically one model"
+            " id + display name per line). Use it when you need a CONCRETE model id to pass as"
+            " nelix_start's `model` (beyond the tier aliases). Read-only: it starts no session and"
+            " changes nothing. 'executor' is the agent's configured name. If that agent has no"
+            " model-discovery command configured you get a clear 'not configured' error — relay it"
+            " and do not retry."),
+         "parameters": {**_OBJ, "properties": {"executor": {"type": "string"}},
+                        "required": ["executor"]}},
+        nelix_models)
 
     def slash_nelix(raw_args):
         raw = (raw_args or "").strip()

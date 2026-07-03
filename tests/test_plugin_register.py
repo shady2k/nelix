@@ -74,7 +74,7 @@ def test_register_wires_tools_command_skill_hook(monkeypatch, tmp_path):
     try:
         nelix.register(ctx)
         assert set(ctx.tools) == {"nelix_start","nelix_status","nelix_respond","nelix_stop",
-                                  "nelix_restart","nelix_dialog","nelix_screen"}
+                                  "nelix_restart","nelix_dialog","nelix_screen","nelix_models"}
         assert "nelix" in ctx.commands
         assert "nelix-orchestration" in ctx.skills
         # on_session_finalize (NOT on_session_end): the latter fires per run_conversation
@@ -105,7 +105,7 @@ def test_tool_schemas_are_llm_function_shaped(monkeypatch, tmp_path):
     try:
         nelix.register(ctx)
         for tname in ("nelix_start", "nelix_status", "nelix_respond", "nelix_stop", "nelix_dialog",
-                      "nelix_screen"):
+                      "nelix_screen", "nelix_models"):
             fn = {**ctx.tools[tname]["schema"], "name": tname}  # mirror Hermes' builder
             assert fn.get("description"), f"{tname}: no description in the LLM function spec"
             params = fn.get("parameters")
@@ -153,6 +153,72 @@ def test_nelix_start_threads_model_to_rpcclient(monkeypatch, tmp_path):
         captured.clear()
         ctx.tools["nelix_start"]["handler"]({"executor": "opencode", "task": "go"})
         assert captured["model"] is None
+    finally:
+        nelix.supervisor.teardown()
+
+
+def test_nelix_models_schema_and_relays_body(monkeypatch, tmp_path):
+    # nelix-g9k: read-only tool; schema {executor} required. The handler runs config_error_for,
+    # ensures the daemon, calls RpcClient.models, and relays the body (drops the status).
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    try:
+        nelix.register(ctx)
+        params = ctx.tools["nelix_models"]["schema"]["parameters"]
+        assert params["required"] == ["executor"]
+        assert set(params["properties"]) == {"executor"}
+        assert ctx.tools["nelix_models"]["schema"]["description"]         # documented for the LLM
+        # Avoid spinning the fake daemon: stub ensure_running + RpcClient.
+        monkeypatch.setattr(nelix.supervisor, "ensure_running",
+                            lambda: Transport.tcp("127.0.0.1", 9999, "t"))
+        captured = {}
+
+        class FakeRpc:
+            def __init__(self, *a, **k): pass
+            def models(self, executor):
+                captured["executor"] = executor
+                return 200, {"output": "model-x\nmodel-y (Display)", "truncated": False}
+        monkeypatch.setattr(nelix, "RpcClient", FakeRpc)
+        out = ctx.tools["nelix_models"]["handler"]({"executor": "opencode"})
+        assert captured["executor"] == "opencode"
+        assert json.loads(out) == {"output": "model-x\nmodel-y (Display)", "truncated": False}
+    finally:
+        nelix.supervisor.teardown()
+
+
+def test_nelix_models_relays_config_error_without_touching_daemon(monkeypatch, tmp_path):
+    # A broken/disabled executor config is relayed as a message; the daemon is NEVER spun up.
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    try:
+        nelix.register(ctx)
+        monkeypatch.setattr(nelix.registry, "config_error_for", lambda v, e: {"error": "boom-config"})
+        called = {"ensure": False}
+        monkeypatch.setattr(nelix.supervisor, "ensure_running",
+                            lambda: called.__setitem__("ensure", True) or None)
+        out = ctx.tools["nelix_models"]["handler"]({"executor": "opencode"})
+        assert json.loads(out)["error"] == "boom-config"
+        assert called["ensure"] is False                                  # config-first: no daemon
+    finally:
+        nelix.supervisor.teardown()
+
+
+def test_nelix_models_relays_error_body_on_failure_status(monkeypatch, tmp_path):
+    # On a 502/404/400 the handler relays the clean {error} body unchanged (status dropped).
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    try:
+        nelix.register(ctx)
+        monkeypatch.setattr(nelix.supervisor, "ensure_running",
+                            lambda: Transport.tcp("127.0.0.1", 9999, "t"))
+
+        class FakeRpc:
+            def __init__(self, *a, **k): pass
+            def models(self, executor):
+                return 502, {"error": {"executor": executor, "reason": "timeout"}}
+        monkeypatch.setattr(nelix, "RpcClient", FakeRpc)
+        out = ctx.tools["nelix_models"]["handler"]({"executor": "opencode"})
+        assert json.loads(out)["error"] == {"executor": "opencode", "reason": "timeout"}
     finally:
         nelix.supervisor.teardown()
 
