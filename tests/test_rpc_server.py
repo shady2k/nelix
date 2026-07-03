@@ -34,7 +34,8 @@ class FakeManager:
                                   pending={"decision_id": "dec-1", "kind": "waiting_for_user", "text": "y/n?"})
         return RespondOutcome("stale", pending={"decision_id": "dec-1", "kind": "waiting_for_user",
                                                 "text": "y/n?"})
-    def status(self, session_id=None): return {"sessions": {}} if session_id is None else {"state": "working"}
+    def status(self, session_id=None, include_progress=False):
+        return {"sessions": {}} if session_id is None else {"state": "working"}
     def stop(self, session_id):
         self.stopped.append(session_id)
         return StopOutcome("stopped", snapshot={"session_id": session_id,
@@ -214,6 +215,53 @@ def test_respond_at_capacity_is_503_honest_backpressure():
     assert "respond_at_capacity" in buf.getvalue()
 
 
+class _NotDeliveredManager:
+    """Stands in for Manager.respond returning the async-question RespondOutcome("not_delivered",
+    ...) — either sub-case (Task 4 in-Session closing/terminal: reason=None, snapshot present; or
+    Task 6 manager-level terminal-survival: reason="executor_finished", no snapshot)."""
+    def __init__(self, reason=None, snapshot=None):
+        self._events = EventQueue()
+        self._reason = reason
+        self._snapshot = snapshot
+
+    def respond(self, session_id, answer, decision_id=None):
+        return RespondOutcome("not_delivered", reason=self._reason, snapshot=self._snapshot)
+
+
+def test_respond_not_delivered_executor_finished_is_200_refresh_status():
+    # Task 6 manager-level terminal-survival path: the executor had ALREADY exited before the async
+    # answer arrived. This must be a clean, defined outcome (not a 4xx caller error) so the MCP layer
+    # relays it plainly and Hermes reconciles via refresh_status instead of retrying the call.
+    import io
+    buf = io.StringIO()
+    srv, base = _serve(_NotDeliveredManager(reason="executor_finished"), buf)
+    try:
+        st, b = _req("POST", base + "/respond",
+                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1"})
+        assert st == 200
+        assert b["operation"] == "respond" and b["status"] == "not_delivered"
+        assert b["reason"] == "executor_finished"
+        assert b["next_action"] == "refresh_status"
+    finally:
+        srv.shutdown()
+
+
+def test_respond_not_delivered_in_session_closing_carries_snapshot_no_reason():
+    # Task 4 in-Session closing/terminal path predates the `reason` field (always None there) but
+    # DOES carry a snapshot — both must reach the caller so Hermes can tell the two sub-cases apart.
+    snap = {"session_id": "s1", "control_state": "terminal", "terminal_kind": "crashed"}
+    srv, base = _serve(_NotDeliveredManager(reason=None, snapshot=snap), __import__("io").StringIO())
+    try:
+        st, b = _req("POST", base + "/respond",
+                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1"})
+        assert st == 200 and b["status"] == "not_delivered"
+        assert b["reason"] is None
+        assert b["snapshot"]["terminal_kind"] == "crashed"
+        assert b["next_action"] == "refresh_status"
+    finally:
+        srv.shutdown()
+
+
 def test_start_envelope_shape():
     m = FakeManager()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8790, "t"))
@@ -309,7 +357,7 @@ def test_responses_are_utf8_not_ascii_escaped():
     # screen/transcript text (Cyrillic task echo, ❯) must reach Hermes as real UTF-8,
     # not \uXXXX escapes (ensure_ascii=False in _send).
     class CyrManager:
-        def status(self, session_id=None):
+        def status(self, session_id=None, include_progress=False):
             return {"msg": "вторая строка ❯"}
     srv = make_server(CyrManager(), Transport.tcp("127.0.0.1", 8779, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -343,7 +391,7 @@ class FakeManagerRaisesValueError:
     def start(self, executor, task, cwd):
         raise ValueError(f"launcher 'auto' is not implemented (post-MVP); use 'local'")
     def respond(self, *a): return None
-    def status(self, session_id=None): return {}
+    def status(self, session_id=None, include_progress=False): return {}
     def stop(self, session_id): return False
 
 
@@ -376,7 +424,7 @@ class _FakeSession:
 
 class FakeManagerWithDialog:
     def __init__(self): self._events = EventQueue()
-    def status(self, sid=None):
+    def status(self, sid=None, include_progress=False):
         return {"session_id": "s1", "executor": EXECUTOR, "state": "idle_prompt",
                 "decision": {"kind": "waiting_for_user",
                              "text": "Proceed?", "hint": "needs_permission"}}
@@ -397,7 +445,7 @@ def test_status_includes_decision():
 
 class _ModalManager:
     def __init__(self): self._events = EventQueue()
-    def status(self, sid=None):
+    def status(self, sid=None, include_progress=False):
         return {"session_id": "s1", "state": "awaiting_user",
                 "decision": {"kind": "waiting_for_user", "prompt_kind": "modal_choice",
                              "options": [{"id": "1", "label": "Enrich all three"},

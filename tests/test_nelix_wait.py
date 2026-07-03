@@ -240,7 +240,7 @@ def test_nelix_wait_discovers_unix_endpoint_and_prints_doorbell(tmp_path, unix_s
             self._events = EventQueue()
         def start(self, *a): return "s1", 0
         def respond(self, *a, **k): ...
-        def status(self, sid=None): return {"sessions": {}}
+        def status(self, sid=None, include_progress=False): return {"sessions": {}}
         def stop(self, *a): return True
         def get(self, sid): return None
         def screen(self, *a, **k): return {}

@@ -90,7 +90,8 @@ def register(ctx):
         if transport is None:
             return _j({"sessions": {}})
         sid = args.get("session_id")
-        body = RpcClient(transport).status(sid)
+        include_progress = bool(args.get("include_progress", False))
+        body = RpcClient(transport).status(sid, include_progress=include_progress)
         if sid is None:
             # ALL-SESSIONS board read (the path SKILL.md tells Hermes to use on every wake):
             # reconcile every session, then drop any registry entry not on the live board.
@@ -218,8 +219,17 @@ def register(ctx):
             "Read an agent's current state and any pending decision (incl. its decision_id and the"
             " live screen). The wake is only a doorbell — on each wake call this ONCE to see what the"
             " agent needs, then act. Do NOT poll it in a loop: while the agent works it just says"
-            " 'still working' and nelix wakes you on the next event. Omit session_id to list all."),
-         "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"}}}},
+            " 'still working' and nelix wakes you on the next event. Omit session_id to list all."
+            " A snapshot may carry `async_question` — a NON-blocking question the agent asked WHILE"
+            " it kept working (`executor_blocked:false`; it did not pause, unlike `decision`)."
+            " Answer it with nelix_respond, passing its `id` as decision_id; if the agent finishes"
+            " before your answer arrives, nelix_respond reports `not_delivered` instead of resuming"
+            " it. `include_progress:true` also returns the agent's bounded progress-note list (its"
+            " own non-waking status updates) even while it's still working, for when you need that"
+            " detail on demand — omit it (the default) to keep the normal poll-free 'still working'"
+            " view with nothing extra to read."),
+         "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
+                                               "include_progress": {"type": "boolean"}}}},
         nelix_status)
     ctx.register_tool(
         "nelix_respond", "nelix",
@@ -231,6 +241,13 @@ def register(ctx):
             " it on a pending question the daemon returns `missing_decision_id` with that pending"
             " decision — retry using it (no separate nelix_status call). After it succeeds, end your"
             " turn — nelix wakes you on the next event."
+            " `decision_id` may also name an outstanding `async_question.id` (a non-blocking question"
+            " the agent asked while still working, from a status snapshot) — answering that delivers"
+            " your answer as a fresh follow-up turn, not a keystroke into a paused modal. If the"
+            " agent already finished before your answer got there, expect `status:\"not_delivered\"`"
+            " (`reason:\"executor_finished\"`) instead of `resumed`: nothing was sent — its"
+            " `next_action` is `refresh_status`, so reconcile via nelix_status and report the"
+            " agent's actual outcome to the user."
             " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
             " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
             " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."

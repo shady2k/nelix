@@ -437,7 +437,11 @@ class SessionManager:
             with self._lock:
                 self._reserved -= 1
 
-    def status(self, session_id=None):
+    def status(self, session_id=None, include_progress=False):
+        """`include_progress` (Task 8): the explicit on-demand detail surface — merge
+        `Session.progress_view()` into the returned snapshot(s) even during active-working, where
+        `snapshot()` itself deliberately omits progress (anti-poll gate, session.py ~1260). Default
+        False keeps today's behavior byte-for-byte: nothing merged, no snapshot() gate bypassed."""
         if session_id is not None:
             with self._lock:
                 sess = self._sessions.get(session_id)
@@ -445,6 +449,8 @@ class SessionManager:
                 return {"error": "unknown session"}
             cursor = self._events.latest_seq(session_id)   # BEFORE snapshot: never arm past unseen
             snap = sess.snapshot()
+            if include_progress:
+                snap.update(sess.progress_view())
             snap["cursor"] = cursor
             return snap
         with self._lock:
@@ -460,8 +466,13 @@ class SessionManager:
             self._terminal_async = {sid: (rec, exp) for sid, (rec, exp) in self._terminal_async.items()
                                     if exp > now}
             recent = {sid: snap for sid, (snap, exp) in self._terminal.items()}
-        return {"sessions": {sid: {**s.snapshot(), "seq": per_seq.get(sid, 0)}
-                             for sid, s in snapshot.items()},
+        sessions = {}
+        for sid, s in snapshot.items():
+            s_snap = s.snapshot()
+            if include_progress:
+                s_snap.update(s.progress_view())
+            sessions[sid] = {**s_snap, "seq": per_seq.get(sid, 0)}
+        return {"sessions": sessions,
                 "limit": self._limit,
                 "cursor": cursor,
                 "recent_terminal": recent}

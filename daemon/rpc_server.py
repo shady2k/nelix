@@ -150,11 +150,16 @@ def make_server(manager, transport, logger=None):
                 evt = manager._events.wait_event(after_seq=after, timeout=25, session_id=sid)
                 self._send(200, {"event": _evt_dict(evt) if evt else None})
             elif p.path == "/status":
-                sid = parse_qs(p.query).get("session_id", [None])[0]
+                qs = parse_qs(p.query)
+                sid = qs.get("session_id", [None])[0]
+                # Task 8: explicit on-demand progress detail, off by default (anti-poll: an
+                # active-working snapshot stays progress-free unless the caller asks for it).
+                include_progress = qs.get("include_progress", ["0"])[0].lower() in ("1", "true")
                 self._log_read("status", sid)
                 # Stamp the RPC protocol version at the wire layer (always present, regardless of
                 # session_id) so a supervisor can tell our protocol from an old daemon's.
-                self._send(200, {**manager.status(sid), "rpc_protocol": RPC_PROTOCOL_VERSION})
+                self._send(200, {**manager.status(sid, include_progress=include_progress),
+                                 "rpc_protocol": RPC_PROTOCOL_VERSION})
             elif p.path == "/dialog":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
@@ -346,6 +351,20 @@ def make_server(manager, transport, logger=None):
                     self._send(409, {"operation": "respond", "status": "invalid_option", "session_id": sid,
                                      "error": "invalid_option", "pending": outcome.pending,
                                      "next_action": "fix_call"})
+                elif outcome.status == "not_delivered":
+                    # Task 6/8: an async-question answer that could not be delivered — either the
+                    # session went closing/terminal WHILE we resolved it (in-Session path, Task 4:
+                    # reason=None) or the executor had ALREADY exited before the answer arrived
+                    # (manager-level terminal-survival path, Task 6: reason="executor_finished").
+                    # Either way the answer was correlated (mark_answered ran; nothing is left
+                    # dangling) but nothing was typed. 200, not 4xx: this is a defined outcome, not
+                    # a caller mistake to fix_call — next_action=refresh_status so Hermes reads the
+                    # session's real final state (done/crashed/gone) before reporting to the user.
+                    resp = {"operation": "respond", "status": "not_delivered", "session_id": sid,
+                            "reason": outcome.reason, "next_action": "refresh_status"}
+                    if outcome.snapshot is not None:
+                        resp["snapshot"] = outcome.snapshot
+                    self._send(200, resp)
                 elif outcome.status == "terminal":
                     self._send(409, {"operation": "respond", "status": "terminal", "session_id": sid,
                                      "error": "session_terminal", "next_action": "refresh_status"})
