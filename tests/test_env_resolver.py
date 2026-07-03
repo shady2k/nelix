@@ -209,3 +209,27 @@ def test_run_capture_stdin_is_devnull_not_inherited():
         os.dup2(saved0, 0)
         for fd in (saved0, r_fd, w_fd):
             os.close(fd)
+
+
+# ---- FIX 1: the configured timeout must ALWAYS bound the call -----------------------------
+def test_run_capture_backgrounded_child_does_not_bypass_timeout():
+    # A command whose /bin/sh exits immediately but leaves a long-lived BACKGROUND child holding the
+    # stdout pipe must NOT make the call block for that child's lifetime: the reader thread wedges in
+    # read1() waiting for an EOF the surviving grandchild never sends, and merely closing our read end
+    # blocks on the BufferedReader lock read1 holds. Cleanup kills the whole process group, freeing
+    # the pipe, so the call returns fast with a redacted reason (here empty_output — the shell exited
+    # 0 with no output).
+    t0 = time.monotonic()
+    value, reason = run_capture("sleep 30 &", {}, 0.2, _CAP)
+    assert value is None and reason in {"empty_output", "timeout"}
+    assert time.monotonic() - t0 < 5.0        # bounded — NOT the 30s child lifetime
+
+
+def test_run_capture_captures_output_before_a_backgrounded_child():
+    # Same shape but the command prints first: the buffered output is still captured (closing a pipe's
+    # write end does not discard already-buffered bytes) and the call returns fast — the lingering
+    # background child is reaped by the process-group cleanup, not waited on.
+    t0 = time.monotonic()
+    out = run_capture("echo hi; sleep 30 &", {}, 5.0, _CAP)
+    assert out == ("hi", None)
+    assert time.monotonic() - t0 < 5.0

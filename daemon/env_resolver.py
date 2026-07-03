@@ -19,6 +19,8 @@ NOTHING, so no subprocess exception (a `CalledProcessError` / `TimeoutExpired` t
 boundary. The command / stdout / stderr are never stored or returned. Callers turn a non-None reason
 into their OWN typed error, raised OUTSIDE any except so `__context__` stays clean.
 """
+import os
+import signal
 import subprocess
 import threading
 
@@ -26,6 +28,10 @@ import threading
 # 1 MiB is a generous anti-runaway ceiling, not a tuning knob. models_cmd passes its own cap.
 _ENV_CMD_MAX_BYTES = 1 << 20
 _READ_CHUNK = 65536
+# Upper bound on how long teardown itself may take (reader.join / final reap) AFTER the child's
+# process group has been SIGKILLed. Killing the group frees any grandchild-held pipe, so the reader
+# hits EOF and the join returns near-instantly; this is only the backstop if that ever stalls.
+_CLEANUP_GRACE = 2.0
 
 
 class EnvResolveError(Exception):
@@ -42,8 +48,42 @@ class EnvResolveError(Exception):
 def _close(f):
     try:
         f.close()
+    except (OSError, ValueError):
+        pass
+
+
+def _kill_group(proc):
+    # SIGKILL the child's WHOLE process group. `start_new_session=True` makes the shell the group
+    # leader, so this also kills a grandchild the command backgrounded (`cmd &`) that inherited the
+    # stdout pipe. A plain `proc.kill()` would leave that grandchild holding the write end, so the
+    # reader stays blocked in read1() waiting for an EOF that never comes — and even closing our read
+    # end then blocks on the BufferedReader lock read1 holds (verified). Killing the group frees the
+    # pipe, giving the reader a real EOF. Best-effort: an already-gone group raises OSError (ESRCH).
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
     except OSError:
         pass
+
+
+def _reap(proc):
+    try:
+        proc.wait(timeout=_CLEANUP_GRACE)
+    except Exception:
+        pass                                   # bounded; a stuck reap must not wedge the call
+
+
+def _cleanup(proc, reader):
+    # Unconditional, BOUNDED teardown run on EVERY exit path so the configured timeout always bounds
+    # the call. Kill the group FIRST (frees a grandchild-held pipe -> reader gets EOF), then a bounded
+    # join, then close our read end and reap the shell.
+    _kill_group(proc)
+    if reader is not None:
+        try:
+            reader.join(_CLEANUP_GRACE)
+        except RuntimeError:
+            pass                               # thread never started (Thread.start failed) -> nothing to join
+    _close(proc.stdout)
+    _reap(proc)
 
 
 def run_capture(command, base_env, timeout, max_bytes):
@@ -64,6 +104,13 @@ def run_capture(command, base_env, timeout, max_bytes):
     memory until the child exits — a fast producer would balloon memory within the timeout window):
     a background reader drains stdout so a large producer can't wedge the child on a full pipe, reads
     at most `max_bytes + 1` bytes total, and kills the child the moment it exceeds the cap.
+
+    The configured `timeout` ALWAYS bounds the call. The child runs in its OWN process group
+    (`start_new_session`); teardown (`_cleanup`, in a `finally` on every path) SIGKILLs that whole
+    group, so a command that exits fast but backgrounds a long-lived child (`cmd &`) inheriting the
+    stdout pipe cannot keep the reader blocked in read1() for the child's lifetime — the group-kill
+    frees the pipe (EOF), then a BOUNDED `reader.join` / reap finishes teardown.
+
     stderr -> DEVNULL (never captured — it is redacted anyway — and a full stderr pipe can't deadlock
     the child). stdin=DEVNULL + close_fds default: never inherit the daemon's stdin / PTY / socket FDs.
     """
@@ -74,6 +121,7 @@ def run_capture(command, base_env, timeout, max_bytes):
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,         # redacted + a full stderr pipe can't deadlock the child
             env=base_env,                      # close_fds=True is the default: no PTY/socket FD leak
+            start_new_session=True,            # own process group -> cleanup can kill backgrounded grandchildren
         )
     except OSError:
         return (None, "spawn_failed")
@@ -101,16 +149,19 @@ def run_capture(command, base_env, timeout, max_bytes):
 
     reader = threading.Thread(target=_drain, daemon=True)
     reader.start()
+    timed_out = False
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        reader.join()
-        _close(proc.stdout)
+        timed_out = True
+    finally:
+        # Bounded teardown on EVERY path (success / timeout / overflow): kill the group so a
+        # backgrounded grandchild holding the pipe can't wedge reader.join for its lifetime.
+        _cleanup(proc, reader)
+    # Result derived AFTER cleanup: the reader has been joined (or bounded-abandoned), so `chunks`
+    # and `exceeded` are final and stable.
+    if timed_out:
         return (None, "timeout")
-    reader.join()
-    _close(proc.stdout)
     if exceeded:
         return (None, "output_too_large")
     if proc.returncode != 0:
