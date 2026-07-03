@@ -149,6 +149,26 @@ def test_nelix_respond_binds_to_session_without_event_id(monkeypatch, tmp_path):
         nelix.supervisor.teardown()
 
 
+def test_nelix_respond_description_names_idle_deliver_now_outcome(monkeypatch, tmp_path):
+    # nelix-wp9: answering an async_question.id has THREE outcomes, not two. Besides queued (busy)
+    # and not_delivered (exited), an IDLE agent gets the answer delivered IMMEDIATELY as a fresh
+    # turn — the daemon returns the normal resumed envelope (status:"resumed", next_action:"end_turn"),
+    # NOT status:"queued". The description previously mentioned `resumed` only in the negative
+    # ("not_delivered instead of resumed"), so an orchestrator had nothing to key on and narrated an
+    # immediate delivery as "queued". The contract must name status:"resumed" for this path.
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    try:
+        nelix.register(ctx)
+        desc = ctx.tools["nelix_respond"]["schema"]["description"]
+        assert 'status:"queued"' in desc          # busy (already documented)
+        assert 'status:"not_delivered"' in desc    # exited (already documented)
+        assert 'status:"resumed"' in desc          # idle -> deliver_now (nelix-wp9: newly named)
+        assert "immediately" in desc.lower()       # delivered now, not queued for later
+    finally:
+        nelix.supervisor.teardown()
+
+
 def test_session_finalize_hook_calls_teardown(monkeypatch, tmp_path):
     nelix = _load_with_fake(monkeypatch, tmp_path)
     called = {}
