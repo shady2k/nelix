@@ -47,6 +47,9 @@ def resolve_env_cmds(env_cmd, base_env, timeout):
             proc = subprocess.run(
                 ["/bin/sh", "-c", command],
                 capture_output=True, text=True, timeout=timeout, env=base_env,
+                stdin=subprocess.DEVNULL,         # never inherit/consume the daemon's stdin: a
+                                                  # stdin-reading command sees EOF, not a hang
+                                                  # (mirrors reaper.py's subprocess discipline)
                 check=True,                       # non-zero exit -> CalledProcessError
             )
         except subprocess.TimeoutExpired:

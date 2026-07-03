@@ -3,6 +3,7 @@
 These drive the REAL subprocess path (/bin/sh -c) — no mocking of subprocess — so the trim,
 pipe, ambient-env, and fail-closed semantics are exercised exactly as they run at spawn.
 """
+import os
 import traceback
 
 import pytest
@@ -66,6 +67,23 @@ def test_timeout_raises_and_kills_child():
         resolve_env_cmds({"TOK": "sleep 5"}, {}, 0.2)
     assert ei.value.var == "TOK"
     assert ei.value.reason == "timeout"
+
+
+def test_command_reading_stdin_does_not_inherit_daemon_stdin():
+    # The resolver passes stdin=subprocess.DEVNULL (like reaper.py): a command that reads stdin sees
+    # immediate EOF instead of blocking on / consuming the daemon's stdin. We point the PARENT's fd 0
+    # at a pipe that never gets data and never hits EOF (the write end is held open) — without the
+    # DEVNULL guard the child would inherit it and `read` would block until the 3s timeout fires.
+    r_fd, w_fd = os.pipe()                  # no data ever written; write end kept open -> no EOF
+    saved0 = os.dup(0)
+    try:
+        os.dup2(r_fd, 0)
+        out = resolve_env_cmds({"V": "read x; echo ok"}, {}, 3.0)   # must NOT time out
+        assert out == {"V": "ok"}
+    finally:
+        os.dup2(saved0, 0)
+        for fd in (saved0, r_fd, w_fd):
+            os.close(fd)
 
 
 # ---- no-leak structure --------------------------------------------------------------------
