@@ -1,6 +1,13 @@
 import json
+import os
 
-from daemon.hook_settings import claude_hook_settings_json, hook_launch
+from daemon.hook_settings import (
+    claude_hook_settings_json,
+    executor_message_instructions,
+    hook_launch,
+)
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def test_settings_static_and_valid_json():
@@ -24,3 +31,18 @@ def test_hook_launch_argv_and_env():
     json.loads(out["argv_extra"][1])                 # valid
     assert out["env"] == {"NELIX_SESSION": "s-abc", "NELIX_HOOK_SOCK": "/x/rpc.sock",
                           "NELIX_HOOK_SECRET": "secretxyz"}
+
+
+def test_executor_message_instructions_mentions_commands_by_absolute_path():
+    # The executor is told about nelix-question/nelix-note by ABSOLUTE path (never via PATH, which
+    # nelix never mutates) so it can invoke them regardless of its own cwd or shell configuration.
+    text = executor_message_instructions()
+    assert os.path.join(_REPO_ROOT, "bin", "nelix-question") in text
+    assert os.path.join(_REPO_ROOT, "bin", "nelix-note") in text
+    assert "--continuation-plan" in text                      # nelix-question requires it
+    assert "AskUserQuestion" in text                          # contrasted with the blocking tool
+
+
+def test_executor_message_instructions_static():
+    # Session-agnostic like claude_hook_settings_json(): identical every call, no per-launch state.
+    assert executor_message_instructions() == executor_message_instructions()
