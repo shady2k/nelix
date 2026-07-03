@@ -16,7 +16,7 @@ from daemon import lifecycle_log
 from daemon import reaper
 from daemon.belief import BeliefEngine, Publish, Withdraw, Actuate
 from daemon.clock import WallClock
-from daemon.config import BeliefConfig, MAX_PROGRESS_NOTES
+from daemon.config import BeliefConfig, MAX_PROGRESS_NOTES, MAX_SUMMARY_LEN
 from daemon.dialog import Dialog
 from daemon.observation import ObservationCtx
 from daemon.transcript_builder import TranscriptBuilder
@@ -1053,7 +1053,14 @@ class Session:
             # can still drive this deterministically.
             self._progress.append({"progress_seq": seq, "ts": self._clock.now(),
                                     "summary": note.summary, "details": note.details})
-            return seq
+        # Ingress audit (nelix-wz6): a non-waking note is invisible in the daemon log otherwise —
+        # its arrival is only inferable from the ABSENCE of an extra wake. Logged OUTSIDE the lock
+        # (mirrors async_question_resolved's discipline). The summary is bounded to the config cap
+        # (never unbounded free text) and runs through obs.Logger's `summary` free-text redactor.
+        if self._log is not None:
+            self._log.info("session", "note_recorded", session_id=self._id,
+                           progress_seq=seq, summary=note.summary[:MAX_SUMMARY_LEN])
+        return seq
 
     def _progress_view_locked(self):
         # Caller must hold self._lock (the Lock is not reentrant) — shared by progress_view() and
@@ -1110,6 +1117,12 @@ class Session:
             self._next_qseq += 1
             qid = f"q_{self._next_qseq}"
             state = self._state
+        # Ingress audit (nelix-wz6): the question's ARRIVAL was previously invisible in the daemon
+        # log (only its later resolution showed up). Logged once we've committed to a fresh question
+        # (past the already-pending guards above), OUTSIDE the lock (async_question_resolved's
+        # discipline). Metadata only — question_id, never the free-text body.
+        if self._log is not None:
+            self._log.info("session", "async_question_asked", session_id=self._id, question_id=qid)
         # INSTALL RACE — this method is NOT self-synchronizing across concurrent same-session callers:
         # the publish runs lock-free (lock-order rule above) and the slot store is a SECOND lock
         # acquisition below. Two windows exist:
@@ -1131,6 +1144,12 @@ class Session:
         # this method alone.
         evt = self._events.publish(self._id, self._executor, "async_question", q.question[:200],
                                    state, requires_response=True, decision_id=qid)
+        # Ingress audit (nelix-wz6): this is the SOLE async-channel wake publish — a `note` never
+        # publishes (non-waking by design), so a wake for the async channel is always a question's.
+        # Logged at THIS call site, not inside EventQueue.publish (which fires for every event kind).
+        if self._log is not None:
+            self._log.info("session", "wake_published", session_id=self._id,
+                           kind="async_question", seq=evt.seq, question_id=qid)
         with self._lock:
             self._async_question = {"id": qid, "question": q.question,
                                      "assumption": q.assumption,
