@@ -9,6 +9,8 @@ from daemon.session import Session            # noqa: E402
 from daemon.dialog import Dialog              # noqa: E402
 from daemon.drivers.claude import ClaudeDriver  # noqa: E402
 from daemon.events import EventQueue          # noqa: E402
+from daemon.hooks import HookEvent            # noqa: E402
+from tests._session_replay import default_logger, _REAL_LOGGER  # noqa: E402
 
 
 class Spec:
@@ -160,11 +162,13 @@ def _clock(values):
     return now
 
 
-def _session(tmp_path, frames=(), handle=None, spec=None, step=1.0):
+def _session(tmp_path, frames=(), handle=None, spec=None, step=1.0, logger=_REAL_LOGGER):
     from daemon.clock import FakeClock
+    if logger is _REAL_LOGGER:
+        logger = default_logger()          # real Logger by default -> every self._log.* site fires
     ev = EventQueue()
     clock = FakeClock(0.0)
-    sess = Session("s1", "demo", ClaudeDriver(), None, spec or Spec(), ev, clock=clock)
+    sess = Session("s1", "demo", ClaudeDriver(), None, spec or Spec(), ev, clock=clock, logger=logger)
     sess._handle = (handle if handle is not None
                     else FakeHandle(list(frames), stop=sess._stop, clock=clock, step=step))
     sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
@@ -1018,7 +1022,9 @@ class PasteCollapseHandle(LiveHandle):
             self._frames[j] = self._frames[j].replace("❯ \n", "❯ [Pasted text #1]\n")
 
 
-def make_session(tmp_path, frames, handle_cls=LiveHandle, spec=None):
+def make_session(tmp_path, frames, handle_cls=LiveHandle, spec=None, logger=_REAL_LOGGER):
+    if logger is _REAL_LOGGER:
+        logger = default_logger()          # real Logger by default -> _run/_loop log sites fire
     ev = EventQueue()
     handle = handle_cls(list(frames))
 
@@ -1030,7 +1036,7 @@ def make_session(tmp_path, frames, handle_cls=LiveHandle, spec=None):
         def stop(self, h):
             pass
 
-    sess = Session("s1", "demo", ClaudeDriver(), _Launcher(), spec or Spec(), ev)
+    sess = Session("s1", "demo", ClaudeDriver(), _Launcher(), spec or Spec(), ev, logger=logger)
     return sess, handle, ev
 
 
@@ -1261,7 +1267,13 @@ def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeyp
     # decision, and must mark the now-obsolete re-emit event answered (so pending() stays clean).
     monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
-    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    # logger=None ON PURPOSE: this test stubs ev.publish to RETURN None (the `defer` below) to capture
+    # a re-emit without publishing it — a degenerate stub the real EventQueue.publish never does (it
+    # always returns an Event). _publish then logs audit_decision(evt.event_id); with a real Logger that
+    # would raise on the None `evt`, but that is the stub's artifact, not a prod path (real publish is
+    # non-None, so evt.event_id is always safe). The real-Logger default is exercised by the other
+    # _session tests; this one keeps the None-guard so the None-returning stub is tolerated.
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box], logger=None)
     sess._loop()
     sess._stop.clear()                                # a real respond runs while the monitor is live
     sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
@@ -1382,9 +1394,11 @@ def test_session_screen_cleans_by_default_and_raw_is_exact(tmp_path):
 
 # ---- observability: finalization correctness (Task 5) ------------------------
 
-def _bare_session(tmp_path, handle):
+def _bare_session(tmp_path, handle, logger=_REAL_LOGGER):
+    if logger is _REAL_LOGGER:
+        logger = default_logger()          # real Logger by default -> _run/_finish log sites fire
     ev = EventQueue()
-    sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), ev)
+    sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), ev, logger=logger)
     sess._handle = handle
     sess._dialog = Dialog(tmp_path / "s1", tail_lines=Spec.tail_lines,
                           spool_max_bytes=Spec.spool_max_bytes)
@@ -1489,6 +1503,30 @@ def test_delivered_run_logs_readiness_and_delivery(tmp_path):
     evs = _events_in(buf)
     assert "executor_spawned" in evs and "cli_ready" in evs
     assert "delivery_attempt" in evs and "delivery_confirmed" in evs
+
+
+def test_run_loop_survives_hook_flow_with_real_logger(tmp_path):
+    # nelix-6qs: close the "crashes only with a real Logger" class. The REAL monitor
+    # (_run -> _loop -> _drain_hooks) runs with a real Logger in prod, and _drain_hooks logs a
+    # `hook_applied` DEBUG line per drained hook. A bad self._log.*(...) call (the event= kwarg
+    # collision of 74c162e, or any future one) raises TypeError on the FIRST hook and kills the
+    # monitor — invisible when the loop wires logger=None (the line sits behind
+    # `if self._log is not None:`). Drive the whole real wiring with a real Logger and a real hook
+    # flow so a re-landing of that class FAILS here instead of shipping green.
+    box = "Welcome back!\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"
+    sess, handle, _ = make_session(tmp_path, frames=[box])
+    log, buf = _capture_logger()
+    sess._log = log
+    sess.start("do the thing", str(tmp_path))
+    assert _wait_for(lambda: sess._task_delivery == "delivered")
+    sess.on_hook(HookEvent("s1", "UserPromptSubmit"))          # first hook: hooks take over (busy)
+    sess.on_hook(HookEvent("s1", "Stop"))                      # -> idle
+    reached_idle = _wait_for(lambda: sess.snapshot()["control_state"] == "idle")
+    sess.stop()
+    evs = _events_in(buf)
+    assert reached_idle                                         # the Stop hook drained (monitor alive)
+    assert "hook_applied" in evs                                # the crashing line actually fired
+    assert "monitor_exception" not in evs                      # the monitor survived the hook flow
 
 
 # ---- delivery must not wedge on a blocking PTY write (real PtySession) --------

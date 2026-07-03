@@ -17,6 +17,7 @@ from daemon.events import EventQueue             # noqa: E402
 from daemon.hooks import HookEvent               # noqa: E402
 from daemon.clock import FakeClock               # noqa: E402
 from daemon.obs import Logger                     # noqa: E402
+from tests._session_replay import default_logger, _REAL_LOGGER  # noqa: E402
 import io                                          # noqa: E402
 
 
@@ -84,7 +85,12 @@ class HookFakeHandle:
         pass
 
 
-def _hook_session(tmp_path, frame="✦ Working… (esc to interrupt)", step=1.0, logger=None):
+def _hook_session(tmp_path, frame="✦ Working… (esc to interrupt)", step=1.0, logger=_REAL_LOGGER):
+    # Default: a real Logger so _drain_hooks' `hook_applied` line (the 74c162e crash site) is
+    # EXERCISED on every hook test, not just the point regression below. Pass logger=None for the
+    # None-guard path, or an own capture Logger to assert on the log.
+    if logger is _REAL_LOGGER:
+        logger = default_logger()
     ev = EventQueue()
     clock = FakeClock(0.0)
     sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), ev, logger=logger, clock=clock)

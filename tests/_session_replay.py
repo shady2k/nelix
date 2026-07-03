@@ -16,6 +16,7 @@ deterministically, no real PTY/threads.
 import json
 import threading
 import time
+from io import StringIO
 from pathlib import Path
 
 from daemon.session import Session
@@ -25,9 +26,27 @@ from daemon.drivers.claude import ClaudeDriver
 from daemon.transcript_builder import TranscriptBuilder
 from daemon.events import EventQueue
 from daemon.clock import FakeClock
+from daemon.obs import Logger
 from tests._replay import replay_frames
 
 _GOLDEN = Path(__file__).resolve().parent / "golden" / "claude" / "_regression"
+
+# Sentinel distinguishing "helper default" (-> a real Logger) from an explicit ``logger=None`` (the
+# no-logger / None-guard path). The DEFAULT for every session-test helper is a real Logger so that
+# each ``if self._log is not None:`` branch — every ``self._log.*(...)`` call site — is EXERCISED
+# under test. The hook-state crash (fix 74c162e) shipped in 100% of prod sessions while the suite
+# stayed green precisely because every helper wired ``logger=None``, leaving the crashing log line
+# dead code. A test that genuinely needs the None-guard path passes ``logger=None`` explicitly.
+_REAL_LOGGER = object()
+
+
+def default_logger():
+    """A real DEBUG Logger over a throwaway ``StringIO``: the session-test-helper default. Debug
+    level so even the high-volume debug lines (``hook_applied``, ``respond_attempt``) are actually
+    emitted — a bad kwarg (e.g. the ``event=`` positional/keyword collision) then raises here instead
+    of sitting dead under a ``logger=None`` test. Tests that ASSERT on the log pass their own capture
+    Logger; this default is intentionally un-inspectable (coverage, not assertion)."""
+    return Logger(level="debug", stream=StringIO())
 
 
 class Spec:
@@ -141,9 +160,13 @@ class RawReplayHandle:
         pass
 
 
-def _wire(tmp_path, spec, logger=None):
+def _wire(tmp_path, spec, logger=_REAL_LOGGER):
     """Build a Session wired exactly like tests/test_session.py: real ClaudeDriver, FakeClock,
-    EventQueue, private Dialog. Returns (sess, ev, clock)."""
+    EventQueue, private Dialog. Defaults to a real Logger so every ``self._log.*`` site is exercised;
+    pass ``logger=None`` for the None-guard path or an own capture Logger to assert on the log.
+    Returns (sess, ev, clock)."""
+    if logger is _REAL_LOGGER:
+        logger = default_logger()
     ev = EventQueue()
     clock = FakeClock(0.0)
     sess = Session("s1", "demo", ClaudeDriver(), None, spec, ev, clock=clock, logger=logger)
@@ -168,7 +191,7 @@ def replay_session(tmp_path, frames, *, spec=None, step=1.0, pad_last=0):
 
 
 def delivery_run(tmp_path, frames, *, task, spec=None, step=1.0, pad_last=0,
-                 logger=None, on_terminal=None):
+                 logger=_REAL_LOGGER, on_terminal=None):
     """Drive the REAL Session DELIVERY path (Session._run's pre-delivery loop + _deliver_task) over a
     real capture, synchronously and deterministically.
 
@@ -240,7 +263,7 @@ def respond_via_monitor(sess, answer, decision_id, frame, *, timeout=10.0, befor
 
 
 def delivery_drive(tmp_path, frames, *, task, spec=None, step=1.0, respond=None,
-                   max_iters=None, logger=None):
+                   max_iters=None, logger=_REAL_LOGGER):
     """Drive Session._run's PRE-DELIVERY loop body frame-by-frame over a REAL capture — the
     deterministic, single-threaded equivalent of the monitor's delivery phase, with one injection
     point ``respond`` a test uses to answer a modal at exactly the moment the orchestrator would
