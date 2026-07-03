@@ -412,6 +412,18 @@ class SessionManager:
         # A follow-up on an IDLE session (turn complete, alive, no respondable decision) is a NEW
         # turn: route it through send_turn (re-acquire an active slot + re-open the turn) — never
         # respond(), whose no_pending path can't drive a non-respondable idle decision (plan Task 10).
+        #
+        # M4 (final whole-branch review, doc-only): this branch is reached — instead of the
+        # decision_id-dispatch branch above — whenever `decision_id` is falsy or names no
+        # outstanding async question, INCLUDING the case where the session is idle with a lone
+        # outstanding async_question and the caller answered it WITHOUT a decision_id. Async answers
+        # SHOULD pass decision_id (see the `question` tool
+        # docs), but this is a deliberate choice, not an oversight: a strict guard here (rejecting a
+        # decision_id-less idle answer) would also break legitimate idle follow-ups, which never
+        # carry a decision_id. So a decision_id-less answer on an idle session is treated as a plain
+        # follow-up turn — the async question is left untouched in its slot (still pending) and is
+        # only ever auto-resolved if the session later goes terminal with it still outstanding
+        # (Task 6 terminal survival -> reason="executor_finished"), never by this fall-through.
         if sess.snapshot().get("control_state") == "idle":
             return self.send_turn(session_id, answer)
         return sess.respond(answer, decision_id=decision_id)

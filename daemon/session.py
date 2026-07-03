@@ -1073,7 +1073,12 @@ class Session:
         (in _publish) exists for the single blocking pause; installing a question there would let
         it clobber a real decision, or a real decision clobber it. Only one question may be
         outstanding per session at a time: a caller that already has one pending gets the existing
-        id back (never a fresh mint), so a retried/duplicate `question` call is a no-op wake.
+        id back (never a fresh mint), so a retried/duplicate `question` call is a no-op wake. A new
+        question is ALSO rejected while an earlier answer is still queued for delivery (M2, final
+        whole-branch review): self._async_reply_pending is a single slot, so accepting q2 here would
+        let its answer silently overwrite reply1 the moment both are answered while busy, even
+        though the caller was told reply1 was "queued" — the single-outstanding-reply model holds
+        until delivery, not just until correlation.
 
         The EventQueue publish below is wake-only — kind="async_question" is deliberately absent
         from RESPONDABLE_KINDS, so it can never become EventQueue.pending()'s answer and never
@@ -1091,14 +1096,23 @@ class Session:
                 # snapshot both keep the untruncated question).
                 return None, {"id": self._async_question["id"],
                               "question": self._async_question["question"][:200]}
+            if self._async_reply_pending is not None:
+                # M2 (final whole-branch review): an earlier answer is still QUEUED for delivery
+                # (busy -> answered -> queued_busy) even though self._async_question was already
+                # cleared by that answer's correlation. self._async_reply_pending is a SINGLE slot,
+                # so accepting a second question here would let ITS answer silently OVERWRITE the
+                # still-undelivered reply1 the instant both are answered while busy — reply1 would
+                # be lost even though the caller was told "queued". Reject with the same
+                # already_pending shape as the live-question branch above (id is unknown here since
+                # the original question's slot is already gone; the queued reply text stands in for
+                # "question" so the caller can see what's blocking).
+                return None, {"id": None, "question": self._async_reply_pending[:200]}
             self._next_qseq += 1
             qid = f"q_{self._next_qseq}"
             state = self._state
-        # INSTALL RACE — CALLER (route layer, Task 5) MUST serialize `question` posts per session.
-        # The publish runs lock-free (lock-order rule above) and the slot store is a SECOND lock
-        # acquisition below, so this method is NOT self-synchronizing across concurrent same-session
-        # callers. Two windows exist, both closed today only because ONE executor posts serially and
-        # /wait vs /status are separate round-trips (never concurrent for one session):
+        # INSTALL RACE — this method is NOT self-synchronizing across concurrent same-session callers:
+        # the publish runs lock-free (lock-order rule above) and the slot store is a SECOND lock
+        # acquisition below. Two windows exist:
         #   (1) DOUBLE-STORE: two callers can both pass the already-pending check (slot still None)
         #       before either reaches the store -> both mint a qid, both publish, both store, and the
         #       later store CLOBBERS the earlier question (both callers still see (qid, None)).
@@ -1107,8 +1121,14 @@ class Session:
         #       (no async_question in the snapshot yet). The _decision path closes the analogous window
         #       via _publish's on_publish/_install hook (installs the slot UNDER the EventQueue lock,
         #       before waiters are notified); this method intentionally does NOT replicate that.
-        # RESOLUTION: the HTTP route layer serializes `question` posts per session (or, if it must fan
-        # out concurrently, adopts the on_publish install pattern) — do not rely on this method alone.
+        # RESOLUTION (M3, final whole-branch review — corrected; the route layer does NOT serialize
+        # `question` posts, there is no per-session lock in daemon/rpc_server.py's _dispatch_message):
+        # this race is unhittable in practice because of the SINGLE SERIAL EXECUTOR invariant (one
+        # executor process posts one `question` at a time — there is no concurrent same-session caller
+        # to race with) plus /wait and /status being SEPARATE round-trips (a status puller is never
+        # itself a concurrent `question` poster). If a future caller ever fans `question` posts out
+        # concurrently for one session, adopt the on_publish install pattern instead of relying on
+        # this method alone.
         evt = self._events.publish(self._id, self._executor, "async_question", q.question[:200],
                                    state, requires_response=True, decision_id=qid)
         with self._lock:
@@ -1285,15 +1305,24 @@ class Session:
     def terminal_snapshot(self):
         """Read-only advisory snapshot for a disappearing session, so the companion can relay
         a completion/crash even after the manager has freed the slot. Display-only; the durable
-        restart count lives in the manager's lineage table."""
+        restart count lives in the manager's lineage table.
+
+        Carries the SAME progress fields as snapshot()'s gated addition (I1, final whole-branch
+        review): _finish publishes the terminal event then Manager._free_slot synchronously frees
+        the slot, so by the time Hermes reads status the session lives only here (recent_terminal).
+        Without the progress trail, the curated "what did the executor accomplish" surface (spec
+        §7/§1) would vanish at exactly the moment it matters most — completion. Always included
+        (never gated): a terminal read IS the wake point, there is nothing left to poll for."""
         with self._lock:
-            return {"session_id": self._id, "executor": self._executor,
+            snap = {"session_id": self._id, "executor": self._executor,
                     "task": self._task_raw, "cwd": self._cwd,
                     "control_state": "terminal", "terminal_kind": self._terminal_kind,
                     "task_delivery": self._task_delivery,
                     "screen_excerpt": self._last_screen_excerpt, "pending": False,
                     "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
                     "restart_count": self.restart_count, "terminal": True}
+            snap.update(self._progress_view_locked())
+            return snap
 
     # respond's submit-confirm poll interval (read-only render reads; the monitor owns pump()).
     _CONFIRM_POLL = 0.1

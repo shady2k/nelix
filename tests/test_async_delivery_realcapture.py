@@ -24,7 +24,7 @@ from daemon.drivers.claude import ClaudeDriver    # noqa: E402
 from daemon.events import EventQueue              # noqa: E402
 from daemon.hooks import HookEvent                # noqa: E402
 from daemon.manager import SessionManager         # noqa: E402
-from daemon.messages import AsyncQuestion, format_async_reply  # noqa: E402
+from daemon.messages import AsyncQuestion, ProgressNote, format_async_reply  # noqa: E402
 from daemon.session import Session                # noqa: E402
 
 
@@ -215,6 +215,26 @@ def test_respond_after_finish_returns_not_delivered(tmp_path):
     assert sess._handle.writes == []                      # nothing typed — the executor is gone
 
 
+def test_terminal_snapshot_carries_progress_trail(tmp_path):
+    # I1 (final whole-branch review): _finish publishes the terminal event then synchronously frees
+    # the slot (Manager._free_slot), so by the time Hermes reads status the session lives only in
+    # recent_terminal / status()'s terminal_snapshot() path. Progress notes recorded before exit must
+    # still be visible there — otherwise the curated progress trail (spec §7/§1: what the executor
+    # accomplished) is lost exactly at completion, the one moment it matters most.
+    sess, mgr, _ = _manager_session(tmp_path)
+    _drive_busy(sess)
+    sess.append_progress_note(ProgressNote("did step 1", None))
+    sess.append_progress_note(ProgressNote("did step 2", "more detail"))
+    sess._stop.set()
+    sess._finish()                                        # real terminal funnel -> _free_slot runs
+    assert mgr.get(_SID) is None                          # deregistered: the slot was freed
+    board = mgr.status()
+    snap = board["recent_terminal"][_SID]
+    assert snap["progress_total"] == 2
+    summaries = [n["summary"] for n in snap["progress"]]
+    assert summaries == ["did step 1", "did step 2"]
+
+
 def test_respond_after_finish_wrong_id_is_unknown_session(tmp_path):
     # The terminal-survival fallback is narrowly scoped to the id that was actually auto-resolved;
     # any other decision_id for the same freed session still falls through to unknown_session.
@@ -314,6 +334,39 @@ def test_busy_reply_requeued_when_delivery_declines(tmp_path):
     sess.drain_async_reply()                             # next idle tick -> delivered
     assert sess._async_reply_pending is None
     assert len(calls) == 2 and "Hermes: use a" in calls[-1]
+
+
+def test_second_question_rejected_while_earlier_reply_still_queued(tmp_path):
+    # M2 (final whole-branch review): the already_pending guard in record_async_question checks
+    # only self._async_question, which is cleared the moment an answer is CORRELATED (even though
+    # the reply itself is only QUEUED, not yet delivered, while busy). Without this guard: busy ->
+    # ask q1 -> answer q1 (slot cleared, reply1 queued) -> still busy -> ask q2 (wrongly accepted,
+    # since the slot was cleared) -> answer q2 -> reply2 OVERWRITES reply1 in the single
+    # _async_reply_pending slot -> reply1 is silently lost even though Hermes was told "queued".
+    sess, mgr, _ = _manager_session(tmp_path)
+    _drive_busy(sess)
+    qid1, err1 = sess.record_async_question(_Q)
+    assert err1 is None
+    out1 = mgr.respond(_SID, "use a", decision_id=qid1)
+    assert out1.status == "queued"                      # busy -> reply1 enqueued, not delivered yet
+    assert not sess.has_pending_async()                  # q1's slot was cleared (correlation)
+    reply1 = sess._async_reply_pending
+    assert reply1 is not None and "Hermes: use a" in reply1
+
+    # Still busy: a second question must be REJECTED (already_pending shape), not accepted — else
+    # answering it would clobber reply1.
+    q2 = AsyncQuestion("c or d?", "keep coding", "c", None)
+    qid2, err2 = sess.record_async_question(q2)
+    assert qid2 is None
+    assert err2 is not None and "id" in err2             # same already_pending shape as the
+                                                          # live-question branch (route maps -> 409)
+    assert sess._async_reply_pending == reply1            # reply1 is UNTOUCHED, still queued
+
+    # Once the executor goes idle, reply1 (and only reply1) is delivered — nothing was lost.
+    _drive_idle(sess)
+    w = "".join(sess._handle.writes)
+    assert "Hermes: use a" in w
+    assert "c or d?" not in w                             # q2 was never accepted, never answered
 
 
 def test_plain_idle_followup_still_routes_to_send_turn(tmp_path):

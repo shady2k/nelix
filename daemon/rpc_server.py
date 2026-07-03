@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import paths
+from daemon.config import MSG_MAX_BODY
 from daemon.dialog import DialogReader
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hooks import HookEvent
@@ -21,10 +22,6 @@ _MAX_BODY = 4 * 1024 * 1024   # 4 MiB body cap (post-auth memory hygiene; genero
 _HOOK_MAX_BODY = 256 * 1024   # tight cap for hook payloads: they are small lifecycle events
 _HOOK_RATE_CAPACITY = 60      # per-session token-bucket burst (generous for a busy turn's tool events)
 _HOOK_RATE_REFILL = 30.0      # tokens/sec sustained; a genuine flood/forge attempt is dropped
-# /message payloads carry a few free-text fields (question/continuation_plan/details, each capped at
-# MAX_BODY_LEN by parse_message_body) — comfortably smaller than a hook event, so the same tight cap
-# as /hook applies.
-_MSG_MAX_BODY = 256 * 1024
 
 
 class _HookRateLimiter:
@@ -244,7 +241,7 @@ def make_server(manager, transport, logger=None):
             # (msg_limiter) so message spam can never starve hook delivery. Never touches the PTY
             # (single-writer PTY invariant): only manager state methods are called here.
             sid = p.path[len("/message/"):]
-            body = self._read_json(max_body=_MSG_MAX_BODY)   # 413 (too large) / 400 (malformed)
+            body = self._read_json(max_body=MSG_MAX_BODY)   # 413 (too large) / 400 (malformed)
             sess = manager.get(sid)
             secret = getattr(sess, "hook_secret", None) if sess is not None else None
             provided = self.headers.get("X-Nelix-Hook-Secret", "")

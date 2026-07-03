@@ -78,7 +78,7 @@ def test_question_field_truncates_to_max_body_len():
 
 def test_config_caps_values():
     from daemon.config import MSG_MAX_BODY, MAX_PROGRESS_NOTES, MAX_SUMMARY_LEN, MAX_BODY_LEN
-    assert MSG_MAX_BODY == 8192
+    assert MSG_MAX_BODY == 256 * 1024
     assert MAX_PROGRESS_NOTES == 50
     assert MAX_SUMMARY_LEN == 280
     assert MAX_BODY_LEN == 4000

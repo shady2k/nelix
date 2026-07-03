@@ -190,3 +190,18 @@ def test_message_bucket_exhausted_returns_429(server):
     for _ in range(MSG_LIMIT + 2):
         last, _ = post(server, "/message/s1", {"kind": "note", "summary": "x"})
     assert last == 429
+
+
+def test_message_oversized_body_is_413(server):
+    # M1 (final whole-branch review): the route consumes config.MSG_MAX_BODY (no separate magic
+    # number) — a claimed Content-Length past that cap 413s, mirroring /hook's tight body cap.
+    from daemon.config import MSG_MAX_BODY
+    u = urlparse(server)
+    c = http.client.HTTPConnection(u.hostname, u.port, timeout=5)
+    c.putrequest("POST", "/message/s1")
+    c.putheader("X-Nelix-Token", TOKEN)
+    c.putheader("X-Nelix-Hook-Secret", SECRET)
+    c.putheader("Content-Length", str(MSG_MAX_BODY + 1))   # claim past the cap ...
+    c.endheaders()                                         # ... but send no body
+    r = c.getresponse(); st = r.status; r.read(); c.close()
+    assert st == 413
