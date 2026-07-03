@@ -288,9 +288,9 @@ def test_run_capture_group_kill_happens_before_reap(monkeypatch):
         order.append("killpg")
         return real_killpg(pgid, sig)
 
-    def spy_reap(proc):
+    def spy_reap(proc, deadline):
         order.append("reap")
-        return real_reap(proc)
+        return real_reap(proc, deadline)
     monkeypatch.setattr(er.os, "killpg", spy_killpg)
     monkeypatch.setattr(er, "_reap", spy_reap)
     assert run_capture("echo hi", {}, 5.0, _CAP) == ("hi", None)
@@ -348,7 +348,9 @@ def test_run_capture_escaping_grandchild_returns_within_grace(tmp_path):
     value, reason = run_capture(esc, {}, 5.0, _CAP)
     dt = time.monotonic() - t0
     assert value is None and reason == "run_failed"
-    assert dt < 8.0, f"cleanup hung ({dt:.2f}s) — must be bounded by ~timeout+grace"
+    # Shell exits fast (sentinel), so teardown is dominated by ONE _CLEANUP_GRACE (2.0s) join; the
+    # join+reap now share a single deadline (FIX B), so ~2.x s total, not ~timeout+2*grace.
+    assert dt < 4.0, f"cleanup hung ({dt:.2f}s) — must be bounded by ~timeout+ONE grace"
 
 
 def test_run_capture_wedged_reader_abandons_without_partial_value_or_close(monkeypatch):
@@ -358,7 +360,7 @@ def test_run_capture_wedged_reader_abandons_without_partial_value_or_close(monke
     # Force reader_clean=False even though `echo hi` really did produce "hi\n": the result must be
     # run_failed, never the partial ("hi", None), and _close must not be invoked.
     import daemon.env_resolver as er
-    monkeypatch.setattr(er, "_join_reader", lambda reader, grace: False)
+    monkeypatch.setattr(er, "_join_reader", lambda reader, deadline: False)
     closed = []
     real_close = er._close
     monkeypatch.setattr(er, "_close", lambda f: closed.append(f))
@@ -396,3 +398,26 @@ def test_run_capture_overflow_does_not_reap_before_group_kill(monkeypatch):
         f"a reaping Popen method ran BEFORE killpg (pid-reuse race): {before}"
     # The reader no longer uses any Popen-level kill/signal at all (only raw os.killpg):
     assert "kill" not in order and "send_signal" not in order
+
+
+# ---- FIX B (wave 3): teardown is bounded by ~ONE grace, not join-grace + reap-grace --------
+def test_run_capture_join_and_reap_share_one_cleanup_deadline(monkeypatch):
+    # Worst-case teardown must be ~timeout + ONE grace, not + 2*grace. Structural proof: the bounded
+    # join and the reap receive the SAME monotonic deadline, so a wedged reader that eats the whole
+    # grace on the join leaves the reap ~0 budget (they share the one grace, they don't each get one).
+    import daemon.env_resolver as er
+    seen = {}
+    real_join, real_reap = er._join_reader, er._reap
+
+    def spy_join(reader, deadline):
+        seen["join"] = deadline
+        return real_join(reader, deadline)
+
+    def spy_reap(proc, deadline):
+        seen["reap"] = deadline
+        return real_reap(proc, deadline)
+    monkeypatch.setattr(er, "_join_reader", spy_join)
+    monkeypatch.setattr(er, "_reap", spy_reap)
+    assert run_capture("echo hi", {}, 5.0, _CAP) == ("hi", None)
+    assert "join" in seen and "reap" in seen
+    assert seen["join"] == seen["reap"], "join and reap must share ONE cleanup deadline (~1 grace total)"

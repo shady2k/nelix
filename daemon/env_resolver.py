@@ -71,11 +71,15 @@ def _kill_group(proc):
         pass
 
 
-def _reap(proc):
+def _reap(proc, deadline):
+    # Reap within whatever remains of the SHARED cleanup deadline (FIX B): the join may already have
+    # consumed most/all of the one grace, so the reap gets only the remainder — teardown as a whole is
+    # bounded by ~one grace, not join-grace + reap-grace. remaining=0 -> a non-blocking reap of the
+    # (already SIGKILLed / exited) child.
     try:
-        proc.wait(timeout=_CLEANUP_GRACE)
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
     except Exception:
-        pass                                   # bounded; a stuck reap must not wedge the call
+        pass
 
 
 def _wait_exit_no_reap(proc, timeout):
@@ -99,16 +103,17 @@ def _wait_exit_no_reap(proc, timeout):
         time.sleep(min(_EXIT_POLL_INTERVAL, remaining))
 
 
-def _join_reader(reader, grace):
-    """Bounded join. Returns True if the reader CLEANLY exited (drained to EOF) or was never started,
-    False if it is still alive after `grace` — i.e. wedged in read1() because an escaped grandchild
-    still holds the write end (FIX B). A False result means the reader thread AND its fd must be
-    ABANDONED: closing proc.stdout would block on the BufferedReader lock the wedged read1 holds, and
-    the capture state is not stable to read (FIX C)."""
+def _join_reader(reader, deadline):
+    """Bounded join until `deadline` (a monotonic timestamp SHARED with the reap so join+reap together
+    cost ~one grace, not two — FIX B). Returns True if the reader CLEANLY exited (drained to EOF) or
+    was never started, False if it is still alive at the deadline — i.e. wedged in read1() because an
+    escaped grandchild still holds the write end. A False result means the reader thread AND its fd
+    must be ABANDONED: closing proc.stdout would block on the BufferedReader lock the wedged read1
+    holds, and the capture state is not stable to read (FIX B/C)."""
     if reader is None:
         return True
     try:
-        reader.join(grace)
+        reader.join(max(0.0, deadline - time.monotonic()))
     except RuntimeError:
         return True                            # thread never started (Thread.start failed)
     return not reader.is_alive()
@@ -207,15 +212,18 @@ def run_capture(command, base_env, timeout, max_bytes):
         # route's broad `except ValueError` as a wrong 404. Cleanup below still reaps the child.
         failed = True
     finally:
-        # Bounded teardown on EVERY path. Order matters:
+        # Bounded teardown on EVERY path, capped at ~ONE _CLEANUP_GRACE TOTAL (FIX B): the join and the
+        # reap SHARE one deadline, so a wedged reader can't cost a full grace on the join AND another on
+        # the reap. Order matters:
         #   FIX A: kill the group while proc.pid is STILL OWNED (WNOWAIT never reaped it), BEFORE reap.
-        #   FIX B: only _close proc.stdout when the reader confirmed-exited — a wedged read1() holds the
-        #          BufferedReader lock, so closing from here would block PAST the grace (cleanup hang).
+        #   FIX B/C: only _close proc.stdout when the reader confirmed-exited — a wedged read1() holds
+        #            the BufferedReader lock, so closing from here would block PAST the grace.
+        cleanup_deadline = time.monotonic() + _CLEANUP_GRACE
         _kill_group(proc)
-        reader_clean = _join_reader(reader, _CLEANUP_GRACE)
+        reader_clean = _join_reader(reader, cleanup_deadline)
         if reader_clean:
             _close(proc.stdout)
-        _reap(proc)                            # reap AFTER killpg, always (no leaked child)
+        _reap(proc, cleanup_deadline)          # reap AFTER killpg, within the SHARED deadline
     # FIX C: a not-cleanly-exited reader may still be appending -> chunks/exceeded are NOT stable, so
     # return a redacted failure WITHOUT reading them (and having left proc.stdout open + the thread
     # abandoned above). This is also how an escaped-grandchild pipe hang surfaces.
