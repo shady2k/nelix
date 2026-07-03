@@ -79,6 +79,20 @@ def test_no_env_cmd_spawn_env_is_byte_identical(monkeypatch):
     assert cap["env"] == spec.resolved_env()
 
 
+def test_env_cmd_reruns_on_every_spawn_not_cached(monkeypatch, tmp_path):
+    # Resolution is per-spawn, never cached: each LocalLauncher.start re-runs the command. This is
+    # exactly what a restart does (restart -> _spawn -> Session.start -> launcher.start), so a rotated
+    # secret is picked up. A counter file records one append per resolution.
+    counter = tmp_path / "runs"
+    spec = make_spec(command="claude", driver="claude",
+                     env_cmd={"TOK": f"printf x >> {counter}; cat {counter}"})
+    cap1 = _run(monkeypatch, spec)
+    cap2 = _run(monkeypatch, spec)                     # a second spawn of the SAME spec (e.g. a restart)
+    assert counter.read_text() == "xx"                # ran twice, once per spawn — not cached
+    assert cap1["env"]["TOK"] == "x"                  # first spawn saw one run
+    assert cap2["env"]["TOK"] == "xx"                 # second spawn re-ran (fresh value)
+
+
 def test_env_cmd_failure_raises_before_spawn(monkeypatch):
     # A failing resolver aborts the launch BEFORE the broker is ever asked to spawn.
     captured = {}

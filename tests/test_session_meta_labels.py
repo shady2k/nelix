@@ -94,3 +94,26 @@ def test_properties_expose_executor_task_cwd(tmp_path, monkeypatch):
     assert sess.executor == "claude"
     assert sess.task == "a task"
     assert sess.cwd == str(tmp_path)
+
+
+def test_meta_persists_no_env_or_env_cmd_secret(tmp_path, monkeypatch):
+    # nelix-c5o §5: _write_meta must NEVER serialize env — neither the static [env] nor the env_cmd
+    # command (which can carry a secret path). On restart the command is RE-RUN, never read from disk.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    spec = ExecutorSpec(command="claude", args=[], env={"STATIC_SECRET": "s3cr3t-static-value"},
+                        driver="claude", env_cmd={"TOK": "print-the-secret-token"})
+
+    class _Drv:
+        command_prefixes = ()
+        submit_key = "\r"
+        def __init__(self): self._settle = 0
+
+    sess = Session("s-envc0001", "claude", _Drv(), _NoopLauncher(), spec, EventQueue())
+    sess.lineage_id = "s-envc0001"
+    sess.start("do the thing", str(tmp_path))
+    sess.stop()
+    raw = paths.session_meta(paths.sessions_root() / "s-envc0001").read_text()
+    meta = json.loads(raw)
+    assert "env" not in meta and "env_cmd" not in meta
+    assert "s3cr3t-static-value" not in raw          # the static secret value never persisted
+    assert "print-the-secret-token" not in raw       # nor the env_cmd command string
