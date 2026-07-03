@@ -22,12 +22,13 @@ Long tasks routinely run many minutes. A ticking timer or visible activity means
 
 ## Start
 
-Settle three things per agent:
+Settle these per agent:
 - **task** — the goal + where to look (a thin pointer: bead id, file/area, constraints), NOT a pre-baked analysis you produced by reading the code yourself.
 - **cwd** — which project. Default = your current dir, or a path the user gives; ask only if unclear.
 - **mandate** — what you may decide vs must ask. Default: relay every agent question to the user. Destructive actions (delete, `git push`, writing outside the project) are always named explicitly, never blanket. Keep the mandate in your own context.
+- **model** *(optional)* — run this session on a specific model: a tier alias (`haiku`/`sonnet`/`opus`) or a full model id. Omit for the executor's configured default. Start-time only — to change model, start a new session.
 
-Then `nelix_start(executor, task, cwd)` and end your turn — you spend nothing while it works. You may report the launch result (agent name, task, cwd) from the returned snapshot without a separate `nelix_status` call. If the result carries `config_errors`, the executor's `nelix.toml` is misconfigured: relay the `error` message verbatim and stop — do not retry until the user fixes the config.
+Then `nelix_start(executor, task, cwd, model?)` and end your turn — you spend nothing while it works. You may report the launch result (agent name, task, cwd) from the returned snapshot without a separate `nelix_status` call. If the result carries `config_errors`, the executor's `nelix.toml` is misconfigured: relay the `error` message verbatim and stop — do not retry until the user fixes the config.
 
 ## The board
 

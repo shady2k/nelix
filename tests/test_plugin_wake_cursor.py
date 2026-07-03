@@ -116,7 +116,7 @@ def _setup(monkeypatch, tmp_path, client_cls):
 def test_start_arms_per_session_waiter(monkeypatch, tmp_path):
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
     _, ctx = _setup(monkeypatch, tmp_path, C)
     ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
     cmds = _terminal_cmds(ctx)
@@ -129,7 +129,7 @@ def test_board_read_rearms_after_wake_second_event_wakes_again(monkeypatch, tmp_
     second wake. Modelled as: start (arm@0), board shows seq=4 -> re-arm@4."""
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
         def status(self, sid=None, include_progress=False):
             # all-sessions board read after the first wake; session advanced to seq 4
             return {"sessions": {"s-1": {"session_id": "s-1", "state": "waiting_for_user",
@@ -146,7 +146,7 @@ def test_board_read_rearms_after_wake_second_event_wakes_again(monkeypatch, tmp_
 def test_board_read_drops_terminal_session(monkeypatch, tmp_path):
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
         def status(self, sid=None, include_progress=False):
             # s-1 finished: absent from live sessions, present in recent_terminal
             return {"sessions": {}, "recent_terminal": {"s-1": {"terminal": True}}, "cursor": 9}
@@ -164,7 +164,7 @@ def test_board_read_drops_live_listed_terminal_session(monkeypatch, tmp_path):
     dead session that emits no further events and is stranded."""
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
         def status(self, sid=None, include_progress=False):
             return {"sessions": {"s-1": {"session_id": "s-1", "state": "exited",
                                          "terminal_kind": "done", "seq": 9}},
@@ -181,7 +181,7 @@ def test_per_session_status_live_terminal_kind_drops(monkeypatch, tmp_path):
     must drop, not re-arm."""
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
         def status(self, sid=None, include_progress=False):
             return {"session_id": "s-1", "state": "working",
                     "terminal_kind": "delivery_failed", "cursor": 7}
@@ -195,7 +195,7 @@ def test_per_session_status_live_terminal_kind_drops(monkeypatch, tmp_path):
 def test_per_session_status_unknown_drops(monkeypatch, tmp_path):
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
         def status(self, sid=None, include_progress=False):
             return {"error": "unknown session"}         # per-session read of a gone session
     nelix, ctx = _setup(monkeypatch, tmp_path, C)
@@ -208,7 +208,7 @@ def test_per_session_status_unknown_drops(monkeypatch, tmp_path):
 def test_respond_rearms_without_prior_status(monkeypatch, tmp_path):
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
         def respond(self, *a, **k): return True, {"status": "resumed", "next_after_seq": 6}
     _, ctx = _setup(monkeypatch, tmp_path, C)
     ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
@@ -222,7 +222,7 @@ def test_respond_failed_arms_no_waiter_and_keeps_recover(monkeypatch, tmp_path):
     # not resume) and must keep the daemon-owned next_action='recover' so the orchestrator recovers.
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
         def respond(self, *a, **k):
             return False, {"operation": "respond", "status": "respond_failed", "session_id": "s-1",
                            "snapshot": {"session_id": "s-1", "control_state": "busy", "pending": False},
@@ -243,7 +243,7 @@ def test_respond_not_delivered_surfaces_cleanly_no_waiter_arm(monkeypatch, tmp_p
     # swallowed, and armed=False (there is nothing left to wake for on this session).
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
         def respond(self, *a, **k):
             return True, {"operation": "respond", "status": "not_delivered", "session_id": "s-1",
                           "reason": "executor_finished", "next_action": "refresh_status"}
@@ -264,7 +264,7 @@ def test_respond_queued_async_answer_surfaces_cleanly_no_waiter_arm(monkeypatch,
     # the delivery/next event, so nelix_respond arms no waiter of its own here).
     class C:
         def __init__(self, t): pass
-        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def start(self, *a, **k): return {"session_id": "s-1", "next_after_seq": 0}
         def respond(self, *a, **k):
             return True, {"operation": "respond", "status": "queued", "session_id": "s-1",
                           "snapshot": {"session_id": "s-1", "control_state": "busy", "pending": False},
@@ -281,7 +281,7 @@ def test_respond_queued_async_answer_surfaces_cleanly_no_waiter_arm(monkeypatch,
 
 class _EnvelopeClient:
     def __init__(self, t): pass
-    def start(self, *a):
+    def start(self, *a, **k):
         return {"operation": "start", "status": "started", "session_id": "s-1",
                 "snapshot": {"session_id": "s-1", "control_state": "busy"},
                 "next_after_seq": 0, "next_action": "end_turn"}
@@ -316,7 +316,7 @@ def test_with_waiter_downgrade_when_arm_skipped(monkeypatch, tmp_path):
     must be downgraded to 'refresh_status', waiter.armed=False."""
     class C:
         def __init__(self, t): pass
-        def start(self, *a):
+        def start(self, *a, **k):
             return {"operation": "start", "status": "started", "session_id": "s-1",
                     "snapshot": {"session_id": "s-1", "control_state": "busy"},
                     "next_after_seq": 0, "next_action": "end_turn"}
@@ -336,7 +336,7 @@ def test_with_waiter_downgrade_when_arm_skipped(monkeypatch, tmp_path):
 class _StopRequestedClient:
     """Client that returns stop_requested from stop(); start arms the session registry."""
     def __init__(self, t): pass
-    def start(self, *a):
+    def start(self, *a, **k):
         return {"operation": "start", "status": "started", "session_id": "s-1",
                 "snapshot": {"session_id": "s-1", "control_state": "busy"},
                 "next_after_seq": 0, "next_action": "end_turn"}

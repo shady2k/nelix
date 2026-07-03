@@ -14,6 +14,11 @@ class Driver(Protocol):
     """
     hook_capable: bool = False   # True if this CLI reports its own lifecycle via nelix hooks
                                  # (launcher injects --settings + NELIX_* env); else screen-only.
+    # CLI flag that selects the per-session model (nelix-9k0), or None if this CLI cannot express a
+    # model override. Structural typing: a concrete driver does NOT inherit this default — it must
+    # declare it to advertise support, and every read uses getattr(driver, "model_flag", None) so a
+    # driver that omits it is treated as "no override support" (never an AttributeError).
+    model_flag: "str | None" = None
     command_prefixes: tuple      # leading tokens the CLI reads as a command, not a prompt
     submit_key: str              # the key that submits a line (CR for most TUIs)
 

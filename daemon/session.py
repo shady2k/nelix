@@ -132,6 +132,9 @@ class Session:
         self.lineage_id = None         # manager-set: restart chain id (None until manager assigns)
         self.restarted_from = None     # manager-set: immediate predecessor session_id, or None
         self.restart_count = 0         # manager-set snapshot of the lineage count (display only)
+        self.model = None              # manager-set: validated per-session model override (nelix-9k0),
+        #                                or None. Persisted in meta so an auto-restart re-injects the
+        #                                SAME model instead of silently reverting to the executor default.
         self._last_screen_excerpt = "" # last published screen excerpt (for the terminal snapshot)
         self._terminal_kind = None     # done | crashed | delivery_failed (set at each terminal point)
         # _task_delivery synchronization (I1): the ONLY genuinely cross-thread transition is the
@@ -260,7 +263,8 @@ class Session:
         meta = {"cols": self._cols, "rows": self._rows, "executor": self._executor,
                 "driver": getattr(self._spec, "driver", None),
                 "task": self._task_raw, "cwd": self._cwd,
-                "lineage_id": self.lineage_id, "restarted_from": self.restarted_from}
+                "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
+                "model": self.model}       # nelix-9k0: per-session override, re-applied on restart
         try:
             with open(paths.session_meta(self._sessions_dir / self._id), "w",
                       opener=paths.private_opener) as f:

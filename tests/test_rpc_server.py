@@ -13,9 +13,9 @@ from daemon.transport import Transport
 class FakeManager:
     def __init__(self):
         self._events = EventQueue(); self.started = None; self.responded = []; self.stopped = []
-        self.respond_status = "resumed"
-    def start(self, executor, task, cwd):
-        self.started = (executor, task, cwd)
+        self.respond_status = "resumed"; self.started_model = "__unset__"
+    def start(self, executor, task, cwd, model=None):
+        self.started = (executor, task, cwd); self.started_model = model
         return StartOutcome(session_id="s1", base_seq=0,
                             snapshot={"session_id": "s1", "control_state": "busy",
                                       "task_delivery": "pending", "pending": False})
@@ -418,11 +418,64 @@ def test_rpc_requires_token():
 class FakeManagerRaisesValueError:
     def __init__(self):
         self._events = EventQueue()
-    def start(self, executor, task, cwd):
+    def start(self, executor, task, cwd, model=None):
         raise ValueError(f"launcher 'auto' is not implemented (post-MVP); use 'local'")
     def respond(self, *a): return None
     def status(self, session_id=None, include_progress=False): return {}
     def stop(self, session_id): return False
+
+
+def test_rpc_start_threads_model_to_manager():
+    # nelix-9k0: /start reads optional body["model"] and passes it to manager.start(..., model=...).
+    m = FakeManager()
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8795, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8795/start",
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "model": "haiku"})
+        assert st == 200
+        assert m.started_model == "haiku"
+    finally:
+        srv.shutdown()
+
+
+def test_rpc_start_without_model_passes_none():
+    # No model in the body -> manager.start receives model=None (byte-identical to pre-feature).
+    m = FakeManager()
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8796, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8796/start",
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo"})
+        assert st == 200
+        assert m.started_model is None
+    finally:
+        srv.shutdown()
+
+
+class FakeManagerRejectsModel:
+    def __init__(self): self._events = EventQueue()
+    def start(self, executor, task, cwd, model=None):
+        from daemon.manager import ModelRejected
+        raise ModelRejected("driver does not support a model override")
+    def respond(self, *a): return None
+    def status(self, session_id=None, include_progress=False): return {}
+    def stop(self, session_id): return False
+
+
+def test_rpc_start_model_rejected_returns_400():
+    # ModelRejected is a ValueError subclass; /start must catch it BEFORE the generic
+    # (RuntimeError, ValueError)->409 branch and return 400 (client input error, not daemon-full).
+    m = FakeManagerRejectsModel()
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8797, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8797/start",
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "model": "bad"})
+        assert st == 400, f"expected 400, got {st}"
+        assert "error" in b
+    finally:
+        srv.shutdown()
 
 
 def test_rpc_start_value_error_returns_409():

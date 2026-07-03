@@ -43,9 +43,13 @@ class RpcClient:
         finally:
             conn.close()
 
-    def start(self, executor, task, cwd):
-        _, body = self._call("POST", "/start",
-                             {"executor": executor, "task": task, "cwd": cwd})
+    def start(self, executor, task, cwd, model=None):
+        # model (nelix-9k0): the key is only ADDED when provided, so a default (no-model) call is
+        # byte-for-byte the same request as before this option existed (mirrors status's include_progress).
+        payload = {"executor": executor, "task": task, "cwd": cwd}
+        if model is not None:
+            payload["model"] = model
+        _, body = self._call("POST", "/start", payload)
         return body
 
     def status(self, session_id=None, include_progress=False):

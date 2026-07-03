@@ -14,6 +14,7 @@ from daemon.dialog import DialogReader
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
+from daemon.manager import ModelRejected
 from daemon.messages import parse_message_body
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.transport import peer_is_self
@@ -288,7 +289,10 @@ def make_server(manager, transport, logger=None):
             body = self._read_json()
             if p.path == "/start":
                 try:
-                    outcome = manager.start(body["executor"], body["task"], body["cwd"])
+                    outcome = manager.start(body["executor"], body["task"], body["cwd"],
+                                            model=body.get("model"))
+                except ModelRejected as e:           # subclass of ValueError: catch BEFORE the 409
+                    self._send(400, {"error": str(e)}); return   # bad-shape/unsupported model = client input error
                 except PtyInputRejected as e:        # subclass of ValueError: catch BEFORE it
                     self._send(400, {"error": str(e)}); return
                 except (RuntimeError, ValueError) as e:

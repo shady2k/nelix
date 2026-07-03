@@ -64,6 +64,7 @@ def _is_choice_prompt(frame):
 @register("claude")
 class ClaudeDriver:
     hook_capable = True         # Claude reports its lifecycle via nelix hooks (--settings injection)
+    model_flag = "--model"      # `claude --model <v>` selects the model (nelix-9k0 per-session override)
     command_prefixes = ("/",)   # a leading '/' opens a TUI slash-command, not a prompt
     submit_key = "\r"           # the TUI treats CR (not LF) as Enter
 

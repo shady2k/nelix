@@ -4,11 +4,60 @@ import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import paths
+from daemon.drivers import get_driver
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.session import RespondOutcome, Session
+
+_MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
+
+
+class ModelRejected(ValueError):
+    """A per-session `model` override that nelix refuses BEFORE spawning: a bad-shape value
+    (empty / control chars / oversized) or a driver that cannot express a model override. A
+    ValueError subclass (like PtyInputRejected) so /start maps it to 400 — caught ahead of the
+    generic ValueError->409 branch (client input error, not daemon-full)."""
+
+
+def _validate_model_shape(model):
+    """Shape-only validation (spec §5): pass-through — nelix keeps no allowlist, the CLI is the
+    authority on model validity. A clean value is forwarded VERBATIM; the checks run on the ORIGINAL
+    string (never a normalized copy) so an edge control char or surrounding whitespace is REJECTED,
+    not silently trimmed-and-accepted. `.strip()` is used ONLY to detect the empty/whitespace-only
+    case. Returns the value unchanged, or raises ModelRejected."""
+    if not isinstance(model, str):
+        raise ModelRejected(f"model must be a string, got {type(model).__name__}")
+    if not model.strip():
+        raise ModelRejected("model is empty or whitespace-only")
+    if len(model) > _MODEL_MAX_LEN:
+        raise ModelRejected(f"model is too long (max {_MODEL_MAX_LEN} chars)")
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in model):
+        raise ModelRejected("model contains ASCII control characters (incl newline/tab)")
+    if model != model.strip():
+        raise ModelRejected("model has leading or trailing whitespace")
+    return model
+
+
+def _strip_model_flag(args, flag):
+    """Remove any existing occurrence of `flag` in BOTH `<flag> <v>` and `<flag>=<v>` forms (the
+    fold is driver-flag-based, never a globally-hardcoded '--model'). Returns (cleaned, stripped)."""
+    cleaned, stripped, i, n = [], False, 0, len(args)
+    eq = flag + "="
+    while i < n:
+        a = args[i]
+        if a == flag:
+            stripped = True
+            i += 2 if i + 1 < n else 1      # drop the flag AND its value (or a malformed trailing flag)
+            continue
+        if a.startswith(eq):
+            stripped = True
+            i += 1
+            continue
+        cleaned.append(a)
+        i += 1
+    return cleaned, stripped
 
 
 @dataclass
@@ -113,6 +162,10 @@ class SessionManager:
         self._terminal_async = {}
         self._terminal_ttl = terminal_snapshot_ttl
         self._clock = clock
+        # Same seam _make uses for session construction, reused for the model-capability read (a
+        # model override reads driver.model_flag). Never call get_driver() directly — that would
+        # bypass an injected factory (tests / custom drivers).
+        self._driver_factory = driver_factory or get_driver
         self._lock = threading.Lock()
         if session_factory is not None:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
@@ -120,10 +173,30 @@ class SessionManager:
             self._make = lambda sid, ex, spec: _default_session_factory(
                 sid, ex, spec, events, launcher_factory, driver_factory, logger)
 
-    def start(self, executor_name, task, cwd):
-        return self._spawn(executor_name, task, cwd, lineage_id=None, restarted_from=None)
+    def start(self, executor_name, task, cwd, model=None):
+        return self._spawn(executor_name, task, cwd, lineage_id=None, restarted_from=None,
+                           model=model)
 
-    def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, reserve=False):
+    def _apply_model_override(self, spec, executor_name, model):
+        """Validate + fold a per-session `model` into a fresh per-session ExecutorSpec (last-wins).
+        Runs BEFORE the session lock and cap checks so a bad/unsupported model returns 400, not a
+        409 'daemon full'. Idempotent — re-applying the already-validated value (the restart/recovery
+        path does exactly this against the fresh original spec) re-strips + re-folds to the same argv.
+        Returns (folded_spec, validated_model). Raises ModelRejected on bad shape or an incapable driver."""
+        model = _validate_model_shape(model)
+        flag = getattr(self._driver_factory(spec.driver), "model_flag", None)
+        if flag is None:
+            raise ModelRejected(
+                f"executor {executor_name!r} (driver {spec.driver!r}) does not support a model override")
+        cleaned, stripped = _strip_model_flag(spec.args, flag)
+        if stripped and self._logger is not None:
+            # A toml-pinned model was overridden — an operationally significant, otherwise-silent action.
+            self._logger.info("manager", "model_override_applied", executor=executor_name,
+                              model=model, driver=spec.driver)
+        return replace(spec, args=[*cleaned, flag, model]), model
+
+    def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, reserve=False,
+               model=None):
         # reserve=True: a slot reservation was made for us by restart() (old session popped +
         # self._reserved bumped under the lock). We OWN that reservation and must release it exactly
         # once: consume it ATOMICALLY with inserting the new session (so len(_sessions)+_reserved
@@ -143,6 +216,13 @@ class SessionManager:
                     self._logger.warning("manager", "session_start_rejected",
                                          reason="bad_cwd", executor=executor_name)
                 raise ValueError(f"cwd does not exist or is not a directory: {cwd!r}")
+            # Per-session model override (nelix-9k0): validate + fold BEFORE the lock/cap checks so a
+            # bad-shape or unsupported-driver model returns 400, never a 409 "daemon full". Omitted
+            # model -> spec is untouched (byte-identical to pre-feature). The validated value is stored
+            # on the session (+ meta) so an auto-restart re-injects the SAME model, not the default.
+            applied_model = None
+            if model is not None:
+                spec, applied_model = self._apply_model_override(spec, executor_name, model)
             with self._lock:
                 # Split accounting (spec §slots): the active cap counts only sessions occupying an
                 # active slot (everything except `idle`) + in-flight restart reservations; a retained
@@ -174,6 +254,7 @@ class SessionManager:
                 sess.lineage_id = lineage_id or sid          # first in chain -> lineage = own id
                 sess.restarted_from = restarted_from
                 sess.restart_count = self._lineages.get(sess.lineage_id, 0)
+                sess.model = applied_model                   # validated override (or None): survives restart
                 self._sessions[sid] = sess
                 if reserve:
                     self._reserved -= 1                      # consume atomically with the insert
@@ -204,14 +285,16 @@ class SessionManager:
         return StartOutcome(session_id=sid, base_seq=base_seq, snapshot=sess.snapshot())
 
     def _restart_source(self, session_id):
-        """Resolve (executor, task, cwd, lineage_id, active_session_or_None) for a restart.
+        """Resolve (executor, task, cwd, lineage_id, active_session_or_None, model) for a restart.
         Source is an ACTIVE session if present, else the PERSISTED session-dir meta (the main path:
-        a crashed/done session has already been removed from _sessions). Returns None if neither."""
+        a crashed/done session has already been removed from _sessions). `model` is the per-session
+        override to re-apply (or None); OLD meta lacking the field defaults to None (no override, the
+        pre-nelix-9k0 behaviour). Returns None if neither source exists."""
         with self._lock:
             sess = self._sessions.get(session_id)
         if sess is not None:
             return (sess.executor, sess.task, sess.cwd,
-                    sess.lineage_id or session_id, sess)
+                    sess.lineage_id or session_id, sess, getattr(sess, "model", None))
         try:
             meta = json.loads(paths.session_meta(paths.sessions_root() / session_id).read_text())
         except (OSError, ValueError):
@@ -219,13 +302,13 @@ class SessionManager:
         if not meta.get("executor") or meta.get("cwd") is None:
             return None
         return (meta["executor"], meta.get("task"), meta["cwd"],
-                meta.get("lineage_id") or session_id, None)
+                meta.get("lineage_id") or session_id, None, meta.get("model"))
 
     def restart(self, session_id, force=False):
         src = self._restart_source(session_id)
         if src is None:
             return RestartOutcome("unknown_session")
-        executor, task, cwd, lineage_id, active = src
+        executor, task, cwd, lineage_id, active, model = src
         spec = self._specs.get(executor)
         max_restarts = spec.max_restarts if spec is not None else 0
         with self._lock:
@@ -258,8 +341,10 @@ class SessionManager:
         # or releases it in its own finally if it raises before inserting. restart() must NOT also
         # touch self._reserved here (that would double-decrement).
         try:
+            # Re-apply the per-session model override (same-lineage recovery must not silently drop
+            # it). _spawn re-validates + re-folds against the fresh original spec (idempotent).
             started = self._spawn(executor, task, cwd, lineage_id=lineage_id,
-                                  restarted_from=session_id, reserve=reserve)
+                                  restarted_from=session_id, reserve=reserve, model=model)
             new_sid, base_seq = started.session_id, started.base_seq
         except Exception:
             if self._logger is not None:

@@ -241,7 +241,7 @@ hatch, never the production runtime.
 
 | Tool | Type | Description |
 |------|------|-------------|
-| `nelix_start(task, workdir, tool)` | Sync, returns immediately | RPC → daemon: spawn PTY child for `tool`, attach its driver, **arm the wake-up waiter** (§4), return `{operation, status, session_id, snapshot, next_after_seq, next_action}`. MVP rejects a start while another session is active (§3.7) |
+| `nelix_start(task, workdir, tool, model?)` | Sync, returns immediately | RPC → daemon: spawn PTY child for `tool`, attach its driver, **arm the wake-up waiter** (§4), return `{operation, status, session_id, snapshot, next_after_seq, next_action}`. Optional `model` runs this session on a specific model — a tier alias (`haiku`/`sonnet`/`opus`) or a full model id; omit for the executor's configured default (start-time only; survives auto-restart). MVP rejects a start while another session is active (§3.7) |
 | `nelix_respond(session_id, event_id, answer)` | Sync | RPC → daemon: validate the answer (§5), inject it via the PTY, mark the event `answered`, resume classification, re-arm the waiter. Rejects a stale/closed `event_id` |
 | `nelix_status(session_id)` | Sync | RPC → daemon: return current driver state + the **canonical pending event** (if any) + last summary + duration. The reconciliation/fetch path (§4) |
 | `nelix_stop(session_id)` | Sync | RPC → daemon: cancel the session — graceful interrupt → timeout → force kill — and return a post-stop status (§3.7) |

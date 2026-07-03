@@ -118,6 +118,45 @@ def test_tool_schemas_are_llm_function_shaped(monkeypatch, tmp_path):
         nelix.supervisor.teardown()
 
 
+def test_nelix_start_schema_has_optional_model(monkeypatch, tmp_path):
+    # nelix-9k0: the tool schema gains an optional `model` (NOT in required); its description says it
+    # accepts a tier alias or a full model id, omit for the executor default.
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    try:
+        nelix.register(ctx)
+        params = ctx.tools["nelix_start"]["schema"]["parameters"]
+        assert "model" in params["properties"]
+        assert params["properties"]["model"]["type"] == "string"
+        assert params["required"] == ["executor", "task"]          # model stays optional
+        assert params["properties"]["model"].get("description")     # documented for the LLM
+    finally:
+        nelix.supervisor.teardown()
+
+
+def test_nelix_start_threads_model_to_rpcclient(monkeypatch, tmp_path):
+    # The handler passes args.get("model") into RpcClient.start; omitted -> None (no wire change).
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    captured = {}
+
+    class FakeRpc:
+        def __init__(self, *a, **k): pass
+        def start(self, executor, task, cwd, model=None):
+            captured["model"] = model
+            return {"session_id": "s1", "next_after_seq": 0}
+    monkeypatch.setattr(nelix, "RpcClient", FakeRpc)
+    try:
+        nelix.register(ctx)
+        ctx.tools["nelix_start"]["handler"]({"executor": "opencode", "task": "go", "model": "haiku"})
+        assert captured["model"] == "haiku"
+        captured.clear()
+        ctx.tools["nelix_start"]["handler"]({"executor": "opencode", "task": "go"})
+        assert captured["model"] is None
+    finally:
+        nelix.supervisor.teardown()
+
+
 def test_nelix_respond_binds_to_session_without_event_id(monkeypatch, tmp_path):
     # The MCP tool takes no opaque event_id. decision_id stays OPTIONAL in the schema (the tool has
     # two modes — answer-a-question vs idle-follow-up); the real guard is in the daemon by state.

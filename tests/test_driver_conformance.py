@@ -32,6 +32,48 @@ def test_driver_protocol_has_observe_not_classify():
         assert not hasattr(Driver, name), f"Driver protocol must NOT declare {name}()"
 
 
+def test_driver_protocol_declares_model_flag_default_none():
+    # nelix-9k0: the model-override capability is declared on the Driver contract as an OPTIONAL
+    # `model_flag`. The protocol documents the default (None = no override support). It is NOT in
+    # the registry's callable-only _REQUIRED_MEMBERS set (a driver may legitimately omit it).
+    assert hasattr(Driver, "model_flag")
+    assert Driver.model_flag is None
+    from daemon.drivers import _REQUIRED_MEMBERS
+    assert "model_flag" not in _REQUIRED_MEMBERS
+
+
+def test_claude_driver_advertises_model_flag():
+    # ClaudeDriver sets it EXPLICITLY (Protocol structural typing means concrete drivers do NOT
+    # inherit the `= None` default) — `claude --model <v>` selects the model.
+    assert ClaudeDriver.model_flag == "--model"
+    assert ClaudeDriver().model_flag == "--model"
+
+
+def test_model_flag_read_is_getattr_safe_for_a_driver_without_it():
+    # A registered driver that never declares model_flag must be read as "no override support" via
+    # getattr(..., None) — a bare attribute access would raise AttributeError (structural typing).
+    from daemon.drivers import register, get_driver, DRIVERS
+    from daemon.observation import Observation
+
+    @register("_stub_no_model_flag")
+    class _Stub:
+        command_prefixes = ()
+        submit_key = "\r"
+        def normalize_frame(self, frame): return frame
+        def observe(self, frame, ctx): return Observation(prompt_kind="none")
+        def is_transcript_volatile(self, row): return False
+        def format_submission(self, text): return text
+        def submit_text(self, text): return text
+        def select_option(self, id): return id
+        def interrupt(self): return "\x1b"
+
+    try:
+        drv = get_driver("_stub_no_model_flag")               # registry does NOT require model_flag
+        assert getattr(drv, "model_flag", None) is None       # no AttributeError, reads as unsupported
+    finally:
+        DRIVERS.pop("_stub_no_model_flag", None)
+
+
 def test_registry_fails_closed_for_unmigrated_driver():
     # A driver that does not implement observe() must be REJECTED at instantiation — the registry
     # fails closed rather than letting the core call a missing classification contract (NIT-17).

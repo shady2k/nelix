@@ -75,7 +75,10 @@ def register(ctx):
             return _j(cfg_err)
         resolve_launcher("auto")               # isolation parity: fail closed
         transport = supervisor.ensure_running()
-        body = RpcClient(transport).start(args["executor"], args["task"], cwd)
+        # model (nelix-9k0): optional per-session executor model override, threaded to the wire only
+        # when provided (RpcClient.start omits it from the body otherwise).
+        body = RpcClient(transport).start(args["executor"], args["task"], cwd,
+                                          model=args.get("model"))
         # Register this new session's base cursor, then arm one waiter scoped to it. Only arm on a
         # successful start — a failed start (e.g. bad cwd) has no session and must not arm a waiter.
         armed_after = None
@@ -210,7 +213,12 @@ def register(ctx):
             " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ,
                         "properties": {"executor": {"type": "string"}, "task": {"type": "string"},
-                                       "cwd": {"type": "string"}},
+                                       "cwd": {"type": "string"},
+                                       "model": {"type": "string", "description": (
+                                           "Optional per-session model. Accepts whatever the"
+                                           " executor's CLI accepts — a tier alias"
+                                           " (haiku/sonnet/opus) or a full model id; omit for the"
+                                           " executor's configured default.")}},
                         "required": ["executor", "task"]}},
         nelix_start)
     ctx.register_tool(
