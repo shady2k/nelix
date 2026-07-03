@@ -11,6 +11,7 @@ from urllib.parse import urlparse, parse_qs
 import paths
 from daemon.config import MSG_MAX_BODY
 from daemon.dialog import DialogReader
+from daemon.env_resolver import EnvResolveError
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
@@ -295,6 +296,11 @@ def make_server(manager, transport, logger=None):
                     self._send(400, {"error": str(e)}); return   # bad-shape/unsupported model = client input error
                 except PtyInputRejected as e:        # subclass of ValueError: catch BEFORE it
                     self._send(400, {"error": str(e)}); return
+                except EnvResolveError as e:         # nelix-c5o: upstream resolver/secret-backend failure
+                    # 502 (not the client 400, not the capacity 409): the daemon is healthy, an env_cmd
+                    # command failed. str(e) is REDACTED (var + reason only, no command/stdout/stderr);
+                    # the orchestrator relays it and stops (does not blind-retry).
+                    self._send(502, {"error": str(e)}); return
                 except (RuntimeError, ValueError) as e:
                     self._send(409, {"error": str(e)}); return
                 except KeyError as e:

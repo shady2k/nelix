@@ -1,6 +1,7 @@
+import math
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # Message-plane caps (executor -> orchestrator async messages; consumed by daemon/messages.py and
@@ -59,6 +60,11 @@ class ExecutorSpec:
     env: dict
     driver: str
     launcher: str = "auto"
+    # nelix-c5o: runtime-resolved env values. Each command's trimmed stdout becomes the value of the
+    # named env var at spawn (see daemon/env_resolver.py); merged over static `env` and under the
+    # NELIX_* hook env. `field(default_factory=dict)` because a bare `{}` default is a dataclass error.
+    env_cmd: dict = field(default_factory=dict)
+    env_cmd_timeout_seconds: float = 15.0    # per-command resolution deadline (seconds)
     settle_seconds: float = 1.5
     delivery_confirm_seconds: float = 10.0   # how long to wait for delivery confirmation before failing
     respond_write_seconds: float = 5.0       # deadline for the respond() PTY write (wedged-stdin guard)
@@ -99,11 +105,44 @@ def _spec_num(spec, key, default, *, cast, floor=0):
     return cast(v)
 
 
+def _spec_timeout(spec, key, default):
+    """A per-executor timeout that must be a FINITE, strictly-positive number, else `default`.
+    Unlike `_spec_num`, TOML `inf`/`nan` are rejected here (they make `subprocess.run(timeout=...)`
+    never fire -> a hung /start, defeating the fail-closed contract) and 0/negatives are rejected
+    (a non-positive timeout is meaningless). Bad value -> default (lenient), never skips the executor."""
+    v = spec.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return default
+    v = float(v)
+    if not math.isfinite(v) or v <= 0:
+        return default
+    return v
+
+
 @dataclass
 class ExecutorLoad:
     specs: dict                  # name -> ExecutorSpec (valid only)
     executor_errors: list        # [{"name": str, "problem": str}]
     parse_error: "str | None"    # whole-file TOML/IO error, else None
+
+
+def _build_env_cmd(name, spec):
+    """Parse + validate [executors.<name>.env_cmd]. Each KEY must be a non-empty string with no `=`
+    (it becomes an env var name), and each VALUE a non-empty string (the command run at spawn). A bad
+    entry raises ValueError -> per-executor load error (executor skipped, others still load)."""
+    raw = spec.get("env_cmd", {})
+    if not isinstance(raw, dict):
+        raise ValueError(f"executor {name!r}: 'env_cmd' must be a table of VAR = command")
+    out = {}
+    for var, cmd in raw.items():
+        if not isinstance(var, str) or var == "" or "=" in var:
+            raise ValueError(
+                f"executor {name!r}: env_cmd var {var!r} must be a non-empty name without '='")
+        if not isinstance(cmd, str) or cmd == "":
+            raise ValueError(
+                f"executor {name!r}: env_cmd[{var!r}] must be a non-empty command string")
+        out[var] = cmd
+    return out
 
 
 def _build_spec(name, spec):
@@ -121,6 +160,8 @@ def _build_spec(name, spec):
         env=dict(spec.get("env", {})),
         driver=spec["driver"],
         launcher=spec.get("launcher", "auto"),
+        env_cmd=_build_env_cmd(name, spec),
+        env_cmd_timeout_seconds=_spec_timeout(spec, "env_cmd_timeout_seconds", 15.0),
         settle_seconds=float(spec.get("settle_seconds", 1.5)),
         delivery_confirm_seconds=_spec_num(spec, "delivery_confirm_seconds", 10.0, cast=float),
         respond_write_seconds=_spec_num(spec, "respond_write_seconds", 5.0, cast=float),

@@ -275,13 +275,26 @@ means implementing this contract — the universality cost (§1.3).
 **Launch constraint — the configured `command` must `exec` into the leaf CLI.** The daemon spawns
 it under a bare PTY with no interactive job-control shell in front, so whatever is spawned owns the
 terminal's **foreground process group**. A supervising wrapper that stays alive around the CLI
-(`envconsul -- claude`, `vault exec -- …`, any `foo -- bar` that fork+waits) keeps the foreground
+(any `<secret-fetch-command> -- <cli>` or `foo -- bar` shim that fork+waits) keeps the foreground
 group for itself; the real CLI runs in a background group, takes `SIGTTIN`/`SIGTTOU` on first
 terminal access and is **stopped** (`ps` STAT `T`), rendering nothing — the daemon then only sees a
 blank screen. Such a wrapper works when a human runs it (their shell hands over the foreground) but
 not here. Operators must fetch secrets and then `exec` the CLI so it *replaces* the wrapper. The
 daemon does not manipulate the child's job-control state; it treats a leaf that never produces output
 as a startup failure and bounds the wait rather than blocking forever (§3.7).
+
+**Runtime-resolved launch env (`env_cmd`) — usually retires the wrapper (nelix-c5o).** A wrapper was
+often needed only to fetch a runtime secret (an auth token that cannot be a plaintext literal in the
+config) into the CLI's env. Instead, `[executors.<name>.env_cmd]` maps an env var to a command: at
+spawn the daemon runs each command, uses its trimmed stdout (like shell `$(…)`) as the value, merges
+it over the static `[env]`, and launches the leaf CLI **directly** — so the `command` is the
+foreground leaf and the exec-into-leaf constraint holds without any script. nelix stays a dumb bridge
+(it runs the operator's command and does not interpret the value; the value is the executor's *own*
+auth, bound for its env regardless). A non-zero exit, timeout, or empty stdout is a clean start
+failure, never a daemon crash. The resolved value is held only in memory at spawn — never logged,
+persisted, or rendered by nelix's own sinks (§5) — and resolution re-runs on every spawn (incl.
+restart), so nothing is cached and a rotated secret is picked up. This also lets nelix own the
+complete launch env (endpoint + auth), unblocking endpoint-based model discovery (nelix-g9k).
 
 ### 3.6 State Classifier (inside the driver)
 

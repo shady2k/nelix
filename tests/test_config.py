@@ -265,3 +265,90 @@ def test_non_finite_int_field_collected_not_raised(tmp_path):
     assert set(load.specs) == {"good"}        # both inf executors skipped
     assert load.parse_error is None
     assert {e["name"] for e in load.executor_errors} == {"bigtail", "bigrestart"}
+
+
+# ---- nelix-c5o: env_cmd (runtime-resolved env values) --------------------------------------
+def test_env_cmd_defaults_empty_and_timeout_default(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.a]\ncommand="x"\ndriver="claude"\n')
+    a = load_executors(str(cfg)).specs["a"]
+    assert a.env_cmd == {}                       # absent -> empty dict (no-op)
+    assert a.env_cmd_timeout_seconds == 15.0     # default
+
+
+def test_env_cmd_parsed_and_timeout_override(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text(
+        '[executors.a]\ncommand="x"\ndriver="claude"\nenv_cmd_timeout_seconds=30\n'
+        '[executors.a.env_cmd]\nTOKEN="print-secret"\nADDR="echo 1.2.3.4"\n')
+    a = load_executors(str(cfg)).specs["a"]
+    assert a.env_cmd == {"TOKEN": "print-secret", "ADDR": "echo 1.2.3.4"}
+    assert a.env_cmd_timeout_seconds == 30.0
+
+
+def test_env_cmd_bad_timeout_falls_back_to_default(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.a]\ncommand="x"\ndriver="claude"\nenv_cmd_timeout_seconds="oops"\n')
+    a = load_executors(str(cfg)).specs["a"]
+    assert a.env_cmd_timeout_seconds == 15.0     # non-numeric -> default, no crash
+
+
+import pytest
+
+
+@pytest.mark.parametrize("val", ["inf", "-inf", "nan", "0", "0.0", "-3"])
+def test_env_cmd_timeout_non_finite_or_nonpositive_falls_back_to_default(tmp_path, val):
+    # inf/nan would make subprocess.run(timeout=...) never fire -> a stdin-less sleep hangs /start
+    # forever, defeating fail-closed; <=0 is meaningless. All fall back to the finite 15.0 default,
+    # and (unlike an int field) the executor still LOADS — this is a lenient per-field guard.
+    cfg = tmp_path / "n.toml"
+    cfg.write_text(f'[executors.a]\ncommand="x"\ndriver="claude"\nenv_cmd_timeout_seconds={val}\n')
+    load = load_executors(str(cfg))
+    assert "a" in load.specs                      # not skipped — bad timeout is defaulted, not fatal
+    a = load.specs["a"]
+    assert a.env_cmd_timeout_seconds == 15.0
+    import math
+    assert math.isfinite(a.env_cmd_timeout_seconds) and a.env_cmd_timeout_seconds > 0
+
+
+def test_env_cmd_timeout_positive_value_passes_through(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.a]\ncommand="x"\ndriver="claude"\nenv_cmd_timeout_seconds=0.5\n')
+    assert load_executors(str(cfg)).specs["a"].env_cmd_timeout_seconds == 0.5
+
+
+def test_env_cmd_empty_value_is_per_executor_error(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.bad]\ncommand="x"\ndriver="claude"\n'
+                   '[executors.bad.env_cmd]\nTOKEN=""\n'
+                   '[executors.good]\ncommand="y"\ndriver="claude"\n')
+    load = load_executors(str(cfg))
+    assert set(load.specs) == {"good"}           # bad skipped, good still loads (resilient)
+    assert any(e["name"] == "bad" and "env_cmd" in e["problem"] for e in load.executor_errors)
+
+
+def test_env_cmd_non_string_value_is_per_executor_error(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.bad]\ncommand="x"\ndriver="claude"\n'
+                   '[executors.bad.env_cmd]\nTOKEN=5\n')
+    load = load_executors(str(cfg))
+    assert "bad" not in load.specs
+    assert any(e["name"] == "bad" and "env_cmd" in e["problem"] for e in load.executor_errors)
+
+
+def test_env_cmd_empty_key_is_per_executor_error(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.bad]\ncommand="x"\ndriver="claude"\n'
+                   '[executors.bad.env_cmd]\n""="echo hi"\n')
+    load = load_executors(str(cfg))
+    assert "bad" not in load.specs
+    assert any(e["name"] == "bad" and "env_cmd" in e["problem"] for e in load.executor_errors)
+
+
+def test_env_cmd_key_with_equals_is_per_executor_error(tmp_path):
+    cfg = tmp_path / "n.toml"
+    cfg.write_text('[executors.bad]\ncommand="x"\ndriver="claude"\n'
+                   '[executors.bad.env_cmd]\n"A=B"="echo hi"\n')
+    load = load_executors(str(cfg))
+    assert "bad" not in load.specs
+    assert any(e["name"] == "bad" and "env_cmd" in e["problem"] for e in load.executor_errors)

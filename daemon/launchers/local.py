@@ -4,6 +4,7 @@ import os
 import paths
 from daemon.broker_client import get_broker
 from daemon.drivers import DRIVERS
+from daemon.env_resolver import resolve_env_cmds
 from daemon.hook_settings import executor_message_instructions, hook_launch
 from daemon.launchers.base import ExecutorCapabilities
 from daemon.pty_session import PtySession
@@ -154,6 +155,12 @@ class LocalLauncher:
               *, session_id=None, hook_secret=None):
         argv = spec.argv()
         env = spec.resolved_env()
+        # nelix-c5o: resolve runtime env values (env_cmd) at spawn and merge them OVER the static
+        # [env], but BEFORE hook injection below — so env_cmd overrides a same-key static value yet
+        # can never displace the NELIX_* hook addressing (which is injected LAST). Runs on every
+        # spawn (incl restart/recovery): nothing is cached, so a rotated secret is picked up. A
+        # resolver failure raises EnvResolveError here, before the broker is asked to spawn.
+        env = {**env, **resolve_env_cmds(spec.env_cmd, os.environ, spec.env_cmd_timeout_seconds)}
         # For a hook-capable driver with a session id + per-session secret, fold the additive
         # --settings hook config into argv and the NELIX_* addressing into env BEFORE the spawn.
         # Never touches the user's config; injection is skipped for hookless drivers (fallback path).
