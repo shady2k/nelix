@@ -246,6 +246,7 @@ hatch, never the production runtime.
 | `nelix_status(session_id)` | Sync | RPC → daemon: return current driver state + the **canonical pending event** (if any) + last summary + duration. The reconciliation/fetch path (§4) |
 | `nelix_stop(session_id)` | Sync | RPC → daemon: cancel the session — graceful interrupt → timeout → force kill — and return a post-stop status (§3.7) |
 | `nelix_restart(session_id, mode, task?)` | Sync | RPC → daemon: terminate the current CLI child and re-spawn in the **same** session/workdir. `mode="fresh"` or `mode="resume"`; optional `task`. Re-arms the waiter. Returns `{operation, status, session_id, snapshot, next_after_seq, next_action}` (§3.7) |
+| `nelix_models(tool)` | Sync, **read-only** | RPC → daemon (`GET /models`): run the executor's configured `models_cmd` with its resolved env (§3.5) and **relay stdout** as the model list. Starts no session and changes nothing. `not configured` if the executor has no `models_cmd`; a resolver/command failure is a redacted upstream error (only the reason). Used to discover a concrete `model` id to pass to `nelix_start` (§3.5) |
 
 All are thin RPC clients with **fast, non-blocking** handlers returning a JSON string — none blocks
 waiting for the CLI. The long wait (until the next event) is handled out-of-band by the background
@@ -294,7 +295,24 @@ auth, bound for its env regardless). A non-zero exit, timeout, or empty stdout i
 failure, never a daemon crash. The resolved value is held only in memory at spawn — never logged,
 persisted, or rendered by nelix's own sinks (§5) — and resolution re-runs on every spawn (incl.
 restart), so nothing is cached and a rotated secret is picked up. This also lets nelix own the
-complete launch env (endpoint + auth), unblocking endpoint-based model discovery (nelix-g9k).
+complete launch env (endpoint + auth), which is what makes command-based model discovery possible
+(`models_cmd`, below).
+
+**Read-only model discovery (`models_cmd`) — nelix-g9k.** An orchestrator sometimes needs a
+*concrete* model id (beyond the `haiku`/`sonnet`/`opus` tier aliases `nelix_start` forwards). There
+is no universal non-interactive "list models" across CLIs, and a backend endpoint would require
+knowing its URL, auth header, path, and response shape — vendor POLICY the dumb bridge must not
+embed. So `[executors.<name>]` gains an optional `models_cmd`: the `nelix_models` tool (`GET
+/models`) runs it with the **same resolved env** the CLI gets at spawn (`[env]` + `env_cmd`, minus
+hook injection) and **relays its stdout verbatim** as the model list. The command does its own
+fetch/format; nelix knows nothing about endpoints, auth, or shape — the same "runs a command,
+resolves nothing" pattern as `env_cmd`, reusing its one bounded-capture subprocess helper (`close_fds`
+/ `stdin=DEVNULL` / timeout / no-leak). It is read-only (no session; no validation of the value —
+`nelix_start` stays pass-through, this is an advisory menu). Fail-closed: an absent `models_cmd` is a
+clean "not configured", and a non-zero exit / timeout / empty or oversized stdout / a failed
+`env_cmd` is a redacted error (only the reason) — never a crash, and never logging the command or its
+output (§5). Rejected alternative: nelix itself calling a `/v1/models`-style endpoint (it would have
+to embed vendor-specific URL/auth/shape knowledge — not a dumb bridge).
 
 ### 3.6 State Classifier (inside the driver)
 
