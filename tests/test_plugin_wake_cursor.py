@@ -258,6 +258,27 @@ def test_respond_not_delivered_surfaces_cleanly_no_waiter_arm(monkeypatch, tmp_p
     assert len(_terminal_cmds(ctx)) == cmds_before        # no new waiter dispatched
 
 
+def test_respond_queued_async_answer_surfaces_cleanly_no_waiter_arm(monkeypatch, tmp_path):
+    # Task 8: a busy-queued async answer (executor still working) must reach Hermes as a clean
+    # status:"queued"/refresh_status, and armed=False (the answer is in flight; nelix will wake on
+    # the delivery/next event, so nelix_respond arms no waiter of its own here).
+    class C:
+        def __init__(self, t): pass
+        def start(self, *a): return {"session_id": "s-1", "next_after_seq": 0}
+        def respond(self, *a, **k):
+            return True, {"operation": "respond", "status": "queued", "session_id": "s-1",
+                          "snapshot": {"session_id": "s-1", "control_state": "busy", "pending": False},
+                          "next_action": "refresh_status"}
+    _, ctx = _setup(monkeypatch, tmp_path, C)
+    ctx.tools["nelix_start"]["handler"]({"executor": "claude", "task": "t", "cwd": str(tmp_path)})
+    cmds_before = len(_terminal_cmds(ctx))
+    body = json.loads(ctx.tools["nelix_respond"]["handler"](
+        {"session_id": "s-1", "answer": "use a", "decision_id": "q_1"}))
+    assert body["status"] == "queued" and body["next_action"] == "refresh_status"
+    assert body["waiter"]["armed"] is False
+    assert len(_terminal_cmds(ctx)) == cmds_before        # no new waiter dispatched
+
+
 class _EnvelopeClient:
     def __init__(self, t): pass
     def start(self, *a):

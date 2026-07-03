@@ -262,6 +262,36 @@ def test_respond_not_delivered_in_session_closing_carries_snapshot_no_reason():
         srv.shutdown()
 
 
+class _QueuedManager:
+    """Manager.respond returning RespondOutcome("queued", snapshot=...) — the COMMON async case: the
+    executor asked a non-blocking question, kept working, and Hermes's answer landed while it was
+    still busy, so it was correlated + enqueued (monitor delivers at the next idle)."""
+    def __init__(self):
+        self._events = EventQueue()
+
+    def respond(self, session_id, answer, decision_id=None):
+        return RespondOutcome("queued",
+                              snapshot={"session_id": session_id, "control_state": "busy",
+                                        "pending": False})
+
+
+def test_respond_queued_async_answer_is_200_not_false_no_pending():
+    # Regression: a busy-queued async answer must be a clean 200 status:"queued" (accepted, will be
+    # delivered at the next idle), NOT the no_pending catch-all's 409/fix_call — that would misreport
+    # the COMMON async path (executor still working) as a malformed call.
+    srv, base = _serve(_QueuedManager(), __import__("io").StringIO())
+    try:
+        st, b = _req("POST", base + "/respond",
+                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1"})
+        assert st == 200
+        assert b["operation"] == "respond" and b["status"] == "queued"
+        assert b["status"] != "no_pending" and b.get("error") != "no_pending_decision"
+        assert b["next_action"] == "refresh_status"
+        assert b["snapshot"]["control_state"] == "busy"
+    finally:
+        srv.shutdown()
+
+
 def test_start_envelope_shape():
     m = FakeManager()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8790, "t"))

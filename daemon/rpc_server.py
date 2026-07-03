@@ -351,6 +351,19 @@ def make_server(manager, transport, logger=None):
                     self._send(409, {"operation": "respond", "status": "invalid_option", "session_id": sid,
                                      "error": "invalid_option", "pending": outcome.pending,
                                      "next_action": "fix_call"})
+                elif outcome.status == "queued":
+                    # Task 4/8: an async-question answer accepted while the executor is BUSY — the
+                    # COMMON async case (it asked, then kept working). resolve_async_question already
+                    # correlated + enqueued it; the monitor (sole PTY writer) delivers it at the next
+                    # working->idle edge. Nothing was typed yet and nothing FAILED, so this is a 200,
+                    # NOT the no_pending catch-all (a false 409/fix_call). next_action=refresh_status:
+                    # the answer is in flight, so Hermes reconciles via status rather than ending its
+                    # turn blindly on an unarmed waiter.
+                    resp = {"operation": "respond", "status": "queued", "session_id": sid,
+                            "next_action": "refresh_status"}
+                    if outcome.snapshot is not None:
+                        resp["snapshot"] = outcome.snapshot
+                    self._send(200, resp)
                 elif outcome.status == "not_delivered":
                     # Task 6/8: an async-question answer that could not be delivered — either the
                     # session went closing/terminal WHILE we resolved it (in-Session path, Task 4:
