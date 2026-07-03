@@ -38,6 +38,16 @@ launcher = "local"       # MVP: only "local" is implemented ("auto"/"docker" are
 #                                 # leaving the leaf CLI SIGTTIN-stopped -> blank screen), the daemon
 #                                 # terminal-fails the session with a logged escalation (0 = off)
 # max_restarts            = 3     # consecutive auto-restarts (no progress) before Hermes escalates
+#
+# Read-only MODEL DISCOVERY (optional). `models_cmd` is a command nelix runs — with THIS executor's
+# resolved env (static [env] + any env_cmd secrets below) — whose stdout it RELAYS verbatim as the
+# executor's model list (surfaced by the nelix_models tool). nelix knows nothing about endpoints,
+# auth, or response shape: the command does its own fetch/format and prints the list (typically one
+# "id  display-name" per line). Same fail-closed + no-leak discipline as env_cmd — a non-zero exit,
+# timeout, empty or oversized stdout is a clean error, and neither the command nor its output is ever
+# logged. A bare key on THIS table; omit it if the executor exposes no model list.
+# models_cmd = "<command that prints the model list to stdout>"
+# models_cmd_timeout_seconds = 15   # per-command deadline (seconds; default 15)
 
 # Retention (optional; defaults shown). Applied by the daemon/supervisor.
 daemon_log_retain    = 10    # how many daemon-<ts>-<pid>.log files to keep (min 1)

@@ -148,6 +148,29 @@ def test_client_screen_raw_appends_raw_query(monkeypatch):
     assert seen == {"m": "GET", "p": "/screen?session_id=s-1&raw=1"}
 
 
+def test_client_models_returns_status_and_body(monkeypatch):
+    # nelix-g9k: models returns (status, body) — the status is KEPT (unlike other GET helpers) so
+    # the tool layer can tell 404/400/502 from a 200 relay.
+    c = RpcClient(Transport.tcp("x", 80, "t"))
+    seen = {}
+    monkeypatch.setattr(c, "_call",
+                        lambda m, p, body=None: seen.update(m=m, p=p)
+                        or (200, {"output": "model-a\nmodel-b", "truncated": False}))
+    st, body = c.models("demo")
+    assert st == 200 and body == {"output": "model-a\nmodel-b", "truncated": False}
+    assert seen == {"m": "GET", "p": "/models?executor=demo"}
+
+
+def test_client_models_url_encodes_executor_and_keeps_error_status(monkeypatch):
+    c = RpcClient(Transport.tcp("x", 80, "t"))
+    seen = {}
+    monkeypatch.setattr(c, "_call",
+                        lambda m, p, body=None: seen.update(p=p) or (502, {"error": {"reason": "timeout"}}))
+    st, body = c.models("a b/c")
+    assert st == 502 and body["error"]["reason"] == "timeout"
+    assert seen["p"] == "/models?executor=a+b%2Fc"       # executor is url-encoded
+
+
 def test_client_screen_force_appends_force_query(monkeypatch):
     from rpc_client import RpcClient
     c = RpcClient(Transport.tcp("x", 80, "t"))

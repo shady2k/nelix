@@ -87,6 +87,13 @@ class RpcClient:
         st, body = self._call("POST", "/respond", payload)
         return st == 200, body
 
+    def models(self, executor):
+        # nelix-g9k: returns (status, body) — UNLIKE the other GET helpers, which drop the HTTP
+        # status. /models needs it to distinguish 404 (unknown executor) / 400 (not configured) /
+        # 502 (upstream resolver/command failure) from a 200 relay (mirrors respond's (ok, body)).
+        st, body = self._call("GET", "/models?" + urllib.parse.urlencode({"executor": executor}))
+        return st, body
+
     def stop(self, session_id):
         _, body = self._call("POST", "/stop", {"session_id": session_id})
         return body
