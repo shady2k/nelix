@@ -99,18 +99,19 @@ def _wait_exit_no_reap(proc, timeout):
         time.sleep(min(_EXIT_POLL_INTERVAL, remaining))
 
 
-def _cleanup(proc, reader):
-    # Unconditional, BOUNDED teardown run on EVERY exit path so the configured timeout always bounds
-    # the call. Kill the group FIRST (frees a grandchild-held pipe -> reader gets EOF), then a bounded
-    # join, then close our read end and reap the shell.
-    _kill_group(proc)
-    if reader is not None:
-        try:
-            reader.join(_CLEANUP_GRACE)
-        except RuntimeError:
-            pass                               # thread never started (Thread.start failed) -> nothing to join
-    _close(proc.stdout)
-    _reap(proc)
+def _join_reader(reader, grace):
+    """Bounded join. Returns True if the reader CLEANLY exited (drained to EOF) or was never started,
+    False if it is still alive after `grace` — i.e. wedged in read1() because an escaped grandchild
+    still holds the write end (FIX B). A False result means the reader thread AND its fd must be
+    ABANDONED: closing proc.stdout would block on the BufferedReader lock the wedged read1 holds, and
+    the capture state is not stable to read (FIX C)."""
+    if reader is None:
+        return True
+    try:
+        reader.join(grace)
+    except RuntimeError:
+        return True                            # thread never started (Thread.start failed)
+    return not reader.is_alive()
 
 
 def run_capture(command, base_env, timeout, max_bytes):
@@ -133,11 +134,17 @@ def run_capture(command, base_env, timeout, max_bytes):
     a background reader drains stdout so a large producer can't wedge the child on a full pipe, reads
     at most `max_bytes + 1` bytes total, and kills the child the moment it exceeds the cap.
 
-    The configured `timeout` ALWAYS bounds the call. The child runs in its OWN process group
-    (`start_new_session`); teardown (`_cleanup`, in a `finally` on every path) SIGKILLs that whole
-    group, so a command that exits fast but backgrounds a long-lived child (`cmd &`) inheriting the
-    stdout pipe cannot keep the reader blocked in read1() for the child's lifetime — the group-kill
-    frees the pipe (EOF), then a BOUNDED `reader.join` / reap finishes teardown.
+    The configured `timeout` ALWAYS bounds the call (teardown is bounded on every path):
+      - The child runs in its OWN process group (`start_new_session`). Teardown observes the child's
+        exit WITHOUT reaping it (WNOWAIT), SIGKILLs the whole group while proc.pid is still OWNED (so
+        killpg can't hit a reused pid — FIX A), then reaps. A command that exits fast but backgrounds
+        a long-lived child (`cmd &`) inheriting the stdout pipe can't wedge the reader for the child's
+        lifetime — the group-kill frees the pipe (EOF).
+      - If a backgrounded grandchild `setsid`s OUT of the group (or otherwise keeps the write end
+        open), killpg can't free the pipe and the reader stays wedged in read1(). Teardown then
+        ABANDONS the reader thread + its fd after a BOUNDED join (it does NOT close proc.stdout — that
+        would block on the read1 buffer lock) and returns `run_failed` (FIX B). The capture state is
+        only read when the reader confirmed-exited, so a partial/garbled value is never returned (FIX C).
 
     stderr -> DEVNULL (never captured — it is redacted anyway — and a full stderr pipe can't deadlock
     the child). stdin=DEVNULL + close_fds default: never inherit the daemon's stdin / PTY / socket FDs.
@@ -180,12 +187,13 @@ def run_capture(command, base_env, timeout, max_bytes):
     reader = None
     timed_out = False
     failed = False
+    reader_clean = True
     try:
         reader = threading.Thread(target=_drain, daemon=True)
         reader.start()
         # FIX A: observe the child's exit WITHOUT reaping it (WNOWAIT), so proc.pid stays owned until
-        # the group-kill in _cleanup. Reaping here (the old proc.wait) then killing the group later
-        # could SIGKILL a REUSED pid's group on a high-churn daemon.
+        # the group-kill below. Reaping here then killing the group later could SIGKILL a REUSED pid's
+        # group on a high-churn daemon.
         timed_out = not _wait_exit_no_reap(proc, timeout)
     except Exception:
         # TOTAL after Popen: a Thread.start() / waitid / reader-setup failure maps to a redacted
@@ -194,12 +202,20 @@ def run_capture(command, base_env, timeout, max_bytes):
         # route's broad `except ValueError` as a wrong 404. Cleanup below still reaps the child.
         failed = True
     finally:
-        # Bounded teardown on EVERY path (success / timeout / overflow / failure): kill the group so a
-        # backgrounded grandchild holding the pipe can't wedge reader.join for its lifetime, and reap
-        # the child even when the body failed (no leaked child/thread).
-        _cleanup(proc, reader)
-    # Result derived AFTER cleanup: the reader has been joined (or bounded-abandoned), so `chunks`
-    # and `exceeded` are final and stable.
+        # Bounded teardown on EVERY path. Order matters:
+        #   FIX A: kill the group while proc.pid is STILL OWNED (WNOWAIT never reaped it), BEFORE reap.
+        #   FIX B: only _close proc.stdout when the reader confirmed-exited — a wedged read1() holds the
+        #          BufferedReader lock, so closing from here would block PAST the grace (cleanup hang).
+        _kill_group(proc)
+        reader_clean = _join_reader(reader, _CLEANUP_GRACE)
+        if reader_clean:
+            _close(proc.stdout)
+        _reap(proc)                            # reap AFTER killpg, always (no leaked child)
+    # FIX C: a not-cleanly-exited reader may still be appending -> chunks/exceeded are NOT stable, so
+    # return a redacted failure WITHOUT reading them (and having left proc.stdout open + the thread
+    # abandoned above). This is also how an escaped-grandchild pipe hang surfaces.
+    if not reader_clean:
+        return (None, "run_failed")
     if failed:
         return (None, "run_failed")
     if timed_out:

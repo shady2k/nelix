@@ -126,6 +126,7 @@ def test_error_is_not_a_value_error():
 # directly (real /bin/sh, no mocking except the OSError case) and assert it RAISES NOTHING —
 # every outcome is a (value, reason) tuple.
 import subprocess
+import sys
 import threading
 import time
 
@@ -322,3 +323,44 @@ def test_run_capture_total_on_primary_wait_failure(monkeypatch):
     monkeypatch.setattr(er.os, "waitid", boom)
     value, reason = run_capture("echo hi", {}, 5.0, _CAP)
     assert value is None and reason == "run_failed"
+
+
+# ---- FIX B/C: a reader that never EOFs is ABANDONED; cleanup never hangs past ~grace -------
+def test_run_capture_escaping_grandchild_returns_within_grace(tmp_path):
+    # A backgrounded grandchild that setsid()s OUT of the child's process group keeps the stdout
+    # write-end open: killpg can't free the pipe, so the reader stays wedged in read1() forever. The
+    # call must still RETURN within ~timeout+grace with a redacted reason (never hang, never block in
+    # _close on the read1 buffer lock).
+    #
+    # Deterministic escape: the grandchild touches a sentinel ONLY after setsid(), and the shell waits
+    # for it before exiting — so by the time teardown's killpg fires, the grandchild has provably left
+    # the group (no race with interpreter startup) and still holds the pipe.
+    sentinel = tmp_path / "escaped"
+    script = tmp_path / "esc.py"
+    script.write_text(
+        "import os, time\n"
+        "os.setsid()\n"                                 # leave the shell's process group
+        f"open({str(sentinel)!r}, 'w').close()\n"       # signal 'I have escaped'
+        "time.sleep(5)\n")                              # hold the stdout pipe past timeout+grace
+    esc = (f"{sys.executable} {script} & "
+           f"while [ ! -f {sentinel} ]; do sleep 0.02; done")
+    t0 = time.monotonic()
+    value, reason = run_capture(esc, {}, 5.0, _CAP)
+    dt = time.monotonic() - t0
+    assert value is None and reason == "run_failed"
+    assert dt < 8.0, f"cleanup hung ({dt:.2f}s) — must be bounded by ~timeout+grace"
+
+
+def test_run_capture_wedged_reader_abandons_without_partial_value_or_close(monkeypatch):
+    # FIX C: when the reader has NOT confirmed-exited, the shared capture state (chunks/exceeded) is
+    # not stable, so run_capture must return a failure reason WITHOUT deriving a value from it — and
+    # FIX B: it must NOT close proc.stdout from the caller thread (that would block on the read1 lock).
+    # Force reader_clean=False even though `echo hi` really did produce "hi\n": the result must be
+    # run_failed, never the partial ("hi", None), and _close must not be invoked.
+    import daemon.env_resolver as er
+    monkeypatch.setattr(er, "_join_reader", lambda reader, grace: False)
+    closed = []
+    real_close = er._close
+    monkeypatch.setattr(er, "_close", lambda f: closed.append(f))
+    assert run_capture("echo hi", {}, 5.0, _CAP) == (None, "run_failed")
+    assert closed == [], "proc.stdout must NOT be closed when the reader is abandoned (would block)"
