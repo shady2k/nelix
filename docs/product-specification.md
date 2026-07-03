@@ -275,7 +275,7 @@ means implementing this contract — the universality cost (§1.3).
 **Launch constraint — the configured `command` must `exec` into the leaf CLI.** The daemon spawns
 it under a bare PTY with no interactive job-control shell in front, so whatever is spawned owns the
 terminal's **foreground process group**. A supervising wrapper that stays alive around the CLI
-(`envconsul -- claude`, `vault exec -- …`, any `foo -- bar` that fork+waits) keeps the foreground
+(any `<secret-fetch-command> -- <cli>` or `foo -- bar` shim that fork+waits) keeps the foreground
 group for itself; the real CLI runs in a background group, takes `SIGTTIN`/`SIGTTOU` on first
 terminal access and is **stopped** (`ps` STAT `T`), rendering nothing — the daemon then only sees a
 blank screen. Such a wrapper works when a human runs it (their shell hands over the foreground) but

@@ -17,7 +17,7 @@
 # If you DO keep a script (e.g. for logic env_cmd can't express), it must `exec` the CLI so it
 # replaces the script and becomes the foreground leader (no lingering parent):
 #   #!/bin/bash
-#   export API_KEY="$(your-secret-manager get -field=key path/to/secret)"   # fetch, then...
+#   export SERVICE_SECRET_VALUE="$(secret-fetch-command)"        # fetch, then...
 #   exec my-agent-cli "$@"                                        # ...exec (no lingering parent)
 [executors.example_cli]
 command = "my-agent-cli"
@@ -64,4 +64,4 @@ log_level = "info"
 # This sub-table MUST be the last thing in the [executors.example_cli] section (a sub-table header
 # captures every bare key that follows it).
 # [executors.example_cli.env_cmd]
-# SERVICE_AUTH_TOKEN = "a command that prints the secret to stdout"
+# SERVICE_SECRET_VALUE = "<command that prints the secret value to stdout>"
