@@ -23,7 +23,7 @@ class FakeManager:
     def respond(self, s, a, decision_id=None):
         self.calls.append(("respond", s, a, decision_id))
         return RespondOutcome("resumed", seq=3, decision_id="dec-x")
-    def status(self, sid=None): return {"sessions": {}}
+    def status(self, sid=None, include_progress=False): return {"sessions": {}}
     def stop(self, s):
         self.calls.append(("stop", s))
         return StopOutcome("stopped", snapshot={"session_id": s,
@@ -85,7 +85,7 @@ class _Sess:
 
 class FakeManagerDialog:
     def __init__(self): self._events = EventQueue()
-    def status(self, sid=None): return {"sessions": {}}
+    def status(self, sid=None, include_progress=False): return {"sessions": {}}
     def get(self, sid): return _Sess() if sid == "s1" else None
 
 

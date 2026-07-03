@@ -9,10 +9,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import paths
+from daemon.config import MSG_MAX_BODY
 from daemon.dialog import DialogReader
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
+from daemon.messages import parse_message_body
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.transport import peer_is_self
 
@@ -61,6 +63,10 @@ def make_server(manager, transport, logger=None):
     is_unix = transport.kind == "unix"
     token = transport.token
     hook_limiter = _HookRateLimiter()      # per-session flood guard for /hook (shared across threads)
+    # A SEPARATE instance (same class/config) for /message: distinct bucket per sid so an executor
+    # flooding questions/notes can never starve /hook delivery (spec — see
+    # test_message_limiter_separate_from_hooks).
+    msg_limiter = _HookRateLimiter()
 
     class Handler(BaseHTTPRequestHandler):
         def _auth(self):
@@ -141,11 +147,16 @@ def make_server(manager, transport, logger=None):
                 evt = manager._events.wait_event(after_seq=after, timeout=25, session_id=sid)
                 self._send(200, {"event": _evt_dict(evt) if evt else None})
             elif p.path == "/status":
-                sid = parse_qs(p.query).get("session_id", [None])[0]
+                qs = parse_qs(p.query)
+                sid = qs.get("session_id", [None])[0]
+                # Task 8: explicit on-demand progress detail, off by default (anti-poll: an
+                # active-working snapshot stays progress-free unless the caller asks for it).
+                include_progress = qs.get("include_progress", ["0"])[0].lower() in ("1", "true")
                 self._log_read("status", sid)
                 # Stamp the RPC protocol version at the wire layer (always present, regardless of
                 # session_id) so a supervisor can tell our protocol from an old daemon's.
-                self._send(200, {**manager.status(sid), "rpc_protocol": RPC_PROTOCOL_VERSION})
+                self._send(200, {**manager.status(sid, include_progress=include_progress),
+                                 "rpc_protocol": RPC_PROTOCOL_VERSION})
             elif p.path == "/dialog":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
@@ -223,9 +234,57 @@ def make_server(manager, transport, logger=None):
             sess.on_hook(ev)
             self._send(204, None)
 
+        def _dispatch_message(self, p):
+            # POST /message/<sid>: the executor-facing async message channel — a `question` it
+            # doesn't want to block on, or a non-waking `note`. Authenticated identically to /hook
+            # (same per-session secret, X-Nelix-Hook-Secret) but rate-limited from a SEPARATE bucket
+            # (msg_limiter) so message spam can never starve hook delivery. Never touches the PTY
+            # (single-writer PTY invariant): only manager state methods are called here.
+            sid = p.path[len("/message/"):]
+            body = self._read_json(max_body=MSG_MAX_BODY)   # 413 (too large) / 400 (malformed)
+            sess = manager.get(sid)
+            secret = getattr(sess, "hook_secret", None) if sess is not None else None
+            provided = self.headers.get("X-Nelix-Hook-Secret", "")
+            # Fail closed and identically for unknown session, missing secret, and bad secret — no
+            # existence oracle (mirrors _dispatch_hook exactly). compare_digest keeps it constant-time.
+            if not secret or not hmac.compare_digest(provided, secret):
+                if logger is not None:
+                    logger.warning("rpc", "message_unauthorized", session_id=sid, status=401)
+                self._send(401, {"error": "unauthorized"}); return
+            # Per-session flood guard, SEPARATE bucket from /hook's — see msg_limiter above.
+            if not msg_limiter.allow(sid):
+                if logger is not None:
+                    logger.warning("rpc", "message_rate_limited", session_id=sid, status=429)
+                self._send(429, {"error": "rate_limited"}); return
+            if not isinstance(body, dict):
+                raise _BadRequest(400, "malformed JSON body")
+            kind = body.get("kind")
+            obj, err = parse_message_body(kind, body)
+            if err is not None:
+                status, msg = err
+                self._send(status, {"error": msg}); return
+            if kind == "question":
+                qid, qerr = manager.record_async_question(sid, obj)
+                if qerr is not None:
+                    if "id" in qerr:      # already pending — not an error, a conflicting state
+                        self._send(409, {"status": "already_pending",
+                                         "pending": {"id": qerr["id"],
+                                                      "question": qerr["question"]}}); return
+                    # {"error": "unknown_session"} — the rare post-auth race (session freed between
+                    # the auth lookup above and this call); auth already 401s a truly-unknown sid.
+                    self._send(404, {"error": "unknown_session"}); return
+                self._send(200, {"status": "queued", "id": qid}); return
+            # kind == "note" (the only other value parse_message_body accepts)
+            seq = manager.append_progress_note(sid, obj)
+            if seq is None:
+                self._send(404, {"error": "unknown_session"}); return
+            self._send(200, {"status": "recorded", "progress_seq": seq})
+
         def _dispatch_post(self, p):
             if p.path.startswith("/hook/"):
                 self._dispatch_hook(p); return
+            if p.path.startswith("/message/"):
+                self._dispatch_message(p); return
             body = self._read_json()
             if p.path == "/start":
                 try:
@@ -289,6 +348,33 @@ def make_server(manager, transport, logger=None):
                     self._send(409, {"operation": "respond", "status": "invalid_option", "session_id": sid,
                                      "error": "invalid_option", "pending": outcome.pending,
                                      "next_action": "fix_call"})
+                elif outcome.status == "queued":
+                    # Task 4/8: an async-question answer accepted while the executor is BUSY — the
+                    # COMMON async case (it asked, then kept working). resolve_async_question already
+                    # correlated + enqueued it; the monitor (sole PTY writer) delivers it at the next
+                    # working->idle edge. Nothing was typed yet and nothing FAILED, so this is a 200,
+                    # NOT the no_pending catch-all (a false 409/fix_call). next_action=refresh_status:
+                    # the answer is in flight, so Hermes reconciles via status rather than ending its
+                    # turn blindly on an unarmed waiter.
+                    resp = {"operation": "respond", "status": "queued", "session_id": sid,
+                            "next_action": "refresh_status"}
+                    if outcome.snapshot is not None:
+                        resp["snapshot"] = outcome.snapshot
+                    self._send(200, resp)
+                elif outcome.status == "not_delivered":
+                    # Task 6/8: an async-question answer that could not be delivered — either the
+                    # session went closing/terminal WHILE we resolved it (in-Session path, Task 4:
+                    # reason=None) or the executor had ALREADY exited before the answer arrived
+                    # (manager-level terminal-survival path, Task 6: reason="executor_finished").
+                    # Either way the answer was correlated (mark_answered ran; nothing is left
+                    # dangling) but nothing was typed. 200, not 4xx: this is a defined outcome, not
+                    # a caller mistake to fix_call — next_action=refresh_status so Hermes reads the
+                    # session's real final state (done/crashed/gone) before reporting to the user.
+                    resp = {"operation": "respond", "status": "not_delivered", "session_id": sid,
+                            "reason": outcome.reason, "next_action": "refresh_status"}
+                    if outcome.snapshot is not None:
+                        resp["snapshot"] = outcome.snapshot
+                    self._send(200, resp)
                 elif outcome.status == "terminal":
                     self._send(409, {"operation": "respond", "status": "terminal", "session_id": sid,
                                      "error": "session_terminal", "next_action": "refresh_status"})

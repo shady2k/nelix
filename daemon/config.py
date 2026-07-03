@@ -3,6 +3,20 @@ import tomllib
 from dataclasses import dataclass
 
 
+# Message-plane caps (executor -> orchestrator async messages; consumed by daemon/messages.py and
+# the /message route in daemon/rpc_server.py).
+# MSG_MAX_BODY bounds the raw HTTP request body the /message route will read (a 413 past this),
+# NOT the sum of the parsed-field caps below: a `question` payload carries several free-text fields
+# (question/continuation_plan/assumption/impact_if_wrong, each capped at MAX_BODY_LEN) plus JSON
+# overhead, which can exceed a tight per-field-sum bound — so this mirrors /hook's tight body cap
+# (daemon/rpc_server.py's _HOOK_MAX_BODY) rather than trying to derive a smaller value from the
+# field caps.
+MSG_MAX_BODY = 256 * 1024  # max raw HTTP request body bytes accepted by the message route
+MAX_PROGRESS_NOTES = 50  # max progress notes retained per session
+MAX_SUMMARY_LEN = 280    # ProgressNote.summary cap (short, tweet-length)
+MAX_BODY_LEN = 4000      # cap for longer free-text fields (question, continuation_plan, details)
+
+
 @dataclass
 class BeliefConfig:
     """Tunables for the pure BeliefEngine (spec §7). All durations are seconds; the engine reads

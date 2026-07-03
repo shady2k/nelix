@@ -11,7 +11,7 @@ def _load(monkeypatch, tmp_path, restart_result, capture=None):
 
     class _Client:
         def __init__(self, t): pass
-        def status(self, sid=None): return {"sessions": {}, "cursor": 3}
+        def status(self, sid=None, include_progress=False): return {"sessions": {}, "cursor": 3}
         def restart(self, session_id, force=False):
             if capture is not None:
                 capture.append({"session_id": session_id, "force": force})

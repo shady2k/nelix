@@ -1,8 +1,11 @@
 import json
+import os
 
 import daemon.launchers.local as local
 import paths
 from conftest import make_spec
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class FakeBroker:
@@ -142,3 +145,43 @@ def test_no_injection_without_session_and_secret(monkeypatch):
     cap = _run(monkeypatch, spec)
     assert "--settings" not in cap["argv"]
     assert "NELIX_SESSION" not in cap["env"]
+
+
+def test_injects_executor_message_instructions_for_claude(monkeypatch):
+    # The executor must be TOLD (via --append-system-prompt) that nelix-question/nelix-note exist,
+    # by absolute path, without disturbing the existing --settings hook fold.
+    spec = make_spec(command="claude", args=["--foo"], driver="claude")
+    cap = _run(monkeypatch, spec, session_id="s-1", hook_secret="sek")
+    argv = cap["argv"]
+    assert argv.count("--append-system-prompt") == 1
+    text = argv[argv.index("--append-system-prompt") + 1]
+    assert os.path.join(_REPO_ROOT, "bin", "nelix-question") in text
+    assert os.path.join(_REPO_ROOT, "bin", "nelix-note") in text
+    assert "--settings" in argv                                # hook fold untouched
+    json.loads(argv[argv.index("--settings") + 1])             # still valid JSON
+
+
+def test_merges_user_append_system_prompt_instead_of_dropping_either(monkeypatch):
+    # Claude's --append-system-prompt is LAST-WINS across repeated occurrences (verified empirically:
+    # it does NOT concatenate) -- so nelix must fold its instruction into the user's existing flag
+    # rather than appending a second occurrence, or one of the two texts would be silently dropped.
+    spec = make_spec(command="claude", args=["--append-system-prompt", "USER_PROMPT_MARKER"],
+                      driver="claude")
+    cap = _run(monkeypatch, spec, session_id="s-1", hook_secret="sek")
+    argv = cap["argv"]
+    assert argv.count("--append-system-prompt") == 1
+    text = argv[argv.index("--append-system-prompt") + 1]
+    assert "USER_PROMPT_MARKER" in text                        # user's own text preserved
+    assert "nelix-question" in text                            # ours merged in alongside it
+
+
+def test_no_system_prompt_injection_for_non_hook_driver(monkeypatch):
+    spec = make_spec(command="codex", args=[], driver="codex")
+    cap = _run(monkeypatch, spec, session_id="s-1", hook_secret="sek")
+    assert "--append-system-prompt" not in cap["argv"]
+
+
+def test_no_system_prompt_injection_without_session_and_secret(monkeypatch):
+    spec = make_spec(command="claude", args=[], driver="claude")
+    cap = _run(monkeypatch, spec)
+    assert "--append-system-prompt" not in cap["argv"]

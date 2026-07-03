@@ -8,6 +8,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import deque
 from dataclasses import dataclass
 
 import paths
@@ -15,13 +16,14 @@ from daemon import lifecycle_log
 from daemon import reaper
 from daemon.belief import BeliefEngine, Publish, Withdraw, Actuate
 from daemon.clock import WallClock
-from daemon.config import BeliefConfig
+from daemon.config import BeliefConfig, MAX_PROGRESS_NOTES
 from daemon.dialog import Dialog
 from daemon.observation import ObservationCtx
 from daemon.transcript_builder import TranscriptBuilder
 from daemon.events import EXTERNAL_OUTPUT_POLICY, RESPONDABLE_KINDS
 from daemon.hooks import normalize_claude_hook
 from daemon.hygiene import prepare_pty_input
+from daemon.messages import format_async_reply
 from daemon.errors import PtyWriteTimeout
 
 
@@ -29,16 +31,23 @@ from daemon.errors import PtyWriteTimeout
 class RespondOutcome:
     """Result of binding an answer to a session's current pending decision. `status` is one of
     'resumed' | 'respond_failed' | 'no_pending' | 'stale' | 'invalid_option' | 'write_timeout' |
-    'terminal'; `pending` carries current decision metadata on a pre-claim guard mismatch;
+    'terminal' | 'missing_decision_id' | 'unknown_session' | 'at_capacity' (manager: no active slot to
+    re-acquire), or, for an async-question answer (Task 4): 'queued' (busy — the monitor delivers the
+    reply at the next idle) | 'not_delivered' (session closing/terminal, or — manager-level, Task 6 —
+    the session already exited with its async question auto-resolved: `reason='executor_finished'`);
+    `pending` carries current decision metadata on a pre-claim guard mismatch;
     `snapshot` is the post-respond session snapshot on resumed/write_timeout/respond_failed;
     `respond_failed` means the answer was typed but never LEFT the box (submit unconfirmed) so the
-    caller must recover; `answered_decision_id` names the decision this answer was bound to."""
+    caller must recover; `answered_decision_id` names the decision this answer was bound to;
+    `reason` is set only on the manager-level not_delivered/executor_finished terminal-survival
+    outcome (None everywhere else — the in-Session not_delivered path predates this field)."""
     status: str
     seq: int = None
     decision_id: str = None
     pending: dict = None
     snapshot: dict = None
     answered_decision_id: str = None
+    reason: str = None
 
 
 def _pending_meta(decision):
@@ -139,6 +148,29 @@ class Session:
         #                                is mid-flight. Drained by _drain_pending_answer (each pre-delivery
         #                                tick + the delivery transition) so the answer write and the
         #                                delivery decision are serialized on ONE thread and cannot race.
+        # Progress notes (message-plane, executor -> orchestrator): a bounded, NON-waking log an
+        # executor appends to via append_progress_note. Deliberately separate from _decision/_events
+        # — appending one must NEVER publish (that would trip an armed nelix-wait waiter and wake
+        # the orchestrator, the exact phantom-pre-delivery class of bug 92a0dc6 closed elsewhere).
+        self._progress = deque(maxlen=MAX_PROGRESS_NOTES)  # last N {progress_seq,ts,summary,details}
+        self._progress_total = 0       # monotonic count of ALL notes ever appended (never reset)
+        # Async question (message-plane, executor -> orchestrator): a NON-blocking question the
+        # executor keeps working around. Lives in its OWN slot, deliberately never installed into
+        # self._decision — that slot's supersede logic (in _publish) is built for the single
+        # blocking pause and would clobber/mask a real decision (or be masked by one). Publishing
+        # is wake-only (kind="async_question" is NOT in RESPONDABLE_KINDS, so EventQueue.pending()
+        # keeps meaning "blocking decision only"): it exists purely to trip the already-armed
+        # nelix-wait waiter; the question itself is served out of this slot, not resolved via the
+        # queue. {id, question, assumption, continuation_plan, event_id, executor_blocked} or None.
+        self._async_question = None
+        # Async REPLY delivery (Task 4): when the orchestrator answers an async question while the
+        # executor is still BUSY, the answer cannot be typed on the RPC thread (single-writer PTY) —
+        # resolve_async_question stores the self-contained reply-block text HERE and the MONITOR (sole
+        # writer) delivers it as a fresh turn at the next working->idle transition (drain_async_reply).
+        # None unless an answer landed while busy. An idle-at-answer-time reply never uses this slot
+        # (the manager delivers it immediately via the slot-reacquiring send_turn path).
+        self._async_reply_pending = None
+        self._next_qseq = 0            # monotonic per-session counter for q_<n> ids
         self._finalized = False        # _finish ran (idempotency guard, under self._lock)
         self._exc = None               # sys.exc_info() if the monitor body raised
         self._exc_text = None          # formatted traceback captured at catch time
@@ -153,6 +185,11 @@ class Session:
         #                                keep working unchanged.
         self._sessions_dir = _sessions_root()
         self.on_terminal = None        # manager-set: free the slot on terminal state
+        self.deliver_turn = None       # manager-set (Task 4): deliver a queued async reply as a FRESH
+        #                                turn via the manager's slot-reacquiring send_turn. The monitor
+        #                                has no manager handle of its own, so it calls back through this
+        #                                (mirrors on_terminal/reaper_ctx wiring). None until the manager
+        #                                assigns it; a session-only unit test leaves it None.
         self.reaper_ctx = None         # daemon-set reaper.ReaperContext (None => no reaping)
         self._closing = False          # terminal cleanup started: respond/screen must not write
 
@@ -540,6 +577,10 @@ class Session:
         self._apply_actions(actions, obs)
         self._log_trail(obs, actions)
         self._log_notes(notes)
+        # Task 4: at the working->idle transition (state now idle, set by the hooks/screen path above),
+        # deliver any async reply that landed while the executor was busy. The monitor is the sole PTY
+        # writer, so this busy-case delivery happens HERE (never on the RPC thread that enqueued it).
+        self.drain_async_reply()
         return obs.prompt_kind in ("crash", "exit") or not self._handle.is_alive()
 
     def _drain_hooks(self):
@@ -998,6 +1039,207 @@ class Session:
         with self._lock:
             return self._decision is None and self._state == "busy"
 
+    def append_progress_note(self, note):
+        """Append a non-waking progress note (message-plane, executor -> orchestrator). This is a
+        passive log entry ONLY: it MUST NOT call self._events.publish (or anything that advances
+        the EventQueue seq / notifies a waiter) — doing so would trip an armed nelix-wait long-poll
+        and wake the orchestrator, exactly the phantom pre-delivery class of bug closed in 92a0dc6.
+        A progress note is read lazily on the next status/decision pull, never delivered as a wake.
+        Returns the new (session-lifetime-monotonic) progress_seq."""
+        with self._lock:
+            self._progress_total += 1
+            seq = self._progress_total
+            # Use the injected clock (spec §5.7), never time.time() directly, so a recorded capture
+            # can still drive this deterministically.
+            self._progress.append({"progress_seq": seq, "ts": self._clock.now(),
+                                    "summary": note.summary, "details": note.details})
+            return seq
+
+    def _progress_view_locked(self):
+        # Caller must hold self._lock (the Lock is not reentrant) — shared by progress_view() and
+        # the gated snapshot() addition below.
+        return {"progress": list(self._progress), "progress_total": self._progress_total,
+                "progress_retained": len(self._progress)}
+
+    def progress_view(self):
+        """Explicit progress detail surface (Task 8): the full retained list + counters,
+        independent of snapshot's wake-point gating."""
+        with self._lock:
+            return self._progress_view_locked()
+
+    def record_async_question(self, q):
+        """Record an executor's non-blocking `question` (message-plane, executor -> orchestrator)
+        in its OWN slot — self._async_question, NEVER self._decision. _decision's supersede logic
+        (in _publish) exists for the single blocking pause; installing a question there would let
+        it clobber a real decision, or a real decision clobber it. Only one question may be
+        outstanding per session at a time: a caller that already has one pending gets the existing
+        id back (never a fresh mint), so a retried/duplicate `question` call is a no-op wake. A new
+        question is ALSO rejected while an earlier answer is still queued for delivery (M2, final
+        whole-branch review): self._async_reply_pending is a single slot, so accepting q2 here would
+        let its answer silently overwrite reply1 the moment both are answered while busy, even
+        though the caller was told reply1 was "queued" — the single-outstanding-reply model holds
+        until delivery, not just until correlation.
+
+        The EventQueue publish below is wake-only — kind="async_question" is deliberately absent
+        from RESPONDABLE_KINDS, so it can never become EventQueue.pending()'s answer and never
+        collides with a real blocking decision's decision_id space. It exists purely to trip the
+        already-armed nelix-wait waiter; the question is served out of this slot on the next
+        status/decision pull, not resolved through the queue.
+
+        Published OUTSIDE self._lock (lock order: never hold it across a queue publish — mirrors
+        _publish's own discipline, session.py ~975). Returns (id, None) on success, or
+        (None, {"id":..., "question":...}) if a question is already pending."""
+        with self._lock:
+            if self._async_question is not None:
+                # Truncated the same way _publish caps an event summary (text[:200], ~line 984):
+                # this is an error-payload preview, not the record itself (the slot and the
+                # snapshot both keep the untruncated question).
+                return None, {"id": self._async_question["id"],
+                              "question": self._async_question["question"][:200]}
+            if self._async_reply_pending is not None:
+                # M2 (final whole-branch review): an earlier answer is still QUEUED for delivery
+                # (busy -> answered -> queued_busy) even though self._async_question was already
+                # cleared by that answer's correlation. self._async_reply_pending is a SINGLE slot,
+                # so accepting a second question here would let ITS answer silently OVERWRITE the
+                # still-undelivered reply1 the instant both are answered while busy — reply1 would
+                # be lost even though the caller was told "queued". Reject with the same
+                # already_pending shape as the live-question branch above (id is unknown here since
+                # the original question's slot is already gone; the queued reply text stands in for
+                # "question" so the caller can see what's blocking).
+                return None, {"id": None, "question": self._async_reply_pending[:200]}
+            self._next_qseq += 1
+            qid = f"q_{self._next_qseq}"
+            state = self._state
+        # INSTALL RACE — this method is NOT self-synchronizing across concurrent same-session callers:
+        # the publish runs lock-free (lock-order rule above) and the slot store is a SECOND lock
+        # acquisition below. Two windows exist:
+        #   (1) DOUBLE-STORE: two callers can both pass the already-pending check (slot still None)
+        #       before either reaches the store -> both mint a qid, both publish, both store, and the
+        #       later store CLOBBERS the earlier question (both callers still see (qid, None)).
+        #   (2) EVENT-WITHOUT-PAYLOAD: publish() below runs _cv.notify_all() BEFORE self._async_question
+        #       is set, so a woken /status puller can observe the wake event with the slot still None
+        #       (no async_question in the snapshot yet). The _decision path closes the analogous window
+        #       via _publish's on_publish/_install hook (installs the slot UNDER the EventQueue lock,
+        #       before waiters are notified); this method intentionally does NOT replicate that.
+        # RESOLUTION (M3, final whole-branch review — corrected; the route layer does NOT serialize
+        # `question` posts, there is no per-session lock in daemon/rpc_server.py's _dispatch_message):
+        # this race is unhittable in practice because of the SINGLE SERIAL EXECUTOR invariant (one
+        # executor process posts one `question` at a time — there is no concurrent same-session caller
+        # to race with) plus /wait and /status being SEPARATE round-trips (a status puller is never
+        # itself a concurrent `question` poster). If a future caller ever fans `question` posts out
+        # concurrently for one session, adopt the on_publish install pattern instead of relying on
+        # this method alone.
+        evt = self._events.publish(self._id, self._executor, "async_question", q.question[:200],
+                                   state, requires_response=True, decision_id=qid)
+        with self._lock:
+            self._async_question = {"id": qid, "question": q.question,
+                                     "assumption": q.assumption,
+                                     "continuation_plan": q.continuation_plan,
+                                     "event_id": evt.event_id, "executor_blocked": False}
+        return qid, None
+
+    def has_pending_async(self, id=None):
+        """True iff a question is outstanding (optionally: iff it's THIS id)."""
+        with self._lock:
+            if self._async_question is None:
+                return False
+            return id is None or self._async_question["id"] == id
+
+    def pending_async_id(self):
+        """The id of the outstanding async question, if any, else None. A lightweight peek (mirrors
+        has_pending_async) used by the manager at terminal cleanup (Task 6) to learn WHICH question
+        to auto-resolve without guessing/enumerating it."""
+        with self._lock:
+            return None if self._async_question is None else self._async_question["id"]
+
+    def resolve_async_question(self, id, answer):
+        """Resolve an outstanding async question (message-plane) by id and prepare its answer as a
+        self-contained FRESH user turn. Correlation and delivery are SEPARATE (spec): this does the
+        CORRELATION — mark the async-question event answered + clear the slot — and builds the reply
+        block, but it NEVER writes the PTY itself. It returns a (disposition, reply_text) the caller
+        (the manager) acts on:
+          - ("deliver_now", text): the executor is IDLE now -> the manager writes `text` as a fresh
+            turn via its slot-reacquiring send_turn (that path already runs on the RPC thread for idle
+            follow-ups; nothing is typed HERE).
+          - ("queued_busy", text): the executor is BUSY -> `text` is stored as self._async_reply_pending
+            and the MONITOR (the sole PTY writer) delivers it at the next working->idle transition
+            (drain_async_reply). Single-writer PTY is preserved: an answer that lands while busy is
+            NEVER typed off the monitor thread.
+          - ("not_delivered", None): the session is CLOSING/TERMINAL -> nothing enqueued, nothing typed
+            (the executor is gone). The slot is still cleared + the event marked answered (the answer
+            WAS correlated), so no dangling question survives.
+        An unknown / mismatched id is ("not_delivered", None) with the outstanding question untouched.
+        """
+        with self._lock:
+            q = self._async_question
+            if q is None or q.get("id") != id:
+                return ("not_delivered", None)       # no such outstanding question (wrong/absent id)
+            event_id = q.get("event_id")
+            text = format_async_reply(q.get("question"), q.get("assumption"), answer)
+            # CLEAR the slot under the lock: a second respond for the same id then sees
+            # has_pending_async False and can never double-deliver.
+            self._async_question = None
+            closing = self._closing or self._terminal_kind is not None
+            idle = self._state == "idle"
+            if not closing and not idle:
+                # BUSY: enqueue for the monitor (sole writer) to deliver at the next idle. Set under the
+                # lock so the monitor's drain (also under the lock) sees a consistent value.
+                self._async_reply_pending = text
+        # Correlation resolve runs OUTSIDE self._lock (never hold it across an EventQueue op).
+        if event_id is not None:
+            self._events.mark_answered(event_id)
+        if self._log is not None:
+            self._log.info("session", "async_question_resolved", session_id=self._id,
+                           question_id=id,
+                           disposition="not_delivered" if closing else ("deliver_now" if idle
+                                                                        else "queued_busy"))
+        if closing:
+            return ("not_delivered", None)
+        if idle:
+            return ("deliver_now", text)
+        return ("queued_busy", text)
+
+    def drain_async_reply(self):
+        """Monitor-thread hook at the working->idle transition (Task 4): if an async reply was enqueued
+        while the executor was busy, deliver it now as a FRESH turn. The monitor is the SOLE PTY writer,
+        so a busy-case async reply is written HERE, never on the RPC thread. Delivery goes through the
+        manager's slot-reacquiring send_turn (self.deliver_turn) — the now-idle session freed its active
+        slot, so resuming it must re-acquire one (mirrors an idle follow-up). CLAIM the pending text
+        under the lock (a duplicate drain is then a no-op) and call the callback OUTSIDE the lock
+        (deliver_turn re-enters via send_turn -> self._lock; never hold the lock across it). Only drains
+        when genuinely idle and not tearing down — err toward leaving the reply queued.
+        """
+        with self._lock:
+            text = self._async_reply_pending
+            if text is None or self._state != "idle" or self._closing:
+                return
+            self._async_reply_pending = None          # claim it: exactly one delivery
+            deliver = self.deliver_turn
+        if deliver is None:
+            self.requeue_async_reply(text)   # no manager wiring (session-only unit path): keep queued
+            return
+        outcome = deliver(text)
+        # Best-effort at THIS idle: send_turn can decline WITHOUT typing anything if no active slot is
+        # free right now (at_capacity) or a concurrent idle follow-up already resumed the session
+        # (no_pending). Re-queue those so the monitor retries at the next idle instead of dropping a
+        # Hermes answer. A confirmed 'resumed' consumed it; a write_timeout (partial/wedged write) or a
+        # terminal outcome is deliberately NOT retried — re-typing a partial write or chasing a dead
+        # session would be worse than the miss.
+        if getattr(outcome, "status", None) in ("at_capacity", "no_pending"):
+            self.requeue_async_reply(text)
+
+    def requeue_async_reply(self, text):
+        """Re-queue an async reply whose delivery attempt DECLINED WITHOUT typing (send_turn returned
+        at_capacity / no_pending), so the monitor retries the FRAMED reply block at the next
+        working->idle edge instead of dropping it — and an orchestrator retry never falls through to
+        delivering a bare, unframed answer. Shared by BOTH the monitor's drain and the RPC-thread
+        idle-now path (Manager.respond). Guarded: never clobber a newer queued reply, never re-queue
+        into a closing/terminal session. Types NOTHING (single-writer PTY intact)."""
+        with self._lock:
+            if (self._async_reply_pending is None and not self._closing
+                    and self._terminal_kind is None):
+                self._async_reply_pending = text
+
     def snapshot(self):
         with self._lock:
             # control_state is the orchestrator-visible plane (spec §6/§8): busy | awaiting_user |
@@ -1028,13 +1270,34 @@ class Session:
                 dec = {k: v for k, v in self._decision.items()
                        if k not in ("decision_key", "modal_dedup")}
                 snap["decision"] = dec
+            # async_question is its OWN field, entirely independent of decision above: an executor
+            # can be mid-question AND mid-blocking-decision at once (own slot, own supersede-free
+            # lifecycle — see record_async_question). event_id is internal (the EventQueue-side
+            # resolution handle), never exposed.
+            if self._async_question is not None:
+                snap["async_question"] = {k: v for k, v in self._async_question.items()
+                                          if k != "event_id"}
+            # Progress notes surface ONLY at a wake point (a pending decision, an outstanding async
+            # question, or terminal) — the gate mirrors the decision/terminal check above,
+            # deliberately NOT extended to the plain active-working branch below (anti-poll: see
+            # that branch's comment).
+            if self._decision is not None or self._async_question is not None or terminal:
+                snap.update(self._progress_view_locked())
             # active-working snapshots are deliberately low-information: no progress bait, just
             # "end your turn" — nelix wakes Hermes on the next event, so there is nothing to poll.
             # `pending` means a RESPONDABLE decision is outstanding: a non-respondable `idle`
-            # (requires_response=False) is surfaced as a decision but is NOT pending (nothing to answer).
+            # (requires_response=False) is surfaced as a decision but is NOT pending (nothing to
+            # answer). async_question is deliberately NOT folded into `pending` (it never blocks;
+            # RESPONDABLE_KINDS/pending() must keep meaning "blocking decision only").
             snap["pending"] = (self._decision is not None
                                and self._decision.get("requires_response", True))
-            if self._decision is None and not terminal and self._state == "busy":
+            # The "still working, nelix will wake you" message is only accurate when NOTHING has
+            # woken the orchestrator yet. An outstanding async_question already tripped the waiter
+            # (record_async_question's publish) and is surfaced above via its own field, so this
+            # low-info filler would be stale/misleading here — suppress it whenever a question is
+            # outstanding, even with no _decision and the executor otherwise busy.
+            if (self._decision is None and self._async_question is None
+                    and not terminal and self._state == "busy"):
                 snap["message"] = ("Agent is still working. End your turn; nelix will wake "
                                    "you on the next event.")
             return snap
@@ -1042,15 +1305,24 @@ class Session:
     def terminal_snapshot(self):
         """Read-only advisory snapshot for a disappearing session, so the companion can relay
         a completion/crash even after the manager has freed the slot. Display-only; the durable
-        restart count lives in the manager's lineage table."""
+        restart count lives in the manager's lineage table.
+
+        Carries the SAME progress fields as snapshot()'s gated addition (I1, final whole-branch
+        review): _finish publishes the terminal event then Manager._free_slot synchronously frees
+        the slot, so by the time Hermes reads status the session lives only here (recent_terminal).
+        Without the progress trail, the curated "what did the executor accomplish" surface (spec
+        §7/§1) would vanish at exactly the moment it matters most — completion. Always included
+        (never gated): a terminal read IS the wake point, there is nothing left to poll for."""
         with self._lock:
-            return {"session_id": self._id, "executor": self._executor,
+            snap = {"session_id": self._id, "executor": self._executor,
                     "task": self._task_raw, "cwd": self._cwd,
                     "control_state": "terminal", "terminal_kind": self._terminal_kind,
                     "task_delivery": self._task_delivery,
                     "screen_excerpt": self._last_screen_excerpt, "pending": False,
                     "lineage_id": self.lineage_id, "restarted_from": self.restarted_from,
                     "restart_count": self.restart_count, "terminal": True}
+            snap.update(self._progress_view_locked())
+            return snap
 
     # respond's submit-confirm poll interval (read-only render reads; the monitor owns pump()).
     _CONFIRM_POLL = 0.1

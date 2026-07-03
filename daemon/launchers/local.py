@@ -4,7 +4,7 @@ import os
 import paths
 from daemon.broker_client import get_broker
 from daemon.drivers import DRIVERS
-from daemon.hook_settings import hook_launch
+from daemon.hook_settings import executor_message_instructions, hook_launch
 from daemon.launchers.base import ExecutorCapabilities
 from daemon.pty_session import PtySession
 
@@ -85,6 +85,65 @@ def _fold_hook_settings(argv, argv_extra):
     return [*cleaned, "--settings", json.dumps(merged)]
 
 
+def _read_text_file(path):
+    # Best-effort read of a user-supplied --append-system-prompt-file target. On any failure return
+    # None so the caller falls back to "no user text" rather than crashing the launch.
+    try:
+        with open(os.path.expanduser(path)) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _split_system_prompt_args(argv):
+    # Strip EVERY user --append-system-prompt (both "--append-system-prompt <v>" and
+    # "--append-system-prompt=<v>") AND --append-system-prompt-file (both forms) from argv, returning
+    # (cleaned_argv, effective_text). Verified empirically against the real `claude` CLI: repeated
+    # --append-system-prompt flags do NOT concatenate -- the LAST occurrence wins, and mixing the
+    # inline and -file forms is a hard CLI error ("Cannot use both --append-system-prompt and
+    # --append-system-prompt-file"). So the effective user text is whichever form's flag appears
+    # LAST in argv, matching Claude's own last-wins semantics; a -file value is read from disk.
+    cleaned, text, i, n = [], None, 0, len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "--append-system-prompt":
+            if i + 1 < n:
+                text = argv[i + 1]
+                i += 2
+                continue
+            i += 1                                  # malformed trailing flag (no value): drop it
+            continue
+        if a.startswith("--append-system-prompt="):
+            text = a[len("--append-system-prompt="):]
+            i += 1
+            continue
+        if a == "--append-system-prompt-file":
+            if i + 1 < n:
+                text = _read_text_file(argv[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+        if a.startswith("--append-system-prompt-file="):
+            text = _read_text_file(a[len("--append-system-prompt-file="):])
+            i += 1
+            continue
+        cleaned.append(a)
+        i += 1
+    return cleaned, text
+
+
+def _fold_system_prompt(argv, instruction):
+    # Fold our executor instruction into a SINGLE --append-system-prompt. Claude does NOT concatenate
+    # repeated occurrences of this flag (see _split_system_prompt_args) -- appending a second one
+    # would silently drop either the user's system-prompt text or ours, defeating either the user's
+    # config or the whole point of this injection. Instead: pull out the user's effective text (if
+    # any), concatenate ours after it, and emit exactly one inline flag.
+    cleaned, user_text = _split_system_prompt_args(argv)
+    merged = f"{user_text}\n\n{instruction}" if user_text else instruction
+    return [*cleaned, "--append-system-prompt", merged]
+
+
 class LocalLauncher:
     """Run the executor as a host process in a PTY. Isolation == host. The actual fork+exec
     happens in the single-threaded broker (daemon.pty_broker), never in the daemon."""
@@ -101,6 +160,7 @@ class LocalLauncher:
         if session_id and hook_secret and _driver_hook_capable(spec.driver):
             inj = hook_launch(session_id, str(paths.rpc_sock()), hook_secret)
             argv = _fold_hook_settings(argv, inj["argv_extra"])
+            argv = _fold_system_prompt(argv, executor_message_instructions())
             env = {**env, **inj["env"]}
         master_fd, pid, pgid = get_broker().spawn(argv, cwd, env, cols, rows)
         return PtySession(master_fd, pid, pgid, cols=cols, rows=rows,

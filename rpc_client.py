@@ -48,8 +48,15 @@ class RpcClient:
                              {"executor": executor, "task": task, "cwd": cwd})
         return body
 
-    def status(self, session_id=None):
-        q = "?" + urllib.parse.urlencode({"session_id": session_id}) if session_id else ""
+    def status(self, session_id=None, include_progress=False):
+        # include_progress (Task 8): the query param is only ADDED when true, so a default call
+        # is byte-for-byte the same request as before this option existed.
+        params = {}
+        if session_id:
+            params["session_id"] = session_id
+        if include_progress:
+            params["include_progress"] = 1
+        q = "?" + urllib.parse.urlencode(params) if params else ""
         _, body = self._call("GET", "/status" + q)
         return body
 
