@@ -6,6 +6,8 @@ from daemon.launchers.local import LocalLauncher
 
 
 class _FakeSpec:
+    env_cmd = {}                      # nelix-c5o: no runtime-resolved env values (no-op)
+    env_cmd_timeout_seconds = 15.0
     def argv(self):
         return ["cat"]
     def resolved_env(self):
