@@ -63,6 +63,29 @@ def test_respond_success_logs_attempt_submitted_confirmed(tmp_path):
     assert "respond_failed" not in by
 
 
+def test_respond_attempt_logs_redacted_answer(tmp_path):
+    # nelix-eea: respond_attempt logged only answer_chars (a count) -> the literal answer (Enter vs
+    # `1` vs an option-id) was unrecoverable from the log (the "where did the 1 come from" incident,
+    # s-9c0b6eeb). Log the answer itself, run through the obs free-text redactor (answer is in
+    # _FREE_TEXT_FIELDS) so a secret pattern is MASKED but the SHAPE stays visible for forensics.
+    buf, log = _log_buf()
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._log = log
+    sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
+    answer = "deploy sk-livesecret1234567890abcd now"    # a secret token embedded in shaped free text
+    sess._handle = SubmitLandsHandle(answer)
+    out = sess.respond(answer, decision_id=sess._decision["decision_id"])
+    assert out.status == "resumed"
+    rec = _by_event(buf)["respond_attempt"]
+    assert "answer" in rec                                    # the answer text is now logged, not just a count
+    assert "sk-livesecret1234567890abcd" not in rec["answer"] # the secret pattern is masked
+    assert "***" in rec["answer"]                            # ... masked, not silently dropped
+    assert rec["answer"].startswith("deploy ") and rec["answer"].endswith(" now")  # shape survives
+    assert rec["answer_chars"] == len(answer)                # the count is unchanged (both coexist)
+
+
 def test_respond_submit_unconfirmed_logs_respond_failed(tmp_path):
     # Free-text Enter dropped: the answer is stranded in the box -> respond_failed(submit_unconfirmed).
     buf, log = _log_buf()

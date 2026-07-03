@@ -23,7 +23,7 @@ _SECRET_FIELDS = {
 # String fields run through the secret-pattern redactor.
 _FREE_TEXT_FIELDS = {
     "msg", "task", "grid", "screen_excerpt", "summary", "stderr",
-    "traceback", "error", "err", "exception",
+    "traceback", "error", "err", "exception", "answer",
 }
 
 

@@ -1424,7 +1424,7 @@ class Session:
         if self._log is not None:
             self._log.debug("session", "respond_attempt", session_id=self._id, decision_id=did,
                             prompt_kind=decision.get("prompt_kind"), is_modal=True,
-                            is_blocked=True, answer_chars=len(clean), writer="monitor")
+                            is_blocked=True, answer_chars=len(clean), answer=clean, writer="monitor")
         # Wait (bounded) for the monitor to drain; it sets pa["outcome"] + done. The monitor owns the
         # write, so this RPC thread types NOTHING — it only relays the outcome the monitor set.
         remaining = max(0.0, pa["deadline"] - time.monotonic())
@@ -1613,7 +1613,7 @@ class Session:
         if self._log is not None:
             self._log.debug("session", "respond_attempt", session_id=self._id, decision_id=did,
                             prompt_kind=decision.get("prompt_kind"), is_modal=is_modal,
-                            is_blocked=is_blocked, answer_chars=len(clean))
+                            is_blocked=is_blocked, answer_chars=len(clean), answer=clean)
         # one logical decision may span several notification events (re-emits) -> resolve the whole
         # decision by id (targeted, not a blanket session-answer), so pending() stays honest and the
         # next waiter arms past the whole resolved decision. Coexisting decisions are untouched.
