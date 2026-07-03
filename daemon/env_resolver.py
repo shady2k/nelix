@@ -180,7 +180,12 @@ def run_capture(command, base_env, timeout, max_bytes):
                 chunks.append(b)
                 total += len(b)
             exceeded = True
-            proc.kill()                        # over the cap: kill so proc.wait() returns at once
+            # Over the cap: SIGKILL the whole group so the primary WNOWAIT wait sees the exit at once.
+            # Use the RAW _kill_group (os.killpg), NEVER proc.kill(): Popen.kill()->send_signal() polls
+            # (waitpid) and would REAP the child, releasing proc.pid before the finally's group-kill and
+            # reopening the pid-reuse killpg race (FIX A, wave 3). INVARIANT: no reaping Popen method is
+            # called before the single _reap in the finally, so proc.pid stays OWNED through every kill.
+            _kill_group(proc)
         except (OSError, ValueError):
             pass                               # pipe closed under us (timeout/overflow kill) -> stop
 

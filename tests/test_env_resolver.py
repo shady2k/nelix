@@ -364,3 +364,35 @@ def test_run_capture_wedged_reader_abandons_without_partial_value_or_close(monke
     monkeypatch.setattr(er, "_close", lambda f: closed.append(f))
     assert run_capture("echo hi", {}, 5.0, _CAP) == (None, "run_failed")
     assert closed == [], "proc.stdout must NOT be closed when the reader is abandoned (would block)"
+
+
+# ---- FIX A (wave 3): the OVERFLOW path must not reap proc.pid before the group-kill --------
+def test_run_capture_overflow_does_not_reap_before_group_kill(monkeypatch):
+    # Residual pid-reuse race: on overflow the reader used to call proc.kill(), whose send_signal()
+    # first polls (waitpid) and REAPS an already-exited child (verified) -> proc.pid is released
+    # BEFORE the finally's os.killpg(proc.pid), which could then hit a REUSED pid's group. The reader
+    # must instead use a RAW, non-reaping group signal. INVARIANT: no reaping Popen method
+    # (kill/poll/wait/send_signal/communicate) runs before the FIRST os.killpg — proc.pid stays OWNED
+    # until the single reap in the finally.
+    import daemon.env_resolver as er
+    order = []
+    real_killpg = os.killpg
+    monkeypatch.setattr(er.os, "killpg",
+                        lambda pg, sig: (order.append("killpg"), real_killpg(pg, sig))[1])
+    for _name in ("kill", "poll", "send_signal", "wait", "communicate"):
+        _real = getattr(subprocess.Popen, _name)
+
+        def _spy(self, *a, _n=_name, _r=_real, **k):
+            order.append(_n)
+            return _r(self, *a, **k)
+        monkeypatch.setattr(subprocess.Popen, _name, _spy)
+
+    # An overflow command that writes > max_bytes and EXITS immediately (the race trigger).
+    value, reason = run_capture("printf 'xxxxxxxxxx'", {}, 5.0, 8)
+    assert (value, reason) == (None, "output_too_large")         # overflow behaviour preserved
+    assert "killpg" in order, "the process group must be SIGKILLed"
+    before = order[:order.index("killpg")]
+    assert not ({"kill", "poll", "send_signal", "wait", "communicate"} & set(before)), \
+        f"a reaping Popen method ran BEFORE killpg (pid-reuse race): {before}"
+    # The reader no longer uses any Popen-level kill/signal at all (only raw os.killpg):
+    assert "kill" not in order and "send_signal" not in order
