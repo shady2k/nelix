@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 
 import paths
 from daemon.drivers import get_driver
-from daemon.env_resolver import EnvResolveError, resolve_env_cmds, _run_capture
+from daemon.env_resolver import EnvResolveError, resolve_env_cmds, run_capture
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.session import RespondOutcome, Session
 
@@ -35,7 +35,7 @@ class ModelsNotConfigured(Exception):
 
 
 class ModelsCmdError(Exception):
-    """nelix-g9k: `models_cmd` failed to produce output. Carries ONLY `reason` (∈ the _run_capture
+    """nelix-g9k: `models_cmd` failed to produce output. Carries ONLY `reason` (∈ the run_capture
     reason set) — never the command, stdout, or stderr — so the route/manager can log/relay {reason}
     without leaking a secret the command may have referenced (spec §5). Maps to a redacted 502."""
 
@@ -630,8 +630,8 @@ class SessionManager:
         # always current. An env_cmd failure raises EnvResolveError here (before models_cmd runs).
         env = {**spec.resolved_env(),
                **resolve_env_cmds(spec.env_cmd, os.environ, spec.env_cmd_timeout_seconds)}
-        value, reason = _run_capture(spec.models_cmd, env, spec.models_cmd_timeout_seconds,
-                                     _MODELS_MAX_BYTES)
+        value, reason = run_capture(spec.models_cmd, env, spec.models_cmd_timeout_seconds,
+                                    _MODELS_MAX_BYTES)
         if reason is not None:
             # Redacted: only the reason crosses the boundary (never the command / stdout / stderr).
             raise ModelsCmdError(reason)

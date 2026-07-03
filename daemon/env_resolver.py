@@ -3,7 +3,7 @@
 A `[executors.X.env_cmd]` entry maps an env var to a shell command; at spawn nelix runs the command
 and uses its trimmed stdout as the var's value in the child env. This retires the per-service wrapper
 (nelix builds the full launch env and spawns the leaf CLI directly) and lets nelix own the launch env.
-nelix-g9k reuses the SAME helper (`_run_capture`) for `models_cmd` (read-only model discovery) so
+nelix-g9k reuses the SAME helper (`run_capture`) for `models_cmd` (read-only model discovery) so
 both paths share one `close_fds`/`stdin=DEVNULL`/timeout/bounded-capture/leak discipline.
 
 Fork-safety (spec §4.2): the daemon routes PTY spawns through the single-threaded pty_broker because
@@ -13,7 +13,7 @@ only async-signal-safe work between fork and exec (no Python post-fork) — the 
 way to run a subprocess. `close_fds=True` (the default) is kept so the child never inherits the PTY
 master / control-socket FDs. So this runs on the RPC handler thread, NOT through the broker.
 
-Secret-leak guard (spec §5): `_run_capture` is TOTAL — it returns `(value, reason)` and RAISES
+Secret-leak guard (spec §5): `run_capture` is TOTAL — it returns `(value, reason)` and RAISES
 NOTHING, so no subprocess exception (a `CalledProcessError` / `TimeoutExpired` traceback embeds the
 `['/bin/sh','-c',<command>]` argv, which exc_info logging would then write out) can cross the
 boundary. The command / stdout / stderr are never stored or returned. Callers turn a non-None reason
@@ -46,7 +46,7 @@ def _close(f):
         pass
 
 
-def _run_capture(command, base_env, timeout, max_bytes):
+def run_capture(command, base_env, timeout, max_bytes):
     """Run `/bin/sh -c command` and capture up to `max_bytes` of stdout, BOUNDED. TOTAL: returns
     `(value, reason)` and RAISES NOTHING — no subprocess exception can drag the command / argv /
     stdout / stderr into a traceback (spec §4.2, §5).
@@ -133,10 +133,10 @@ def resolve_env_cmds(env_cmd, base_env, timeout):
     EnvResolveError(var, reason). An empty `env_cmd` is a no-op ({})."""
     resolved = {}
     for var, command in env_cmd.items():
-        value, reason = _run_capture(command, base_env, timeout, _ENV_CMD_MAX_BYTES)
-        # Raise OUTSIDE any except (there is none — _run_capture returned a tuple, no exception is in
+        value, reason = run_capture(command, base_env, timeout, _ENV_CMD_MAX_BYTES)
+        # Raise OUTSIDE any except (there is none — run_capture returned a tuple, no exception is in
         # flight) so EnvResolveError.__context__ / __cause__ are genuinely None (not merely
-        # display-suppressed). _run_capture already stripped every command / argv / stdout / stderr,
+        # display-suppressed). run_capture already stripped every command / argv / stdout / stderr,
         # so the ONLY thing crossing this boundary is (var, reason) — a structural leak guard (§5).
         if reason is not None:
             raise EnvResolveError(var, reason)
