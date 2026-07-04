@@ -71,6 +71,10 @@ def test_open_valueerror_is_redacted(monkeypatch):
         md.discover("anthropic", {"ANTHROPIC_AUTH_TOKEN": "supersecrettoken"})
     assert e.value.reason == "http_error"
     assert "supersecrettoken" not in str(e.value)
+    # The DiscoveryError must be raised OUTSIDE the except block: no context/cause chain at all,
+    # so the token-bearing ValueError can never be reached via __context__/__cause__/traceback.
+    assert e.value.__context__ is None
+    assert e.value.__cause__ is None
 
 
 def test_unsupported_protocol(monkeypatch):

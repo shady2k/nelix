@@ -63,6 +63,7 @@ def _discover_anthropic(env):
     else:
         headers["x-api-key"] = token
         headers["anthropic-version"] = _ANTHROPIC_VERSION
+    err = None
     try:
         req = urllib.request.Request(f"{base}/v1/models?limit=1000", headers=headers, method="GET")
         with _open(req, _DISCOVERY_TIMEOUT) as resp:
@@ -70,9 +71,12 @@ def _discover_anthropic(env):
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
         # ValueError also covers a malformed header (e.g. a token with an interior newline): on
         # Python 3.11 urllib raises a raw ValueError whose message INCLUDES the offending header
-        # value. `from None` drops that token-bearing exception from the chain so no traceback /
-        # __context__ can leak it past this boundary (redacted: no status/url/body/exception text).
-        raise DiscoveryError("http_error") from None
+        # value. The DiscoveryError is raised OUTSIDE this except block (below) so it has no
+        # __context__/__cause__ at all -- the token-bearing exception never hangs off it, not even
+        # as a suppressed context (redacted: no status/url/body/exception text).
+        err = "http_error"
+    if err is not None:
+        raise DiscoveryError(err)
     if len(raw) > _MODELS_MAX_BYTES:
         raise DiscoveryError("too_large")
     try:

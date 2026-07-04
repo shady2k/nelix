@@ -1,7 +1,7 @@
 """nelix-kwr: per-executor model-list cache. Keyed by (executor, normalized base_url, auth_kind,
-salted token fingerprint) so a token/base_url change never serves a stale-credential list. TTL-bounded
-with single-flight coalescing (concurrent cold starts share one fetch). The token itself is never
-stored/logged — only a salted sha256 fingerprint is kept."""
+salted token fingerprint, protocol) so a token/base_url/protocol change never serves a stale-credential
+or stale-protocol list. TTL-bounded with single-flight coalescing (concurrent cold starts share one
+fetch). The token itself is never stored/logged — only a salted sha256 fingerprint is kept."""
 import hashlib
 import os
 import threading
@@ -18,12 +18,12 @@ class ModelCache:
         self._entries = {}            # key -> (expires_at, list)
         self._inflight = {}           # key -> threading.Event
 
-    def _key(self, executor, base_url, auth_kind, token):
+    def _key(self, executor, base_url, auth_kind, token, protocol):
         fp = hashlib.sha256(self._salt + (token or "").encode()).hexdigest()[:16]
-        return (executor, (base_url or "").rstrip("/"), auth_kind, fp)
+        return (executor, (base_url or "").rstrip("/"), auth_kind, fp, protocol)
 
     def models(self, executor, base_url, auth_kind, token, env, protocol, *, force=False):
-        key = self._key(executor, base_url, auth_kind, token)
+        key = self._key(executor, base_url, auth_kind, token, protocol)
         while True:
             with self._lock:
                 if not force:
