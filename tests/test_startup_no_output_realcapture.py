@@ -7,7 +7,10 @@ monitor's pre-delivery loop spins forever. Session._run must bound the pre-deliv
 with an UNCONDITIONAL deadline on the INJECTED clock: past startup_timeout_seconds with nothing
 classifiable ever shown, terminal-fail SYMMETRICALLY with crash/exit — one SURFACED escalation
 (delivery_failed / hint=startup_no_output), a forensic lifecycle record, and a clean reap/slot-free.
-It must NOT trip when a real prompt (input box / modal) or a stable banner appears.
+It is avoided ONLY by a classifiable prompt (delivery flips task_delivery out of "pending") or by a
+modal/permission that routes through _emit_blocked (the _blocked_fp exclusion); a stable but
+NON-classifiable banner does NOT exempt it — waiting to inject the task is bounded unconditionally
+(nelix-b5q).
 
 Frames are produced by feeding synthetic/real PTY bytes through the REAL GhosttyRenderer (the repo's
 real-capture norm — never hand-fabricated frame strings), then driven through the REAL Session via
