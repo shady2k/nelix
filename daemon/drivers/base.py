@@ -19,6 +19,13 @@ class Driver(Protocol):
     # declare it to advertise support, and every read uses getattr(driver, "model_flag", None) so a
     # driver that omits it is treated as "no override support" (never an AttributeError).
     model_flag: "str | None" = None
+    # nelix-kwr: discovery protocol key (drives daemon/model_discovery). None = the driver's backend
+    # exposes no model list (pre-flight validation is skipped). Structural typing like model_flag.
+    models_protocol: "str | None" = None
+    # nelix-kwr: model names that are always valid (tier aliases the CLI remaps via env defaults, so
+    # they never appear in /v1/models). Matched case-insensitively; the original string is passed to
+    # the CLI unchanged.
+    model_aliases: frozenset = frozenset()
     command_prefixes: tuple      # leading tokens the CLI reads as a command, not a prompt
     submit_key: str              # the key that submits a line (CR for most TUIs)
 
