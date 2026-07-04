@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests._session_replay import (   # noqa: E402
     replay_session, delivery_run, delivery_drive, respond_via_monitor, capture_frames, raw_frames,
-    _wire, RawReplayHandle, Spec,
+    replay_hooks, _wire, RawReplayHandle, Spec, _GOLDEN,
 )
 from daemon.drivers.claude import ClaudeDriver   # noqa: E402
 from daemon.observation import ObservationCtx   # noqa: E402
@@ -129,6 +129,98 @@ def test_i6b_modal_respond_routes_to_select_option_over_real_capture(tmp_path):
     # The chosen option's LABEL (not the bare id) is recorded in the transcript.
     assert "Enrich all three" in sess._dialog.page()["text"]
     assert ev.pending("s1") is None                     # answered -> cleared
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# nelix-32f — AskUserQuestion hook prompt_kind collision (one stable modal decision)
+# ─────────────────────────────────────────────────────────────────────────────
+# A single on-screen AskUserQuestion modal emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice)
+# AND PermissionRequest (-> permission_choice) in this claude build (daemon log s-9610d25c @
+# 20:57:20: no concurrent Bash tool — AskUserQuestion itself fires the PermissionRequest).
+# daemon/belief.py keyed the pending slot by prompt_kind:epoch, so the two hooks produced two
+# DIFFERENT decision keys and the second SUPERSEDED the first; when PermissionRequest arrived second
+# the stable modal_choice decision was withdrawn, so respond() rejected every option answer
+# (missing_decision_id -> invalid_option x3) and the orchestrator could never answer the modal.
+# Compounding factor: a hook-derived modal carries NO options (the hook path's Publish payload omits
+# them), so even modulo the collision respond(option_id) is invalid_option. The fix collapses the two
+# hooks to ONE stable modal_choice decision (belief.py) AND attaches the on-screen options to it
+# (session.py) so the orchestrator can answer end-to-end.
+
+def test_askuserquestion_collision_one_answerable_modal_decision(tmp_path):
+    """Drive the REAL session with the staged ground-truth hook sequence (UserPromptSubmit ->
+        PreToolUse[AskUserQuestion] -> PermissionRequest) over the real 6-option 'Next step' modal
+        capture. The collision MUST collapse to exactly ONE respondable modal_choice decision whose
+        decision_id is stable, whose options are the on-screen 6, and which respond(option_id) answers
+        end-to-end (no invalid_option). RED on current code: the permission hook supersedes modal_choice
+        (prompt_kind becomes permission_choice) and the decision carries NO options -> respond('1') is
+        invalid_option. GREEN: one stable modal_choice with options; respond('1') -> select_option."""
+    frames = capture_frames("s-9610d25c-askuserquestion-collision.capture")
+    modal = frames[-1]
+    # NON-VACUITY: the real capture ends on the 6-option AskUserQuestion modal.
+    assert "Next step" in modal and "Enter to select" in modal, (
+        "fixture must end on the AskUserQuestion 6-option modal")
+
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([modal], clock=clock)
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"            # the collision is mid-turn (post-delivery)
+    hooks = _GOLDEN / "s-9610d25c-askuserquestion-collision.hooks.jsonl"
+    trail = replay_hooks(sess, hooks)
+    # the trail ends in the modal pause regardless of which hook "won" the collision.
+    assert trail[-1][1] == "awaiting_user", trail
+
+    dec = sess.snapshot().get("decision")
+    assert dec is not None, "the collision must leave ONE pending decision"
+    # AC2: prompt_kind reflects the real modal (modal_choice), NOT permission_choice.
+    assert dec["prompt_kind"] == "modal_choice", (
+        f"the modal's prompt_kind must survive the permission hook (got {dec.get('prompt_kind')!r})")
+    assert dec["kind"] == "waiting_for_user"
+    did = dec["decision_id"]
+    # AC3/AC5: the on-screen 6 options are attached so respond(option_id) can route to select_option.
+    assert [o["id"] for o in dec["options"]] == ["1", "2", "3", "4", "5", "6"], (
+        f"a hook-derived modal must carry the screen's options (got {dec.get('options')!r})")
+    # AC3: a valid option id is answered end-to-end (select_option -> digit+CR as ONE write).
+    out = sess.respond("1", decision_id=did)
+    assert out.status == "resumed", f"respond(valid option) must succeed (got {out.status})"
+    assert "1\r" in sess._handle.writes, "select_option must type digit+CR as one write"
+    assert "1" not in sess._handle.writes, "NOT the free-text two-write path"
+
+
+def test_askuserquestion_collision_prefers_modal_choice_under_reordered_delivery(tmp_path):
+    """AC2 (session-level): hooks are delivered as separate HTTP POSTs, so PermissionRequest may reach
+        nelix BEFORE PreToolUse[AskUserQuestion]. The Session's decision must STILL end modal_choice
+        with a STABLE decision_id (the late modal hook UPGRADES the published decision in place via the
+        re-emit prompt_kind refresh), carry the screen's 6 options, and remain answerable end-to-end.
+        RED without session.py's re-emit prompt_kind refresh: the engine re-emits modal_choice but the
+        Session keeps the stale permission_choice, so the decision's prompt_kind never upgrades."""
+    from daemon.hooks import HookEvent
+    frames = capture_frames("s-9610d25c-askuserquestion-collision.capture")
+    modal = frames[-1]
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([modal], clock=clock)
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"
+
+    def fire(event, tool_name=None):
+        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name))
+        sess._loop_once()
+
+    fire("UserPromptSubmit")
+    fire("PermissionRequest")                            # permission arrives FIRST
+    dec_perm = sess.snapshot()["decision"]
+    assert dec_perm["prompt_kind"] == "permission_choice"
+    did = dec_perm["decision_id"]
+    fire("PreToolUse", tool_name="AskUserQuestion")      # modal arrives SECOND -> in-place upgrade
+    dec = sess.snapshot()["decision"]
+    assert dec is not None
+    assert dec["decision_id"] == did, "the upgrade is in place: decision_id stays stable"
+    assert dec["prompt_kind"] == "modal_choice", (
+        f"the late modal hook must upgrade the decision to modal_choice (got {dec.get('prompt_kind')!r})")
+    # the modal's 6 options are attached (screen-sourced); the upgraded decision is answerable.
+    assert [o["id"] for o in dec["options"]] == ["1", "2", "3", "4", "5", "6"]
+    out = sess.respond("1", decision_id=did)
+    assert out.status == "resumed", f"respond(valid option) must succeed after the upgrade (got {out.status})"
+    assert "1\r" in sess._handle.writes
 
 
 # ─────────────────────────────────────────────────────────────────────────────

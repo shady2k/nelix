@@ -1,0 +1,10 @@
+# Ground-truth hook sequence synthesized from daemon-20260704-201855-44106.log
+# `hook_applied` events for session s-9610d25c @ 2026-07-04T20:57:20 (nelix hook-prompt-kind collision).
+#
+# A single on-screen AskUserQuestion modal ("Next step", 6 options) emitted BOTH:
+#   1. PreToolUse[AskUserQuestion]  -> prompt_kind=modal_choice   (dec-cac4e8f5)
+#   2. PermissionRequest            -> prompt_kind=permission_choice (dec-0903ad69, SUPERSEDED #1)
+# See tests/golden/claude/_regression/s-9610d25c-askuserquestion-collision.raw for the matching screen.
+{"hook_event_name": "UserPromptSubmit"}
+{"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion"}
+{"hook_event_name": "PermissionRequest"}

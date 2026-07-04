@@ -113,6 +113,68 @@ def test_posttooluse_askquestion_withdraws_pending():
     assert any(isinstance(a, Withdraw) for a in acts) and e.state.control_state == "busy"
 
 
+def test_askuserquestion_permission_collision_is_one_stable_modal_decision():
+    # nelix-32f: a single on-screen AskUserQuestion modal emits BOTH PreToolUse[AskUserQuestion]
+    # (-> modal_choice) AND PermissionRequest (-> permission_choice) in this claude build (verified
+    # in daemon log s-9610d25c @ 20:57:20: no concurrent Bash — AskUserQuestion itself fires the
+    # PermissionRequest). The two hooks share ONE turn-epoch, so they MUST collapse to EXACTLY ONE
+    # respondable decision whose identity is STABLE across the second hook (an in-place update, NOT a
+    # supersede), and whose prompt_kind reflects the real modal (modal_choice). On current code the
+    # permission_choice key differs from the modal_choice key -> a second Publish supersedes the first
+    # (belief.py keys the pending slot by prompt_kind:epoch) -> the stable modal decision is withdrawn.
+    e = eng()
+    e.on_hook(H("working", opens=True), 0.0)                                  # UserPromptSubmit
+    a1 = e.on_hook(H("waiting_for_user", prompt_kind="modal_choice"), 0.1)    # PreToolUse[AskUserQuestion]
+    pubs1 = [a for a in a1 if isinstance(a, Publish)]
+    assert len(pubs1) == 1 and pubs1[0].payload["prompt_kind"] == "modal_choice"
+    stable_key = pubs1[0].decision_key
+
+    a2 = e.on_hook(H("waiting_for_user", prompt_kind="permission_choice"), 0.2)  # PermissionRequest
+    pubs2 = [a for a in a2 if isinstance(a, Publish)]
+
+    # AC1: EXACTLY ONE Publish total — the second hook MUST NOT supersede/re-publish.
+    assert len(pubs1) + len(pubs2) == 1, (
+        f"the collision's second hook must be an in-place update, not a supersede (got "
+        f"{len(pubs1) + len(pubs2)} publishes)")
+    # AC1 (identity): the modal decision is STILL the epoch's pending pause — same key, not replaced.
+    assert e._hook_pending_key == stable_key, (
+        "the modal decision's identity must be stable across the permission hook")
+    assert e.state.control_state == "awaiting_user"
+    # AC2: the decision's prompt_kind reflects the real modal (modal_choice), not permission_choice.
+    assert pubs1[0].payload["prompt_kind"] == "modal_choice"
+
+
+def test_collision_prefers_modal_choice_under_reordered_hook_delivery():
+    # AC2 robustness: hooks are delivered as separate HTTP POSTs, so the PermissionRequest may reach
+    # nelix BEFORE the PreToolUse[AskUserQuestion]. The merge must STILL end on modal_choice (the more
+    # specific reading) with a STABLE decision_key — the late modal hook is an in-place UPGRADE re-emit
+    # (same decision_key, so the Session keeps one stable decision_id), never a supersede.
+    e = eng()
+    e.on_hook(H("working", opens=True), 0.0)
+    a1 = e.on_hook(H("waiting_for_user", prompt_kind="permission_choice"), 0.1)  # permission first
+    p1 = [a for a in a1 if isinstance(a, Publish)][0]
+    assert p1.payload["prompt_kind"] == "permission_choice"
+    key = p1.decision_key
+    a2 = e.on_hook(H("waiting_for_user", prompt_kind="modal_choice"), 0.2)        # modal second
+    p2 = [a for a in a2 if isinstance(a, Publish)]
+    assert len(p2) == 1 and p2[0].decision_key == key, (
+        "the late modal hook re-emits the SAME decision (stable identity), never supersedes")
+    assert p2[0].payload["prompt_kind"] == "modal_choice"     # upgraded to the more specific kind
+    assert e._hook_pending_kind == "modal_choice"
+
+
+def test_genuine_permission_request_without_askuserquestion_still_publishes_permission_choice():
+    # AC4 complement (no regression): a real Bash permission in an epoch with NO AskUserQuestion
+    # still publishes permission_choice and is answerable. The collision merge must not collapse a
+    # lone permission_choice into anything else.
+    e = eng()
+    e.on_hook(H("working", opens=True), 0.0)
+    acts = e.on_hook(H("waiting_for_user", prompt_kind="permission_choice"), 0.1)
+    p = [a for a in acts if isinstance(a, Publish)][0]
+    assert p.kind == "waiting_for_user" and p.payload["prompt_kind"] == "permission_choice"
+    assert e.state.control_state == "awaiting_user"
+
+
 def test_duplicate_stop_idempotent():
     e = eng()
     a1 = e.on_hook(H("idle", closes=True), 0.0)
