@@ -33,7 +33,6 @@ class Spec:
     startup_timeout_seconds = 60.0
     tail_lines = 100
     status_tail_chars = 4000
-    dialog_page_chars = 8000
     spool_max_bytes = 1_000_000
 
     def argv(self):

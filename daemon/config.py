@@ -84,7 +84,6 @@ class ExecutorSpec:
     heartbeat_stale_after: float = 10.0  # §7.4 frozen-but-should-tick -> stale after this long
     tail_lines: int = 400
     status_tail_chars: int = 4000
-    dialog_page_chars: int = 8000
     spool_max_bytes: int = 8_388_608
 
     def argv(self):
@@ -179,7 +178,6 @@ def _build_spec(name, spec):
         heartbeat_stale_after=_spec_num(spec, "heartbeat_stale_after", 10.0, cast=float),
         tail_lines=int(spec.get("tail_lines", 400)),
         status_tail_chars=int(spec.get("status_tail_chars", 4000)),
-        dialog_page_chars=int(spec.get("dialog_page_chars", 8000)),
         spool_max_bytes=int(spec.get("spool_max_bytes", 8_388_608)),
     )
 
