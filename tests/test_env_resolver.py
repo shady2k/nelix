@@ -126,13 +126,19 @@ def test_error_is_not_a_value_error():
 # directly (real /bin/sh, no mocking except the OSError case) and assert it RAISES NOTHING —
 # every outcome is a (value, reason) tuple.
 import subprocess
-import sys
-import threading
 import time
 
 from daemon.env_resolver import run_capture
 
 _CAP = 65536
+
+
+def test_run_capture_portable_without_os_waitid(monkeypatch):
+    # nelix-cb0 anti-recurrence guard: run_capture MUST NOT depend on os.waitid (absent on macOS
+    # Python < 3.13 — the daemon runs 3.11). Remove the attribute and prove a trivial command still
+    # succeeds; the pre-fix code hit AttributeError -> swallowed -> run_failed for EVERY command.
+    monkeypatch.delattr(os, "waitid", raising=False)
+    assert run_capture("echo hi", {}, 5.0, _CAP) == ("hi", None)
 
 
 def test_run_capture_success_strips_trailing_newline():
@@ -176,15 +182,15 @@ def test_run_capture_decode_failed_on_non_utf8_stdout():
     assert run_capture(r"printf '\377\376'", {}, 5.0, _CAP) == (None, "decode_failed")
 
 
-def test_run_capture_output_too_large_kills_producer_and_bounds_memory():
-    # An UNBOUNDED producer past the cap must be KILLED (return promptly), NOT buffered until the
-    # timeout — this is the bounded-capture guarantee subprocess.run(capture_output=True) lacks. A
-    # generous 10s timeout: had we returned via timeout instead of the cap-kill, the call would take
-    # ~10s; it returns in well under a second, proving the child was killed at the cap.
-    t0 = time.monotonic()
-    value, reason = run_capture("while :; do printf 'xxxxxxxxxxxxxxxx'; done", {}, 10.0, 1024)
+def test_run_capture_output_too_large_bounds_memory_on_file_read(tmp_path):
+    # A FINITE producer that writes far past the cap and then EXITS must map to output_too_large, and
+    # memory must stay bounded: we read at most max_bytes+1 bytes back from the temp file regardless of
+    # how large the file grew (nelix-cb0 removed the infinite-producer-must-be-killed case — an
+    # infinite producer now hits the timeout, which is a distinct test; capture is a file, not a pipe).
+    big = tmp_path / "big"                          # 100_000 'a' bytes on disk, 1_024-byte cap
+    big.write_text("a" * 100_000)
+    value, reason = run_capture(f"cat {big}", {}, 10.0, 1024)
     assert (value, reason) == (None, "output_too_large")
-    assert time.monotonic() - t0 < 5.0        # killed on the cap, did NOT run to the 10s timeout
 
 
 def test_run_capture_exactly_at_cap_is_accepted():
@@ -214,46 +220,37 @@ def test_run_capture_stdin_is_devnull_not_inherited():
             os.close(fd)
 
 
-# ---- FIX 1: the configured timeout must ALWAYS bound the call -----------------------------
-def test_run_capture_backgrounded_child_does_not_bypass_timeout():
-    # A command whose /bin/sh exits immediately but leaves a long-lived BACKGROUND child holding the
-    # stdout pipe must NOT make the call block for that child's lifetime: the reader thread wedges in
-    # read1() waiting for an EOF the surviving grandchild never sends, and merely closing our read end
-    # blocks on the BufferedReader lock read1 holds. Cleanup kills the whole process group, freeing
-    # the pipe, so the call returns fast with a redacted reason (here empty_output — the shell exited
-    # 0 with no output).
+# ---- the timeout ALWAYS bounds the call; a backgrounded child does not block it (nelix-cb0) ----
+# A short (2s) background sleep is enough: the shell exits immediately and the call must return well
+# BEFORE the child finishes (asserted < 1.5s < 2s), which both proves non-blocking AND lets the
+# grandchild clean itself up quickly so repeated test runs don't stack long-lived processes.
+def test_run_capture_backgrounded_child_does_not_block_the_call():
+    # nelix-cb0 accepted trade-off: stdout is a temp FILE, not a pipe, so a command whose /bin/sh
+    # exits immediately but leaves a BACKGROUND child (`cmd &`) does NOT block the call for that
+    # child's lifetime — proc.wait() waits only on the shell, which exited. The grandchild is left
+    # running (no group-kill except on timeout); these are trusted operator commands. Returns fast
+    # with empty_output (the shell produced no stdout).
     t0 = time.monotonic()
-    value, reason = run_capture("sleep 30 &", {}, 0.2, _CAP)
-    assert value is None and reason in {"empty_output", "timeout"}
-    assert time.monotonic() - t0 < 5.0        # bounded — NOT the 30s child lifetime
+    value, reason = run_capture("sleep 2 &", {}, 5.0, _CAP)
+    assert (value, reason) == (None, "empty_output")
+    assert time.monotonic() - t0 < 1.5        # bounded by the shell's exit, NOT the 2s child lifetime
 
 
 def test_run_capture_captures_output_before_a_backgrounded_child():
-    # Same shape but the command prints first: the buffered output is still captured (closing a pipe's
-    # write end does not discard already-buffered bytes) and the call returns fast — the lingering
-    # background child is reaped by the process-group cleanup, not waited on.
+    # Same shape but the command prints first: the output written to the temp file is captured and the
+    # call returns fast — the lingering background child does not delay proc.wait() (only the shell is
+    # waited on) and does not corrupt the already-written stdout.
     t0 = time.monotonic()
-    out = run_capture("echo hi; sleep 30 &", {}, 5.0, _CAP)
+    out = run_capture("echo hi; sleep 2 &", {}, 5.0, _CAP)
     assert out == ("hi", None)
-    assert time.monotonic() - t0 < 5.0
+    assert time.monotonic() - t0 < 1.5        # returned before the 2s background child finished
 
 
-# ---- FIX 2: run_capture is TOTAL — no exception escapes after Popen -----------------------
-def test_run_capture_total_on_thread_start_failure(monkeypatch):
-    # A post-spawn failure (here Thread.start raising) must map to a redacted reason, never escape:
-    # an escaping exception could hit the /models generic 500 (embedding the argv in a traceback) or
-    # be misclassified by the route's broad `except ValueError` as a wrong 404. Cleanup still reaps
-    # the spawned child (bounded), so nothing leaks.
-    def boom(self):
-        raise RuntimeError("cannot start thread")
-    monkeypatch.setattr(threading.Thread, "start", boom)
-    value, reason = run_capture("echo hi", {}, 5.0, _CAP)
-    assert value is None and reason == "run_failed"
-
-
+# ---- run_capture is TOTAL — no exception escapes after Popen -------------------------------
 def test_run_capture_total_on_proc_wait_failure(monkeypatch):
-    # A proc.wait() failure (any non-TimeoutExpired exception) is also caught -> run_failed, not an
-    # escaping exception.
+    # An UNEXPECTED proc.wait() failure (any non-TimeoutExpired exception) is caught -> run_failed,
+    # not an escaping exception (which could hit the /models generic 500 embedding the argv, or be
+    # misclassified by the route's broad `except ValueError` as a wrong 404).
     def boom(self, timeout=None):
         raise RuntimeError("wait blew up")
     monkeypatch.setattr(subprocess.Popen, "wait", boom)
@@ -272,152 +269,65 @@ def test_run_capture_total_on_non_oserror_popen_failure(monkeypatch):
     assert run_capture("echo hi", {}, 5.0, _CAP) == (None, "spawn_failed")
 
 
-# ---- FIX A: the group-kill must run while proc.pid is still OWNED (unreaped) --------------
-def test_run_capture_group_kill_happens_before_reap(monkeypatch):
-    # PID-reuse safety: teardown must SIGKILL the child's process group BEFORE reaping the child.
-    # Once reaped, proc.pid is released and can be reused as an unrelated pgid, so a later
-    # killpg(proc.pid) could hit the WRONG group. Assert the order structurally (killpg strictly
-    # before the reaping wait) and that the child is NOT reaped when killpg fires.
-    import daemon.env_resolver as er
-    order = []
-    real_killpg = os.killpg
-    real_reap = er._reap
+# ---- nelix-cb0: the run_failed path is LOGGED (sanitized), so it is no longer undebuggable ----
+class _RecordingLogger:
+    """Minimal stand-in for daemon.obs.Logger — records warning() calls as (component, event, fields)."""
 
-    def spy_killpg(pgid, sig):
-        assert "reap" not in order, "child was reaped BEFORE the group-kill (pid-reuse race)"
-        order.append("killpg")
-        return real_killpg(pgid, sig)
+    def __init__(self):
+        self.records = []
 
-    def spy_reap(proc, deadline):
-        order.append("reap")
-        return real_reap(proc, deadline)
-    monkeypatch.setattr(er.os, "killpg", spy_killpg)
-    monkeypatch.setattr(er, "_reap", spy_reap)
-    assert run_capture("echo hi", {}, 5.0, _CAP) == ("hi", None)
-    assert order == ["killpg", "reap"]            # group-kill strictly before the reaping wait
+    def warning(self, component, event, session_id=None, **fields):
+        self.records.append((component, event, fields))
 
 
-def test_run_capture_primary_wait_is_non_reaping_wnowait(monkeypatch):
-    # The primary wait must observe the child's exit WITHOUT reaping it (os.waitid WNOWAIT), so the
-    # pid stays owned until the group-kill. Assert every primary-wait call carries WNOWAIT.
-    import daemon.env_resolver as er
-    seen = []
-    real_waitid = os.waitid
-
-    def spy_waitid(idtype, id, options):
-        seen.append(options)
-        return real_waitid(idtype, id, options)
-    monkeypatch.setattr(er.os, "waitid", spy_waitid)
-    assert run_capture("echo hi", {}, 5.0, _CAP) == ("hi", None)
-    assert seen, "primary wait must use os.waitid"
-    assert all(o & os.WNOWAIT for o in seen), "primary wait must be WNOWAIT (must not reap)"
-
-
-def test_run_capture_total_on_primary_wait_failure(monkeypatch):
-    # The primary wait is now os.waitid; an UNEXPECTED error there must be caught -> run_failed, never
-    # an escaping exception (total guarantee preserved after the FIX A restructure).
-    import daemon.env_resolver as er
-
-    def boom(*a, **k):
-        raise RuntimeError("waitid blew up")
-    monkeypatch.setattr(er.os, "waitid", boom)
-    value, reason = run_capture("echo hi", {}, 5.0, _CAP)
-    assert value is None and reason == "run_failed"
+def test_run_capture_run_failed_logs_sanitized_exc_without_leaking_command(monkeypatch):
+    # Force an unexpected proc.wait() failure; run_capture must (a) return (None, "run_failed") and
+    # (b) LOG a sanitized record carrying the exception TYPE — with NO command / stdout / stderr / argv
+    # anywhere in the log, so the previously-undebuggable failure is visible but leak-free.
+    def boom(self, timeout=None):
+        raise RuntimeError("wait blew up")
+    monkeypatch.setattr(subprocess.Popen, "wait", boom)
+    logger = _RecordingLogger()
+    value, reason = run_capture("echo SECRET_LEAK_MARKER", {}, 5.0, _CAP, logger=logger)
+    assert (value, reason) == (None, "run_failed")
+    assert len(logger.records) == 1
+    component, event, fields = logger.records[0]
+    assert event == "run_capture_failed"
+    assert fields["exc_type"] == "RuntimeError"          # the sanitized type IS recorded
+    # No command / stdout / argv leaks into the log — not via any field, not via the exc message.
+    blob = repr((component, event, fields))
+    assert "SECRET_LEAK_MARKER" not in blob
+    assert "/bin/sh" not in blob
 
 
-# ---- FIX B/C: a reader that never EOFs is ABANDONED; cleanup never hangs past ~grace -------
-def test_run_capture_escaping_grandchild_returns_within_grace(tmp_path):
-    # A backgrounded grandchild that setsid()s OUT of the child's process group keeps the stdout
-    # write-end open: killpg can't free the pipe, so the reader stays wedged in read1() forever. The
-    # call must still RETURN within ~timeout+grace with a redacted reason (never hang, never block in
-    # _close on the read1 buffer lock).
-    #
-    # Deterministic escape: the grandchild touches a sentinel ONLY after setsid(), and the shell waits
-    # for it before exiting — so by the time teardown's killpg fires, the grandchild has provably left
-    # the group (no race with interpreter startup) and still holds the pipe.
-    sentinel = tmp_path / "escaped"
-    script = tmp_path / "esc.py"
-    script.write_text(
-        "import os, time\n"
-        "os.setsid()\n"                                 # leave the shell's process group
-        f"open({str(sentinel)!r}, 'w').close()\n"       # signal 'I have escaped'
-        "time.sleep(5)\n")                              # hold the stdout pipe past timeout+grace
-    esc = (f"{sys.executable} {script} & "
-           f"while [ ! -f {sentinel} ]; do sleep 0.02; done")
-    t0 = time.monotonic()
-    value, reason = run_capture(esc, {}, 5.0, _CAP)
-    dt = time.monotonic() - t0
-    assert value is None and reason == "run_failed"
-    # Shell exits fast (sentinel), so teardown is dominated by ONE _CLEANUP_GRACE (2.0s) join; the
-    # join+reap now share a single deadline (FIX B), so ~2.x s total, not ~timeout+2*grace.
-    assert dt < 4.0, f"cleanup hung ({dt:.2f}s) — must be bounded by ~timeout+ONE grace"
-
-
-def test_run_capture_wedged_reader_abandons_without_partial_value_or_close(monkeypatch):
-    # FIX C: when the reader has NOT confirmed-exited, the shared capture state (chunks/exceeded) is
-    # not stable, so run_capture must return a failure reason WITHOUT deriving a value from it — and
-    # FIX B: it must NOT close proc.stdout from the caller thread (that would block on the read1 lock).
-    # Force reader_clean=False even though `echo hi` really did produce "hi\n": the result must be
-    # run_failed, never the partial ("hi", None), and _close must not be invoked.
-    import daemon.env_resolver as er
-    monkeypatch.setattr(er, "_join_reader", lambda reader, deadline: False)
-    closed = []
-    real_close = er._close
-    monkeypatch.setattr(er, "_close", lambda f: closed.append(f))
+def test_run_capture_run_failed_without_logger_does_not_raise(monkeypatch):
+    # The logger is optional (callers without one still get the total contract): a run_failed with
+    # logger=None must not raise.
+    def boom(self, timeout=None):
+        raise RuntimeError("wait blew up")
+    monkeypatch.setattr(subprocess.Popen, "wait", boom)
     assert run_capture("echo hi", {}, 5.0, _CAP) == (None, "run_failed")
-    assert closed == [], "proc.stdout must NOT be closed when the reader is abandoned (would block)"
 
 
-# ---- FIX A (wave 3): the OVERFLOW path must not reap proc.pid before the group-kill --------
-def test_run_capture_overflow_does_not_reap_before_group_kill(monkeypatch):
-    # Residual pid-reuse race: on overflow the reader used to call proc.kill(), whose send_signal()
-    # first polls (waitpid) and REAPS an already-exited child (verified) -> proc.pid is released
-    # BEFORE the finally's os.killpg(proc.pid), which could then hit a REUSED pid's group. The reader
-    # must instead use a RAW, non-reaping group signal. INVARIANT: no reaping Popen method
-    # (kill/poll/wait/send_signal/communicate) runs before the FIRST os.killpg — proc.pid stays OWNED
-    # until the single reap in the finally.
-    import daemon.env_resolver as er
-    order = []
-    real_killpg = os.killpg
-    monkeypatch.setattr(er.os, "killpg",
-                        lambda pg, sig: (order.append("killpg"), real_killpg(pg, sig))[1])
-    for _name in ("kill", "poll", "send_signal", "wait", "communicate"):
-        _real = getattr(subprocess.Popen, _name)
-
-        def _spy(self, *a, _n=_name, _r=_real, **k):
-            order.append(_n)
-            return _r(self, *a, **k)
-        monkeypatch.setattr(subprocess.Popen, _name, _spy)
-
-    # An overflow command that writes > max_bytes and EXITS immediately (the race trigger).
-    value, reason = run_capture("printf 'xxxxxxxxxx'", {}, 5.0, 8)
-    assert (value, reason) == (None, "output_too_large")         # overflow behaviour preserved
-    assert "killpg" in order, "the process group must be SIGKILLed"
-    before = order[:order.index("killpg")]
-    assert not ({"kill", "poll", "send_signal", "wait", "communicate"} & set(before)), \
-        f"a reaping Popen method ran BEFORE killpg (pid-reuse race): {before}"
-    # The reader no longer uses any Popen-level kill/signal at all (only raw os.killpg):
-    assert "kill" not in order and "send_signal" not in order
+def test_run_capture_timeout_does_not_log_run_failed():
+    # A timeout is an EXPECTED outcome (its own reason), NOT a run_failed — it must not emit the
+    # run_capture_failed record (whose only risk, a TimeoutExpired str embedding the argv, is thereby
+    # avoided entirely on this path).
+    logger = _RecordingLogger()
+    assert run_capture("sleep 1", {}, 0.2, _CAP, logger=logger) == (None, "timeout")
+    assert logger.records == []
 
 
-# ---- FIX B (wave 3): teardown is bounded by ~ONE grace, not join-grace + reap-grace --------
-def test_run_capture_join_and_reap_share_one_cleanup_deadline(monkeypatch):
-    # Worst-case teardown must be ~timeout + ONE grace, not + 2*grace. Structural proof: the bounded
-    # join and the reap receive the SAME monotonic deadline, so a wedged reader that eats the whole
-    # grace on the join leaves the reap ~0 budget (they share the one grace, they don't each get one).
-    import daemon.env_resolver as er
-    seen = {}
-    real_join, real_reap = er._join_reader, er._reap
+def test_run_capture_logger_that_raises_does_not_break_total_contract(monkeypatch):
+    # The diagnostic must NOT break run_capture's TOTAL contract: if the logger's stream is
+    # closed/full and .warning() raises (write/flush error), that exception must NOT escape the
+    # run_failed path (nor become the traceback context of the original exc). run_capture must still
+    # return the reason.
+    class _ExplodingLogger:
+        def warning(self, *a, **k):
+            raise OSError("stream closed")
 
-    def spy_join(reader, deadline):
-        seen["join"] = deadline
-        return real_join(reader, deadline)
-
-    def spy_reap(proc, deadline):
-        seen["reap"] = deadline
-        return real_reap(proc, deadline)
-    monkeypatch.setattr(er, "_join_reader", spy_join)
-    monkeypatch.setattr(er, "_reap", spy_reap)
-    assert run_capture("echo hi", {}, 5.0, _CAP) == ("hi", None)
-    assert "join" in seen and "reap" in seen
-    assert seen["join"] == seen["reap"], "join and reap must share ONE cleanup deadline (~1 grace total)"
+    def boom(self, timeout=None):
+        raise RuntimeError("wait blew up")
+    monkeypatch.setattr(subprocess.Popen, "wait", boom)
+    assert run_capture("echo hi", {}, 5.0, _CAP, logger=_ExplodingLogger()) == (None, "run_failed")

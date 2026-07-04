@@ -629,9 +629,10 @@ class SessionManager:
         # c5o-resolved secret. Re-runs env_cmd per call (no caching) — a fresh secret-backend fetch,
         # always current. An env_cmd failure raises EnvResolveError here (before models_cmd runs).
         env = {**spec.resolved_env(),
-               **resolve_env_cmds(spec.env_cmd, os.environ, spec.env_cmd_timeout_seconds)}
+               **resolve_env_cmds(spec.env_cmd, os.environ, spec.env_cmd_timeout_seconds,
+                                  logger=self._logger)}
         value, reason = run_capture(spec.models_cmd, env, spec.models_cmd_timeout_seconds,
-                                    _MODELS_MAX_BYTES)
+                                    _MODELS_MAX_BYTES, logger=self._logger)
         if reason is not None:
             # Redacted: only the reason crosses the boundary (never the command / stdout / stderr).
             raise ModelsCmdError(reason)
