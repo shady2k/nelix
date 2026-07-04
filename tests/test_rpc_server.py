@@ -478,6 +478,31 @@ def test_rpc_start_model_rejected_returns_400():
         srv.shutdown()
 
 
+class FakeManagerModelUnavailable:
+    def __init__(self): self._events = EventQueue()
+    def start(self, executor, task, cwd, model=None):
+        from daemon.manager import ModelUnavailable
+        raise ModelUnavailable([{"id": "glm-5.2", "display_name": "GLM-5.2"}])
+    def respond(self, *a): return None
+    def status(self, session_id=None, include_progress=False): return {}
+    def stop(self, session_id): return False
+
+
+def test_start_model_unavailable_returns_400_with_list():
+    # nelix-kwr: an explicitly-requested model not offered by the backend -> 400 + the discovered
+    # available_models list, so the caller can pick a real one (not a daemon-full 409).
+    m = FakeManagerModelUnavailable()
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8798, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st, b = _req("POST", "http://127.0.0.1:8798/start",
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "model": "bad"})
+        assert st == 400, f"expected 400, got {st}"
+        assert b["available_models"] == [{"id": "glm-5.2", "display_name": "GLM-5.2"}]
+    finally:
+        srv.shutdown()
+
+
 def test_rpc_start_value_error_returns_409():
     m = FakeManagerRaisesValueError()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8768, "t"))

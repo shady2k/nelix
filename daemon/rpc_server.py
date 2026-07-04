@@ -15,7 +15,7 @@ from daemon.env_resolver import EnvResolveError
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
-from daemon.manager import ModelRejected
+from daemon.manager import ModelRejected, ModelUnavailable
 from daemon.messages import parse_message_body
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.transport import peer_is_self
@@ -292,6 +292,8 @@ def make_server(manager, transport, logger=None):
                 try:
                     outcome = manager.start(body["executor"], body["task"], body["cwd"],
                                             model=body.get("model"))
+                except ModelUnavailable as e:        # nelix-kwr: model not offered by the backend
+                    self._send(400, {"error": str(e), "available_models": e.available_models}); return
                 except ModelRejected as e:           # subclass of ValueError: catch BEFORE the 409
                     self._send(400, {"error": str(e)}); return   # bad-shape/unsupported model = client input error
                 except PtyInputRejected as e:        # subclass of ValueError: catch BEFORE it
