@@ -6,6 +6,11 @@ VENV ?= .venv
 PY   := $(VENV)/bin/python
 PIP  := $(VENV)/bin/pip
 
+# Nelix runs inside the Hermes daemon venv, which is Python 3.11. Pin dev + tests to the
+# same interpreter so a stray newer Python can't ship a 3.12+-only API green and break the
+# daemon (nelix-cb0: os.waitid — 3.13+ — passed on a 3.14 .venv, died on the 3.11 daemon).
+PYTHON ?= python3.11
+
 # Installed-plugin checkout used by `deploy` / `reinstall-plugin`. Override for another profile:
 #   make reinstall-plugin PLUGIN_DIR=/path/to/plugins/nelix
 PLUGIN_DIR ?= $(HOME)/.hermes/profiles/local/plugins/nelix
@@ -18,15 +23,19 @@ help:  ## List the available commands
 		| awk -F':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: venv
-venv:  ## Create the virtualenv if it is missing
-	@test -d $(VENV) || python3 -m venv $(VENV)
+venv:  ## Create the Python 3.11 virtualenv if it is missing
+	@test -d $(VENV) || $(PYTHON) -m venv $(VENV)
 
 .PHONY: install
 install: venv  ## Create the venv and install dependencies
 	$(PIP) install -r requirements.txt
 
+.PHONY: check-python
+check-python:  ## Fail unless the venv is Python 3.11 (the daemon's floor)
+	@$(PY) -c "import sys; v=sys.version_info; sys.exit(0 if v[:2]==(3,11) else 'nelix targets Python 3.11 (the Hermes daemon venv); this $(VENV) is %d.%d — recreate it: rm -rf $(VENV) && make install' % v[:2])"
+
 .PHONY: test
-test:  ## Run the test suite
+test: check-python  ## Run the test suite
 	$(PY) -m pytest -q
 
 .PHONY: clean
