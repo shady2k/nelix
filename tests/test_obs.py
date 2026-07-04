@@ -98,6 +98,43 @@ def test_redact_still_masks_real_secrets_after_tightening():
     assert opaque not in redact("session " + opaque + " started")
 
 
+def test_redact_masks_aws_temporary_access_key_id_asia():
+    """nelix-4ei follow-up: AWS TEMPORARY (S3/STS) access-key IDs 'ASIA...' (20
+    alnum chars) were caught by the old _LONGTOK{16,} but leak once the floor
+    rose to 32 — _PREFIXED only listed AKIA (long-term keys). Add ASIA too."""
+    assert redact("ASIAIOSFODNN7EXAMPLE") == "***"             # temporary key id
+    assert "AKIAIOSFODNN7EXAMPLE" not in redact(              # long-term key id stays masked
+        "rotated AKIAIOSFODNN7EXAMPLE and ASIAIOSFODNN7EXAMPLE")
+
+
+def test_redact_masks_separator_bearing_opaque_tokens():
+    """nelix-4ei follow-up: a 32+ char opaque token containing - or _ (base64url /
+    session / bearer tokens with NO key=/prefix/bearer wrapper) leaked because
+    every sub-run between separators was <32. A separator-tolerant opaque mask
+    must catch it."""
+    base64url = "xY3z9-abCDefghIJKLmnopQRSTuvwxYZ012345-_aBcDeFgHiJk"
+    assert len(base64url) >= 50
+    # confirm it really is the opaque shape we claim to be testing
+    assert any(c.isdigit() for c in base64url)
+    assert any(c.isupper() for c in base64url)
+    assert any(c.islower() for c in base64url)
+    assert ("-" in base64url) or ("_" in base64url)
+    assert redact(base64url) == "***"
+    assert base64url not in redact("session " + base64url + " accepted")
+
+
+def test_separator_opaque_mask_spares_benign_identifiers_and_uuids():
+    """The separator-tolerant mask must NOT reach back and mask benign kebab/snake
+    identifiers (short, single-case, no digit) nor a hyphenated UUID (single-case
+    hex, not a credential). UUIDs span >=32 chars + digits + separators but only
+    one letter case, so they must survive."""
+    for ident in ("acmetool-redirector", "ansible-playbook", "already-reloaded"):
+        assert redact(ident) == ident
+    lower_uuid = "550e8400-e29b-41d4-a716-446655440000"   # 36 chars, lowercase hex
+    assert redact(lower_uuid) == lower_uuid
+    assert redact(lower_uuid.upper()) == lower_uuid.upper()  # uppercase hex UUID too
+
+
 def test_error_exc_info_captures_redacted_traceback():
     buf = io.StringIO()
     log = Logger(stream=buf)

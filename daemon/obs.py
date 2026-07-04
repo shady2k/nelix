@@ -13,8 +13,17 @@ _KV = re.compile(r"((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s
 # key=) are still caught. Prefixed secrets (sk-/ghp_/AKIA/eyJ) and key=value are
 # handled by _KV/_PREFIXED/_BEARER regardless of length.
 _LONGTOK = re.compile(r"\b[A-Za-z0-9]{32,}\b")
-# Mask: known secret prefixes (Bearer, sk-, ghp_, gho_, ghs_, xox, AKIA, eyJ) regardless of length
-_PREFIXED = re.compile(r"\b(?:sk-|ghp_|gho_|ghs_|xox[a-z]-|AKIA|eyJ)[A-Za-z0-9._\-]+")
+# Separator-tolerant opaque token (nelix-4ei follow-up): base64url / session /
+# bearer tokens that contain `-` or `_` never form a single 32+ sub-run between
+# separators, so _LONGTOK misses them. We match any 32+ run in [A-Za-z0-9_-] and
+# mask it ONLY when it spans all three of digit/upper/lower — the signature of an
+# opaque token. Benign kebab/snake identifiers (short, single-case, no digit) and
+# hyphenated UUIDs (single-case hex, 36 chars) don't span three classes, so they
+# survive. Runs BEFORE _LONGTOK so a separator-bearing token masks as one ***.
+_LONGTOK_SEP = re.compile(r"[A-Za-z0-9_-]{32,}")
+# Mask: known secret prefixes (Bearer, sk-, ghp_, gho_, ghs_, xox, AKIA, ASIA, eyJ)
+# regardless of length. ASIA = AWS temporary (STS/S3) access-key IDs; AKIA = long-term.
+_PREFIXED = re.compile(r"\b(?:sk-|ghp_|gho_|ghs_|xox[a-z]-|AKIA|ASIA|eyJ)[A-Za-z0-9._\-]+")
 # Mask: Bearer <token> form
 _BEARER = re.compile(r"(?i)\bbearer\s+\S+")
 
@@ -33,9 +42,21 @@ _FREE_TEXT_FIELDS = {
 }
 
 
+def _mask_if_opaque(m) -> str:
+    """_LONGTOK_SEP callback: mask the run only if it spans digit+upper+lower
+    (an opaque token), otherwise leave it (a benign identifier / UUID)."""
+    tok = m.group(0)
+    if (any(c.isdigit() for c in tok)
+            and any(c.isupper() for c in tok)
+            and any(c.islower() for c in tok)):
+        return "***"
+    return tok
+
+
 def redact(text: str) -> str:
     s = _KV.sub(lambda m: m.group(1) + "***", text)
-    s = _LONGTOK.sub("***", s)
+    s = _LONGTOK_SEP.sub(_mask_if_opaque, s)   # separator-bearing opaque (whole token)
+    s = _LONGTOK.sub("***", s)                  # contiguous opaque (no separators)
     s = _PREFIXED.sub("***", s)
     s = _BEARER.sub("Bearer ***", s)
     return s
