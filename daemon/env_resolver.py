@@ -96,8 +96,14 @@ def _log_run_failed(logger, exc):
         exc_msg = None
     else:
         exc_msg = str(exc)
-    logger.warning("env_resolver", "run_capture_failed",
-                   exc_type=type(exc).__name__, exc_msg=exc_msg)
+    # The diagnostic must NOT break run_capture's TOTAL contract: a closed/full log stream can make
+    # warning()'s write/flush raise, and that must never escape the run_failed path (nor attach as the
+    # original exc's traceback context). A dropped diagnostic line is strictly better than a raise.
+    try:
+        logger.warning("env_resolver", "run_capture_failed",
+                       exc_type=type(exc).__name__, exc_msg=exc_msg)
+    except Exception:
+        pass
 
 
 def run_capture(command, base_env, timeout, max_bytes, logger=None):
@@ -118,11 +124,18 @@ def run_capture(command, base_env, timeout, max_bytes, logger=None):
     Capture is via a `tempfile.TemporaryFile`, NOT a pipe: `proc.wait(timeout)` alone bounds the call
     — no background reader, no pipe-deadlock defence, and (crucially) no `os.waitid`, which does not
     exist on the daemon's Python 3.11 (nelix-cb0). Memory stays bounded because at most `max_bytes+1`
-    bytes are read back from the file; an over-cap FINITE producer is detected on that read. The
-    accepted trade-off (vs. the old group-kill-on-overflow reader): a command that BACKGROUNDS a child
-    (`cmd &`) leaves that grandchild running after the shell exits — these are trusted, operator-
-    authored secret/model commands, so that is acceptable. The process group is SIGKILLed only when
-    the call itself must be torn down (timeout / unexpected error).
+    bytes are read back from the file; an over-cap FINITE producer is detected on that read.
+
+    ACCEPTED LIMITATION (background stdout producer): the process group is SIGKILLed ONLY on a
+    teardown path (timeout / unexpected error), never on success. So a command that BACKGROUNDS a
+    stdout producer (e.g. `yes &`) leaves that grandchild ALIVE and WRITING to the temp file AFTER
+    run_capture returns — the shell is reaped on success, but the grandchild survives it. This CANNOT
+    be prevented without a group-kill on the success path, which the portable (no-`os.waitid`) design
+    can't do race-free: killing the group means reaping the shell first, after which `proc.pid` no
+    longer owns the group and `os.killpg(proc.pid, ...)` could hit a REUSED pid's group (the exact
+    pid-reuse race the earlier waitid design existed to avoid). The bounded read caps the VALUE we
+    keep, but a runaway background producer can still fill DISK (not memory). This is acceptable for
+    the only callers — trusted, operator-authored `env_cmd` / `models_cmd` secret/model commands.
 
     stderr -> DEVNULL (never captured — it is redacted anyway — and can't fill/deadlock anything).
     stdin=DEVNULL + close_fds default: never inherit the daemon's stdin / PTY / socket FDs. The child

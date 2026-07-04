@@ -221,16 +221,19 @@ def test_run_capture_stdin_is_devnull_not_inherited():
 
 
 # ---- the timeout ALWAYS bounds the call; a backgrounded child does not block it (nelix-cb0) ----
+# A short (2s) background sleep is enough: the shell exits immediately and the call must return well
+# BEFORE the child finishes (asserted < 1.5s < 2s), which both proves non-blocking AND lets the
+# grandchild clean itself up quickly so repeated test runs don't stack long-lived processes.
 def test_run_capture_backgrounded_child_does_not_block_the_call():
     # nelix-cb0 accepted trade-off: stdout is a temp FILE, not a pipe, so a command whose /bin/sh
-    # exits immediately but leaves a long-lived BACKGROUND child (`cmd &`) does NOT block the call for
-    # that child's lifetime — proc.wait() waits only on the shell, which exited. The grandchild is
-    # left running (no group-kill except on timeout); these are trusted operator commands. Returns
-    # fast with empty_output (the shell produced no stdout).
+    # exits immediately but leaves a BACKGROUND child (`cmd &`) does NOT block the call for that
+    # child's lifetime — proc.wait() waits only on the shell, which exited. The grandchild is left
+    # running (no group-kill except on timeout); these are trusted operator commands. Returns fast
+    # with empty_output (the shell produced no stdout).
     t0 = time.monotonic()
-    value, reason = run_capture("sleep 30 &", {}, 5.0, _CAP)
+    value, reason = run_capture("sleep 2 &", {}, 5.0, _CAP)
     assert (value, reason) == (None, "empty_output")
-    assert time.monotonic() - t0 < 5.0        # bounded by the shell's exit, NOT the 30s child lifetime
+    assert time.monotonic() - t0 < 1.5        # bounded by the shell's exit, NOT the 2s child lifetime
 
 
 def test_run_capture_captures_output_before_a_backgrounded_child():
@@ -238,9 +241,9 @@ def test_run_capture_captures_output_before_a_backgrounded_child():
     # call returns fast — the lingering background child does not delay proc.wait() (only the shell is
     # waited on) and does not corrupt the already-written stdout.
     t0 = time.monotonic()
-    out = run_capture("echo hi; sleep 30 &", {}, 5.0, _CAP)
+    out = run_capture("echo hi; sleep 2 &", {}, 5.0, _CAP)
     assert out == ("hi", None)
-    assert time.monotonic() - t0 < 5.0
+    assert time.monotonic() - t0 < 1.5        # returned before the 2s background child finished
 
 
 # ---- run_capture is TOTAL — no exception escapes after Popen -------------------------------
@@ -311,5 +314,20 @@ def test_run_capture_timeout_does_not_log_run_failed():
     # run_capture_failed record (whose only risk, a TimeoutExpired str embedding the argv, is thereby
     # avoided entirely on this path).
     logger = _RecordingLogger()
-    assert run_capture("sleep 5", {}, 0.2, _CAP, logger=logger) == (None, "timeout")
+    assert run_capture("sleep 1", {}, 0.2, _CAP, logger=logger) == (None, "timeout")
     assert logger.records == []
+
+
+def test_run_capture_logger_that_raises_does_not_break_total_contract(monkeypatch):
+    # The diagnostic must NOT break run_capture's TOTAL contract: if the logger's stream is
+    # closed/full and .warning() raises (write/flush error), that exception must NOT escape the
+    # run_failed path (nor become the traceback context of the original exc). run_capture must still
+    # return the reason.
+    class _ExplodingLogger:
+        def warning(self, *a, **k):
+            raise OSError("stream closed")
+
+    def boom(self, timeout=None):
+        raise RuntimeError("wait blew up")
+    monkeypatch.setattr(subprocess.Popen, "wait", boom)
+    assert run_capture("echo hi", {}, 5.0, _CAP, logger=_ExplodingLogger()) == (None, "run_failed")
