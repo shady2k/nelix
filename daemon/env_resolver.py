@@ -1,16 +1,17 @@
-"""nelix-c5o / nelix-g9k: run a command and use its stdout — the shared, bounded subprocess helper.
+"""nelix-c5o: run a command and use its stdout — the shared, bounded subprocess helper.
 
 A `[executors.X.env_cmd]` entry maps an env var to a shell command; at spawn nelix runs the command
 and uses its trimmed stdout as the var's value in the child env. This retires the per-service wrapper
 (nelix builds the full launch env and spawns the leaf CLI directly) and lets nelix own the launch env.
-nelix-g9k reuses the SAME helper (`run_capture`) for `models_cmd` (read-only model discovery) so
-both paths share one `close_fds`/`stdin=DEVNULL`/timeout/bounded-capture/leak discipline.
+`run_capture` is written as a general-purpose helper (command in, bounded stdout out) so a future
+caller besides `env_cmd` can reuse the same `close_fds`/`stdin=DEVNULL`/timeout/bounded-capture/leak
+discipline without re-deriving it.
 
 nelix-cb0: capture is via a TEMP FILE, not a pipe + reader thread. The daemon runs Python 3.11
 (macOS), where `os.waitid` does NOT exist (added on macOS in 3.13); the previous pipe design used
 `os.waitid` to observe the child's exit without reaping it, so on the real daemon EVERY command hit
-AttributeError -> the broad `except` -> a spurious `run_failed` (env_cmd + models_cmd both dead
-despite green 3.14 tests). Writing stdout to a `tempfile.TemporaryFile` removes the pipe entirely:
+AttributeError -> the broad `except` -> a spurious `run_failed` (env_cmd dead despite green 3.14
+tests). Writing stdout to a `tempfile.TemporaryFile` removes the pipe entirely:
 `proc.wait(timeout=...)` alone bounds the call, no background reader, no `os.waitid`, no pipe-deadlock
 to defend against, and memory stays bounded because we read at most `max_bytes + 1` back from the file.
 
@@ -36,7 +37,7 @@ import subprocess
 import tempfile
 
 # Bounded-capture cap for env_cmd stdout: a runtime env value (auth token, backend addr) is tiny, so
-# 1 MiB is a generous anti-runaway ceiling, not a tuning knob. models_cmd passes its own cap.
+# 1 MiB is a generous anti-runaway ceiling, not a tuning knob.
 _ENV_CMD_MAX_BYTES = 1 << 20
 # Upper bound on the best-effort reap AFTER a timeout/error SIGKILL. Killing the process group makes
 # the child reapable at once; this is only the backstop if that ever stalls.
@@ -135,7 +136,7 @@ def run_capture(command, base_env, timeout, max_bytes, logger=None):
     longer owns the group and `os.killpg(proc.pid, ...)` could hit a REUSED pid's group (the exact
     pid-reuse race the earlier waitid design existed to avoid). The bounded read caps the VALUE we
     keep, but a runaway background producer can still fill DISK (not memory). This is acceptable for
-    the only callers — trusted, operator-authored `env_cmd` / `models_cmd` secret/model commands.
+    the only caller — trusted, operator-authored `env_cmd` secret commands.
 
     stderr -> DEVNULL (never captured — it is redacted anyway — and can't fill/deadlock anything).
     stdin=DEVNULL + close_fds default: never inherit the daemon's stdin / PTY / socket FDs. The child

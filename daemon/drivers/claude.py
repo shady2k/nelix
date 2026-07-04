@@ -65,6 +65,8 @@ def _is_choice_prompt(frame):
 class ClaudeDriver:
     hook_capable = True         # Claude reports its lifecycle via nelix hooks (--settings injection)
     model_flag = "--model"      # `claude --model <v>` selects the model (nelix-9k0 per-session override)
+    models_protocol = "anthropic"                          # nelix-kwr: Anthropic /v1/models discovery
+    model_aliases = frozenset({"haiku", "sonnet", "opus"}) # tier aliases (remapped via ANTHROPIC_DEFAULT_*_MODEL)
     command_prefixes = ("/",)   # a leading '/' opens a TUI slash-command, not a prompt
     submit_key = "\r"           # the TUI treats CR (not LF) as Enter
 

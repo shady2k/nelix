@@ -249,8 +249,9 @@ def test_run_capture_captures_output_before_a_backgrounded_child():
 # ---- run_capture is TOTAL — no exception escapes after Popen -------------------------------
 def test_run_capture_total_on_proc_wait_failure(monkeypatch):
     # An UNEXPECTED proc.wait() failure (any non-TimeoutExpired exception) is caught -> run_failed,
-    # not an escaping exception (which could hit the /models generic 500 embedding the argv, or be
-    # misclassified by the route's broad `except ValueError` as a wrong 404).
+    # not an escaping exception (which could reach /start's broad `except (RuntimeError, ValueError)`
+    # handler for env_cmd resolution and leak str(e) straight into the 409 response body, bypassing
+    # run_capture's fail-closed (value, reason) contract entirely).
     def boom(self, timeout=None):
         raise RuntimeError("wait blew up")
     monkeypatch.setattr(subprocess.Popen, "wait", boom)
@@ -260,7 +261,8 @@ def test_run_capture_total_on_proc_wait_failure(monkeypatch):
 
 def test_run_capture_total_on_non_oserror_popen_failure(monkeypatch):
     # A NON-OSError failure AT Popen (e.g. a bad arg -> ValueError) must also be caught, not escape
-    # and get misclassified by the /models route's broad `except ValueError` as a 404.
+    # to /start's env_cmd resolution path and leak str(e) via the same broad `except (RuntimeError,
+    # ValueError)` handler.
     import daemon.env_resolver as er
 
     def boom(*a, **k):

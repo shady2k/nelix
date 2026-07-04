@@ -65,11 +65,6 @@ class ExecutorSpec:
     # NELIX_* hook env. `field(default_factory=dict)` because a bare `{}` default is a dataclass error.
     env_cmd: dict = field(default_factory=dict)
     env_cmd_timeout_seconds: float = 15.0    # per-command resolution deadline (seconds)
-    # nelix-g9k: read-only model discovery. `models_cmd` is a command whose stdout is relayed as the
-    # executor's model list (run with the executor's resolved env; see daemon/manager.py::models).
-    # None = the executor exposes no model list (nelix_models returns "not configured").
-    models_cmd: "str | None" = None
-    models_cmd_timeout_seconds: float = 15.0  # per-command deadline for models_cmd (seconds)
     settle_seconds: float = 1.5
     delivery_confirm_seconds: float = 10.0   # how long to wait for delivery confirmation before failing
     respond_write_seconds: float = 5.0       # deadline for the respond() PTY write (wedged-stdin guard)
@@ -150,20 +145,6 @@ def _build_env_cmd(name, spec):
     return out
 
 
-def _build_models_cmd(name, spec):
-    """Parse + validate models_cmd (nelix-g9k). Absent -> None (executor exposes no model list).
-    Present -> must be a non-empty string (the command run for read-only model discovery). A bad
-    value raises ValueError -> per-executor load error (executor skipped, others still load). The
-    message names ONLY the field/problem, NEVER the value: a command can carry a secret path, and
-    this mirrors _build_env_cmd echoing only the var name (spec §4.1)."""
-    if "models_cmd" not in spec:
-        return None
-    raw = spec.get("models_cmd")
-    if not isinstance(raw, str) or raw == "":
-        raise ValueError(f"executor {name!r}: 'models_cmd' must be a non-empty command string")
-    return raw
-
-
 def _build_spec(name, spec):
     """Build one ExecutorSpec or raise (KeyError/TypeError/ValueError) with a clear,
     user-relayable message. The caller collects the raise as a per-executor error."""
@@ -181,8 +162,6 @@ def _build_spec(name, spec):
         launcher=spec.get("launcher", "auto"),
         env_cmd=_build_env_cmd(name, spec),
         env_cmd_timeout_seconds=_spec_timeout(spec, "env_cmd_timeout_seconds", 15.0),
-        models_cmd=_build_models_cmd(name, spec),
-        models_cmd_timeout_seconds=_spec_timeout(spec, "models_cmd_timeout_seconds", 15.0),
         settle_seconds=float(spec.get("settle_seconds", 1.5)),
         delivery_confirm_seconds=_spec_num(spec, "delivery_confirm_seconds", 10.0, cast=float),
         respond_write_seconds=_spec_num(spec, "respond_write_seconds", 5.0, cast=float),

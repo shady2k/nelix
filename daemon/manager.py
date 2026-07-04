@@ -8,13 +8,13 @@ from dataclasses import dataclass, replace
 
 import paths
 from daemon.drivers import get_driver
-from daemon.env_resolver import EnvResolveError, resolve_env_cmds, run_capture
+from daemon.env_resolver import EnvResolveError, resolve_env_cmds
 from daemon.events import EXTERNAL_OUTPUT_POLICY
+from daemon.model_cache import ModelCache
+from daemon.model_discovery import discover, auth_of, DiscoveryError
 from daemon.session import RespondOutcome, Session
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
-_MODELS_MAX_BYTES = 65536  # nelix-g9k: bounded-capture cap for models_cmd stdout (a model list is
-                           # small; a producer past this is misconfigured -> output_too_large -> 502)
 
 
 class ModelRejected(ValueError):
@@ -24,24 +24,12 @@ class ModelRejected(ValueError):
     generic ValueError->409 branch (client input error, not daemon-full)."""
 
 
-class ModelsNotConfigured(Exception):
-    """nelix-g9k: the executor has no `models_cmd` configured. A distinct type (NOT a ValueError)
-    so the /models route maps it to a clean 400 'not configured' — relayable, so the orchestrator
-    learns not to retry — separate from an unknown-executor ValueError (404)."""
-
-    def __init__(self, executor):
-        super().__init__(f"executor {executor!r} has no models_cmd configured")
-        self.executor = executor
-
-
-class ModelsCmdError(Exception):
-    """nelix-g9k: `models_cmd` failed to produce output. Carries ONLY `reason` (∈ the run_capture
-    reason set) — never the command, stdout, or stderr — so the route/manager can log/relay {reason}
-    without leaking a secret the command may have referenced (spec §5). Maps to a redacted 502."""
-
-    def __init__(self, reason):
-        super().__init__(f"models_cmd failed: {reason}")
-        self.reason = reason
+class ModelUnavailable(ValueError):
+    """nelix-kwr: an explicitly-requested model is not offered by the executor's backend. Subclasses
+    ValueError so the /start route catches it (before the generic 409) and returns 400 + the list."""
+    def __init__(self, available_models):
+        super().__init__("requested model is not offered by this executor")
+        self.available_models = available_models          # [{"id","display_name"}], sorted, capped
 
 
 def _validate_model_shape(model):
@@ -189,6 +177,10 @@ class SessionManager:
         # model override reads driver.model_flag). Never call get_driver() directly — that would
         # bypass an injected factory (tests / custom drivers).
         self._driver_factory = driver_factory or get_driver
+        # nelix-kwr: pre-flight model-membership cache, one per daemon (fresh random salt each
+        # start). Protocol-agnostic; _check_model_available reads the driver's own models_protocol
+        # and passes it through to .models(), so the cache never assumes which strategy runs.
+        self._model_cache = ModelCache(discover_fn=discover)
         self._lock = threading.Lock()
         if session_factory is not None:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
@@ -217,6 +209,46 @@ class SessionManager:
             self._logger.info("manager", "model_override_applied", executor=executor_name,
                               model=model, driver=spec.driver)
         return replace(spec, args=[*cleaned, flag, model]), model
+
+    def _check_model_available(self, spec, executor_name, model):
+        """nelix-kwr pre-flight: reject a model the backend does not offer BEFORE spawning. Runs
+        before the session lock. FAIL-OPEN on any discovery ambiguity (no protocol / alias / no auth
+        token / discovery error) — the CLI stays the authority; raise ModelUnavailable ONLY on a
+        confident miss. EnvResolveError propagates (mapped to 502 upstream), NOT swallowed."""
+        driver = self._driver_factory(spec.driver)
+        protocol = getattr(driver, "models_protocol", None)
+        if protocol is None:
+            return
+        aliases = getattr(driver, "model_aliases", frozenset())
+        if model.lower() in {a.lower() for a in aliases}:
+            return
+        # Same resolved env the child gets at spawn (EnvResolveError propagates as today's 502).
+        env = {**spec.resolved_env(),
+               **resolve_env_cmds(spec.env_cmd, os.environ, spec.env_cmd_timeout_seconds,
+                                  logger=self._logger)}
+        kind, token = auth_of(env)
+        if kind is None:
+            self._log_validation_skipped(executor_name, "no_auth")
+            return
+        base = env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+        try:
+            models = self._model_cache.models(executor_name, base, kind, token, env, protocol)
+            if not self._model_present(model, models):
+                models = self._model_cache.models(executor_name, base, kind, token, env, protocol,
+                                                   force=True)
+                if not self._model_present(model, models):
+                    raise ModelUnavailable(sorted(models, key=lambda m: m["id"]))
+        except DiscoveryError as e:
+            self._log_validation_skipped(executor_name, e.reason)    # fail-open
+            return
+
+    @staticmethod
+    def _model_present(model, models):
+        return model.lower() in {m["id"].lower() for m in models}
+
+    def _log_validation_skipped(self, executor, reason):
+        if self._logger is not None:
+            self._logger.info("manager", "model_validation_skipped", executor=executor, reason=reason)
 
     def _log_spawn_failure(self, event, session_id, exc):
         """Log a spawn/restart failure. An EnvResolveError (nelix-c5o) is logged REDACTED — only
@@ -259,6 +291,7 @@ class SessionManager:
             applied_model = None
             if model is not None:
                 spec, applied_model = self._apply_model_override(spec, executor_name, model)
+                self._check_model_available(spec, executor_name, applied_model)
             with self._lock:
                 # Split accounting (spec §slots): the active cap counts only sessions occupying an
                 # active slot (everything except `idle`) + in-flight restart reservations; a retained
@@ -606,40 +639,6 @@ class SessionManager:
                 "limit": self._limit,
                 "cursor": cursor,
                 "recent_terminal": recent}
-
-    def models(self, executor):
-        """nelix-g9k: read-only model discovery. LOCKLESS — reads the immutable `_specs` and runs
-        the executor's configured `models_cmd` with its RESOLVED env, relaying stdout. Never holds
-        `self._lock` across the subprocess and touches no session / capacity state. Returns
-        `(text, truncated)`.
-
-        Raises (each mapped to a distinct HTTP code by the /models route, never a generic 500):
-          - ValueError           unknown executor              -> 404
-          - ModelsNotConfigured  no `models_cmd` configured     -> 400 (relayable; don't retry)
-          - EnvResolveError      an `env_cmd` failed to resolve -> 502 (redacted)
-          - ModelsCmdError       `models_cmd` failed/oversized  -> 502 (redacted: only the reason)
-        """
-        spec = self._specs.get(executor)
-        if spec is None:
-            raise ValueError(f"unknown executor: {executor!r} (configured: {sorted(self._specs)})")
-        if spec.models_cmd is None:
-            raise ModelsNotConfigured(executor)
-        # The SAME env the child would get at spawn (minus hook injection): resolved_env() (os.environ
-        # + expanded static [env]) with env_cmd merged OVER it, so models_cmd can reference a
-        # c5o-resolved secret. Re-runs env_cmd per call (no caching) — a fresh secret-backend fetch,
-        # always current. An env_cmd failure raises EnvResolveError here (before models_cmd runs).
-        env = {**spec.resolved_env(),
-               **resolve_env_cmds(spec.env_cmd, os.environ, spec.env_cmd_timeout_seconds,
-                                  logger=self._logger)}
-        value, reason = run_capture(spec.models_cmd, env, spec.models_cmd_timeout_seconds,
-                                    _MODELS_MAX_BYTES, logger=self._logger)
-        if reason is not None:
-            # Redacted: only the reason crosses the boundary (never the command / stdout / stderr).
-            raise ModelsCmdError(reason)
-        # `truncated` is False under this fail-closed policy: an over-cap model list surfaces as a
-        # redacted output_too_large (502) above, never a silent truncation. The flag is kept in the
-        # return contract (and on the wire) so a future soft-truncate policy stays shape-compatible.
-        return value, False
 
     def stop(self, session_id, reason="user_stop"):
         with self._lock:
