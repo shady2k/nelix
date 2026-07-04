@@ -111,6 +111,29 @@ def test_noise_without_classifiable_prompt_fails_terminally(tmp_path):
     assert handle.writes == []
 
 
+# ---- 2b. slow-churn that LATCHES saw_stable then never classifies: must still trip -----------------
+
+def test_slow_churning_stable_frame_still_trips(tmp_path):
+    # Slow-churn hole (nelix-b5q): non-classifiable output that changes SLOWER than the pump, so each
+    # frame repeats across a pump before changing. The old sticky `saw_stable` latch read that repeat
+    # as a permanent "sign of life" and disabled the startup deadline forever -> the session hung
+    # pre-delivery. The hard injection deadline must trip regardless. Unlike test #2 (a distinct frame
+    # every pump, which never latched), here each rendered frame is HELD for two pumps.
+    base = _render([b"\x1b[2J\x1b[H" + f"loading step {i} ".encode() + b"." * (i + 2) + b"\r\n"
+                    for i in range(1, 6)])
+    frames = [f for f in base for _ in range(2)]     # hold each frame 2 pumps -> latches saw_stable
+    buf = io.StringIO()
+    sess, ev, handle = delivery_run(tmp_path, frames, task="do the work", spec=_FastStartupSpec(),
+                                    logger=Logger(level="debug", stream=buf))
+    # terminal fail via the startup deadline, despite a stable non-empty frame having been seen
+    assert sess._task_delivery == "failed"
+    assert sess._terminal_kind == "delivery_failed"
+    assert _has_event(ev, "delivery_failed", "startup_no_output")
+    rec = _startup_records(buf)[0]
+    assert rec["screen_ever_nonempty"] is True        # it DID render (just never classified)
+    assert handle.writes == []                         # PASSIVE: never typed / signaled the child
+
+
 # ---- 3a. guard: a real input box within budget delivers normally (no false trip) -----------------
 
 def test_real_input_box_delivers_and_does_not_trip(monkeypatch, tmp_path):
