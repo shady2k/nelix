@@ -673,6 +673,30 @@ class Session:
                     and not d.get("options")):
                 d["options"] = [{"id": o.id, "label": o.label} for o in obs.options]
 
+    def _hydrate_respond_options(self, decision):
+        # nelix-5r3: a hook-derived modal/permission decision is published with options=[] (hooks
+        # don't parse the screen); _enrich_hook_modal_options attaches the on-screen options on the
+        # NEXT screen tick. A respond() landing in that sub-second window would otherwise reject a
+        # VALID option id as invalid_option — validation (below) runs before enrichment fills them.
+        # Hydrate the options HERE, from the current screen, when the decision is modal/permission
+        # and carries none, so validation never sees [] while the modal is still on screen. Same
+        # fill-empty-only rule + in-place mutation as the tick-side enrichment (respond()'s later
+        # claim binds to this object's identity), and a no-op once the tick-side enrichment has run.
+        if decision.get("prompt_kind") not in ("modal_choice", "permission_choice"):
+            return
+        if decision.get("options"):
+            return
+        if self._handle is None:
+            return
+        with self._lock:
+            frame = self._handle.render()
+        obs = self._driver.observe(frame, self._obs_ctx())
+        if (obs is None or obs.prompt_kind not in ("modal_choice", "permission_choice")
+                or not obs.options):
+            return
+        with self._lock:
+            decision["options"] = [{"id": o.id, "label": o.label} for o in obs.options]
+
     def _apply_actions(self, actions, obs):
         # Translate the engine's revocable decisions into events / PTY writes. The engine is pure;
         # this is the only place its verdicts touch the world.
@@ -1616,6 +1640,13 @@ class Session:
         # stays pending and no keys are sent (closes the "prose into a menu" trap).
         is_modal = decision.get("prompt_kind") in ("modal_choice", "permission_choice")
         options = decision.get("options") or []
+        if is_modal and not options:
+            # nelix-5r3: a hook-derived modal/permission pause publishes options=[]; the on-screen
+            # options are attached on the next screen tick (_enrich_hook_modal_options). If respond()
+            # beats that tick, hydrate the options from the current screen so a VALID option id is not
+            # rejected as invalid_option.
+            self._hydrate_respond_options(decision)
+            options = decision.get("options") or []
         if is_modal and clean not in {o["id"] for o in options}:
             return RespondOutcome("invalid_option", pending=_pending_meta(decision))
         is_blocked = decision["kind"] == "blocked"

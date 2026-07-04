@@ -224,6 +224,68 @@ def test_askuserquestion_collision_prefers_modal_choice_under_reordered_delivery
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# nelix-5r3 — respond() beats screen-tick option enrichment (hook-options race)
+# ─────────────────────────────────────────────────────────────────────────────
+# nelix-32f split the hook path (publishes a modal/permission decision) from the screen tick that
+# ENRICHES it with the on-screen options (_enrich_hook_modal_options, daemon/session.py). A hook
+# carries NO options (hooks don't parse the screen), so the decision is published with options=[] and
+# the options are attached on the NEXT screen tick. A respond() arriving in that sub-second window —
+# after the hook published but BEFORE the enrichment tick — validates option ids against [] and
+# rejects a VALID id as invalid_option. Self-healing on retry (the orchestrator re-pulls + responds
+# again once enrichment has run) but a real correctness gap Codex flagged in the nelix-32f whole-
+# branch review. Fix: respond() hydrates the options ITSELF from the current screen when the decision
+# is modal/permission and carries none, so validation never sees [] while a modal is on screen.
+
+def test_respond_hydrates_options_when_it_beats_screen_enrichment(tmp_path):
+    """RED on current code (the nelix-32f whole-branch review gap): drive the real session so the
+        modal hook publishes its decision via the hook drain ALONE — NO intervening screen tick, so
+        _enrich_hook_modal_options has NOT attached the on-screen options (options is still []). This
+        is the exact sub-second window between the hook publish and the next tick's enrichment. Then
+        respond('1') arrives. Today it is rejected as invalid_option (the bug); it MUST instead
+        hydrate the on-screen options itself and succeed (select_option -> digit+CR as one write).
+
+        NON-VACUITY: the real capture ends on the 6-option AskUserQuestion modal, and the test
+        asserts options is STILL [] at respond() time (the race window is genuinely open) before
+        asserting the hydrate-and-succeed behaviour."""
+    from daemon.hooks import HookEvent
+    frames = capture_frames("s-9610d25c-askuserquestion-collision.capture")
+    modal = frames[-1]
+    assert "Next step" in modal and "Enter to select" in modal, (
+        "fixture must end on the AskUserQuestion 6-option modal")
+
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([modal], clock=clock)
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"            # the modal pause is mid-turn (post-delivery)
+
+    # Publish the modal decision through the hook drain ONLY. _drain_hooks applies the hook's Publish
+    # (decision installed with options=[], hooks carry none) but — unlike _loop_once — runs NO screen
+    # observe and NO _enrich_hook_modal_options, so the on-screen options have NOT been attached. This
+    # models respond() landing in the window between the hook publish and the next tick's enrichment.
+    def fire(event, tool_name=None):
+        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name))
+        sess._drain_hooks()
+    fire("UserPromptSubmit")                          # open the turn (mirrors the real hook order)
+    fire("PreToolUse", tool_name="AskUserQuestion")   # -> waiting_for_user / modal_choice
+
+    dec = sess.snapshot().get("decision")
+    assert dec is not None, "the modal hook must publish a pending decision"
+    assert dec["prompt_kind"] == "modal_choice" and dec["kind"] == "waiting_for_user"
+    did = dec["decision_id"]
+    # The race window is open: the hook-derived decision carries NO options yet (enrichment hasn't run).
+    assert dec["options"] == [], (
+        f"this models respond()-before-enrichment; options must still be empty (got {dec.get('options')!r})")
+
+    # respond(valid option id) MUST hydrate the on-screen options itself and succeed — NOT reject a
+    # valid id as invalid_option (the bug). RED: invalid_option; GREEN: resumed.
+    out = sess.respond("1", decision_id=did)
+    assert out.status == "resumed", (
+        f"respond(valid option) must hydrate options and succeed (got {out.status})")
+    assert "1\r" in sess._handle.writes, "select_option must type digit+CR as one write"
+    assert "1" not in sess._handle.writes, "NOT the free-text two-write path"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # delivery — confirm-once + terminal publication over the REAL paste-echo capture (s-b8a30317)
 # ─────────────────────────────────────────────────────────────────────────────
 # s-b8a30317-delivery is the real paste-delivery byte stream: an input box appears, then the pasted
