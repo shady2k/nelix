@@ -356,7 +356,6 @@ class Session:
             # the loop spins with control_state=busy indefinitely. Root cause in the field: a launcher
             # that keeps the terminal foreground group leaves the leaf CLI SIGTTIN-stopped (0 bytes).
             ready_at = self._clock.now()
-            saw_stable = False              # a non-empty NORMALIZED frame ever held steady (sign of life)
             screen_ever_nonempty = False    # any non-empty normalized frame at all (forensics)
             while not self._stop.is_set() and self._task_delivery == "pending":
                 advanced = self._handle.pump(0.1)
@@ -372,13 +371,11 @@ class Session:
                     self._norm = norm
                     self._norm_since = now
                     self._last_progress = now
-                # Startup liveness on the NORMALIZED frame: a live working banner/spinner collapses to a
-                # stable non-empty norm (telemetry stripped), so "non-empty + unchanged across a pump" is
-                # a genuine sign of life — churning noise (never twice the same) and a blank screen are not.
+                # Forensics only: record whether the screen ever rendered non-empty content (a pure
+                # blank screen vs. rendered-but-never-classifiable). This does NOT extend the deadline —
+                # waiting to inject the task is bounded unconditionally below (nelix-b5q).
                 if norm.strip():
                     screen_ever_nonempty = True
-                    if not norm_changed:
-                        saw_stable = True
                 # C1: if respond() enqueued a pre-delivery blocked answer, the MONITOR (this thread)
                 # drains it on the current frame — it is the SOLE writer, so the answer write and the
                 # delivery decision (also this thread) cannot interleave. Drained before _delivery_tick
@@ -394,11 +391,13 @@ class Session:
                                   requires_response=True, task_delivery="pending",
                                   decision_key=self._blocked_fp)   # same pause -> reuse decision_id
                     self._last_progress = now              # re-arm so it doesn't re-fire every loop
-                # startup no-output deadline: trip ONLY when nothing classifiable ever appeared — no
-                # `blocked` was ever emitted (a modal/permission/unknown routes through _emit_blocked and
-                # is handled by the nag above) AND the screen never became non-empty+stable (a slow banner
-                # is a sign of life). Delivery/crash/exit already left task_delivery != "pending".
-                if (self._task_delivery == "pending" and self._blocked_fp is None and not saw_stable
+                # startup/injection deadline: nelix delivers the task automatically, so waiting for a
+                # classifiable input box is bounded. Trip when the task was never delivered AND no
+                # `blocked` was ever emitted (a modal/permission routes through _emit_blocked and is
+                # handled by the nag above) AND the budget elapsed — regardless of whether the screen
+                # churned or held a static non-classifiable banner (nelix-b5q). Delivery/crash/exit
+                # already left task_delivery != "pending".
+                if (self._task_delivery == "pending" and self._blocked_fp is None
                         and self._spec.startup_timeout_seconds
                         and clock_now - ready_at > self._spec.startup_timeout_seconds):
                     self._fail_startup_no_output(clock_now - ready_at, screen_ever_nonempty)
