@@ -63,6 +63,16 @@ def test_http_error_is_redacted(monkeypatch):
     assert "supersecret" not in str(e.value) and "401" not in str(e.value)
 
 
+def test_open_valueerror_is_redacted(monkeypatch):
+    def boom(req, timeout):
+        raise ValueError("Invalid header value b'Bearer supersecrettoken\\nInjected: x'")
+    monkeypatch.setattr(md, "_open", boom)
+    with pytest.raises(md.DiscoveryError) as e:
+        md.discover("anthropic", {"ANTHROPIC_AUTH_TOKEN": "supersecrettoken"})
+    assert e.value.reason == "http_error"
+    assert "supersecrettoken" not in str(e.value)
+
+
 def test_unsupported_protocol(monkeypatch):
     with pytest.raises(md.DiscoveryError) as e:
         md.discover("openai", {"ANTHROPIC_AUTH_TOKEN": "t"})

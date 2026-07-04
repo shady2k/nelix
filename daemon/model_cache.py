@@ -22,7 +22,7 @@ class ModelCache:
         fp = hashlib.sha256(self._salt + (token or "").encode()).hexdigest()[:16]
         return (executor, (base_url or "").rstrip("/"), auth_kind, fp)
 
-    def models(self, executor, base_url, auth_kind, token, env, *, force=False):
+    def models(self, executor, base_url, auth_kind, token, env, protocol, *, force=False):
         key = self._key(executor, base_url, auth_kind, token)
         while True:
             with self._lock:
@@ -38,7 +38,7 @@ class ModelCache:
                     leader = False
             if leader:
                 try:
-                    result = self._discover(env)
+                    result = self._discover(protocol, env)
                     with self._lock:
                         self._entries[key] = (self._clock() + self._ttl, result)
                     return result

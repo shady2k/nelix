@@ -2,6 +2,7 @@
 GET the backend's /v1/models and return a normalized list. HTTP lives here ONLY (never in the driver
 class or the core). Leak-safe: the token is used as a header and never logged/stored/returned; every
 failure is a DiscoveryError carrying an enum reason only (no url/status/body/headers/exception text)."""
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -62,12 +63,16 @@ def _discover_anthropic(env):
     else:
         headers["x-api-key"] = token
         headers["anthropic-version"] = _ANTHROPIC_VERSION
-    req = urllib.request.Request(f"{base}/v1/models?limit=1000", headers=headers, method="GET")
     try:
+        req = urllib.request.Request(f"{base}/v1/models?limit=1000", headers=headers, method="GET")
         with _open(req, _DISCOVERY_TIMEOUT) as resp:
             raw = resp.read(_MODELS_MAX_BYTES + 1)
-    except (urllib.error.URLError, OSError):
-        raise DiscoveryError("http_error") from None      # redacted: no status/url/body
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+        # ValueError also covers a malformed header (e.g. a token with an interior newline): on
+        # Python 3.11 urllib raises a raw ValueError whose message INCLUDES the offending header
+        # value. `from None` drops that token-bearing exception from the chain so no traceback /
+        # __context__ can leak it past this boundary (redacted: no status/url/body/exception text).
+        raise DiscoveryError("http_error") from None
     if len(raw) > _MODELS_MAX_BYTES:
         raise DiscoveryError("too_large")
     try:

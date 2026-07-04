@@ -178,10 +178,9 @@ class SessionManager:
         # bypass an injected factory (tests / custom drivers).
         self._driver_factory = driver_factory or get_driver
         # nelix-kwr: pre-flight model-membership cache, one per daemon (fresh random salt each
-        # start). Protocol-agnostic; the discover call passes the driver's protocol. Since only
-        # "anthropic" exists today the lambda hardcodes it; when a second protocol is added, thread
-        # the protocol through _check_model_available into a discover(protocol, env) call.
-        self._model_cache = ModelCache(discover_fn=lambda env: discover("anthropic", env))
+        # start). Protocol-agnostic; _check_model_available reads the driver's own models_protocol
+        # and passes it through to .models(), so the cache never assumes which strategy runs.
+        self._model_cache = ModelCache(discover_fn=discover)
         self._lock = threading.Lock()
         if session_factory is not None:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
@@ -233,9 +232,10 @@ class SessionManager:
             return
         base = env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
         try:
-            models = self._model_cache.models(executor_name, base, kind, token, env)
+            models = self._model_cache.models(executor_name, base, kind, token, env, protocol)
             if not self._model_present(model, models):
-                models = self._model_cache.models(executor_name, base, kind, token, env, force=True)
+                models = self._model_cache.models(executor_name, base, kind, token, env, protocol,
+                                                   force=True)
                 if not self._model_present(model, models):
                     raise ModelUnavailable(sorted(models, key=lambda m: m["id"]))
         except DiscoveryError as e:

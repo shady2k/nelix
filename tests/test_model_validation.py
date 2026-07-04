@@ -18,7 +18,7 @@ def _mgr(monkeypatch, spec, *, discovered=None, disc_exc=None, driver=None):
     def fake_resolve(env_cmd, base, timeout, logger=None):
         return {}
     monkeypatch.setattr("daemon.manager.resolve_env_cmds", fake_resolve)
-    def fake_discover(env):
+    def fake_discover(protocol, env):
         if disc_exc is not None:
             raise disc_exc
         return discovered or []
