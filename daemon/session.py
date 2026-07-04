@@ -578,6 +578,7 @@ class Session:
             notes = self._engine.drain_notes()
             self._sync_control_state()
         self._apply_actions(actions, obs)
+        self._enrich_hook_modal_options(obs)
         self._log_trail(obs, actions)
         self._log_notes(notes)
         # Task 4: at the working->idle transition (state now idle, set by the hooks/screen path above),
@@ -654,6 +655,23 @@ class Session:
         for n in notes:
             self._log.emit(self._NOTE_LEVELS.get(n.event, "debug"),
                            "belief", n.event, self._id, **n.fields)
+
+    def _enrich_hook_modal_options(self, obs):
+        # nelix-32f: a hook-derived modal/permission pause carries NO options — the hook Publish
+        # payload (belief.py) has none, because hooks don't parse the screen. But the on-screen modal
+        # DOES have options, and respond(option_id) rejects any id not in `options` (session.py). So
+        # when the screen CONFIRMS the pause (a modal/permission frame carrying options), attach them
+        # IN PLACE so respond() can route the answer to driver.select_option (AC3/AC5). The decision
+        # object is mutated, never swapped, so a racing respond()'s claim identity stays bound. Only
+        # fills an EMPTY options list (a screen-path modal already carries its own options).
+        if obs is None or obs.prompt_kind not in ("modal_choice", "permission_choice") or not obs.options:
+            return
+        with self._lock:
+            d = self._decision
+            if (d is not None and d.get("kind") == "waiting_for_user"
+                    and d.get("prompt_kind") in ("modal_choice", "permission_choice")
+                    and not d.get("options")):
+                d["options"] = [{"id": o.id, "label": o.label} for o in obs.options]
 
     def _apply_actions(self, actions, obs):
         # Translate the engine's revocable decisions into events / PTY writes. The engine is pure;
@@ -991,6 +1009,13 @@ class Session:
                     cur["event_id"] = evt.event_id
                     cur["seq"] = evt.seq
                     cur["hung"] = hung
+                    # nelix-32f: an in-place re-emit may carry a REFINED prompt_kind — modal_choice
+                    # upgraded from permission_choice when the two hooks one AskUserQuestion modal
+                    # emits arrive reordered. Apply it so the decision reflects the real modal without
+                    # changing the stable decision_id (the held answer keeps its binding).
+                    if prompt_kind is not None and cur.get("prompt_kind") != prompt_kind:
+                        cur["prompt_kind"] = prompt_kind
+                        cur["hint"] = hint
                 elif not is_reemit:
                     # a genuinely new pause -> install it (supersedes any prior pending decision).
                     # Resolve the superseded prior decision's events (targeted by its decision id) so

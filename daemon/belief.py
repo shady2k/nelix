@@ -109,6 +109,7 @@ class BeliefEngine:
         self._turn_epoch = 0              # bumped by each opens_turn (UserPromptSubmit)
         self._turn_open = False           # a turn is running (between open and its close)
         self._hook_pending_key = None     # currently-published hook waiting_for_user, for withdrawal
+        self._hook_pending_kind = None    # its effective prompt_kind (modal_choice wins, nelix-32f)
         self._idle_published_epoch = None  # epoch whose Stop already published idle (idempotency)
         # precedence & lost-hook reconciliation (Task 7): process-exit > hook > bounded screen.
         self._last_hook_at = None          # clock of the most recent hook (lost-hook deadlines)
@@ -184,6 +185,7 @@ class BeliefEngine:
             self._turn_epoch += 1
             self._turn_open = True
             self._hook_pending_key = None
+            self._hook_pending_kind = None
             self._state.control_state = "busy"
             self._state.phase = "busy"
             return actions
@@ -198,6 +200,7 @@ class BeliefEngine:
             if self._hook_pending_key is not None:               # a pending prompt is moot once idle
                 actions.append(Withdraw(decision_key=self._hook_pending_key, reason="superseded"))
                 self._hook_pending_key = None
+                self._hook_pending_kind = None
             self._state.control_state = "idle"
             self._state.phase = "idle"
             actions.append(Publish(kind="idle", respondable=False,
@@ -215,6 +218,7 @@ class BeliefEngine:
             if self._hook_pending_key is not None:
                 actions.append(Withdraw(decision_key=self._hook_pending_key, reason="prompt_left"))
                 self._hook_pending_key = None
+                self._hook_pending_kind = None
             self._turn_open = True
             self._state.control_state = "busy"
             self._state.phase = "busy"
@@ -227,17 +231,33 @@ class BeliefEngine:
         if hobs.kind == "waiting_for_user":
             if self._turn_closed():
                 return actions
-            decision_key = f"{hobs.prompt_kind}:{self._turn_epoch}"
+            # nelix-32f: ONE respondable pause per turn-epoch. A single physical AskUserQuestion modal
+            # emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice) AND PermissionRequest
+            # (-> permission_choice) in this claude build (verified s-9610d25c @ 20:57:20: no concurrent
+            # Bash — AskUserQuestion itself fires the PermissionRequest). The two hooks are the SAME
+            # pause, so the decision is keyed by EPOCH alone (not prompt_kind:epoch); the second hook is
+            # an IN-PLACE refinement, NEVER a supersede (a supersede withdraws the stable decision the
+            # orchestrator is about to answer -> respond() then rejects every option). modal_choice is
+            # the more specific reading and wins (a numbered menu, not a generic allow/deny).
+            decision_key = f"hook_pause:{self._turn_epoch}"
+            effective_kind = self._preferred_prompt_kind(self._hook_pending_kind, hobs.prompt_kind)
             if self._hook_pending_key == decision_key:
-                return actions                                    # same pause already published
+                # same epoch's pause already published. Only a kind UPGRADE re-emits — modal_choice
+                # arriving after permission_choice (e.g. under hook-delivery reordering) — and as a
+                # re-emit (SAME decision_key) so the decision_id stays stable (a held answer binds).
+                if effective_kind != self._hook_pending_kind:
+                    self._hook_pending_kind = effective_kind
+                    actions.append(self._hook_pause_publish(decision_key, effective_kind))
+                self._turn_open = True
+                self._state.control_state = "awaiting_user"
+                self._state.phase = "pause_candidate"
+                return actions
             self._hook_pending_key = decision_key
+            self._hook_pending_kind = effective_kind
             self._turn_open = True
             self._state.control_state = "awaiting_user"
             self._state.phase = "pause_candidate"
-            hint = "needs_permission" if hobs.prompt_kind == "permission_choice" else None
-            actions.append(Publish(kind="waiting_for_user", respondable=True,
-                                   decision_key=decision_key,
-                                   payload={"prompt_kind": hobs.prompt_kind, "hint": hint}))
+            actions.append(self._hook_pause_publish(decision_key, effective_kind))
             return actions
 
         # A plain working hook (Pre/PostToolUse, PostToolUseFailure, ...) is meaningful only inside an
@@ -247,6 +267,21 @@ class BeliefEngine:
             self._state.control_state = "busy"
             self._state.phase = "busy"
         return actions
+
+    @staticmethod
+    def _preferred_prompt_kind(a, b):
+        # The more specific reading of a pause wins: modal_choice (a numbered AskUserQuestion menu)
+        # over permission_choice (a generic allow/deny). Used to merge the two hooks one physical
+        # AskUserQuestion modal emits into one epoch-scoped decision (nelix-32f).
+        if a == "modal_choice" or b == "modal_choice":
+            return "modal_choice"
+        return b if a is None else a
+
+    def _hook_pause_publish(self, decision_key, prompt_kind):
+        hint = "needs_permission" if prompt_kind == "permission_choice" else None
+        return Publish(kind="waiting_for_user", respondable=True,
+                       decision_key=decision_key,
+                       payload={"prompt_kind": prompt_kind, "hint": hint})
 
     def _turn_closed(self):
         """A turn is CLOSED once a Stop/idle published for the CURRENT epoch and no newer
