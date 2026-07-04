@@ -16,6 +16,7 @@ MSG_MAX_BODY = 256 * 1024  # max raw HTTP request body bytes accepted by the mes
 MAX_PROGRESS_NOTES = 50  # max progress notes retained per session
 MAX_SUMMARY_LEN = 280    # ProgressNote.summary cap (short, tweet-length)
 MAX_BODY_LEN = 4000      # cap for longer free-text fields (question, continuation_plan, details)
+DEFAULT_DIALOG_PAGE_CHARS = 8000  # /dialog page size when the caller omits limit (bounded page + next_offset cursor)
 
 
 @dataclass
@@ -83,7 +84,6 @@ class ExecutorSpec:
     heartbeat_stale_after: float = 10.0  # §7.4 frozen-but-should-tick -> stale after this long
     tail_lines: int = 400
     status_tail_chars: int = 4000
-    dialog_page_chars: int = 8000
     spool_max_bytes: int = 8_388_608
 
     def argv(self):
@@ -178,7 +178,6 @@ def _build_spec(name, spec):
         heartbeat_stale_after=_spec_num(spec, "heartbeat_stale_after", 10.0, cast=float),
         tail_lines=int(spec.get("tail_lines", 400)),
         status_tail_chars=int(spec.get("status_tail_chars", 4000)),
-        dialog_page_chars=int(spec.get("dialog_page_chars", 8000)),
         spool_max_bytes=int(spec.get("spool_max_bytes", 8_388_608)),
     )
 

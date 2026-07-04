@@ -604,6 +604,97 @@ def test_dialog_serves_flat_page_with_offset(monkeypatch, tmp_path):
         srv.shutdown()
 
 
+def test_dialog_page_carries_at_end_mid_and_at_end(monkeypatch, tmp_path):
+    import io
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
+    try:
+        # Mid-transcript: next_offset (56) < total_len (100)
+        st, b = _req("GET", base + "/dialog?session_id=s1&offset=42")
+        assert st == 200 and b["at_end"] is False
+        assert "hint" not in b                               # no hint mid-transcript
+        # Past end: next_offset (215) >= total_len (100)
+        st, b = _req("GET", base + "/dialog?session_id=s1&offset=200")
+        assert st == 200 and b["at_end"] is True
+        assert "transcript end" in b["hint"]
+        assert "nelix_status" in b["hint"]                   # advises recovery
+    finally:
+        srv.shutdown()
+
+
+def test_dialog_unknown_session_carries_hint(monkeypatch, tmp_path):
+    import io
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
+    try:
+        st, b = _req("GET", base + "/dialog?session_id=nope")
+        assert st == 404 and b["error"] == "unknown session"
+        assert "nelix_status" in b["hint"]                   # recovery hint, not a bare error
+    finally:
+        srv.shutdown()
+
+
+class _CapturingDialog:
+    """Records the limit the handler passed, so we can prove the default is applied."""
+    available = True
+    last_limit = "unset"
+    def page(self, offset=0, limit=None, snap=True):
+        type(self).last_limit = limit
+        text = f"transcript@{offset}"
+        return {"text": text, "start_offset": offset, "next_offset": offset + len(text),
+                "speaker_at_start": "agent", "continued": False, "total_len": 100}
+
+
+class _CapturingSession:
+    dialog = _CapturingDialog()
+
+
+class _CapturingManager:
+    def __init__(self): self._events = EventQueue()
+    def status(self, sid=None, include_progress=False): return {"sessions": {}}
+    def get(self, sid): return _CapturingSession() if sid == "s1" else None
+
+
+def test_dialog_omitted_limit_uses_daemon_default(monkeypatch, tmp_path):
+    import io
+    from daemon.config import DEFAULT_DIALOG_PAGE_CHARS
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _CapturingDialog.last_limit = "unset"
+    srv, base = _serve(_CapturingManager(), io.StringIO())
+    try:
+        # No limit in the query → handler must substitute DEFAULT_DIALOG_PAGE_CHARS.
+        _req("GET", base + "/dialog?session_id=s1&offset=0")
+        assert _CapturingDialog.last_limit == DEFAULT_DIALOG_PAGE_CHARS
+        # Explicit limit still honored.
+        _req("GET", base + "/dialog?session_id=s1&offset=0&limit=123")
+        assert _CapturingDialog.last_limit == 123
+    finally:
+        srv.shutdown()
+
+
+def test_dialog_at_end_on_exact_final_page_real_reader(monkeypatch, tmp_path):
+    """at_end is True on the final NON-EMPTY page (next_offset == total_len), not only past-end,
+    so a caller needs no extra empty read. Exercises the real Dialog -> transcript.jsonl ->
+    DialogReader -> handler path (not _FakeDialog)."""
+    import io
+    from daemon.dialog import Dialog
+    import paths
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sess_dir = paths.sessions_root() / "s1"
+    d = Dialog(sess_dir, tail_lines=10, spool_max_bytes=4096)
+    d.add_agent_line("hello world")          # flat text becomes "‹agent›\nhello world"
+    d.close()                                # flush transcript.jsonl to disk
+    srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
+    try:
+        st, b = _req("GET", base + "/dialog?session_id=s1&offset=0")
+        assert st == 200
+        assert b["text"]                                    # non-empty final page
+        assert b["next_offset"] == b["total_len"]           # read consumed the whole transcript
+        assert b["at_end"] is True                          # exact final page -> at_end, no extra read
+    finally:
+        srv.shutdown()
+
+
 def test_rpc_start_missing_field_returns_400():
     m = FakeManager()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8769, "t"))

@@ -208,7 +208,7 @@ def register(ctx):
             " name; 'cwd' is the project dir it runs in (omit = your current dir). Before driving"
             " it, you MUST call skill_view(\"nelix:nelix-orchestration\")."
             " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
-            " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
+            " (`end_turn` → end your turn and wait to be woken; `report` → relay to the user;"
             " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."
             " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ,
@@ -235,7 +235,8 @@ def register(ctx):
             " it. `include_progress:true` also returns the agent's bounded progress-note list (its"
             " own non-waking status updates) even while it's still working, for when you need that"
             " detail on demand — omit it (the default) to keep the normal poll-free 'still working'"
-            " view with nothing extra to read."),
+            " view with nothing extra to read."
+            " For the agent's response text (its actual answer), read nelix_dialog."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
                                                "include_progress": {"type": "boolean"}}}},
         nelix_status)
@@ -274,7 +275,13 @@ def register(ctx):
         nelix_respond)
     ctx.register_tool(
         "nelix_stop", "nelix",
-        {"description": ("Stop a running agent by session_id."
+        {"description": ("Stop a running agent's live process by session_id — only when the user"
+                         " asks, or you are certain the session is no longer needed. An idle agent"
+                         " (it finished its turn) is meant to stay alive so the user can continue"
+                         " the SAME session with a follow-up via nelix_respond(session_id, answer)"
+                         " with no decision_id. Do NOT stop after merely relaying a result. Stopping"
+                         " tears down the process; a follow-up would require a fresh nelix_start and"
+                         " lose context."
                          " The returned result is the COMPLETE outcome of this call — obey its"
                          " `next_action` (`report` → stop confirmed, relay to the user;"
                          " `refresh_status` → teardown still in progress, reconcile via status;"
@@ -292,7 +299,7 @@ def register(ctx):
             " and only pass force:true if they explicitly authorize continuing. After it succeeds, end"
             " your turn — nelix wakes you on the next event."
             " The returned result is the COMPLETE outcome of this call — obey its `next_action`"
-            " (`end_turn` → stop and wait to be woken; `report` → relay to the user;"
+            " (`end_turn` → end your turn and wait to be woken; `report` → relay to the user;"
             " `ask_user`/`fix_call`/`recover`/`refresh_status` → act accordingly)."
             " Do NOT call nelix_status after this."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
@@ -301,13 +308,25 @@ def register(ctx):
         nelix_restart)
     ctx.register_tool(
         "nelix_dialog", "nelix",
-        {"description": ("Read the agent's transcript by pages from an offset; each page says whose"
-                         " output it starts with (speaker_at_start); use next_offset to continue."
-                         " For a long session or reading from last_user_input_offset — not for"
-                         " polling progress."),
+        {"description": ("Use this to read the agent's actual answer after it finishes — the"
+                         " prose, code, and diffs it produced — plus the user's prompts, page by"
+                         " page. Call this first whenever you need the agent's response: the"
+                         " status snapshot is a bounded tail, and nelix_screen is not authoritative"
+                         " for completed prose/code/diffs (it is the live terminal, not the record)."
+                         " Returns one page starting at offset; if next_offset < total_len, more"
+                         " remains — call again with that offset. offset=0 (or omitted) reads from"
+                         " the start. Each page tells you speaker_at_start (user vs agent),"
+                         " continued (mid-line), and at_end (true once you've read to total_len)."
+                         " Not for polling progress — nelix_status does that."),
          "parameters": {**_OBJ, "properties": {
-             "session_id": {"type": "string"},
-             "offset": {"type": "integer"}, "limit": {"type": "integer"}},
+             "session_id": {"type": "string", "description": "the session to read."},
+             "offset": {"type": "integer",
+                        "description": "char offset to start at; use next_offset from the previous"
+                                       " page, or 0/omit to start from the beginning."},
+             "limit": {"type": "integer",
+                       "description": "max chars for this page; omit for the daemon's bounded"
+                                      " default. The page snaps to a line boundary and reports"
+                                      " next_offset to continue."}},
              "required": ["session_id"]}},
         nelix_dialog)
     ctx.register_tool(
@@ -316,7 +335,9 @@ def register(ctx):
                          " enough — borders and framing stripped for readability. Not for polling"
                          " progress. While the agent works the screen is withheld with a brief 'still"
                          " working' note; force:true is the only way to see it anyway. raw:true is just"
-                         " unfiltered formatting (and is still withheld while working unless force)."),
+                         " unfiltered formatting (and is still withheld while working unless force)."
+                         " Prefer nelix_dialog for the agent's response text; the screen is for"
+                         " layout / what is visible right now."),
          "parameters": {**_OBJ, "properties": {"session_id": {"type": "string"},
                                                "raw": {"type": "boolean"},
                                                "force": {"type": "boolean"}},

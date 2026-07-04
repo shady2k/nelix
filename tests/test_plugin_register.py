@@ -118,6 +118,30 @@ def test_tool_schemas_are_llm_function_shaped(monkeypatch, tmp_path):
         nelix.supervisor.teardown()
 
 
+def test_dialog_description_tells_llm_to_read_the_answer_first(monkeypatch, tmp_path):
+    """Root cause of the original bug: nelix_dialog was framed as long-session paging, so the
+    orchestrator reached for nelix_screen instead of reading the agent's response. Pin the
+    corrective wording."""
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    nelix.register(ctx)
+    desc = ctx.tools["nelix_dialog"]["schema"]["description"]
+    assert "actual answer" in desc          # operational first sentence
+    assert "Call this first" in desc        # tells the LLM to reach for dialog first
+    assert "nelix_screen" in desc and "not authoritative" in desc   # screen is not the record
+
+
+def test_stop_description_guards_against_stopping_an_idle_session(monkeypatch, tmp_path):
+    """The orchestrator tends to stop sessions after relaying a result. Pin the keep-alive
+    guardrail at the always-visible tool-description layer (the skill is correct but on-demand)."""
+    nelix = _load_with_fake(monkeypatch, tmp_path)
+    ctx = FakeCtx()
+    nelix.register(ctx)
+    desc = ctx.tools["nelix_stop"]["schema"]["description"]
+    assert "only when the user asks" in desc
+    assert "stay alive" in desc             # idle session is meant to stay alive
+
+
 def test_nelix_start_schema_has_optional_model(monkeypatch, tmp_path):
     # nelix-9k0: the tool schema gains an optional `model` (NOT in required); its description says it
     # accepts a tier alias or a full model id, omit for the executor default.
