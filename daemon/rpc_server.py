@@ -15,7 +15,7 @@ from daemon.env_resolver import EnvResolveError
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
-from daemon.manager import ModelRejected, ModelsCmdError, ModelsNotConfigured
+from daemon.manager import ModelRejected
 from daemon.messages import parse_message_body
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.transport import peer_is_self
@@ -141,13 +141,6 @@ def make_server(manager, transport, logger=None):
                 logger.debug("rpc", "read", session_id=sid, tool=tool,
                              seq=manager._events.latest_seq(sid))
 
-        def _log_models(self, executor, reason):
-            # nelix-g9k: dedicated REDACTED per-call record for the models tool — {executor, reason}
-            # only. NEVER the command / stdout / relayed output, and NOT session-scoped (no seq): the
-            # route is executor-scoped, so it must NOT reuse _log_read (which calls latest_seq(sid)).
-            if logger is not None:
-                logger.info("rpc", "models", executor=executor, reason=reason)
-
         def _dispatch_get(self, p):
             if p.path == "/wait":
                 qs = parse_qs(p.query)
@@ -195,32 +188,6 @@ def make_server(manager, transport, logger=None):
                 raw = qs.get("raw", ["0"])[0].lower() in ("1", "true")
                 force = qs.get("force", ["0"])[0].lower() in ("1", "true")
                 self._send(200, manager.screen(sid, raw=raw, force=force))
-            elif p.path == "/models":
-                qs = parse_qs(p.query)
-                executor = qs.get("executor", [None])[0]
-                if not executor:
-                    raise _BadRequest(400, "missing executor")
-                # nelix-g9k: do_GET catches ONLY _BadRequest + generic Exception->500 (exc_info).
-                # Map every models outcome IN-BRANCH so an upstream resolver/command failure is a
-                # clean 4xx/502, NEVER a 500 traceback (which exc_info logging could use to embed the
-                # ['/bin/sh','-c',<command>] argv). Order: not-configured (400) before the broad
-                # ValueError (unknown executor -> 404); both env/cmd failures -> redacted 502.
-                try:
-                    output, truncated = manager.models(executor)
-                except ModelsNotConfigured as e:
-                    self._log_models(executor, "not_configured")
-                    self._send(400, {"error": str(e)}); return
-                except ValueError as e:                      # unknown executor
-                    self._log_models(executor, "unknown_executor")
-                    self._send(404, {"error": str(e)}); return
-                except (EnvResolveError, ModelsCmdError) as e:
-                    # Upstream resolver/command failure; the daemon is healthy. REDACTED body:
-                    # {executor, reason} only — never the command, stdout, stderr, or (for an
-                    # env_cmd failure) the var name.
-                    self._log_models(executor, e.reason)
-                    self._send(502, {"error": {"executor": executor, "reason": e.reason}}); return
-                self._log_models(executor, "ok")
-                self._send(200, {"output": output, "truncated": truncated})
             else:
                 self._send(404, {"error": "not found"})
 
