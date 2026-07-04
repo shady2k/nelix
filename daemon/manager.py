@@ -8,8 +8,10 @@ from dataclasses import dataclass, replace
 
 import paths
 from daemon.drivers import get_driver
-from daemon.env_resolver import EnvResolveError
+from daemon.env_resolver import EnvResolveError, resolve_env_cmds
 from daemon.events import EXTERNAL_OUTPUT_POLICY
+from daemon.model_cache import ModelCache
+from daemon.model_discovery import discover, auth_of, DiscoveryError
 from daemon.session import RespondOutcome, Session
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
@@ -20,6 +22,14 @@ class ModelRejected(ValueError):
     (empty / control chars / oversized) or a driver that cannot express a model override. A
     ValueError subclass (like PtyInputRejected) so /start maps it to 400 — caught ahead of the
     generic ValueError->409 branch (client input error, not daemon-full)."""
+
+
+class ModelUnavailable(ValueError):
+    """nelix-kwr: an explicitly-requested model is not offered by the executor's backend. Subclasses
+    ValueError so the /start route catches it (before the generic 409) and returns 400 + the list."""
+    def __init__(self, available_models):
+        super().__init__("requested model is not offered by this executor")
+        self.available_models = available_models          # [{"id","display_name"}], sorted, capped
 
 
 def _validate_model_shape(model):
@@ -167,6 +177,11 @@ class SessionManager:
         # model override reads driver.model_flag). Never call get_driver() directly — that would
         # bypass an injected factory (tests / custom drivers).
         self._driver_factory = driver_factory or get_driver
+        # nelix-kwr: pre-flight model-membership cache, one per daemon (fresh random salt each
+        # start). Protocol-agnostic; the discover call passes the driver's protocol. Since only
+        # "anthropic" exists today the lambda hardcodes it; when a second protocol is added, thread
+        # the protocol through _check_model_available into a discover(protocol, env) call.
+        self._model_cache = ModelCache(discover_fn=lambda env: discover("anthropic", env))
         self._lock = threading.Lock()
         if session_factory is not None:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
@@ -195,6 +210,45 @@ class SessionManager:
             self._logger.info("manager", "model_override_applied", executor=executor_name,
                               model=model, driver=spec.driver)
         return replace(spec, args=[*cleaned, flag, model]), model
+
+    def _check_model_available(self, spec, executor_name, model):
+        """nelix-kwr pre-flight: reject a model the backend does not offer BEFORE spawning. Runs
+        before the session lock. FAIL-OPEN on any discovery ambiguity (no protocol / alias / no auth
+        token / discovery error) — the CLI stays the authority; raise ModelUnavailable ONLY on a
+        confident miss. EnvResolveError propagates (mapped to 502 upstream), NOT swallowed."""
+        driver = self._driver_factory(spec.driver)
+        protocol = getattr(driver, "models_protocol", None)
+        if protocol is None:
+            return
+        aliases = getattr(driver, "model_aliases", frozenset())
+        if model.lower() in {a.lower() for a in aliases}:
+            return
+        # Same resolved env the child gets at spawn (EnvResolveError propagates as today's 502).
+        env = {**spec.resolved_env(),
+               **resolve_env_cmds(spec.env_cmd, os.environ, spec.env_cmd_timeout_seconds,
+                                  logger=self._logger)}
+        kind, token = auth_of(env)
+        if kind is None:
+            self._log_validation_skipped(executor_name, "no_auth")
+            return
+        base = env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+        try:
+            models = self._model_cache.models(executor_name, base, kind, token, env)
+            if not self._model_present(model, models):
+                models = self._model_cache.models(executor_name, base, kind, token, env, force=True)
+                if not self._model_present(model, models):
+                    raise ModelUnavailable(sorted(models, key=lambda m: m["id"]))
+        except DiscoveryError as e:
+            self._log_validation_skipped(executor_name, e.reason)    # fail-open
+            return
+
+    @staticmethod
+    def _model_present(model, models):
+        return model.lower() in {m["id"].lower() for m in models}
+
+    def _log_validation_skipped(self, executor, reason):
+        if self._logger is not None:
+            self._logger.info("manager", "model_validation_skipped", executor=executor, reason=reason)
 
     def _log_spawn_failure(self, event, session_id, exc):
         """Log a spawn/restart failure. An EnvResolveError (nelix-c5o) is logged REDACTED — only
@@ -237,6 +291,7 @@ class SessionManager:
             applied_model = None
             if model is not None:
                 spec, applied_model = self._apply_model_override(spec, executor_name, model)
+                self._check_model_available(spec, executor_name, applied_model)
             with self._lock:
                 # Split accounting (spec §slots): the active cap counts only sessions occupying an
                 # active slot (everything except `idle`) + in-flight restart reservations; a retained
