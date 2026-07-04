@@ -16,6 +16,7 @@ MSG_MAX_BODY = 256 * 1024  # max raw HTTP request body bytes accepted by the mes
 MAX_PROGRESS_NOTES = 50  # max progress notes retained per session
 MAX_SUMMARY_LEN = 280    # ProgressNote.summary cap (short, tweet-length)
 MAX_BODY_LEN = 4000      # cap for longer free-text fields (question, continuation_plan, details)
+DEFAULT_DIALOG_PAGE_CHARS = 8000  # /dialog page size when the caller omits limit (bounded page + next_offset cursor)
 
 
 @dataclass

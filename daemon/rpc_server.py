@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import paths
-from daemon.config import MSG_MAX_BODY
+from daemon.config import MSG_MAX_BODY, DEFAULT_DIALOG_PAGE_CHARS
 from daemon.dialog import DialogReader
 from daemon.env_resolver import EnvResolveError
 from daemon.events import EXTERNAL_OUTPUT_POLICY
@@ -170,7 +170,10 @@ def make_server(manager, transport, logger=None):
                     # No transcript on disk — fall back to live session if present
                     sess = manager.get(sid)
                     if sess is None or sess.dialog is None:
-                        self._send(404, {"error": "unknown session"}); return
+                        self._send(404, {"error": "unknown session",
+                                         "hint": "the session may have exited or not started;"
+                                                 " call nelix_status (no session_id) to list sessions."})
+                        return
                     reader = sess.dialog   # duck-typed: same page/tail interface
                 offset = self._int(qs.get("offset", ["0"])[0], 0)
                 limit = self._int(qs.get("limit", [None])[0], None)
@@ -178,7 +181,17 @@ def make_server(manager, transport, logger=None):
                     raise _BadRequest(400, "offset must be >= 0")
                 if limit is not None and limit <= 0:
                     raise _BadRequest(400, "limit must be > 0")
+                if limit is None:
+                    limit = DEFAULT_DIALOG_PAGE_CHARS   # bounded page + continuation cursor
                 page = reader.page(offset, limit)
+                # at_end is derivable from the page's own fields (no data-layer change). A caller
+                # stops on at_end without a wasted extra read past the end.
+                page["at_end"] = page["next_offset"] >= page["total_len"]
+                if page["at_end"]:
+                    page["hint"] = (
+                        f"This offset is at or beyond the current transcript end "
+                        f"({page['total_len']} chars). If the session is still active, wait for a"
+                        " nelix wake / nelix_status before reading from total_len again.")
                 page["external_output_policy"] = EXTERNAL_OUTPUT_POLICY
                 self._send(200, page)
             elif p.path == "/screen":
