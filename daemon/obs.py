@@ -6,7 +6,13 @@ import traceback as _traceback
 
 # Mask: key=value where value looks secret-ish, and standalone long tokens.
 _KV = re.compile(r"((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)(\S+)", re.I)
-_LONGTOK = re.compile(r"\b[A-Za-z0-9_\-]{16,}\b")
+# Standalone opaque token: a 32+ char run of letters/digits. The floor (32) sits
+# above the longest real words/compound identifiers (kebab/snake split on `-`/`_`
+# into short sub-tokens like `acmetool`+`redirector`), so benign identifiers in
+# free text survive, while bare opaque secrets (32+ hex/base64, no prefix, no
+# key=) are still caught. Prefixed secrets (sk-/ghp_/AKIA/eyJ) and key=value are
+# handled by _KV/_PREFIXED/_BEARER regardless of length.
+_LONGTOK = re.compile(r"\b[A-Za-z0-9]{32,}\b")
 # Mask: known secret prefixes (Bearer, sk-, ghp_, gho_, ghs_, xox, AKIA, eyJ) regardless of length
 _PREFIXED = re.compile(r"\b(?:sk-|ghp_|gho_|ghs_|xox[a-z]-|AKIA|eyJ)[A-Za-z0-9._\-]+")
 # Mask: Bearer <token> form
