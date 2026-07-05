@@ -224,6 +224,127 @@ def test_askuserquestion_collision_prefers_modal_choice_under_reordered_delivery
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# nelix-5r3 — respond() beats screen-tick option enrichment (hook-options race)
+# ─────────────────────────────────────────────────────────────────────────────
+# nelix-32f split the hook path (publishes a modal/permission decision) from the screen tick that
+# ENRICHES it with the on-screen options (_enrich_hook_modal_options, daemon/session.py). A hook
+# carries NO options (hooks don't parse the screen), so the decision is published with options=[] and
+# the options are attached on the NEXT screen tick. A respond() arriving in that sub-second window —
+# after the hook published but BEFORE the enrichment tick — validates option ids against [] and
+# rejects a VALID id as invalid_option. Self-healing on retry (the orchestrator re-pulls + responds
+# again once enrichment has run) but a real correctness gap Codex flagged in the nelix-32f whole-
+# branch review. Fix: the MONITOR caches the latest modal/permission options it observes
+# (_last_modal_options, written under Session._lock on each tick), and respond() hydrates from THAT
+# cache — it never calls _handle.render() itself, because pump() mutates the renderer unlocked (see
+# test_respond_hydrates_without_calling_the_live_renderer for the thread-safety AC).
+
+def test_respond_hydrates_options_when_it_beats_screen_enrichment(tmp_path):
+    """RED on the nelix-32f code (the whole-branch review gap): a hook-derived modal/permission
+        decision is published with options=[] (hooks don't parse the screen); the on-screen options
+        are attached on the NEXT screen tick (_enrich_hook_modal_options). A respond() arriving in
+        that sub-second window — after the hook publish but BEFORE the enrichment tick — must STILL
+        succeed for a valid option id, hydrating from the MONITOR-OWNED cached latest modal options.
+
+        Models production ordering: the monitor observes the modal frame (caching its options),
+        THEN the modal hook publishes the options=[] decision (beating the enrichment tick), THEN
+        respond() runs. NON-VACUITY: the real capture ends on the 6-option AskUserQuestion modal,
+        and the test asserts options is STILL [] at respond() time (the race window is genuinely
+        open) before asserting the hydrate-and-succeed behaviour. RED: invalid_option; GREEN: resumed."""
+    from daemon.hooks import HookEvent
+    frames = capture_frames("s-9610d25c-askuserquestion-collision.capture")
+    modal = frames[-1]
+    assert "Next step" in modal and "Enter to select" in modal, (
+        "fixture must end on the AskUserQuestion 6-option modal")
+
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([modal], clock=clock)
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"            # the modal pause is mid-turn (post-delivery)
+
+    def fire(event, tool_name=None):
+        # hook path ONLY: enqueue + drain. Publishes the hook's decision with NO screen observe and
+        # NO _enrich_hook_modal_options (that runs in _loop_once, not _drain_hooks).
+        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name))
+        sess._drain_hooks()
+
+    fire("UserPromptSubmit")                          # open the turn (hook_mode -> active)
+    # The monitor observes the modal frame on a real _loop_once tick -> caches its options. With
+    # hook_mode active the screen tick self-gates (publishes nothing), so NO screen-derived decision
+    # is installed here — only the monitor-owned _last_modal_options cache is populated. This is the
+    # monitor's prior observe that respond() will hydrate from.
+    sess._loop_once()
+    assert sess._last_modal_options is not None, "the monitor must cache the modal's options on observe"
+    assert [o["id"] for o in sess._last_modal_options] == ["1", "2", "3", "4", "5", "6"]
+
+    # The modal hook now publishes its decision via the hook drain ALONE — NO intervening screen
+    # tick, so _enrich_hook_modal_options has NOT attached the on-screen options. This is the exact
+    # window between the hook publish and the next tick's enrichment, and respond() is about to land.
+    fire("PreToolUse", tool_name="AskUserQuestion")   # -> waiting_for_user / modal_choice
+
+    dec = sess.snapshot().get("decision")
+    assert dec is not None, "the modal hook must publish a pending decision"
+    assert dec["prompt_kind"] == "modal_choice" and dec["kind"] == "waiting_for_user"
+    did = dec["decision_id"]
+    # The race window is open: the hook-derived decision carries NO options yet (enrichment hasn't run).
+    assert dec["options"] == [], (
+        f"this models respond()-before-enrichment; options must still be empty (got {dec.get('options')!r})")
+
+    # respond(valid option id) MUST hydrate from the cached options and succeed — NOT reject a valid
+    # id as invalid_option (the bug). RED: invalid_option; GREEN: resumed.
+    out = sess.respond("1", decision_id=did)
+    assert out.status == "resumed", (
+        f"respond(valid option) must hydrate options and succeed (got {out.status})")
+    assert "1\r" in sess._handle.writes, "select_option must type digit+CR as one write"
+    assert "1" not in sess._handle.writes, "NOT the free-text two-write path"
+
+
+def test_respond_hydrates_without_calling_the_live_renderer(tmp_path):
+    """nelix-5r3 thread-safety AC (Codex review of 3eaf038): PtySession.pump() mutates the renderer
+        via _feed() OUTSIDE Session._lock, so respond() — which runs on the RPC thread — MUST NOT
+        call _handle.render() against that live renderer (read concurrent with pump's unlocked
+        mutation). It hydrates from the monitor-owned _last_modal_options cache instead. Spy on the
+        handle's render() and assert respond() invokes it ZERO times while hydrating a hook-derived
+        modal decision (options=[]). RED on 3eaf038: the old _hydrate_respond_options called
+        self._handle.render() -> the spy records >=1 call; GREEN: 0 calls (cache read under the lock)."""
+    from daemon.hooks import HookEvent
+    frames = capture_frames("s-9610d25c-askuserquestion-collision.capture")
+    modal = frames[-1]
+    assert "Next step" in modal and "Enter to select" in modal
+
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([modal], clock=clock)
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"
+
+    def fire(event, tool_name=None):
+        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name))
+        sess._drain_hooks()
+
+    fire("UserPromptSubmit")                          # open the turn; hook_mode -> active
+    sess._loop_once()                                 # monitor observes modal -> caches options
+    fire("PreToolUse", tool_name="AskUserQuestion")   # options=[] decision (beats enrichment tick)
+    dec = sess.snapshot()["decision"]
+    did = dec["decision_id"]
+    assert dec["options"] == [], "enrichment hasn't run; the decision still carries no options"
+
+    # Spy render() so the test FAILS if respond() reaches for the live renderer.
+    calls = {"n": 0}
+    _real_render = sess._handle.render
+
+    def spying_render():
+        calls["n"] += 1
+        return _real_render()
+    sess._handle.render = spying_render
+    try:
+        out = sess.respond("1", decision_id=did)
+    finally:
+        sess._handle.render = _real_render           # restore regardless of outcome
+    assert calls["n"] == 0, (
+        f"respond() must hydrate from the cache without rendering (made {calls['n']} render() call(s))")
+    assert out.status == "resumed", f"respond(valid option) must succeed (got {out.status})"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # delivery — confirm-once + terminal publication over the REAL paste-echo capture (s-b8a30317)
 # ─────────────────────────────────────────────────────────────────────────────
 # s-b8a30317-delivery is the real paste-delivery byte stream: an input box appears, then the pasted

@@ -137,6 +137,12 @@ class Session:
         #                                SAME model instead of silently reverting to the executor default.
         self._last_screen_excerpt = "" # last published screen excerpt (for the terminal snapshot)
         self._terminal_kind = None     # done | crashed | delivery_failed (set at each terminal point)
+        # nelix-5r3: MONITOR-OWNED cache of the latest modal/permission options the monitor observed
+        # (None when the latest frame was not a modal/permission). PtySession.pump() mutates the
+        # renderer via _feed() OUTSIDE Session._lock, so an RPC-thread _handle.render() would read it
+        # concurrently -> renderer access is NOT thread-safe. respond() hydrates a hook-derived modal
+        # decision (options=[]) from THIS cache (read under self._lock), never from the live renderer.
+        self._last_modal_options = None
         # _task_delivery synchronization (I1): the ONLY genuinely cross-thread transition is the
         # monitor's pending->"delivered" write, which the RPC-thread respond() reads to gate a
         # pre-delivery blocked answer — that write and that read are both made under self._lock, so
@@ -573,6 +579,7 @@ class Session:
             frame = self._handle.render()
         ctx = self._obs_ctx()
         obs = self._driver.observe(frame, ctx)
+        self._cache_last_modal_options(obs)   # nelix-5r3: monitor-owned; RPC-thread respond() hydrates from this
         with self._lock:
             actions = self._engine.tick(obs, ctx)
             notes = self._engine.drain_notes()
@@ -672,6 +679,41 @@ class Session:
                     and d.get("prompt_kind") in ("modal_choice", "permission_choice")
                     and not d.get("options")):
                 d["options"] = [{"id": o.id, "label": o.label} for o in obs.options]
+
+    def _cache_last_modal_options(self, obs):
+        # nelix-5r3: the MONITOR owns ALL renderer access (pump() mutates the renderer via _feed()
+        # OUTSIDE Session._lock, so an RPC-thread render() would race it). Cache the latest
+        # modal/permission options the monitor observed so respond() can hydrate a hook-derived
+        # decision (options=[]) WITHOUT touching the live renderer. Cleared to None whenever the
+        # latest frame is not a modal/permission, so a stale cache can never hydrate a fresh modal
+        # decision with another prompt's options. Read/written under self._lock (single monitor
+        # writer, RPC-thread reader in _hydrate_respond_options).
+        with self._lock:
+            if (obs is not None and obs.prompt_kind in ("modal_choice", "permission_choice")
+                    and obs.options):
+                self._last_modal_options = [{"id": o.id, "label": o.label} for o in obs.options]
+            else:
+                self._last_modal_options = None
+
+    def _hydrate_respond_options(self, decision):
+        # nelix-5r3: a hook-derived modal/permission decision is published with options=[] (hooks
+        # don't parse the screen); _enrich_hook_modal_options attaches the on-screen options on the
+        # NEXT screen tick. A respond() landing in that sub-second window would otherwise reject a
+        # VALID option id as invalid_option — validation (below) runs before enrichment fills them.
+        # Hydrate the options HERE, from the MONITOR-OWNED cache (_last_modal_options), so validation
+        # never sees [] while the modal is on screen. respond() runs on the RPC thread and MUST NOT
+        # call _handle.render() — pump() mutates that renderer unlocked — so it reads the cache under
+        # self._lock instead. Same fill-empty-only rule + in-place mutation as the tick-side
+        # enrichment (respond()'s later claim binds to this object's identity), and a no-op once the
+        # tick-side enrichment (or a prior hydrate) has populated options.
+        if decision.get("prompt_kind") not in ("modal_choice", "permission_choice"):
+            return
+        if decision.get("options"):
+            return
+        with self._lock:
+            cached = self._last_modal_options
+        if cached:
+            decision["options"] = [dict(o) for o in cached]
 
     def _apply_actions(self, actions, obs):
         # Translate the engine's revocable decisions into events / PTY writes. The engine is pure;
@@ -1616,6 +1658,13 @@ class Session:
         # stays pending and no keys are sent (closes the "prose into a menu" trap).
         is_modal = decision.get("prompt_kind") in ("modal_choice", "permission_choice")
         options = decision.get("options") or []
+        if is_modal and not options:
+            # nelix-5r3: a hook-derived modal/permission pause publishes options=[]; the on-screen
+            # options are attached on the next screen tick (_enrich_hook_modal_options). If respond()
+            # beats that tick, hydrate the options from the current screen so a VALID option id is not
+            # rejected as invalid_option.
+            self._hydrate_respond_options(decision)
+            options = decision.get("options") or []
         if is_modal and clean not in {o["id"] for o in options}:
             return RespondOutcome("invalid_option", pending=_pending_meta(decision))
         is_blocked = decision["kind"] == "blocked"
