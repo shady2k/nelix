@@ -19,7 +19,9 @@ _LONGTOK = re.compile(r"\b[A-Za-z0-9]{32,}\b")
 # mask it ONLY when it spans all three of digit/upper/lower — the signature of an
 # opaque token. Benign kebab/snake identifiers (short, single-case, no digit) and
 # hyphenated UUIDs (single-case hex, 36 chars) don't span three classes, so they
-# survive. Runs BEFORE _LONGTOK so a separator-bearing token masks as one ***.
+# survive. Applied AFTER _KV/_PREFIXED/_BEARER (see redact()) so a dotted prefixed
+# secret is masked whole first; then BEFORE _LONGTOK so a bare separator-bearing
+# token still masks as one ***.
 _LONGTOK_SEP = re.compile(r"[A-Za-z0-9_-]{32,}")
 # Mask: known secret prefixes (Bearer, sk-, ghp_, gho_, ghs_, xox, AKIA, ASIA, eyJ)
 # regardless of length. ASIA = AWS temporary (STS/S3) access-key IDs; AKIA = long-term.
@@ -54,11 +56,15 @@ def _mask_if_opaque(m) -> str:
 
 
 def redact(text: str) -> str:
+    # Specific masks first, then generic: a DOTTED prefixed secret (JWT
+    # 'eyJ<hdr>.<payload>.<sig>', dotted sk-/ghp_ keys) must be masked WHOLE by
+    # _PREFIXED/_BEARER (whose charclass includes '.') before the generic opaque
+    # masks (_LONGTOK_SEP's charclass excludes '.') can split it and leak the tail.
     s = _KV.sub(lambda m: m.group(1) + "***", text)
-    s = _LONGTOK_SEP.sub(_mask_if_opaque, s)   # separator-bearing opaque (whole token)
-    s = _LONGTOK.sub("***", s)                  # contiguous opaque (no separators)
     s = _PREFIXED.sub("***", s)
     s = _BEARER.sub("Bearer ***", s)
+    s = _LONGTOK_SEP.sub(_mask_if_opaque, s)   # separator-bearing opaque (whole token)
+    s = _LONGTOK.sub("***", s)                  # contiguous opaque (no separators)
     return s
 
 

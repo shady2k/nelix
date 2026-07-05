@@ -135,6 +135,22 @@ def test_separator_opaque_mask_spares_benign_identifiers_and_uuids():
     assert redact(lower_uuid.upper()) == lower_uuid.upper()  # uppercase hex UUID too
 
 
+def test_redact_masks_dotted_prefixed_secret_whole():
+    """nelix-4ei fix-wave-2: regex-ORDERING interaction. _LONGTOK_SEP's charclass
+    excludes '.' while _PREFIXED's includes it, so running _LONGTOK_SEP before
+    _PREFIXED partially masks a DOTTED prefixed secret before the prefix rule can
+    see it whole. A JWT 'eyJ<32+ mixed header>.<payload>.<sig>' must mask to a
+    SINGLE *** with no '.payload'/'.signature' (claims + HMAC) leak."""
+    # header is a 36-char, 3-class base64url run -> _LONGTOK_SEP masks it on its own;
+    # payload + signature are short/2-class -> would leak if _PREFIXED doesn't run first
+    jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.userSensitiveData.HMACsig123"
+    out = redact(jwt)
+    assert out == "***"
+    assert "userSensitiveData" not in out     # payload (claims) does not leak
+    assert "HMACsig123" not in out            # signature (HMAC) does not leak
+    assert "." not in out                     # masked whole, no dotted tail
+
+
 def test_error_exc_info_captures_redacted_traceback():
     buf = io.StringIO()
     log = Logger(stream=buf)
