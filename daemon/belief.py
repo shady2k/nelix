@@ -314,6 +314,15 @@ class BeliefEngine:
         now = self._clock.now()
         self._published_key = None
         self._published_kind = None
+        # nelix-f7y: the answer resolves the hook pause too, so drop its pending-pause key. The
+        # `hook_pause:{epoch}` slot exists ONLY to dedup a pause's OWN duplicate/straggler hook (the
+        # AskUserQuestion PreToolUse/PermissionRequest collision, nelix-32f) BEFORE it is answered.
+        # Once answered, the NEXT waiting_for_user hook in the SAME epoch is a FRESH pause (a permission
+        # gate has no PostToolUse[AskUserQuestion] to clear the slot), and must NOT be swallowed by the
+        # "same key already published" guard in on_hook — clearing it here lets on_hook mint a fresh
+        # respondable decision the orchestrator can answer.
+        self._hook_pending_key = None
+        self._hook_pending_kind = None
         self._candidate_fp = None
         self._candidate_since = None
         self._published_prompt_fp = None

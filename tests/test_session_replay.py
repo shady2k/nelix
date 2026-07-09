@@ -951,3 +951,87 @@ def test_predelivery_bodyless_modal_target_aborts_not_submitted(tmp_path, monkey
     reasons = [e.resolved_reason for e in ev._events if e.decision_id == did and e.kind == "blocked"]
     assert reasons and all(r == "superseded" for r in reasons), (
         f"a bodyless-target abort must resolve 'superseded', not 'answered' (got {reasons})")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# nelix-f7y — a SECOND same-kind pause in one turn-epoch must be answerable
+# ─────────────────────────────────────────────────────────────────────────────
+# nelix-32f keyed the hook pause by `hook_pause:{epoch}` (one respondable pause per turn epoch, so the
+# AskUserQuestion PreToolUse/PermissionRequest collision collapses to ONE stable decision). But a
+# permission gate has NO PostToolUse[AskUserQuestion] resolution hook (it is resolved by the answer +
+# the tool running, whose PostToolUse is a PLAIN working hook, not clears_pending). So after the FIRST
+# permission pause is ANSWERED, the engine's `_hook_pending_key` was never cleared, and a SECOND Bash
+# permission in the SAME epoch hit the "same key already published" guard (belief.py) and emitted NO
+# Publish — no respondable decision, so the orchestrator sat at control_state `awaiting_user` forever
+# with nothing to answer. Pre-existing (the old prompt_kind:epoch keying had the identical defect for a
+# same-kind second pause); NOT a regression from nelix-32f. Fix: on_submit clears the pending-pause
+# key so the next waiting_for_user hook is read as a FRESH pause and mints a fresh respondable decision.
+#
+# The HOOK SEQUENCE (two Bash tool-permission gates in one turn, with the answer between them) is the
+# real subject under test — the exact Claude hook shapes normalize_claude_hook maps. The on-screen
+# option source is the REAL captured Bash "run a command" permission menu
+# (tests/golden/claude/permission_prompt/run-command-menu.txt -> permission_choice, options 1/2/3),
+# which respond() hydrates from; the golden corpus has no other Bash-gate frame and fabricating a
+# screen frame is disallowed by the project's real-capture rule.
+
+def test_second_same_kind_permission_pause_in_one_epoch_is_answerable(tmp_path):
+    """RED on current code (nelix-f7y): drive the real Session with the real Bash-permission hook
+        shapes for TWO permission gates in ONE turn epoch —
+          UserPromptSubmit -> PreToolUse[Bash] -> PermissionRequest (pause 1, answered)
+          -> PostToolUse[Bash] -> PreToolUse[Bash] -> PermissionRequest (pause 2)
+        over the REAL 'run a command' permission menu. The first pause is answered end-to-end. The
+        SECOND PermissionRequest must publish a FRESH respondable decision (new decision_id, in the
+        respondable queue) the orchestrator can answer. RED: the answered pause's `_hook_pending_key`
+        is never cleared, so the second hook is swallowed by the same-key guard -> NO decision is
+        published (snapshot decision is None, ev.pending is None) while control_state is `awaiting_user`
+        -> unanswerable. GREEN: a fresh permission_choice decision is published and respond() resumes."""
+    from daemon.hooks import HookEvent
+    menu = (_PERM / "run-command-menu.txt").read_text()
+    # NON-VACUITY: the fixture is a real Bash tool-permission gate the driver reads as permission_choice.
+    obs = ClaudeDriver().observe(
+        menu, ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None))
+    assert obs.prompt_kind == "permission_choice" and [o.id for o in obs.options] == ["1", "2", "3"], (
+        "fixture must be a real Bash permission gate (permission_choice, options 1/2/3)")
+
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([menu], clock=clock, step=0.0)  # step=0: isolate the hook path from timeouts
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"                 # both gates are mid-turn (post-delivery)
+
+    def fire(event, tool_name=None):
+        # The real hook path: enqueue the raw hook event + drain one monitor iteration (on_hook queue
+        # -> _drain_hooks -> engine.on_hook -> apply, then the screen tick that enriches hook-derived
+        # options from the on-screen menu). Exactly what a live `curl` from a hook drives.
+        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name))
+        sess._loop_once()
+
+    # ---- pause 1: a Bash permission gate, published and answered end-to-end ----
+    fire("UserPromptSubmit")                          # open the turn (hook_mode -> active, epoch 1)
+    fire("PreToolUse", tool_name="Bash")              # busy
+    fire("PermissionRequest", tool_name="Bash")       # pause 1
+    dec1 = sess.snapshot().get("decision")
+    assert dec1 is not None and dec1["kind"] == "waiting_for_user", "pause 1 must be a respondable pause"
+    assert dec1["prompt_kind"] == "permission_choice"
+    did1 = dec1["decision_id"]
+    out1 = sess.respond("1", decision_id=did1)
+    assert out1.status == "resumed", f"pause 1 must be answerable (got {out1.status})"
+    assert sess.snapshot().get("decision") is None    # answered -> cleared
+
+    # ---- pause 2: a SECOND Bash permission gate in the SAME turn epoch ----
+    fire("PostToolUse", tool_name="Bash")             # gate 1's tool ran: plain working (NOT clears_pending)
+    fire("PreToolUse", tool_name="Bash")              # busy
+    fire("PermissionRequest", tool_name="Bash")       # pause 2 — MUST publish a fresh respondable decision
+
+    dec2 = sess.snapshot().get("decision")
+    assert dec2 is not None, (
+        "the SECOND same-kind pause must publish a FRESH respondable decision — RED: the answered "
+        "pause's key was never cleared, so this second hook is swallowed and NOTHING is published "
+        "(control_state sits at 'awaiting_user' with no answerable decision)")
+    assert dec2["kind"] == "waiting_for_user" and dec2["prompt_kind"] == "permission_choice"
+    assert dec2["requires_response"] is True
+    assert ev.pending("s1") is not None, "the fresh pause must be in the respondable queue"
+    assert dec2["decision_id"] != did1, "pause 2 must be a FRESH decision, not the answered pause 1's id"
+
+    # end-to-end: the orchestrator can actually answer the second pause.
+    out2 = sess.respond("1", decision_id=dec2["decision_id"])
+    assert out2.status == "resumed", f"pause 2 must be answerable end-to-end (got {out2.status})"
