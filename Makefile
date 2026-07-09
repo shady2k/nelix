@@ -11,9 +11,10 @@ PIP  := $(VENV)/bin/pip
 # daemon (nelix-cb0: os.waitid — 3.13+ — passed on a 3.14 .venv, died on the 3.11 daemon).
 PYTHON ?= python3.11
 
-# Installed-plugin checkout used by `deploy` / `reinstall-plugin`. Override for another profile:
-#   make reinstall-plugin PLUGIN_DIR=/path/to/plugins/nelix
-PLUGIN_DIR ?= $(HOME)/.hermes/profiles/local/plugins/nelix
+# Hermes profile whose installed nelix plugin `deploy` / `reinstall-plugin` refresh via
+# `hermes plugins update` (which runs the plugin's update hooks, not a raw git reset). Override
+# for another profile:  make reinstall-plugin PROFILE=work
+PROFILE ?= local
 
 .DEFAULT_GOAL := help
 
@@ -65,14 +66,11 @@ vt-spike-run: venv  ## Render a captured raw via libghostty-vt: make vt-spike-ru
 	$(PY) spikes/vt-ghostty/compare.py "$(RAW)"
 
 .PHONY: reinstall-plugin
-reinstall-plugin:  ## Reset the installed plugin checkout to origin/main (override PLUGIN_DIR)
-	@test -d "$(PLUGIN_DIR)/.git" || { echo "no plugin checkout at $(PLUGIN_DIR)"; exit 1; }
-	git -C "$(PLUGIN_DIR)" fetch origin
-	git -C "$(PLUGIN_DIR)" reset --hard origin/main
-	git -C "$(PLUGIN_DIR)" log --oneline -1
+reinstall-plugin:  ## Update the installed plugin via `hermes plugins update` (override PROFILE)
+	hermes --profile $(PROFILE) plugins update nelix
 
 .PHONY: deploy
-deploy:  ## Push main, then reset the installed plugin to it
+deploy:  ## Push main, then update the installed plugin to it
 	git push origin main
 	$(MAKE) reinstall-plugin
-	@echo "Deployed. Restart the Hermes 'local' session (/new) so the daemon reloads the new code."
+	@echo "Deployed. Restart the Hermes '$(PROFILE)' session (/new) so the daemon reloads the new code."
