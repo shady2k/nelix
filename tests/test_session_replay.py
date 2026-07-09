@@ -954,37 +954,36 @@ def test_predelivery_bodyless_modal_target_aborts_not_submitted(tmp_path, monkey
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# nelix-f7y — a SECOND same-kind pause in one turn-epoch must be answerable
+# nelix-f7y — a SECOND same-kind gate in one turn-epoch, keyed by per-gate tool_use_id
 # ─────────────────────────────────────────────────────────────────────────────
-# nelix-32f keyed the hook pause by `hook_pause:{epoch}` (one respondable pause per turn epoch, so the
-# AskUserQuestion PreToolUse/PermissionRequest collision collapses to ONE stable decision). But a
-# permission gate has NO PostToolUse[AskUserQuestion] resolution hook (it is resolved by the answer +
-# the tool running, whose PostToolUse is a PLAIN working hook, not clears_pending). So after the FIRST
-# permission pause is ANSWERED, the engine's `_hook_pending_key` was never cleared, and a SECOND Bash
-# permission in the SAME epoch hit the "same key already published" guard (belief.py) and emitted NO
-# Publish — no respondable decision, so the orchestrator sat at control_state `awaiting_user` forever
-# with nothing to answer. Pre-existing (the old prompt_kind:epoch keying had the identical defect for a
-# same-kind second pause); NOT a regression from nelix-32f. Fix: on_submit clears the pending-pause
-# key so the next waiting_for_user hook is read as a FRESH pause and mints a fresh respondable decision.
+# nelix-32f keyed the hook pause by `hook_pause:{epoch}` (one respondable pause per epoch, to collapse
+# the AskUserQuestion PreToolUse[AskUserQuestion]/PermissionRequest collision to ONE stable decision).
+# An epoch-level key fundamentally cannot tell "a duplicate of the answered gate" from "a genuinely new
+# gate" using hooks alone, which produced a symmetric pair of P2 bugs across the earlier fix waves:
+#   * clear-the-key-outright (1232e34)  -> a straggler of the answered gate PHANTOMs a decision.
+#   * epoch tombstone (35f10a7)         -> a genuine second gate whose PermissionRequest is reordered
+#                                          before its PreToolUse (or a DENIED pause 1 with no PostToolUse)
+#                                          is OVER-suppressed -> terminal hang (no self-heal: hook-active
+#                                          tick() publishes no screen decision).
+# Root fix (wave 2): key the pause by Claude's `tool_use_id` — the per-tool-invocation id that is STABLE
+# across a single invocation's hooks (so the collision's two hooks share it -> dedup) and DIFFERENT for
+# a new invocation (so a fresh gate is always distinct -> published, with NO ordering assumption). The
+# answered set (`_hook_answered_ids`) then suppresses only a straggler of an ALREADY-ANSWERED gate (same
+# id), never a real new gate (different id). tool_use_id is documented present on PreToolUse /
+# PermissionRequest / PostToolUse (Claude Code hooks reference); the RPC route threads it through
+# HookEvent -> HookObservation.
 #
-# The HOOK SEQUENCE (two Bash tool-permission gates in one turn, with the answer between them) is the
-# real subject under test — the exact Claude hook shapes normalize_claude_hook maps. The on-screen
-# option source is the REAL captured Bash "run a command" permission menu
-# (tests/golden/claude/permission_prompt/run-command-menu.txt -> permission_choice, options 1/2/3),
-# which respond() hydrates from; the golden corpus has no other Bash-gate frame and fabricating a
-# screen frame is disallowed by the project's real-capture rule.
+# The HOOK SEQUENCE (real Claude hook shapes, incl. the real per-gate tool_use_id normalize_claude_hook
+# now carries) is the subject under test. The on-screen option source is the REAL captured Bash "run a
+# command" permission menu (tests/golden/claude/permission_prompt/run-command-menu.txt ->
+# permission_choice, options 1/2/3), which respond() hydrates from; the golden corpus has no other
+# Bash-gate frame and fabricating a screen frame is disallowed by the project's real-capture rule.
 
-def test_second_same_kind_permission_pause_in_one_epoch_is_answerable(tmp_path):
-    """RED on current code (nelix-f7y): drive the real Session with the real Bash-permission hook
-        shapes for TWO permission gates in ONE turn epoch —
-          UserPromptSubmit -> PreToolUse[Bash] -> PermissionRequest (pause 1, answered)
-          -> PostToolUse[Bash] -> PreToolUse[Bash] -> PermissionRequest (pause 2)
-        over the REAL 'run a command' permission menu. The first pause is answered end-to-end. The
-        SECOND PermissionRequest must publish a FRESH respondable decision (new decision_id, in the
-        respondable queue) the orchestrator can answer. RED: the answered pause's `_hook_pending_key`
-        is never cleared, so the second hook is swallowed by the same-key guard -> NO decision is
-        published (snapshot decision is None, ev.pending is None) while control_state is `awaiting_user`
-        -> unanswerable. GREEN: a fresh permission_choice decision is published and respond() resumes."""
+def _f7y_session(tmp_path):
+    """A delivered, hook-active Session over the REAL Bash 'run a command' permission menu, with a
+    `fire(event, tool_name, tool_use_id)` helper that drives the real hook path (on_hook queue ->
+    _drain_hooks -> engine, then the screen tick that enriches hook-derived options from the menu).
+    Returns (sess, ev, fire)."""
     from daemon.hooks import HookEvent
     menu = (_PERM / "run-command-menu.txt").read_text()
     # NON-VACUITY: the fixture is a real Bash tool-permission gate the driver reads as permission_choice.
@@ -992,99 +991,148 @@ def test_second_same_kind_permission_pause_in_one_epoch_is_answerable(tmp_path):
         menu, ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None))
     assert obs.prompt_kind == "permission_choice" and [o.id for o in obs.options] == ["1", "2", "3"], (
         "fixture must be a real Bash permission gate (permission_choice, options 1/2/3)")
-
     sess, ev, clock = _wire(tmp_path, Spec())
     sess._handle = RawReplayHandle([menu], clock=clock, step=0.0)  # step=0: isolate the hook path from timeouts
     sess._handle._dialog = sess._dialog
-    sess._task_delivery = "delivered"                 # both gates are mid-turn (post-delivery)
+    sess._task_delivery = "delivered"                 # gates are mid-turn (post-delivery)
 
-    def fire(event, tool_name=None):
-        # The real hook path: enqueue the raw hook event + drain one monitor iteration (on_hook queue
-        # -> _drain_hooks -> engine.on_hook -> apply, then the screen tick that enriches hook-derived
-        # options from the on-screen menu). Exactly what a live `curl` from a hook drives.
-        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name))
+    def fire(event, tool_name=None, tool_use_id=None):
+        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name,
+                               tool_use_id=tool_use_id))
         sess._loop_once()
 
+    return sess, ev, fire
+
+
+def test_second_same_kind_permission_pause_in_one_epoch_is_answerable(tmp_path):
+    """A genuine SECOND same-kind Bash permission gate in ONE turn epoch must be answerable — the
+        original nelix-f7y AC. Real hook shapes with distinct per-gate tool_use_ids:
+          UserPromptSubmit -> PreToolUse[Bash tu1] -> PermissionRequest[tu1] (pause 1, answered)
+          -> PostToolUse[Bash tu1] -> PreToolUse[Bash tu2] -> PermissionRequest[tu2] (pause 2)
+        The second PermissionRequest (a DIFFERENT tool_use_id) must publish a FRESH respondable decision
+        the orchestrator can answer. RED on the pre-fix code (epoch-only key): pause 2 is swallowed by
+        the same-key guard / over-suppressed by the epoch tombstone -> no decision. GREEN: distinct
+        tool_use_id -> fresh permission_choice decision, respond() resumes."""
+    sess, ev, fire = _f7y_session(tmp_path)
+
     # ---- pause 1: a Bash permission gate, published and answered end-to-end ----
-    fire("UserPromptSubmit")                          # open the turn (hook_mode -> active, epoch 1)
-    fire("PreToolUse", tool_name="Bash")              # busy
-    fire("PermissionRequest", tool_name="Bash")       # pause 1
+    fire("UserPromptSubmit")                                   # open the turn (hook_mode -> active, epoch 1)
+    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate1")
+    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate1")   # pause 1
     dec1 = sess.snapshot().get("decision")
     assert dec1 is not None and dec1["kind"] == "waiting_for_user", "pause 1 must be a respondable pause"
     assert dec1["prompt_kind"] == "permission_choice"
     did1 = dec1["decision_id"]
     out1 = sess.respond("1", decision_id=did1)
     assert out1.status == "resumed", f"pause 1 must be answerable (got {out1.status})"
-    assert sess.snapshot().get("decision") is None    # answered -> cleared
+    assert sess.snapshot().get("decision") is None            # answered -> cleared
 
-    # ---- pause 2: a SECOND Bash permission gate in the SAME turn epoch ----
-    fire("PostToolUse", tool_name="Bash")             # gate 1's tool ran: plain working (NOT clears_pending)
-    fire("PreToolUse", tool_name="Bash")              # busy
-    fire("PermissionRequest", tool_name="Bash")       # pause 2 — MUST publish a fresh respondable decision
+    # ---- pause 2: a SECOND Bash permission gate (distinct tool_use_id) in the SAME turn epoch ----
+    fire("PostToolUse", tool_name="Bash", tool_use_id="toolu_gate1")   # gate 1's tool ran (plain working)
+    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate2")
+    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate2")   # pause 2 — fresh gate
 
     dec2 = sess.snapshot().get("decision")
     assert dec2 is not None, (
-        "the SECOND same-kind pause must publish a FRESH respondable decision — RED: the answered "
-        "pause's key was never cleared, so this second hook is swallowed and NOTHING is published "
-        "(control_state sits at 'awaiting_user' with no answerable decision)")
+        "a genuinely new gate (distinct tool_use_id) must publish a FRESH respondable decision")
     assert dec2["kind"] == "waiting_for_user" and dec2["prompt_kind"] == "permission_choice"
     assert dec2["requires_response"] is True
     assert ev.pending("s1") is not None, "the fresh pause must be in the respondable queue"
     assert dec2["decision_id"] != did1, "pause 2 must be a FRESH decision, not the answered pause 1's id"
 
-    # end-to-end: the orchestrator can actually answer the second pause.
     out2 = sess.respond("1", decision_id=dec2["decision_id"])
     assert out2.status == "resumed", f"pause 2 must be answerable end-to-end (got {out2.status})"
 
 
 def test_straggler_of_answered_pause_does_not_publish_phantom(tmp_path):
-    """RED on the first f7y fix (1232e34, unconditional clear): after a Bash permission pause is
-        ANSWERED, a late duplicate / straggler PermissionRequest of THAT SAME pause — delivered while
-        the epoch is still OPEN (no Stop), with NO intervening tool progress (no PostToolUse+PreToolUse)
-        — must NOT publish a PHANTOM respondable decision. Hook HTTP delivery is reorderable (the
-        nelix-32f collision models exactly this), so this straggler is real. The unconditional clear
-        reopened the dedup hole shifted to after the answer: on_hook finds no pending key, the
-        closed-turn guard does not apply (epoch still open), so the late duplicate is minted as a fresh
-        pause and a phantom decision is published — the same phantom-decision class that once leaked a
-        stray '1' into a live prod session. GREEN with the answered-pause tombstone: the re-publish for
-        the answered key is suppressed until tool progress (or epoch close) lifts the tombstone."""
-    from daemon.hooks import HookEvent
-    menu = (_PERM / "run-command-menu.txt").read_text()
-    obs = ClaudeDriver().observe(
-        menu, ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None))
-    assert obs.prompt_kind == "permission_choice" and [o.id for o in obs.options] == ["1", "2", "3"], (
-        "fixture must be a real Bash permission gate (permission_choice, options 1/2/3)")
-
-    sess, ev, clock = _wire(tmp_path, Spec())
-    sess._handle = RawReplayHandle([menu], clock=clock, step=0.0)
-    sess._handle._dialog = sess._dialog
-    sess._task_delivery = "delivered"
-
-    def fire(event, tool_name=None):
-        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name))
-        sess._loop_once()
+    """A late duplicate / straggler of the ALREADY-ANSWERED gate (the SAME tool_use_id) must NOT
+        publish a PHANTOM respondable decision — the wave-1 AC, now keyed per-gate. After pause 1 is
+        answered, a straggler PermissionRequest carrying the SAME tool_use_id (reordered/duplicated hook
+        delivery) with NO intervening tool progress is suppressed by the answered-id set. RED on
+        1232e34 (unconditional clear): the duplicate mints a fresh phantom decision — the class that
+        once leaked a stray '1' into a live prod session. GREEN: same id -> suppressed, nothing typed."""
+    sess, ev, fire = _f7y_session(tmp_path)
 
     # pause 1: a Bash permission gate, published and answered end-to-end.
     fire("UserPromptSubmit")
-    fire("PreToolUse", tool_name="Bash")
-    fire("PermissionRequest", tool_name="Bash")
+    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate1")
+    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate1")
     dec1 = sess.snapshot().get("decision")
     assert dec1 is not None and dec1["prompt_kind"] == "permission_choice", "pause 1 must be a permission pause"
     did1 = dec1["decision_id"]
     assert sess.respond("1", decision_id=did1).status == "resumed", "pause 1 must be answerable"
     assert sess.snapshot().get("decision") is None            # answered -> cleared
 
-    # A late duplicate / straggler PermissionRequest of the ALREADY-ANSWERED pause 1, delivered with
-    # NO intervening tool progress (no PostToolUse + new PreToolUse) and while the epoch is still open.
+    # A late duplicate / straggler PermissionRequest of the ALREADY-ANSWERED gate (SAME tool_use_id),
+    # delivered with NO intervening tool progress and while the epoch is still open.
     writes_before = len(sess._handle.writes)
-    fire("PermissionRequest", tool_name="Bash")
+    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate1")
 
     snap = sess.snapshot()
     assert snap.get("decision") is None, (
-        "a late straggler of the ANSWERED pause must NOT publish a phantom decision — RED (1232e34): "
-        "the unconditional clear lets the duplicate mint a fresh phantom respondable decision")
+        "a straggler of the ANSWERED gate (same tool_use_id) must NOT publish a phantom decision")
     assert ev.pending("s1") is None, "no phantom decision may enter the respondable queue"
     assert snap["control_state"] != "awaiting_user", (
-        "the answered pause's straggler must not resurrect awaiting_user (the agent already resumed)")
+        "the answered gate's straggler must not resurrect awaiting_user (the agent already resumed)")
     # and nothing was typed into the PTY off a phantom (the stray-keystroke leak this class caused).
     assert sess._handle.writes[writes_before:] == [], "a suppressed straggler types nothing"
+
+
+def test_reordered_second_gate_still_answerable_no_terminal_oversuppression(tmp_path):
+    """SYMMETRIC regression (nelix-f7y wave 2, Codex-traced terminal hang): a GENUINE second same-kind
+        gate whose PermissionRequest is REORDERED to arrive BEFORE its own PreToolUse (hook delivery is
+        reorderable) MUST still publish a respondable decision the orchestrator can answer. On 35f10a7
+        the epoch tombstone standing from the answered pause 1 matches the second gate's epoch key and
+        SUPPRESSES it (busy, no publish); the later PreToolUse lifts the tombstone but the real gate was
+        already dropped -> nelix has NO respondable decision while the agent is blocked on a live
+        permission prompt, and there is no self-heal (hook-active tick() never publishes a screen
+        decision) -> terminal hang. RED on 35f10a7: no decision after the reordered PermissionRequest.
+        GREEN: the second gate's DISTINCT tool_use_id is not in the answered-id set -> published +
+        answerable regardless of hook order."""
+    sess, ev, fire = _f7y_session(tmp_path)
+
+    # pause 1: answered end-to-end.
+    fire("UserPromptSubmit")
+    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate1")
+    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate1")
+    did1 = sess.snapshot()["decision"]["decision_id"]
+    assert sess.respond("1", decision_id=did1).status == "resumed", "pause 1 must be answerable"
+    assert sess.snapshot().get("decision") is None
+
+    # gate 2, REORDERED: its PermissionRequest is delivered BEFORE its PreToolUse. No PostToolUse for
+    # gate 1 has arrived either (models a denied/slow gate 1). The second gate has a DISTINCT tool_use_id.
+    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate2")   # reordered: permission first
+    dec2 = sess.snapshot().get("decision")
+    assert dec2 is not None, (
+        "a genuine second gate whose PermissionRequest is reordered before its PreToolUse must STILL "
+        "publish a respondable decision — RED (35f10a7): the epoch tombstone over-suppresses it into a "
+        "terminal hang (busy, no decision, no self-heal)")
+    assert dec2["kind"] == "waiting_for_user" and dec2["prompt_kind"] == "permission_choice"
+    assert ev.pending("s1") is not None, "the reordered gate must be in the respondable queue"
+    assert dec2["decision_id"] != did1, "it is a FRESH gate, not the answered pause 1"
+    out2 = sess.respond("1", decision_id=dec2["decision_id"])
+    assert out2.status == "resumed", f"the reordered gate must be answerable (got {out2.status})"
+
+    # the late PreToolUse for gate 2 arrives afterwards -> plain working, must not disturb the resume.
+    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate2")
+    assert sess.snapshot()["control_state"] == "busy"
+
+
+def test_askuserquestion_collision_dedups_by_tool_use_id(tmp_path):
+    """nelix-32f collision dedup, preserved under per-gate keying: ONE physical AskUserQuestion modal
+        emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice) AND PermissionRequest (->
+        permission_choice) — the SAME tool invocation, so the SAME tool_use_id. The two hooks MUST
+        collapse to EXACTLY ONE respondable decision (stable decision_id, prompt_kind modal_choice), not
+        two. Real hook shapes carrying the shared tool_use_id."""
+    sess, ev, fire = _f7y_session(tmp_path)
+    fire("UserPromptSubmit")
+    fire("PreToolUse", tool_name="AskUserQuestion", tool_use_id="toolu_modal")   # -> modal_choice
+    d1 = sess.snapshot().get("decision")
+    assert d1 is not None and d1["prompt_kind"] == "modal_choice", "the modal hook must publish modal_choice"
+    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_modal")       # colliding hook, SAME id
+    d2 = sess.snapshot().get("decision")
+    assert d2 is not None, "the collision must leave ONE pending decision"
+    assert d2["decision_id"] == d1["decision_id"], (
+        "the colliding hook (same tool_use_id) must NOT supersede -> stable decision_id")
+    assert d2["prompt_kind"] == "modal_choice", "modal_choice (the more specific reading) survives"
+    assert ev.pending("s1") is not None

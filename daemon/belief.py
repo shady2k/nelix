@@ -110,11 +110,17 @@ class BeliefEngine:
         self._turn_open = False           # a turn is running (between open and its close)
         self._hook_pending_key = None     # currently-published hook waiting_for_user, for withdrawal
         self._hook_pending_kind = None    # its effective prompt_kind (modal_choice wins, nelix-32f)
-        # nelix-f7y: a tombstone for the pause just ANSWERED whose epoch is still open and which has
-        # seen NO tool progress since. It suppresses a re-publish for that SAME key (a late duplicate /
-        # straggler of the answered pause) WITHOUT blocking a genuinely fresh subsequent gate: any tool
-        # progress (a plain working hook / clears_pending) or an epoch boundary lifts it. See on_submit.
-        self._hook_answered_key = None
+        # nelix-f7y: the set of hook-pause keys ANSWERED in the current epoch (a per-gate tombstone).
+        # A pause is keyed by its Claude `tool_use_id` (stable across one tool invocation's hooks,
+        # distinct per invocation), so a late duplicate / straggler of an answered gate reuses the SAME
+        # key -> suppressed (no phantom re-publish), while a genuinely new gate has a DIFFERENT key ->
+        # published (answerable). No epoch-level ambiguity and no hook-ordering / tool-progress
+        # assumption. Cleared at each epoch boundary. See on_submit + the waiting_for_user branch.
+        # RESIDUAL: a waiting_for_user hook WITHOUT a tool_use_id (only the legacy permission
+        # Notification path; PermissionRequest / PreToolUse[AskUserQuestion] both carry one) falls back
+        # to the epoch key, which cannot distinguish a second same-kind gate from a straggler in one
+        # epoch — the pre-f7y limitation, now confined to that id-less path.
+        self._hook_answered_ids = set()
         self._idle_published_epoch = None  # epoch whose Stop already published idle (idempotency)
         # precedence & lost-hook reconciliation (Task 7): process-exit > hook > bounded screen.
         self._last_hook_at = None          # clock of the most recent hook (lost-hook deadlines)
@@ -191,7 +197,7 @@ class BeliefEngine:
             self._turn_open = True
             self._hook_pending_key = None
             self._hook_pending_kind = None
-            self._hook_answered_key = None          # nelix-f7y: a new epoch retires the answered-pause tombstone
+            self._hook_answered_ids.clear()         # nelix-f7y: a new epoch retires the answered-gate tombstones
             self._state.control_state = "busy"
             self._state.phase = "busy"
             return actions
@@ -203,7 +209,7 @@ class BeliefEngine:
                 return actions
             self._turn_open = False
             self._idle_published_epoch = self._turn_epoch
-            self._hook_answered_key = None                       # nelix-f7y: epoch closed -> retire the tombstone
+            self._hook_answered_ids.clear()                      # nelix-f7y: epoch closed -> retire the tombstones
             if self._hook_pending_key is not None:               # a pending prompt is moot once idle
                 actions.append(Withdraw(decision_key=self._hook_pending_key, reason="superseded"))
                 self._hook_pending_key = None
@@ -222,7 +228,6 @@ class BeliefEngine:
         if hobs.clears_pending:
             if self._turn_closed():
                 return actions
-            self._hook_answered_key = None          # nelix-f7y: tool progress -> the next gate is fresh
             if self._hook_pending_key is not None:
                 actions.append(Withdraw(decision_key=self._hook_pending_key, reason="prompt_left"))
                 self._hook_pending_key = None
@@ -239,20 +244,19 @@ class BeliefEngine:
         if hobs.kind == "waiting_for_user":
             if self._turn_closed():
                 return actions
-            # nelix-32f: ONE respondable pause per turn-epoch. A single physical AskUserQuestion modal
-            # emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice) AND PermissionRequest
-            # (-> permission_choice) in this claude build (verified s-9610d25c @ 20:57:20: no concurrent
-            # Bash — AskUserQuestion itself fires the PermissionRequest). The two hooks are the SAME
-            # pause, so the decision is keyed by EPOCH alone (not prompt_kind:epoch); the second hook is
-            # an IN-PLACE refinement, NEVER a supersede (a supersede withdraws the stable decision the
-            # orchestrator is about to answer -> respond() then rejects every option). modal_choice is
-            # the more specific reading and wins (a numbered menu, not a generic allow/deny).
-            decision_key = f"hook_pause:{self._turn_epoch}"
+            # The pause is keyed by its Claude `tool_use_id` (per-gate): stable across the two hooks a
+            # single physical AskUserQuestion modal emits — PreToolUse[AskUserQuestion] (-> modal_choice)
+            # AND PermissionRequest (-> permission_choice), the SAME tool invocation so the SAME id
+            # (nelix-32f collision, verified s-9610d25c) — and DIFFERENT for a genuinely new gate. When a
+            # hook carries no id (a legacy permission Notification), fall back to the epoch key (which
+            # cannot distinguish a second same-kind gate — see the module residual note on _hook_answered_ids).
+            decision_key = (f"hook_gate:{hobs.tool_use_id}" if hobs.tool_use_id
+                            else f"hook_pause:{self._turn_epoch}")
             effective_kind = self._preferred_prompt_kind(self._hook_pending_kind, hobs.prompt_kind)
             if self._hook_pending_key == decision_key:
-                # same epoch's pause already published. Only a kind UPGRADE re-emits — modal_choice
-                # arriving after permission_choice (e.g. under hook-delivery reordering) — and as a
-                # re-emit (SAME decision_key) so the decision_id stays stable (a held answer binds).
+                # this gate's pause is already published. Only a kind UPGRADE re-emits — modal_choice
+                # arriving after permission_choice (the collision's two hooks, possibly reordered) — and
+                # as a re-emit (SAME decision_key) so the decision_id stays stable (a held answer binds).
                 if effective_kind != self._hook_pending_kind:
                     self._hook_pending_kind = effective_kind
                     actions.append(self._hook_pause_publish(decision_key, effective_kind))
@@ -260,13 +264,14 @@ class BeliefEngine:
                 self._state.control_state = "awaiting_user"
                 self._state.phase = "pause_candidate"
                 return actions
-            if self._hook_answered_key == decision_key:
-                # nelix-f7y: this epoch's pause was already ANSWERED and NO tool progress has happened
-                # since (the tombstone is still standing). A waiting_for_user for the SAME key is a late
-                # duplicate / straggler of that answered pause (reordered hook delivery), NOT a fresh
-                # gate — suppress the re-publish so no PHANTOM respondable decision is minted (which the
-                # orchestrator would answer, leaking a stray keystroke into the resumed turn). The agent
-                # already resumed on the answer, so the true state is busy, not awaiting_user.
+            if decision_key in self._hook_answered_ids:
+                # nelix-f7y: this gate was already ANSWERED. A waiting_for_user for the SAME key is a
+                # late duplicate / straggler of that answered gate (reordered/duplicated hook delivery),
+                # NOT a fresh gate — suppress the re-publish so no PHANTOM respondable decision is minted
+                # (which the orchestrator would answer, leaking a stray keystroke into the resumed turn).
+                # A genuinely new gate has a DIFFERENT id, so it is NOT in this set and publishes below —
+                # no dependence on hook ordering or on a PostToolUse ever arriving (nelix-f7y wave 2).
+                # The agent already resumed on the answer, so the true state is busy, not awaiting_user.
                 self._turn_open = True
                 self._state.control_state = "busy"
                 self._state.phase = "busy"
@@ -283,9 +288,6 @@ class BeliefEngine:
         # open turn. After a Stop with no new UserPromptSubmit it is a late straggler -> ignored (the
         # session must stay idle, not be dragged back to busy by trailing tool events).
         if self._turn_open:
-            # nelix-f7y: the agent resumed tool work after the answer -> lift the answered-pause
-            # tombstone, so a subsequent same-kind gate is (correctly) read as a FRESH answerable pause.
-            self._hook_answered_key = None
             self._state.control_state = "busy"
             self._state.phase = "busy"
         return actions
@@ -336,18 +338,14 @@ class BeliefEngine:
         now = self._clock.now()
         self._published_key = None
         self._published_kind = None
-        # nelix-f7y: the answer resolves the hook pause, so free the pending-pause slot — a genuinely
-        # FRESH subsequent same-kind gate in the SAME epoch (a permission gate has no
-        # PostToolUse[AskUserQuestion] to clear the slot) must NOT be swallowed by on_hook's "same key
-        # already published" guard. But clearing it OUTRIGHT would reopen the nelix-32f duplicate-hook
-        # hole shifted to after the answer: a late duplicate / straggler of THIS answered pause
-        # (hook delivery is reorderable) would then be read as a fresh pause and publish a PHANTOM
-        # respondable decision. So TOMBSTONE the answered key instead: on_hook suppresses a re-publish
-        # for that same key until tool progress (a working / clears_pending hook) or an epoch boundary
-        # lifts the tombstone — the discriminator between "the answered pause's own straggler" (no tool
-        # progress since the answer) and "a fresh gate" (preceded by the agent resuming tool work).
+        # nelix-f7y: the answer resolves the pending hook pause. Free the pending slot AND tombstone the
+        # answered gate's key: a late duplicate / straggler of THIS gate (reorderable hook delivery)
+        # then reuses the same per-gate key and is suppressed in on_hook (no PHANTOM respondable
+        # decision), while a genuinely FRESH subsequent gate has a DIFFERENT key and publishes normally.
+        # Because the key is the per-gate tool_use_id (not the epoch), the tombstone can never suppress
+        # a real new gate — so there is no hook-ordering / PostToolUse dependence and no terminal hang.
         if self._hook_pending_key is not None:
-            self._hook_answered_key = self._hook_pending_key
+            self._hook_answered_ids.add(self._hook_pending_key)
         self._hook_pending_key = None
         self._hook_pending_kind = None
         self._candidate_fp = None

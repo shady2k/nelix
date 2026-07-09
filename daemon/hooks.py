@@ -21,6 +21,7 @@ class HookEvent:
     tool_input: dict = field(default_factory=dict)
     is_interrupt: bool = False
     notification: Optional[str] = None   # matcher/message for Notification events
+    tool_use_id: Optional[str] = None    # per-tool-call id: SAME across one invocation's hooks (nelix-f7y)
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class HookObservation:
     interrupted: bool = False
     prompt_kind: Optional[str] = None   # "permission_choice"|"modal_choice"|"free_text"|None
     raw_event: str = ""
+    tool_use_id: Optional[str] = None   # stable per-gate id for a waiting_for_user pause (nelix-f7y)
 
 
 def normalize_claude_hook(ev: HookEvent) -> HookObservation:
@@ -51,18 +53,20 @@ def normalize_claude_hook(ev: HookEvent) -> HookObservation:
         return HookObservation(kind="working", closes_turn=False, opens_turn=True,
                                clears_pending=False, raw_event=event)
 
-    # A tool wants permission -> the agent is blocked on the user.
+    # A tool wants permission -> the agent is blocked on the user. Carry the tool_use_id: the belief
+    # engine keys the pause by it (per-gate), so a straggler of THIS gate dedups (same id) while a
+    # genuinely new gate is distinct (different id) — no epoch-level ambiguity (nelix-f7y).
     if event == "PermissionRequest":
         return HookObservation(kind="waiting_for_user", closes_turn=False, opens_turn=False,
                                clears_pending=False, prompt_kind="permission_choice",
-                               raw_event=event)
+                               raw_event=event, tool_use_id=ev.tool_use_id)
 
     # AskUserQuestion: PreToolUse raises the modal (waiting); PostToolUse resolves it (back to work).
     if ev.tool_name == "AskUserQuestion":
         if event == "PreToolUse":
             return HookObservation(kind="waiting_for_user", closes_turn=False, opens_turn=False,
                                    clears_pending=False, prompt_kind="modal_choice",
-                                   raw_event=event)
+                                   raw_event=event, tool_use_id=ev.tool_use_id)
         if event == "PostToolUse":
             return HookObservation(kind="working", closes_turn=False, opens_turn=False,
                                    clears_pending=True, raw_event=event)
