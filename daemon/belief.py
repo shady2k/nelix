@@ -120,14 +120,28 @@ class BeliefEngine:
         # A repeated IDENTICAL gate (an allow-once approval then re-running the same command) shares its
         # predecessor's fingerprint, so its tombstone is LIFTED by the fresh working PreToolUse that
         # precedes its PermissionRequest (a new-invocation signal — see the working-hook branch).
-        # RESIDUALS: (1) a waiting_for_user hook with NO tool_input — only the legacy permission
-        # Notification path; PermissionRequest / PreToolUse[AskUserQuestion] both carry it — falls back
-        # to the epoch key, which cannot distinguish a second same-kind gate from a straggler in one
-        # epoch. (2) a repeated identical gate whose PermissionRequest arrives BEFORE any new-invocation
-        # PreToolUse signal for that gate — a Bash gate whose second PermissionRequest is reordered ahead
-        # of its own PreToolUse, or a repeated identical AskUserQuestion (whose PreToolUse IS the pause,
-        # not a working signal) — is genuinely indistinguishable from a straggler of the answered gate
-        # and is suppressed. Truly minimal without a per-gate id, which Claude's PermissionRequest lacks.
+        #
+        # IRREDUCIBLE RESIDUALS. The PermissionRequest we answer carries NO tool_use_id (only PreToolUse
+        # does), so an answered gate cannot be tied to any id — only to its content fingerprint. A later
+        # PreToolUse[fp=X] is byte-identical whether it is (a) a genuine repeated invocation (which MUST
+        # lift the tombstone so the retry is answerable) or (b) a late straggler of the already-answered
+        # gate (which MUST NOT lift). No hook distinguishes them without a per-gate id Claude does not
+        # provide, so any keying choice leaks in one direction:
+        #   (1) id-less waiting_for_user: only the legacy permission Notification path (PermissionRequest
+        #       / PreToolUse[AskUserQuestion] both carry tool_input) falls back to the epoch key, which
+        #       cannot tell a second same-kind gate from a straggler in one epoch.
+        #   (2) repeated identical AskUserQuestion: its PreToolUse IS the pause (a waiting_for_user hook,
+        #       not a "working" one), so there is no working-branch lift — the second modal's fingerprint
+        #       is still tombstoned and it is SUPPRESSED (collapses onto the first).
+        #   (3) double-reorder phantom: an answered gate's OWN PreToolUse[fp=X] delivered LATE (a pure
+        #       reorder where its PermissionRequest arrived first and was answered) lifts hook_gate:X via
+        #       the working branch; a subsequent late/duplicate straggler PermissionRequest[fp=X] then no
+        #       longer hits this set and RE-PUBLISHES a phantom respondable decision (the stray-keystroke
+        #       class). Needs BOTH a late same-gate PreToolUse AND a straggler PermissionRequest for the
+        #       SAME answered fingerprint — a double-reorder.
+        # Wave 4 chose to LIFT (fix (3)-vs-hang in favour of answering the repeat), trading the COMMON
+        # terminal hang (allow-once + retry of an identical command) for the NARROWER, less-severe
+        # phantom (3) — a deliberate tradeoff, not an oversight. Cleared at each epoch boundary.
         self._hook_answered_ids = set()
         self._idle_published_epoch = None  # epoch whose Stop already published idle (idempotency)
         # precedence & lost-hook reconciliation (Task 7): process-exit > hook > bounded screen.

@@ -1180,6 +1180,61 @@ def test_repeated_identical_gate_in_normal_order_is_answerable(tmp_path):
         "the repeated identical gate must be answerable end-to-end")
 
 
+def test_double_reorder_phantom_is_the_accepted_irreducible_residual(tmp_path):
+    """PINS the double-reorder residual (nelix-f7y close-out) so the ACCEPTED behavior is known and any
+        future change is caught. This asserts what CURRENTLY happens, and it is NOT the desired outcome —
+        it is the irreducible limit: Claude's PermissionRequest carries NO tool_use_id, so the engine
+        cannot tell an answered gate's OWN late PreToolUse from a repeated invocation's fresh PreToolUse
+        (both are byte-identical fp=X). Wave 4 chose to LIFT on a PreToolUse[fp=X] — fixing the COMMON
+        terminal hang (allow-once + retry of an identical command) — which for the rarer DOUBLE-REORDER
+        below leaks a phantom instead.
+
+        Sequence (real hook path, real bash_gate.jsonl tool_input for every hook):
+          gate 1: PermissionRequest[Bash cmdA] with NO preceding PreToolUse (pure reorder) -> answered;
+          a LATE PreToolUse[Bash cmdA] (the answered gate's own, reordered after the answer) -> lifts
+          the hook_gate:fp(cmdA) tombstone via the working branch;
+          a straggler PermissionRequest[Bash cmdA] of that SAME answered gate -> no longer in the
+          answered set -> re-publishes a phantom respondable decision (the stray-keystroke class).
+
+        Fixing this WITHOUT reintroducing the terminal hang is impossible without a per-gate id Claude
+        does not provide, so it is documented + accepted. If this test's assertions ever change,
+        re-evaluate the tradeoff in daemon/belief.py's _hook_answered_ids residual comment."""
+    sess, ev, fire = _f7y_session(tmp_path)
+
+    # gate 1: PermissionRequest FIRST (pure reorder, no preceding PreToolUse), then answered.
+    fire("UserPromptSubmit")
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI)
+    dec1 = sess.snapshot().get("decision")
+    assert dec1 is not None and dec1["prompt_kind"] == "permission_choice", "gate 1 must publish a pause"
+    did1 = dec1["decision_id"]
+    assert sess.respond("1", decision_id=did1).status == "resumed", "gate 1 is answered"
+    assert sess.snapshot().get("decision") is None
+
+    # the answered gate's OWN PreToolUse, delivered LATE (reorder) -> lifts the tombstone (working branch).
+    fire("PreToolUse", tool_name="Bash", tool_input=_BASH_TI)
+
+    # a straggler PermissionRequest of the SAME answered gate. ACCEPTED (not desired): the tombstone was
+    # lifted, so this re-publishes a phantom respondable decision instead of being suppressed.
+    writes_before = len(sess._handle.writes)
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI)
+
+    phantom = sess.snapshot().get("decision")
+    assert phantom is not None, (
+        "ACCEPTED RESIDUAL: the double-reorder re-publishes a phantom (the late PreToolUse lifted the "
+        "tombstone). This is the irreducible limit, not the goal — see the belief.py residual comment")
+    assert phantom["prompt_kind"] == "permission_choice"
+    assert phantom["decision_id"] != did1, "the phantom is a fresh decision, not the answered gate 1"
+    assert ev.pending("s1") is not None, "the phantom sits in the respondable queue"
+    # and the phantom is ANSWERABLE — respond() does NOT reject it, so it would type a stray keystroke
+    # into the resumed turn (the stray-keystroke class this residual accepts). Noted explicitly.
+    out = sess.respond("1", decision_id=phantom["decision_id"])
+    assert out.status == "resumed", (
+        f"the phantom is answerable (respond does not reject it): the accepted stray-keystroke leak "
+        f"(got {out.status})")
+    assert sess._handle.writes[writes_before:] == ["1\r"], (
+        "answering the phantom types a stray keystroke into the resumed turn — the accepted residual")
+
+
 def test_askuserquestion_collision_dedups_by_fingerprint(tmp_path):
     """nelix-32f collision dedup under per-gate keying, on the REAL captured shape: ONE physical
         AskUserQuestion modal emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice) AND
