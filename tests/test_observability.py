@@ -15,7 +15,7 @@ from daemon.clock import FakeClock
 from daemon.observation import Observation, ObservationCtx, Heartbeat
 from daemon.config import BeliefConfig
 
-from test_session import (_session, SubmitLandsHandle, StrandedAnswerHandle,
+from test_session import (_session, _drive_confirm, SubmitLandsHandle, StrandedAnswerHandle,
                           WedgedWriteHandle)
 from test_belief_engine import busy, idle, CTX
 
@@ -40,7 +40,7 @@ def _by_event(buf):
 # Gap 1: respond lifecycle (mirror START's delivery_attempt -> delivery_confirmed | delivery_failed)
 # ---------------------------------------------------------------------------
 
-def test_respond_success_logs_attempt_submitted_confirmed(tmp_path):
+def test_respond_success_logs_attempt_submitted_confirmed(monkeypatch, tmp_path):
     buf, log = _log_buf()
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
@@ -49,6 +49,7 @@ def test_respond_success_logs_attempt_submitted_confirmed(tmp_path):
     did = sess._decision["decision_id"]
     sess._stop.clear()                                # a real respond runs while the monitor is live
     sess._handle = SubmitLandsHandle("do the next thing")
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     by = _by_event(buf)
@@ -63,7 +64,7 @@ def test_respond_success_logs_attempt_submitted_confirmed(tmp_path):
     assert "respond_failed" not in by
 
 
-def test_respond_attempt_logs_redacted_answer(tmp_path):
+def test_respond_attempt_logs_redacted_answer(monkeypatch, tmp_path):
     # nelix-eea: respond_attempt logged only answer_chars (a count) -> the literal answer (Enter vs
     # `1` vs an option-id) was unrecoverable from the log (the "where did the 1 come from" incident,
     # s-9c0b6eeb). Log the answer itself, run through the obs free-text redactor (answer is in
@@ -76,6 +77,7 @@ def test_respond_attempt_logs_redacted_answer(tmp_path):
     sess._stop.clear()                                # a real respond runs while the monitor is live
     answer = "deploy sk-livesecret1234567890abcd now"    # a secret token embedded in shaped free text
     sess._handle = SubmitLandsHandle(answer)
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond(answer, decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     rec = _by_event(buf)["respond_attempt"]
@@ -86,7 +88,7 @@ def test_respond_attempt_logs_redacted_answer(tmp_path):
     assert rec["answer_chars"] == len(answer)                # the count is unchanged (both coexist)
 
 
-def test_respond_submit_unconfirmed_logs_respond_failed(tmp_path):
+def test_respond_submit_unconfirmed_logs_respond_failed(monkeypatch, tmp_path):
     # Free-text Enter dropped: the answer is stranded in the box -> respond_failed(submit_unconfirmed).
     buf, log = _log_buf()
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
@@ -95,6 +97,7 @@ def test_respond_submit_unconfirmed_logs_respond_failed(tmp_path):
     sess._loop()
     sess._stop.clear()
     sess._handle = StrandedAnswerHandle("do the next thing")
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"
     by = _by_event(buf)
@@ -235,7 +238,6 @@ def test_decision_superseded_logged(tmp_path):
 
 
 def test_decision_answered_logged(monkeypatch, tmp_path):
-    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     buf, log = _log_buf()
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
@@ -244,6 +246,7 @@ def test_decision_answered_logged(monkeypatch, tmp_path):
     sess._stop.clear()                                # a real respond runs while the monitor is live
     did = sess._decision["decision_id"]
     sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("1", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     by = _by_event(buf)

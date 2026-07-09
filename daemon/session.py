@@ -143,6 +143,12 @@ class Session:
         # concurrently -> renderer access is NOT thread-safe. respond() hydrates a hook-derived modal
         # decision (options=[]) from THIS cache (read under self._lock), never from the live renderer.
         self._last_modal_options = None
+        # nelix-s7v: MONITOR-OWNED cache of the latest RENDERED frame (same thread-safety rationale as
+        # _last_modal_options). The free-text respond() submit-confirm runs on the RPC thread and must
+        # NOT call _handle.render() — pump() mutates that renderer unlocked — so _confirm_submit reads
+        # this cache (written under self._lock on each monitor tick) instead. Empty until the monitor's
+        # first render; the confirm only runs post-delivery, when the monitor loop is already ticking.
+        self._last_render = ""
         # _task_delivery synchronization (I1): the ONLY genuinely cross-thread transition is the
         # monitor's pending->"delivered" write, which the RPC-thread respond() reads to gate a
         # pre-delivery blocked answer — that write and that read are both made under self._lock, so
@@ -577,6 +583,7 @@ class Session:
         self._handle.pump(0.1)
         with self._lock:
             frame = self._handle.render()
+            self._last_render = frame   # nelix-s7v: monitor-owned; RPC-thread _confirm_submit reads this
         ctx = self._obs_ctx()
         obs = self._driver.observe(frame, ctx)
         self._cache_last_modal_options(obs)   # nelix-5r3: monitor-owned; RPC-thread respond() hydrates from this
@@ -1413,17 +1420,21 @@ class Session:
             snap.update(self._progress_view_locked())
             return snap
 
-    # respond's submit-confirm poll interval (read-only render reads; the monitor owns pump()).
+    # respond's submit-confirm poll interval (read-only cache reads; the monitor owns pump()/render()).
     _CONFIRM_POLL = 0.1
 
     def _confirm_submit(self, deadline):
-        # Confirm a free-text submit LANDED, read-only (the monitor thread owns pump(), so draining
-        # here would race it — we only render() under the lock, exactly as snapshot() does). The
+        # Confirm a free-text submit LANDED, read-only. This runs on the RPC thread, so it MUST NOT
+        # call _handle.render(): PtySession.pump() mutates that renderer via _feed() OUTSIDE self._lock,
+        # so an RPC-thread render() would race the monitor's unlocked mutation (nelix-s7v; the same
+        # thread-safety hazard nelix-5r3 closed for the modal-options path). Instead it reads the
+        # MONITOR-OWNED _last_render cache (written under self._lock on every monitor tick) and observes
+        # THAT frame — observe() is pure (no renderer access), so it stays safe on this thread. The
         # submit is confirmed ONLY on POSITIVE post-write evidence: the answer echoed then LEFT the
         # input box, or the turn MOVED to a high-confidence state. Absence of evidence is never a
         # confirm — a bare "no echo" is UNCONFIRMED whether it's a still-empty box or a stranded echo.
         #
-        # Why "no echo" alone can't confirm: the first render right after _press_enter() can still be
+        # Why "no echo" alone can't confirm: the first cached frame after _press_enter() can still be
         # the stale pre-write frame (the monitor may not have rendered our keystrokes yet), and an
         # empty box that NEVER echoed is indistinguishable from a write that went nowhere (the agent
         # wasn't at the prompt) — accepting either would falsely confirm the very dropped-submit race
@@ -1436,7 +1447,7 @@ class Session:
         saw_echo = False
         while True:
             with self._lock:
-                frame = self._handle.render() if self._handle is not None else ""
+                frame = self._last_render
             obs = self._driver.observe(frame, self._obs_ctx())
             moved = ((obs.prompt_kind == "none" and obs.heartbeat.present)
                      or obs.prompt_kind in ("modal_choice", "permission_choice", "crash", "exit"))

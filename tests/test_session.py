@@ -178,6 +178,22 @@ def _session(tmp_path, frames=(), handle=None, spec=None, step=1.0, logger=_REAL
     return sess, ev
 
 
+def _drive_confirm(sess, monkeypatch, handle):
+    """nelix-s7v: the free-text respond() submit-confirm reads the MONITOR-OWNED _last_render cache
+    and NEVER calls _handle.render() on the RPC thread (PtySession.pump() mutates that renderer
+    unlocked, so a render() there would race the monitor). This helper models the monitor tick that
+    owns render(): seed the cache from the scripted handle's first frame, then hook the confirm's
+    inter-poll wait (daemon.session.time.sleep) to pull the handle's NEXT frame into the cache. The
+    confirm then observes the SAME frame progression the handle scripts — routed through the cache,
+    single-threaded and deterministic — instead of rendering it on the RPC thread."""
+    sess._last_render = handle.render()
+    real_sleep = time.sleep
+    def advance(*_a):
+        sess._last_render = handle.render()
+        real_sleep(0.02)          # keep the poll cadence real (honest deadline, not a hot spin)
+    monkeypatch.setattr("daemon.session.time.sleep", advance)
+
+
 def test_sessions_dir_resolves_under_hermes_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), EventQueue())
@@ -349,7 +365,6 @@ def test_frozen_screen_escalates_nonrespondable_intervention_no_bytes(tmp_path):
 
 
 def test_respond_answers_and_appends_user_input(monkeypatch, tmp_path):
-    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
@@ -359,6 +374,7 @@ def test_respond_answers_and_appends_user_input(monkeypatch, tmp_path):
     assert did.startswith("dec-")
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("1", decision_id=did)                                # binds to the named pending decision
     assert out.status == "resumed" and out.seq == pend.seq and out.decision_id == did
     assert ev.pending("s1") is None                       # answered
@@ -407,13 +423,13 @@ def test_respond_to_modal_rejects_unknown_option_keeps_pending(tmp_path):
 
 
 def test_respond_to_free_text_uses_submit_text_not_select(monkeypatch, tmp_path):
-    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
     sess._stop.clear()                                # a real respond runs while the monitor is live
     assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
     sess._handle = SubmitLandsHandle("do the next thing")   # submit lands: echoes then leaves the box
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     # free-text: the text is typed then Enter pressed separately (two writes), not a select_option.
@@ -448,12 +464,12 @@ def test_respond_with_no_pending_decision_is_rejected(tmp_path):
 def test_respond_claims_decision_atomically_no_double_type(monkeypatch, tmp_path):
     # respond claims the decision before typing, so a second respond finds nothing pending and does
     # NOT type again (PTY input is non-idempotent — a duplicate would inject a stray line).
-    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, _ = _session(tmp_path, ["working esc to interrupt", box, box, box])
     sess._loop()
     sess._stop.clear()                                # a real respond runs while the monitor is live
     sess._handle = SubmitLandsHandle("1")             # submit lands: answer echoes then leaves the box
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     assert sess.respond("1", decision_id=sess._decision["decision_id"]).status == "resumed"
     writes_after_first = list(sess._handle.writes)
     assert sess.respond("2").status == "no_pending"       # already claimed
@@ -567,7 +583,7 @@ class SubmitLandsHandle:
         pass
 
 
-def test_respond_free_text_reports_respond_failed_when_submit_unconfirmed(tmp_path):
+def test_respond_free_text_reports_respond_failed_when_submit_unconfirmed(monkeypatch, tmp_path):
     # nelix-sud: respond typed the answer + Enter, but the Enter never landed — the answer is
     # stranded in the box. respond() must NOT claim a false 'resumed'; it confirms the answer LEFT
     # the box within respond_confirm_seconds and, failing that, returns 'respond_failed' so the
@@ -579,6 +595,7 @@ def test_respond_free_text_reports_respond_failed_when_submit_unconfirmed(tmp_pa
     assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = StrandedAnswerHandle("do the next thing")   # Enter dropped: answer stuck in box
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"
     assert out.snapshot is not None                  # carries the snapshot for the recovery path
@@ -672,7 +689,7 @@ class AmbiguousThenStrandedHandle:
         pass
 
 
-def test_respond_does_not_confirm_on_ambiguous_unknown_frame(tmp_path):
+def test_respond_does_not_confirm_on_ambiguous_unknown_frame(monkeypatch, tmp_path):
     # Regression: an ambiguous 'unknown' redraw frame is not a turn-start signal — confirm must keep
     # polling, see the stranded echo, and fail. (A broad 'prompt_kind != free_text' check would have
     # falsely confirmed here.)
@@ -681,11 +698,12 @@ def test_respond_does_not_confirm_on_ambiguous_unknown_frame(tmp_path):
     sess._loop()
     sess._stop.clear()
     sess._handle = AmbiguousThenStrandedHandle("do the next thing")
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"
 
 
-def test_respond_does_not_falsely_confirm_on_stale_pre_write_frame(tmp_path):
+def test_respond_does_not_falsely_confirm_on_stale_pre_write_frame(monkeypatch, tmp_path):
     # Regression for the confirm race: a stale empty frame on the first poll must not be read as
     # 'answer left the box'. Once the dropped-Enter echo renders and stays, respond reports failure.
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
@@ -693,6 +711,7 @@ def test_respond_does_not_falsely_confirm_on_stale_pre_write_frame(tmp_path):
     sess._loop()
     sess._stop.clear()
     sess._handle = StalePreWriteThenStrandedHandle("do the next thing")
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"            # not a false 'resumed' off the stale first frame
 
@@ -736,7 +755,7 @@ class NeverEchoesEmptyBoxHandle:
         pass
 
 
-def test_respond_free_text_reports_respond_failed_when_answer_never_echoes(tmp_path):
+def test_respond_free_text_reports_respond_failed_when_answer_never_echoes(monkeypatch, tmp_path):
     # Codex integration must-fix: the answer never lands in the box (empty frame the WHOLE confirm
     # window) and the turn never moves -> no positive post-write evidence is ever seen. The deadline
     # branch must NOT read bare 'no echo' as success; without positive evidence the submit is
@@ -750,6 +769,7 @@ def test_respond_free_text_reports_respond_failed_when_answer_never_echoes(tmp_p
     armed_before = sess._engine._post_submit_active
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = NeverEchoesEmptyBoxHandle()       # answer never echoes; turn never moves
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "respond_failed"            # NOT a false 'resumed' off the empty box
     assert out.snapshot is not None                  # carries the snapshot for the recovery path
@@ -760,7 +780,7 @@ def test_respond_free_text_reports_respond_failed_when_answer_never_echoes(tmp_p
     assert sess._engine._post_submit_active == armed_before
 
 
-def test_respond_free_text_resumes_when_answer_leaves_box(tmp_path):
+def test_respond_free_text_resumes_when_answer_leaves_box(monkeypatch, tmp_path):
     # The happy path: the submit lands, the answer leaves the box -> confirmed -> 'resumed'.
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
@@ -768,10 +788,46 @@ def test_respond_free_text_resumes_when_answer_leaves_box(tmp_path):
     sess._stop.clear()                               # a real respond runs while the monitor is live
     offset_before = sess._dialog.last_user_input_offset()
     sess._handle = SubmitLandsHandle("do the next thing")
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("do the next thing", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     assert ev.pending("s1") is None
     assert sess._dialog.last_user_input_offset() > offset_before   # confirmed -> marker appended
+
+
+def test_free_text_confirm_reads_cache_without_calling_the_live_renderer(tmp_path):
+    """nelix-s7v thread-safety AC (mirrors nelix-5r3's modal-path spy): PtySession.pump() mutates the
+        renderer via _feed() OUTSIDE Session._lock, so the free-text respond() submit-confirm — which
+        runs on the RPC thread — MUST NOT call _handle.render() against that live renderer (a read
+        concurrent with pump's unlocked mutation). _confirm_submit reads the MONITOR-OWNED _last_render
+        cache instead. Spy the handle's render() and assert respond() invokes it ZERO times while
+        confirming a free-text answer. RED (pre-fix): _confirm_submit called self._handle.render() ->
+        the spy records >=1 call; GREEN: 0 calls (the confirm reads the cache under self._lock)."""
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
+    dec = sess.snapshot()["decision"]
+    assert dec["prompt_kind"] == "free_text", "the box must surface as a free_text pause"
+    did = dec["decision_id"]
+    # The monitor's last tick cached a 'moved' (working) frame, so the confirm resolves from the cache
+    # alone. Spy render() so the test FAILS if the confirm reaches for the live renderer on this thread.
+    sess._last_render = "✶ Working… (esc to interrupt)"
+    calls = {"n": 0}
+    _real_render = sess._handle.render
+
+    def spying_render():
+        calls["n"] += 1
+        return _real_render()
+    sess._handle.render = spying_render
+    try:
+        out = sess.respond("do the next thing", decision_id=did)
+    finally:
+        sess._handle.render = _real_render            # restore regardless of outcome
+    assert calls["n"] == 0, (
+        f"the free-text confirm must read the cache without rendering (made {calls['n']} render call(s))")
+    assert out.status == "resumed", (
+        f"the confirm must resolve from the cached moved frame (got {out.status})")
 
 
 def test_answering_reemitted_blocked_clears_pending(tmp_path):
@@ -805,6 +861,7 @@ def test_respond_with_stale_decision_id_is_rejected_and_returns_current(monkeypa
     assert out.pending["text"]                            # frozen question text in the stale body too
     assert ev.pending("s1") is not None                   # NOT answered
     assert not sess._handle.writes                        # nothing typed
+    _drive_confirm(sess, monkeypatch, sess._handle)       # nelix-s7v: confirm reads the monitor cache
     assert sess.respond("1", decision_id=cur).status == "resumed"   # correct id works
 
 
@@ -919,7 +976,7 @@ def _seed_pending_decision(sess, decision_id="dec-t"):
                       "decision_id": decision_id, "event_id": "e1", "seq": 1}
 
 
-def test_respond_resumes_to_busy_without_echoed_decision(tmp_path):
+def test_respond_resumes_to_busy_without_echoed_decision(monkeypatch, tmp_path):
     # "without echoed decision" = the answer LEAVES the box (the turn moves to working), so the
     # submit-confirm observes POSITIVE post-write evidence (echo-then-gone / moved) and resumes to
     # busy. The corrected contract: a bare empty box that NEVER echoed is NOT a confirmed submit
@@ -927,6 +984,7 @@ def test_respond_resumes_to_busy_without_echoed_decision(tmp_path):
     sess, _ = _session(tmp_path, ["Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"])
     _seed_pending_decision(sess)
     sess._handle = SubmitLandsHandle("do that")       # submit lands: answer echoes then leaves the box
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     out = sess.respond("do that", decision_id=sess._decision["decision_id"])
     assert out.status == "resumed"
     assert out.answered_decision_id == "dec-t"
@@ -1264,7 +1322,6 @@ def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeyp
     # The race Codex flagged: a re-emit is BUILT while the decision is pending, but its install hook
     # runs AFTER a concurrent respond() claimed/answered it. The hook must NOT resurrect the answered
     # decision, and must mark the now-obsolete re-emit event answered (so pending() stays clean).
-    monkeypatch.setattr("daemon.session.time.sleep", lambda *_: None)
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     # logger=None ON PURPOSE: this test stubs ev.publish to RETURN None (the `defer` below) to capture
     # a re-emit without publishing it — a degenerate stub the real EventQueue.publish never does (it
@@ -1286,6 +1343,7 @@ def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeyp
     monkeypatch.setattr(ev, "publish", defer)
     sess._publish("waiting_for_user", hint=None, hung=True, requires_response=True, decision_key=key)
     monkeypatch.setattr(ev, "publish", real_publish)
+    _drive_confirm(sess, monkeypatch, sess._handle)   # nelix-s7v: confirm reads the monitor cache
     assert sess.respond("1", decision_id=sess._decision["decision_id"]).status == "resumed"   # claim+answer BEFORE the re-emit is published
     assert sess._decision is None
     real_publish(*deferred["a"], **deferred["k"])   # now run the deferred re-emit + its install hook
