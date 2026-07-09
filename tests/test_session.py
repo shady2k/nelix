@@ -632,16 +632,17 @@ def test_respond_free_text_reports_respond_failed_when_answer_never_echoes(tmp_p
     sess._loop()
     sess._stop.clear()                               # a real respond runs while the monitor is live
     assert sess.snapshot()["decision"]["prompt_kind"] == "free_text"
-    armed_before = sess._engine._post_submit_active
     offset_before = sess._dialog.last_user_input_offset()
     out = respond_via_submit_monitor(sess, "do the next thing", sess._decision["decision_id"], [_BOX])
     assert out.status == "respond_failed"            # NOT a false 'resumed' off the empty box
     assert out.snapshot is not None                  # carries the snapshot for the recovery path
     assert sess._decision is None                    # claimed, not left half-pending
-    # an unconfirmed submit must NOT advance the transcript and must NOT arm post-submit suppression
-    # (no on_submit) — otherwise the never-delivered answer would suppress the next idle wake.
+    # an unconfirmed submit must NOT advance the transcript (no user marker off a never-landed answer)
     assert sess._dialog.last_user_input_offset() == offset_before
-    assert sess._engine._post_submit_active == armed_before
+    # ...but the answer WAS written, so the engine recorded the submit at WRITE time (Approach B +
+    # Finding 2): post-submit echo-suppression is armed when the monitor types, not at confirm-time.
+    # (The grace is bounded, so a never-landed answer only DELAYS the next idle wake, never loses it.)
+    assert sess._engine._post_submit_active is True
 
 
 def test_respond_free_text_resumes_when_answer_leaves_box(tmp_path):
@@ -739,6 +740,75 @@ def test_free_text_submit_does_not_confirm_off_an_unrelated_pre_submit_moved_tra
     assert out.status != "resumed", (
         f"must NOT confirm off a pre-submit moved frame the monitor never wrote after (got {out.status})")
     assert sess._dialog.last_user_input_offset() == offset_before   # nothing landed -> no marker
+
+
+def test_write_timeout_frees_the_submit_slot_without_a_second_resolve(tmp_path):
+    """nelix-s7v Approach B FINDING 1: on a write timeout the monitor must CLEAR _pending_submit (like
+        the abort / confirm / unconfirmed paths). Otherwise the NEXT tick re-drains the same 'queued'
+        slot with _decision now None, ABORTS it (a SECOND resolve), and overwrites the outcome
+        write_timeout -> stale, so the caller can observe the wrong outcome and the slot lingers. Drive
+        the drain directly (deterministic, no thread race): a wedged write -> write_timeout AND the slot
+        is freed, so a following drain is a no-op. RED on 06f6e09 (slot not cleared)."""
+    sess, ev = _session(tmp_path, ["working esc to interrupt", _BOX, _BOX, _BOX])
+    sess._loop()
+    sess._stop.clear()
+    did = sess.snapshot()["decision"]["decision_id"]
+    sess._handle = WedgedWriteHandle()                # every write raises PtyWriteTimeout
+    with sess._lock:                                  # enqueue exactly as _respond_free_text does
+        sess._pending_submit = {"decision_id": did, "clean": "1", "event": threading.Event(),
+                                "outcome": None, "seq": None, "state": "queued", "saw_echo": False,
+                                "write_deadline": time.monotonic() + sess._spec.respond_write_seconds,
+                                "confirm_deadline": None}
+    ps = sess._pending_submit
+    sess._drain_pending_submit(sess._driver.observe(_BOX, sess._obs_ctx()))  # queued -> write -> timeout
+    assert ps["outcome"] == "write_timeout"
+    assert sess._pending_submit is None               # FINDING 1: slot freed (RED on 06f6e09: still set)
+    # a following tick must be a no-op — it must NOT re-resolve the decision or overwrite the outcome
+    sess._drain_pending_submit(sess._driver.observe(_BOX, sess._obs_ctx()))
+    assert ps["outcome"] == "write_timeout"           # unchanged (RED on 06f6e09: overwritten to 'stale')
+
+
+def test_free_text_submit_written_then_modal_frame_does_not_orphan_the_modal(tmp_path):
+    """nelix-s7v Approach B FINDING 2 (ordering): _loop_once runs engine.tick() BEFORE
+        _drain_pending_submit. After a successful write, the NEXT frame can be a modal — engine.tick()
+        publishes it IMMEDIATELY (high-confidence), THEN the drain confirms the free-text submit. If
+        on_submit runs at confirm-time it CLEARS the engine's just-published modal key, so when the
+        modal later disappears the engine cannot withdraw it -> a STALE pending decision sticks. The
+        fix records the submit (on_submit) at WRITE time, before that next tick's engine.tick(). Driven
+        through the REAL _loop_once. RED on 06f6e09 (stale modal decision sticks); GREEN after."""
+    sess, ev = _session(tmp_path, ["working esc to interrupt", _BOX, _BOX, _BOX])
+    sess._loop()
+    sess._stop.clear()
+    did = sess.snapshot()["decision"]["decision_id"]
+    # box (write) -> a modal on the NEXT tick (engine publishes it + drain confirms) -> modal disappears
+    sess._handle = FakeHandle([_BOX, _MODAL, _WORKING, _WORKING, _WORKING, _WORKING])
+    box = {}
+
+    def rpc():
+        try:
+            box["out"] = sess.respond("do the next thing", decision_id=did)
+        except BaseException as exc:        # pragma: no cover
+            box["err"] = exc
+    t = threading.Thread(target=rpc, daemon=True)
+    t.start()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:      # wait for the submit to enqueue
+        with sess._lock:
+            if sess._pending_submit is not None:
+                break
+        time.sleep(0)
+    for _ in range(6):                      # tick1 box->write, tick2 modal->publish+confirm, tick3+ gone
+        sess._loop_once()
+        time.sleep(0.002)
+    t.join(timeout=3.0)
+    if "err" in box:
+        raise box["err"]
+    assert box["out"].status == "resumed"                    # confirmed off the modal (the turn moved)
+    # the modal the engine published AFTER the write must still be withdrawable once it disappears —
+    # on_submit must NOT have clobbered its published key at confirm-time.
+    assert sess.snapshot().get("decision") is None, (
+        "a modal published after the write was orphaned (on_submit ran at confirm-time and cleared its key)")
+    assert ev.pending("s1") is None
 
 
 def test_answering_reemitted_blocked_clears_pending(tmp_path):

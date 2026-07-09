@@ -1746,6 +1746,8 @@ class Session:
                                 timeout=max(0.0, ps["write_deadline"] - time.monotonic()))
                 self._press_enter(timeout=max(0.0, ps["write_deadline"] - time.monotonic()))
             except PtyWriteTimeout:
+                with self._lock:
+                    self._pending_submit = None   # FINDING 1: free the slot (like abort/confirm/unconfirmed)
                 self._events.resolve_decision(did, "superseded")
                 if self._log is not None:
                     self._log.warning("session", "respond_failed", session_id=self._id,
@@ -1756,6 +1758,17 @@ class Session:
             seq = self._events.resolve_decision(did, "answered")
             with self._lock:
                 self._last_submitted = clean
+                # FINDING 2: RECORD the submit in the engine NOW — this same tick, before the NEXT tick's
+                # engine.tick() feeds a new frame. on_submit forgets the answered decision + arms
+                # post-submit echo-suppression; deferring it to confirm-time let a modal the engine
+                # published (immediately, high-confidence) on the next tick get its _published_key
+                # cleared here, orphaning a stale pending decision. The confirmation below gates ONLY the
+                # transcript marker + the caller's resumed/respond_failed outcome — never the engine's
+                # knowledge of the submit. state=busy is Invariant A (resumed -> working again).
+                self._engine.on_submit(clean)
+                notes = self._engine.drain_notes()
+                self._state = "busy"
+            self._log_notes(notes)
             # Confirm continues on LATER ticks — frames the monitor pumps AFTER this write. Mutating ps
             # here is monitor-thread-local: the RPC waiter reads ps only after its event fires (below).
             ps["seq"] = seq
@@ -1769,14 +1782,11 @@ class Session:
                                 decision_id=did, writer="monitor")
             return
         if confirm:
-            # POSITIVE post-write evidence: the answer landed. Append the user marker, arm post-submit
-            # suppression, and resume to busy (Invariant A) — same tail as the old RPC confirm path.
+            # POSITIVE post-write evidence: the answer LANDED -> append the transcript marker. The engine
+            # was already told of the submit at write time (on_submit above), so confirmation gates ONLY
+            # the marker + the caller's resumed outcome.
             with self._lock:
                 self._dialog.append_user_input(clean)
-                self._engine.on_submit(clean)
-                notes = self._engine.drain_notes()
-                self._state = "busy"
-            self._log_notes(notes)
             if self._log is not None:
                 self._log.info("session", "respond_confirmed", session_id=self._id,
                                decision_id=did, seq=ps.get("seq"), writer="monitor")
@@ -1785,8 +1795,8 @@ class Session:
             return
         if unconfirmed:
             # Written but no landed-submit evidence by the deadline (Enter dropped / stranded echo). The
-            # decision is already resolved 'answered' (the write happened); report respond_failed so the
-            # caller recovers, but do NOT append a marker or arm on_submit off an unconfirmed answer.
+            # engine already knows of the submit (on_submit at write time); report respond_failed so the
+            # caller recovers, and do NOT append the user marker off an unconfirmed answer.
             if self._log is not None:
                 self._log.warning("session", "respond_failed", session_id=self._id,
                                   decision_id=did, reason="submit_unconfirmed")
