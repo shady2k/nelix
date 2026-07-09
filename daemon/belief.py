@@ -110,6 +110,39 @@ class BeliefEngine:
         self._turn_open = False           # a turn is running (between open and its close)
         self._hook_pending_key = None     # currently-published hook waiting_for_user, for withdrawal
         self._hook_pending_kind = None    # its effective prompt_kind (modal_choice wins, nelix-32f)
+        # nelix-f7y: the set of hook-pause keys ANSWERED in the current epoch (a per-gate tombstone).
+        # A pause is keyed by a per-gate FINGERPRINT of its tool_name + tool_input (hooks.gate_fp): both
+        # hooks of ONE physical gate carry identical tool_input -> same key (dedup), different gates
+        # differ -> distinct keys. So a late duplicate / straggler of an answered gate reuses the SAME
+        # key -> suppressed (no phantom re-publish), while a genuinely new gate has a DIFFERENT key ->
+        # published (answerable). No epoch-level ambiguity and no hook-ordering / tool-progress
+        # assumption. Cleared at each epoch boundary. See on_submit + the waiting_for_user branch.
+        # A repeated IDENTICAL gate (an allow-once approval then re-running the same command) shares its
+        # predecessor's fingerprint, so its tombstone is LIFTED by the fresh working PreToolUse that
+        # precedes its PermissionRequest (a new-invocation signal — see the working-hook branch).
+        #
+        # IRREDUCIBLE RESIDUALS. The PermissionRequest we answer carries NO tool_use_id (only PreToolUse
+        # does), so an answered gate cannot be tied to any id — only to its content fingerprint. A later
+        # PreToolUse[fp=X] is byte-identical whether it is (a) a genuine repeated invocation (which MUST
+        # lift the tombstone so the retry is answerable) or (b) a late straggler of the already-answered
+        # gate (which MUST NOT lift). No hook distinguishes them without a per-gate id Claude does not
+        # provide, so any keying choice leaks in one direction:
+        #   (1) id-less waiting_for_user: only the legacy permission Notification path (PermissionRequest
+        #       / PreToolUse[AskUserQuestion] both carry tool_input) falls back to the epoch key, which
+        #       cannot tell a second same-kind gate from a straggler in one epoch.
+        #   (2) repeated identical AskUserQuestion: its PreToolUse IS the pause (a waiting_for_user hook,
+        #       not a "working" one), so there is no working-branch lift — the second modal's fingerprint
+        #       is still tombstoned and it is SUPPRESSED (collapses onto the first).
+        #   (3) double-reorder phantom: an answered gate's OWN PreToolUse[fp=X] delivered LATE (a pure
+        #       reorder where its PermissionRequest arrived first and was answered) lifts hook_gate:X via
+        #       the working branch; a subsequent late/duplicate straggler PermissionRequest[fp=X] then no
+        #       longer hits this set and RE-PUBLISHES a phantom respondable decision (the stray-keystroke
+        #       class). Needs BOTH a late same-gate PreToolUse AND a straggler PermissionRequest for the
+        #       SAME answered fingerprint — a double-reorder.
+        # Wave 4 chose to LIFT (fix (3)-vs-hang in favour of answering the repeat), trading the COMMON
+        # terminal hang (allow-once + retry of an identical command) for the NARROWER, less-severe
+        # phantom (3) — a deliberate tradeoff, not an oversight. Cleared at each epoch boundary.
+        self._hook_answered_ids = set()
         self._idle_published_epoch = None  # epoch whose Stop already published idle (idempotency)
         # precedence & lost-hook reconciliation (Task 7): process-exit > hook > bounded screen.
         self._last_hook_at = None          # clock of the most recent hook (lost-hook deadlines)
@@ -186,6 +219,7 @@ class BeliefEngine:
             self._turn_open = True
             self._hook_pending_key = None
             self._hook_pending_kind = None
+            self._hook_answered_ids.clear()         # nelix-f7y: a new epoch retires the answered-gate tombstones
             self._state.control_state = "busy"
             self._state.phase = "busy"
             return actions
@@ -197,6 +231,7 @@ class BeliefEngine:
                 return actions
             self._turn_open = False
             self._idle_published_epoch = self._turn_epoch
+            self._hook_answered_ids.clear()                      # nelix-f7y: epoch closed -> retire the tombstones
             if self._hook_pending_key is not None:               # a pending prompt is moot once idle
                 actions.append(Withdraw(decision_key=self._hook_pending_key, reason="superseded"))
                 self._hook_pending_key = None
@@ -231,26 +266,38 @@ class BeliefEngine:
         if hobs.kind == "waiting_for_user":
             if self._turn_closed():
                 return actions
-            # nelix-32f: ONE respondable pause per turn-epoch. A single physical AskUserQuestion modal
-            # emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice) AND PermissionRequest
-            # (-> permission_choice) in this claude build (verified s-9610d25c @ 20:57:20: no concurrent
-            # Bash — AskUserQuestion itself fires the PermissionRequest). The two hooks are the SAME
-            # pause, so the decision is keyed by EPOCH alone (not prompt_kind:epoch); the second hook is
-            # an IN-PLACE refinement, NEVER a supersede (a supersede withdraws the stable decision the
-            # orchestrator is about to answer -> respond() then rejects every option). modal_choice is
-            # the more specific reading and wins (a numbered menu, not a generic allow/deny).
-            decision_key = f"hook_pause:{self._turn_epoch}"
+            # The pause is keyed by a per-gate FINGERPRINT of tool_name + tool_input (hooks.gate_fp):
+            # stable across the two hooks a single physical AskUserQuestion modal emits —
+            # PreToolUse[AskUserQuestion] (-> modal_choice) AND PermissionRequest (-> permission_choice)
+            # both carry the SAME {questions:[...]} (nelix-32f collision) — and DIFFERENT for a genuinely
+            # new gate (different tool_input). The PermissionRequest hook carries NO tool_use_id, so the
+            # body fingerprint is the only per-gate identity. When a hook carries no tool_input (a legacy
+            # permission Notification), fall back to the epoch key (see the _hook_answered_ids residuals).
+            decision_key = (f"hook_gate:{hobs.gate_fp}" if hobs.gate_fp
+                            else f"hook_pause:{self._turn_epoch}")
             effective_kind = self._preferred_prompt_kind(self._hook_pending_kind, hobs.prompt_kind)
             if self._hook_pending_key == decision_key:
-                # same epoch's pause already published. Only a kind UPGRADE re-emits — modal_choice
-                # arriving after permission_choice (e.g. under hook-delivery reordering) — and as a
-                # re-emit (SAME decision_key) so the decision_id stays stable (a held answer binds).
+                # this gate's pause is already published. Only a kind UPGRADE re-emits — modal_choice
+                # arriving after permission_choice (the collision's two hooks, possibly reordered) — and
+                # as a re-emit (SAME decision_key) so the decision_id stays stable (a held answer binds).
                 if effective_kind != self._hook_pending_kind:
                     self._hook_pending_kind = effective_kind
                     actions.append(self._hook_pause_publish(decision_key, effective_kind))
                 self._turn_open = True
                 self._state.control_state = "awaiting_user"
                 self._state.phase = "pause_candidate"
+                return actions
+            if decision_key in self._hook_answered_ids:
+                # nelix-f7y: this gate was already ANSWERED. A waiting_for_user for the SAME key is a
+                # late duplicate / straggler of that answered gate (reordered/duplicated hook delivery),
+                # NOT a fresh gate — suppress the re-publish so no PHANTOM respondable decision is minted
+                # (which the orchestrator would answer, leaking a stray keystroke into the resumed turn).
+                # A genuinely new gate has a DIFFERENT id, so it is NOT in this set and publishes below —
+                # no dependence on hook ordering or on a PostToolUse ever arriving (nelix-f7y wave 2).
+                # The agent already resumed on the answer, so the true state is busy, not awaiting_user.
+                self._turn_open = True
+                self._state.control_state = "busy"
+                self._state.phase = "busy"
                 return actions
             self._hook_pending_key = decision_key
             self._hook_pending_kind = effective_kind
@@ -264,6 +311,14 @@ class BeliefEngine:
         # open turn. After a Stop with no new UserPromptSubmit it is a late straggler -> ignored (the
         # session must stay idle, not be dragged back to busy by trailing tool events).
         if self._turn_open:
+            # nelix-f7y: a fresh PreToolUse carrying a gate fingerprint is a NEW-INVOCATION signal (only
+            # PreToolUse carries gate_fp here). If that fingerprint is tombstoned, the agent is invoking
+            # the SAME gate AGAIN (an allow-once approval + a re-run of the identical command), so LIFT
+            # the tombstone -> the gate's next PermissionRequest publishes a fresh answerable decision
+            # instead of being swallowed as a straggler. A gate's OWN first PreToolUse precedes its first
+            # PermissionRequest, so its fingerprint is not yet answered -> discard is a harmless no-op.
+            if hobs.gate_fp is not None:
+                self._hook_answered_ids.discard(f"hook_gate:{hobs.gate_fp}")
             self._state.control_state = "busy"
             self._state.phase = "busy"
         return actions
@@ -314,6 +369,16 @@ class BeliefEngine:
         now = self._clock.now()
         self._published_key = None
         self._published_kind = None
+        # nelix-f7y: the answer resolves the pending hook pause. Free the pending slot AND tombstone the
+        # answered gate's key: a late duplicate / straggler of THIS gate (reorderable hook delivery)
+        # then reuses the same per-gate key and is suppressed in on_hook (no PHANTOM respondable
+        # decision), while a genuinely FRESH subsequent gate has a DIFFERENT key and publishes normally.
+        # Because the key is the per-gate fingerprint (not the epoch), the tombstone can never suppress
+        # a real new gate — so there is no hook-ordering / PostToolUse dependence and no terminal hang.
+        if self._hook_pending_key is not None:
+            self._hook_answered_ids.add(self._hook_pending_key)
+        self._hook_pending_key = None
+        self._hook_pending_kind = None
         self._candidate_fp = None
         self._candidate_since = None
         self._published_prompt_fp = None

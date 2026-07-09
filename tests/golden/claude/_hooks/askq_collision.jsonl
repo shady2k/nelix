@@ -1,0 +1,10 @@
+# REAL captured hooks — live Claude Code 2.1.206, one physical AskUserQuestion modal (nelix-f7y).
+# Verbatim tool bodies (only personal session_id/transcript_path/cwd stripped). THE KEY FACTS:
+#   PreToolUse[AskUserQuestion] carries tool_input + tool_use_id;
+#   PermissionRequest carries the SAME tool_input but NO tool_use_id (the field 62772e4 relied on);
+#   both share prompt_id (turn-level, NOT per-gate). So the ONLY per-gate identity is a fingerprint
+#   of tool_name+tool_input, IDENTICAL across the two hooks -> the collision dedups to one decision.
+{"hook_event_name": "UserPromptSubmit", "prompt_id": "1f0c0a2f-339e-4cb0-a168-01cc74f0325c"}
+{"prompt_id": "1f0c0a2f-339e-4cb0-a168-01cc74f0325c", "permission_mode": "default", "effort": {"level": "xhigh"}, "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "Which do you choose?", "header": "Fruit", "options": [{"label": "Apple", "description": "Choose Apple."}, {"label": "Banana", "description": "Choose Banana."}], "multiSelect": false}]}, "tool_use_id": "toolu_01CJqWsVh7KRATroety7uCkh"}
+{"prompt_id": "1f0c0a2f-339e-4cb0-a168-01cc74f0325c", "permission_mode": "default", "effort": {"level": "xhigh"}, "hook_event_name": "PermissionRequest", "tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "Which do you choose?", "header": "Fruit", "options": [{"label": "Apple", "description": "Choose Apple."}, {"label": "Banana", "description": "Choose Banana."}], "multiSelect": false}]}}
+{"prompt_id": "1f0c0a2f-339e-4cb0-a168-01cc74f0325c", "hook_event_name": "Notification", "message": "Claude needs your permission", "notification_type": "permission_prompt"}
