@@ -143,6 +143,20 @@ class Session:
         # concurrently -> renderer access is NOT thread-safe. respond() hydrates a hook-derived modal
         # decision (options=[]) from THIS cache (read under self._lock), never from the live renderer.
         self._last_modal_options = None
+        # nelix-s7v: MONITOR-OWNED cache of the latest RENDERED frame (same thread-safety rationale as
+        # _last_modal_options). The free-text respond() submit-confirm runs on the RPC thread and must
+        # NOT call _handle.render() — pump() mutates that renderer unlocked — so _confirm_submit reads
+        # this cache (written under self._lock on each monitor tick) instead. Empty until the monitor's
+        # first render; the confirm only runs post-delivery, when the monitor loop is already ticking.
+        self._last_render = ""
+        # nelix-s7v FRESHNESS guard: a monotonic generation the monitor bumps every time it writes
+        # _last_render (under self._lock). Directly rendering on the RPC thread used to give the confirm
+        # a FRESH frame at confirm time (a happens-after the keystroke); the cache alone lost that, so a
+        # stale PRE-submit frame could be read as confirm evidence. respond() captures this value BEFORE
+        # the keystroke write and _confirm_submit observes the cache ONLY once the generation exceeds it
+        # — so EVERY render at/after the write is eligible (no post-submit frame is excluded) while a
+        # pre-submit frame (gen <= captured) is never trusted. Never wraps in practice (bounded by uptime).
+        self._render_gen = 0
         # _task_delivery synchronization (I1): the ONLY genuinely cross-thread transition is the
         # monitor's pending->"delivered" write, which the RPC-thread respond() reads to gate a
         # pre-delivery blocked answer — that write and that read are both made under self._lock, so
@@ -577,6 +591,8 @@ class Session:
         self._handle.pump(0.1)
         with self._lock:
             frame = self._handle.render()
+            self._last_render = frame   # nelix-s7v: monitor-owned; RPC-thread _confirm_submit reads this
+            self._render_gen += 1       # nelix-s7v: bump so a waiting confirm sees a POST-submit frame
         ctx = self._obs_ctx()
         obs = self._driver.observe(frame, ctx)
         self._cache_last_modal_options(obs)   # nelix-5r3: monitor-owned; RPC-thread respond() hydrates from this
@@ -1413,22 +1429,45 @@ class Session:
             snap.update(self._progress_view_locked())
             return snap
 
-    # respond's submit-confirm poll interval (read-only render reads; the monitor owns pump()).
+    # respond's submit-confirm poll interval (read-only cache reads; the monitor owns pump()/render()).
     _CONFIRM_POLL = 0.1
+    # nelix-s7v: floor for the free-text confirm window. The confirm needs at least one POST-submit
+    # monitor render, and the monitor renders once per _loop_once tick (pump(0.1)); this floor (~3 pump
+    # intervals) keeps a misconfigured sub-tick respond_confirm_seconds from timing out before any tick.
+    _CONFIRM_MIN_SECONDS = 0.3
 
-    def _confirm_submit(self, deadline):
-        # Confirm a free-text submit LANDED, read-only (the monitor thread owns pump(), so draining
-        # here would race it — we only render() under the lock, exactly as snapshot() does). The
-        # submit is confirmed ONLY on POSITIVE post-write evidence: the answer echoed then LEFT the
+    def _confirm_submit(self, deadline, submit_gen):
+        # Confirm a free-text submit LANDED, read-only. This runs on the RPC thread, so it MUST NOT
+        # call _handle.render(): PtySession.pump() mutates that renderer via _feed() OUTSIDE self._lock,
+        # so an RPC-thread render() would race the monitor's unlocked mutation (nelix-s7v; the same
+        # thread-safety hazard nelix-5r3 closed for the modal-options path). Instead it reads the
+        # MONITOR-OWNED _last_render cache and observes THAT frame — observe() is pure (no renderer
+        # access), so it stays safe on this thread.
+        #
+        # FRESHNESS (nelix-s7v): rendering on the RPC thread used to give a frame rendered AT confirm
+        # time — a happens-after the keystroke. The cache alone lost that: a monitor tick that ran
+        # BEFORE the answer was typed could leave a stale "moved" frame in the cache, and observing it
+        # would false-confirm (or false-abort) off PRE-submit state. So respond() captures the render
+        # generation BEFORE the keystroke write and passes it here as submit_gen; we observe the cache
+        # ONLY once the generation exceeds it — i.e. the monitor has re-rendered at least once with the
+        # keystroke's effects reachable. Capturing BEFORE the write (not at confirm entry) is what makes
+        # this complete: EVERY render at or after the write has generation > submit_gen and is eligible,
+        # so a single evidence tick landing right after Enter (even one that then exits the child) is
+        # never excluded. A render between the capture and the write landing shows the still-PENDING
+        # free_text box (no echo, not "moved"), so it can never false-confirm. The monitor is the SOLE
+        # renderer; the confirm WAITS for its post-submit re-observation (mirrors nelix-5r3 / the
+        # single-writer PTY discipline). A stale or empty cache is never read as confirmation.
+        #
+        # The submit is confirmed ONLY on POSITIVE post-write evidence: the answer echoed then LEFT the
         # input box, or the turn MOVED to a high-confidence state. Absence of evidence is never a
         # confirm — a bare "no echo" is UNCONFIRMED whether it's a still-empty box or a stranded echo.
         #
-        # Why "no echo" alone can't confirm: the first render right after _press_enter() can still be
-        # the stale pre-write frame (the monitor may not have rendered our keystrokes yet), and an
-        # empty box that NEVER echoed is indistinguishable from a write that went nowhere (the agent
-        # wasn't at the prompt) — accepting either would falsely confirm the very dropped-submit race
-        # we are catching. So we ONLY return True on the positive early-return below; reaching the
-        # deadline/stop means no such evidence was ever seen -> return False (unconfirmed).
+        # Why "no echo" alone can't confirm: even a POST-submit frame can precede the echo (the monitor
+        # rendered after the keystroke but before it echoed), and an empty box that NEVER echoed is
+        # indistinguishable from a write that went nowhere (the agent wasn't at the prompt) — accepting
+        # either would falsely confirm the very dropped-submit race we are catching. So we ONLY return
+        # True on the positive early-return below; reaching the deadline/stop means no such evidence was
+        # ever seen (incl. a monitor that never re-rendered post-submit) -> return False (unconfirmed).
         # The "moved" allowlist is deliberate: a live working spinner (none + heartbeat), a fresh
         # modal/permission question, or a terminal child — NEVER an ambiguous `unknown`/blank repaint
         # frame (a transient redraw dropping the footer would otherwise false-confirm a stranded echo).
@@ -1436,14 +1475,16 @@ class Session:
         saw_echo = False
         while True:
             with self._lock:
-                frame = self._handle.render() if self._handle is not None else ""
-            obs = self._driver.observe(frame, self._obs_ctx())
-            moved = ((obs.prompt_kind == "none" and obs.heartbeat.present)
-                     or obs.prompt_kind in ("modal_choice", "permission_choice", "crash", "exit"))
-            if obs.submitted_echo_present:
-                saw_echo = True
-            elif saw_echo or moved:
-                return True                          # echo cleared / turn moved -> submit confirmed
+                fresh = self._render_gen > submit_gen   # a monitor render happened AFTER the submit
+                frame = self._last_render if fresh else None
+            if fresh:
+                obs = self._driver.observe(frame, self._obs_ctx())
+                moved = ((obs.prompt_kind == "none" and obs.heartbeat.present)
+                         or obs.prompt_kind in ("modal_choice", "permission_choice", "crash", "exit"))
+                if obs.submitted_echo_present:
+                    saw_echo = True
+                elif saw_echo or moved:
+                    return True                      # echo cleared / turn moved -> submit confirmed
             if self._stop.is_set() or time.monotonic() >= deadline:
                 # Reaching the deadline/stop means NO positive post-write evidence was ever seen
                 # (every echo-then-gone / moved case returned True above) -> the submit is UNCONFIRMED.
@@ -1705,6 +1746,18 @@ class Session:
             # on timeout the answer did not land (executor wedged) -> report it, don't re-type.
             # Non-draining (the monitor owns pump(); draining here would race it).
             deadline = time.monotonic() + self._spec.respond_write_seconds
+            # nelix-s7v (freshness): capture the render generation BEFORE the keystroke write, so EVERY
+            # monitor render that could reflect the submit (rendered at or after the write) has a
+            # STRICTLY GREATER generation and is eligible confirm evidence. Capturing AFTER the write
+            # (the fix-wave-1 bug) let a monitor tick in the Enter->capture window bump the generation
+            # past a valid post-submit frame, EXCLUDING it — a false-abort when that tick is the only
+            # evidence (e.g. the answer exits the child, so no later tick ever arrives). A render
+            # between this capture and the write landing shows the still-PENDING free_text box (no echo,
+            # not "moved"), so it can never false-confirm — the confirm just keeps waiting. Only the
+            # free-text path below reads this; the modal path never confirms. Captured under the lock
+            # (the monitor writes _render_gen under it) so it is a clean snapshot.
+            with self._lock:
+                submit_gen = self._render_gen
             try:
                 if is_modal:
                     # The driver presses the digit + confirm (one sequence): never prose into a menu.
@@ -1732,8 +1785,13 @@ class Session:
             # echo would then suppress every wake (nelix-sud). A modal/blocked selection is a single
             # high-confidence keypress with no lingering text echo, so it keeps the prompt behaviour.
             if decision.get("prompt_kind") == "free_text":
-                confirm_deadline = time.monotonic() + self._spec.respond_confirm_seconds
-                if not self._confirm_submit(confirm_deadline):
+                # nelix-s7v: the confirm now needs at least one POST-submit monitor render (pump(0.1)
+                # per _loop_once tick), so floor the window at a few pump intervals — a misconfigured
+                # sub-tick respond_confirm_seconds would otherwise time out before any tick could
+                # arrive and false-abort a landed answer. The 6.0s default is unaffected.
+                confirm_deadline = time.monotonic() + max(self._spec.respond_confirm_seconds,
+                                                          self._CONFIRM_MIN_SECONDS)
+                if not self._confirm_submit(confirm_deadline, submit_gen):
                     if self._log is not None:
                         self._log.warning("session", "respond_failed", session_id=self._id,
                                           decision_id=did, reason="submit_unconfirmed")
