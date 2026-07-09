@@ -143,20 +143,6 @@ class Session:
         # concurrently -> renderer access is NOT thread-safe. respond() hydrates a hook-derived modal
         # decision (options=[]) from THIS cache (read under self._lock), never from the live renderer.
         self._last_modal_options = None
-        # nelix-s7v: MONITOR-OWNED cache of the latest RENDERED frame (same thread-safety rationale as
-        # _last_modal_options). The free-text respond() submit-confirm runs on the RPC thread and must
-        # NOT call _handle.render() — pump() mutates that renderer unlocked — so _confirm_submit reads
-        # this cache (written under self._lock on each monitor tick) instead. Empty until the monitor's
-        # first render; the confirm only runs post-delivery, when the monitor loop is already ticking.
-        self._last_render = ""
-        # nelix-s7v FRESHNESS guard: a monotonic generation the monitor bumps every time it writes
-        # _last_render (under self._lock). Directly rendering on the RPC thread used to give the confirm
-        # a FRESH frame at confirm time (a happens-after the keystroke); the cache alone lost that, so a
-        # stale PRE-submit frame could be read as confirm evidence. respond() captures this value BEFORE
-        # the keystroke write and _confirm_submit observes the cache ONLY once the generation exceeds it
-        # — so EVERY render at/after the write is eligible (no post-submit frame is excluded) while a
-        # pre-submit frame (gen <= captured) is never trusted. Never wraps in practice (bounded by uptime).
-        self._render_gen = 0
         # _task_delivery synchronization (I1): the ONLY genuinely cross-thread transition is the
         # monitor's pending->"delivered" write, which the RPC-thread respond() reads to gate a
         # pre-delivery blocked answer — that write and that read are both made under self._lock, so
@@ -171,6 +157,14 @@ class Session:
         #                                is mid-flight. Drained by _drain_pending_answer (each pre-delivery
         #                                tick + the delivery transition) so the answer write and the
         #                                delivery decision are serialized on ONE thread and cannot race.
+        # nelix-s7v (Approach B): a POST-delivery FREE-TEXT answer enqueued by respond() for the MONITOR
+        # to write AND confirm (sole writer). None unless a free-text respond() is mid-flight. The
+        # monitor owns BOTH the write and the subsequent pump/render, so "confirm only from frames
+        # pumped AFTER my own write" is a genuine happens-after the keystroke — no render-generation
+        # guess, no RPC-thread render(). Drained by _drain_pending_submit each post-delivery tick: it
+        # verifies the free_text prompt is still on screen (else ABORT, nothing typed), writes, then
+        # confirms across LATER ticks (echo-then-gone / high-confidence moved). See _respond_free_text.
+        self._pending_submit = None
         # Progress notes (message-plane, executor -> orchestrator): a bounded, NON-waking log an
         # executor appends to via append_progress_note. Deliberately separate from _decision/_events
         # — appending one must NEVER publish (that would trip an armed nelix-wait waiter and wake
@@ -591,8 +585,6 @@ class Session:
         self._handle.pump(0.1)
         with self._lock:
             frame = self._handle.render()
-            self._last_render = frame   # nelix-s7v: monitor-owned; RPC-thread _confirm_submit reads this
-            self._render_gen += 1       # nelix-s7v: bump so a waiting confirm sees a POST-submit frame
         ctx = self._obs_ctx()
         obs = self._driver.observe(frame, ctx)
         self._cache_last_modal_options(obs)   # nelix-5r3: monitor-owned; RPC-thread respond() hydrates from this
@@ -604,6 +596,11 @@ class Session:
         self._enrich_hook_modal_options(obs)
         self._log_trail(obs, actions)
         self._log_notes(notes)
+        # nelix-s7v (Approach B): advance the post-delivery free-text submit the monitor owns — write it
+        # (verifying the free_text prompt is still up), then confirm from frames pumped on LATER ticks.
+        # The monitor pumped THIS frame above, so any confirm here rests on a genuine post-write
+        # happens-after (the write ran on a prior tick, before this pump). See _drain_pending_submit.
+        self._drain_pending_submit(obs)
         # Task 4: at the working->idle transition (state now idle, set by the hooks/screen path above),
         # deliver any async reply that landed while the executor was busy. The monitor is the sole PTY
         # writer, so this busy-case delivery happens HERE (never on the RPC thread that enqueued it).
@@ -833,9 +830,11 @@ class Session:
             # stalled the full respond_write_seconds with nothing left to drain it.)
             self._closing = True
         # I3: every monitor-thread exit funnels through here — release a respond() still waiting on a
-        # pre-delivery blocked answer BEFORE the rest of teardown, so it wakes promptly (well under
-        # respond_write_seconds) with a non-answered outcome instead of stalling the full window.
+        # pre-delivery blocked answer OR a post-delivery free-text submit BEFORE the rest of teardown,
+        # so it wakes promptly (well under respond_write_seconds) with a non-answered outcome instead of
+        # stalling the full window. Both slots share the _closing gate raised just above.
         self._abort_pending_answer("terminal")
+        self._abort_pending_submit("terminal")
         status = self._handle.leader_status() if self._handle is not None else None
         alive = bool(status and status.alive)
         try:
@@ -1429,70 +1428,11 @@ class Session:
             snap.update(self._progress_view_locked())
             return snap
 
-    # respond's submit-confirm poll interval (read-only cache reads; the monitor owns pump()/render()).
-    _CONFIRM_POLL = 0.1
-    # nelix-s7v: floor for the free-text confirm window. The confirm needs at least one POST-submit
-    # monitor render, and the monitor renders once per _loop_once tick (pump(0.1)); this floor (~3 pump
-    # intervals) keeps a misconfigured sub-tick respond_confirm_seconds from timing out before any tick.
+    # nelix-s7v: floor for the free-text confirm window. The monitor confirms from frames it pumps on
+    # LATER ticks (pump(0.1) per _loop_once tick), so the window must span at least one tick; this floor
+    # (~3 pump intervals) keeps a misconfigured sub-tick respond_confirm_seconds from expiring before
+    # the monitor can re-observe the screen. The 6.0s default is far above this.
     _CONFIRM_MIN_SECONDS = 0.3
-
-    def _confirm_submit(self, deadline, submit_gen):
-        # Confirm a free-text submit LANDED, read-only. This runs on the RPC thread, so it MUST NOT
-        # call _handle.render(): PtySession.pump() mutates that renderer via _feed() OUTSIDE self._lock,
-        # so an RPC-thread render() would race the monitor's unlocked mutation (nelix-s7v; the same
-        # thread-safety hazard nelix-5r3 closed for the modal-options path). Instead it reads the
-        # MONITOR-OWNED _last_render cache and observes THAT frame — observe() is pure (no renderer
-        # access), so it stays safe on this thread.
-        #
-        # FRESHNESS (nelix-s7v): rendering on the RPC thread used to give a frame rendered AT confirm
-        # time — a happens-after the keystroke. The cache alone lost that: a monitor tick that ran
-        # BEFORE the answer was typed could leave a stale "moved" frame in the cache, and observing it
-        # would false-confirm (or false-abort) off PRE-submit state. So respond() captures the render
-        # generation BEFORE the keystroke write and passes it here as submit_gen; we observe the cache
-        # ONLY once the generation exceeds it — i.e. the monitor has re-rendered at least once with the
-        # keystroke's effects reachable. Capturing BEFORE the write (not at confirm entry) is what makes
-        # this complete: EVERY render at or after the write has generation > submit_gen and is eligible,
-        # so a single evidence tick landing right after Enter (even one that then exits the child) is
-        # never excluded. A render between the capture and the write landing shows the still-PENDING
-        # free_text box (no echo, not "moved"), so it can never false-confirm. The monitor is the SOLE
-        # renderer; the confirm WAITS for its post-submit re-observation (mirrors nelix-5r3 / the
-        # single-writer PTY discipline). A stale or empty cache is never read as confirmation.
-        #
-        # The submit is confirmed ONLY on POSITIVE post-write evidence: the answer echoed then LEFT the
-        # input box, or the turn MOVED to a high-confidence state. Absence of evidence is never a
-        # confirm — a bare "no echo" is UNCONFIRMED whether it's a still-empty box or a stranded echo.
-        #
-        # Why "no echo" alone can't confirm: even a POST-submit frame can precede the echo (the monitor
-        # rendered after the keystroke but before it echoed), and an empty box that NEVER echoed is
-        # indistinguishable from a write that went nowhere (the agent wasn't at the prompt) — accepting
-        # either would falsely confirm the very dropped-submit race we are catching. So we ONLY return
-        # True on the positive early-return below; reaching the deadline/stop means no such evidence was
-        # ever seen (incl. a monitor that never re-rendered post-submit) -> return False (unconfirmed).
-        # The "moved" allowlist is deliberate: a live working spinner (none + heartbeat), a fresh
-        # modal/permission question, or a terminal child — NEVER an ambiguous `unknown`/blank repaint
-        # frame (a transient redraw dropping the footer would otherwise false-confirm a stranded echo).
-        # The belief engine's bounded echo-suppression is the async backstop for anything past this.
-        saw_echo = False
-        while True:
-            with self._lock:
-                fresh = self._render_gen > submit_gen   # a monitor render happened AFTER the submit
-                frame = self._last_render if fresh else None
-            if fresh:
-                obs = self._driver.observe(frame, self._obs_ctx())
-                moved = ((obs.prompt_kind == "none" and obs.heartbeat.present)
-                         or obs.prompt_kind in ("modal_choice", "permission_choice", "crash", "exit"))
-                if obs.submitted_echo_present:
-                    saw_echo = True
-                elif saw_echo or moved:
-                    return True                      # echo cleared / turn moved -> submit confirmed
-            if self._stop.is_set() or time.monotonic() >= deadline:
-                # Reaching the deadline/stop means NO positive post-write evidence was ever seen
-                # (every echo-then-gone / moved case returned True above) -> the submit is UNCONFIRMED.
-                # Confirming on bare "no echo" here would false-confirm a never-delivered answer (the
-                # write went nowhere / blank frame the whole window) — the exact dropped-submit class
-                # this check exists to catch. A still-echoed box is unconfirmed too; both -> False.
-                return False
-            time.sleep(min(self._CONFIRM_POLL, max(0.0, deadline - time.monotonic())))
 
     def _respond_blocked(self, decision, did, clean):
         # C1: a PRE-DELIVERY blocked answer is routed through the MONITOR thread — the SOLE writer of a
@@ -1673,6 +1613,207 @@ class Session:
             self._log.info("session", "blocked_answer_aborted", session_id=self._id,
                            decision_id=did, reason=reason)
 
+    # nelix-s7v: the RPC waiter's timeout is a pure backstop (the monitor ALWAYS resolves _pending_submit
+    # — via _drain_pending_submit or _finish's _abort_pending_submit — so the event is the real wake).
+    # Budget = write window + confirm window + this grace for monitor tick latency, so the backstop can
+    # never fire before the monitor's own bounded work would have resolved.
+    _SUBMIT_DRAIN_GRACE = 2.0
+
+    def _respond_free_text(self, decision, did, clean):
+        # Approach B (nelix-s7v): a POST-delivery free-text answer is written AND confirmed by the
+        # MONITOR — the sole PTY writer — so the write and the confirm-observation are ordered on ONE
+        # thread (a genuine happens-after the keystroke). respond() ENQUEUES {decision_id, clean, ...}
+        # into _pending_submit (the claim; a duplicate respond finds it set and is rejected) and WAITS on
+        # the answer's event; _drain_pending_submit verifies the free_text prompt is still up, writes,
+        # and confirms across LATER ticks, then sets the outcome + event. respond() types NOTHING and
+        # never render()s — the RPC-thread render race and the false-confirm/false-abort are gone.
+        with self._lock:
+            if self._closing:
+                return RespondOutcome("terminal")
+            if self._decision is not decision:
+                return RespondOutcome("no_pending")    # already claimed / superseded by a new pause
+            if self._pending_submit is not None:
+                return RespondOutcome("no_pending")    # a submit is already enqueued -> exactly one writer
+            done = threading.Event()
+            ps = {"decision_id": did, "clean": clean, "event": done, "outcome": None, "seq": None,
+                  "state": "queued", "saw_echo": False,
+                  "write_deadline": time.monotonic() + self._spec.respond_write_seconds,
+                  "confirm_deadline": None}
+            self._pending_submit = ps
+        if self._log is not None:
+            self._log.debug("session", "respond_attempt", session_id=self._id, decision_id=did,
+                            prompt_kind="free_text", is_modal=False, is_blocked=False,
+                            answer_chars=len(clean), answer=clean, writer="monitor")
+        # Wait (bounded) for the monitor to write + confirm. The monitor's work is bounded (write window
+        # then confirm window) and it ALWAYS resolves, so `done` is the real wake; this timeout is a pure
+        # backstop for a monitor that somehow never resolves — reclaim + report unconfirmed.
+        budget = (self._spec.respond_write_seconds
+                  + max(self._spec.respond_confirm_seconds, self._CONFIRM_MIN_SECONDS)
+                  + self._SUBMIT_DRAIN_GRACE)
+        if not done.wait(budget):
+            with self._lock:
+                reclaimed = self._pending_submit is ps
+                if reclaimed:
+                    self._pending_submit = None        # monitor never resolved -> reclaim it
+            if reclaimed:
+                self._events.resolve_decision(did, "superseded")
+                if self._log is not None:
+                    self._log.warning("session", "respond_failed", session_id=self._id,
+                                      decision_id=did, reason="monitor_drain_timeout")
+                return RespondOutcome("respond_failed", decision_id=did,
+                                      answered_decision_id=did, snapshot=self.snapshot())
+            done.wait(self._spec.respond_write_seconds)  # monitor claimed it -> about to set; wait
+        outcome = ps["outcome"]
+        if outcome == "submitted":
+            return RespondOutcome("resumed", seq=ps.get("seq"), decision_id=did,
+                                  answered_decision_id=did, snapshot=self.snapshot())
+        if outcome == "respond_failed":
+            return RespondOutcome("respond_failed", decision_id=did,
+                                  answered_decision_id=did, snapshot=self.snapshot())
+        if outcome == "write_timeout":
+            return RespondOutcome("write_timeout", decision_id=did,
+                                  answered_decision_id=did, snapshot=self.snapshot())
+        if outcome == "terminal":
+            return RespondOutcome("terminal", decision_id=did)
+        # "stale": the monitor aborted before typing (screen moved / decision gone) -> NOTHING typed.
+        return RespondOutcome("stale", decision_id=did)
+
+    def _drain_pending_submit(self, obs):
+        # Approach B monitor drain of a POST-delivery free-text submit (runs each _loop_once tick, on the
+        # MONITOR thread — the sole PTY writer). Two ordered phases on _pending_submit:
+        #   "queued"  -> VERIFY the free_text decision respond() claimed is STILL the pending decision AND
+        #                the frame STILL shows a free_text prompt; any mismatch (screen moved / superseded
+        #                / crashed) ABORTS (nothing typed, err toward abort). Else WRITE submit_text +
+        #                Enter and move to "written". The write runs on THIS thread AFTER this tick's
+        #                pump, so every confirm frame (pumped on a LATER tick) is strictly after it — a
+        #                genuine happens-after the keystroke, which a bare render-generation counter
+        #                could not establish (it cannot tell a post-write frame from an unrelated
+        #                pre-write screen change).
+        #   "written" -> CONFIRM from THIS tick's obs (pumped after the write): the answer echoed then
+        #                LEFT the box, or the turn MOVED to a high-confidence state (none+heartbeat /
+        #                modal_choice / permission_choice / crash / exit) — NEVER an ambiguous blank/
+        #                unknown repaint. No evidence by the confirm deadline -> unconfirmed
+        #                (respond_failed). The PTY write and the EventQueue resolve run OUTSIDE self._lock
+        #                (mirrors _drain_pending_answer); the enqueuing respond() wakes via the event on
+        #                every terminal outcome.
+        write = abort = confirm = unconfirmed = False
+        with self._lock:
+            ps = self._pending_submit
+            if ps is None:
+                return
+            state = ps["state"]
+            did = ps["decision_id"]
+            clean = ps["clean"]
+            if state == "queued":
+                decision = self._decision
+                compatible = (decision is not None
+                              and decision.get("decision_id") == did
+                              and obs.prompt_kind == "free_text")
+                if compatible:
+                    self._decision = None        # claim-before-write (one writer); keep ps for confirm
+                    write = True
+                else:
+                    self._pending_submit = None
+                    abort = True
+            else:  # "written" -> confirming from this (post-write) frame
+                moved = ((obs.prompt_kind == "none" and obs.heartbeat.present)
+                         or obs.prompt_kind in ("modal_choice", "permission_choice", "crash", "exit"))
+                # POSITIVE evidence: the answer echoed then LEFT the box (saw_echo now cleared) OR the
+                # turn MOVED. A still-echoed box is NOT confirmed — the deadline check runs EVERY tick
+                # regardless of the echo, else a stranded echo would loop forever (nelix-sud).
+                if obs.submitted_echo_present:
+                    ps["saw_echo"] = True
+                    confirmed_now = False
+                else:
+                    confirmed_now = ps["saw_echo"] or moved
+                if confirmed_now:
+                    self._pending_submit = None
+                    confirm = True
+                elif time.monotonic() >= ps["confirm_deadline"]:
+                    self._pending_submit = None
+                    unconfirmed = True
+        # ---- act OUTSIDE the lock (never hold self._lock across a PTY write / EventQueue resolve) ----
+        if abort:
+            self._events.resolve_decision(did, "superseded")
+            if self._log is not None:
+                self._log.info("session", "submit_aborted", session_id=self._id, decision_id=did)
+            ps["outcome"] = "stale"
+            ps["event"].set()
+            return
+        if write:
+            try:
+                self._type_text(self._driver.submit_text(clean),
+                                timeout=max(0.0, ps["write_deadline"] - time.monotonic()))
+                self._press_enter(timeout=max(0.0, ps["write_deadline"] - time.monotonic()))
+            except PtyWriteTimeout:
+                self._events.resolve_decision(did, "superseded")
+                if self._log is not None:
+                    self._log.warning("session", "respond_failed", session_id=self._id,
+                                      decision_id=did, reason="write_unconfirmed")
+                ps["outcome"] = "write_timeout"
+                ps["event"].set()
+                return
+            seq = self._events.resolve_decision(did, "answered")
+            with self._lock:
+                self._last_submitted = clean
+            # Confirm continues on LATER ticks — frames the monitor pumps AFTER this write. Mutating ps
+            # here is monitor-thread-local: the RPC waiter reads ps only after its event fires (below).
+            ps["seq"] = seq
+            ps["confirm_deadline"] = time.monotonic() + max(self._spec.respond_confirm_seconds,
+                                                            self._CONFIRM_MIN_SECONDS)
+            ps["saw_echo"] = False
+            ps["state"] = "written"
+            if self._log is not None:
+                self._log.info("session", "decision_answered", session_id=self._id, decision_id=did, seq=seq)
+                self._log.debug("session", "respond_submitted", session_id=self._id,
+                                decision_id=did, writer="monitor")
+            return
+        if confirm:
+            # POSITIVE post-write evidence: the answer landed. Append the user marker, arm post-submit
+            # suppression, and resume to busy (Invariant A) — same tail as the old RPC confirm path.
+            with self._lock:
+                self._dialog.append_user_input(clean)
+                self._engine.on_submit(clean)
+                notes = self._engine.drain_notes()
+                self._state = "busy"
+            self._log_notes(notes)
+            if self._log is not None:
+                self._log.info("session", "respond_confirmed", session_id=self._id,
+                               decision_id=did, seq=ps.get("seq"), writer="monitor")
+            ps["outcome"] = "submitted"
+            ps["event"].set()
+            return
+        if unconfirmed:
+            # Written but no landed-submit evidence by the deadline (Enter dropped / stranded echo). The
+            # decision is already resolved 'answered' (the write happened); report respond_failed so the
+            # caller recovers, but do NOT append a marker or arm on_submit off an unconfirmed answer.
+            if self._log is not None:
+                self._log.warning("session", "respond_failed", session_id=self._id,
+                                  decision_id=did, reason="submit_unconfirmed")
+            ps["outcome"] = "respond_failed"
+            ps["event"].set()
+            return
+        # else: state "written", no evidence yet and the deadline not reached -> confirm next tick.
+
+    def _abort_pending_submit(self, reason):
+        # Release a respond() waiting on a post-delivery free-text submit on EVERY monitor-thread exit
+        # (mirrors _abort_pending_answer). CLAIM under the lock; resolve + signal outside. If the write
+        # already ran (state "written"), the answer was typed and the decision resolved 'answered' — the
+        # superseded resolve here is then an idempotent no-op; the outcome is 'terminal' either way (the
+        # session is gone, so the caller refreshes status rather than trusting an unconfirmed submit).
+        with self._lock:
+            ps = self._pending_submit
+            if ps is None:
+                return
+            self._pending_submit = None
+            did = ps["decision_id"]
+        self._events.resolve_decision(did, "superseded")
+        ps["outcome"] = "terminal"
+        ps["event"].set()
+        if self._log is not None:
+            self._log.info("session", "submit_aborted", session_id=self._id,
+                           decision_id=did, reason=reason)
+
     def respond(self, answer, decision_id=None):
         # Bind to the session's CURRENT pending decision (server owns identity). An answer to a
         # pending decision MUST name it: decision_id (sourced from a status pull) is REQUIRED to
@@ -1719,6 +1860,16 @@ class Session:
         # POST-delivery free-text/modal answers keep the direct write below — no delivery race then.
         if is_blocked:
             return self._respond_blocked(decision, did, clean)
+        # nelix-s7v (Approach B): a POST-delivery FREE-TEXT answer is ALSO routed through the MONITOR —
+        # it owns the PTY write AND the subsequent pump/render, so the landed-submit confirm rests on
+        # frames the monitor pumped AFTER its own write (a genuine happens-after the keystroke). That
+        # closes the RPC-thread render race AND the false-confirm/false-abort a render-generation
+        # counter could not (a counter cannot tell a post-write frame from a pre-write screen change).
+        # respond() only ENQUEUES and waits. Modal / other post-delivery answers keep the direct
+        # RPC-thread write below (a single high-confidence keypress, no echo-confirm — the nelix-5r3
+        # modal path is untouched).
+        if decision.get("prompt_kind") == "free_text":
+            return self._respond_free_text(decision, did, clean)
         # Atomically CLAIM the decision: exactly one responder clears it and goes on to type, so
         # concurrent duplicate responds can never both write to the PTY (which is non-idempotent).
         with self._lock:
@@ -1746,18 +1897,6 @@ class Session:
             # on timeout the answer did not land (executor wedged) -> report it, don't re-type.
             # Non-draining (the monitor owns pump(); draining here would race it).
             deadline = time.monotonic() + self._spec.respond_write_seconds
-            # nelix-s7v (freshness): capture the render generation BEFORE the keystroke write, so EVERY
-            # monitor render that could reflect the submit (rendered at or after the write) has a
-            # STRICTLY GREATER generation and is eligible confirm evidence. Capturing AFTER the write
-            # (the fix-wave-1 bug) let a monitor tick in the Enter->capture window bump the generation
-            # past a valid post-submit frame, EXCLUDING it — a false-abort when that tick is the only
-            # evidence (e.g. the answer exits the child, so no later tick ever arrives). A render
-            # between this capture and the write landing shows the still-PENDING free_text box (no echo,
-            # not "moved"), so it can never false-confirm — the confirm just keeps waiting. Only the
-            # free-text path below reads this; the modal path never confirms. Captured under the lock
-            # (the monitor writes _render_gen under it) so it is a clean snapshot.
-            with self._lock:
-                submit_gen = self._render_gen
             try:
                 if is_modal:
                     # The driver presses the digit + confirm (one sequence): never prose into a menu.
@@ -1775,28 +1914,12 @@ class Session:
                                       answered_decision_id=did, snapshot=self.snapshot())
             if self._log is not None:
                 self._log.debug("session", "respond_submitted", session_id=self._id, decision_id=did)
-            # observe() keys echo detection off _last_submitted — set it BEFORE confirming so both the
-            # confirm poll and the monitor thread match the answer we just typed.
+            # observe() keys echo detection off _last_submitted — set it so the engine's post-submit
+            # echo-suppression matches the answer we just typed. (Free-text — which needs a landed-submit
+            # confirm — is routed to the monitor via _respond_free_text; this direct write is a modal
+            # selection or other single-keypress answer that needs no echo-confirm.)
             with self._lock:
                 self._last_submitted = clean
-            # Confirm the submit LANDED (free-text only): mirror START's echo->confirm. A free-text
-            # answer that the executor failed to submit (Enter dropped while mid-render) stays stranded
-            # in the box; without this check respond() would falsely report 'resumed' and the lingering
-            # echo would then suppress every wake (nelix-sud). A modal/blocked selection is a single
-            # high-confidence keypress with no lingering text echo, so it keeps the prompt behaviour.
-            if decision.get("prompt_kind") == "free_text":
-                # nelix-s7v: the confirm now needs at least one POST-submit monitor render (pump(0.1)
-                # per _loop_once tick), so floor the window at a few pump intervals — a misconfigured
-                # sub-tick respond_confirm_seconds would otherwise time out before any tick could
-                # arrive and false-abort a landed answer. The 6.0s default is unaffected.
-                confirm_deadline = time.monotonic() + max(self._spec.respond_confirm_seconds,
-                                                          self._CONFIRM_MIN_SECONDS)
-                if not self._confirm_submit(confirm_deadline, submit_gen):
-                    if self._log is not None:
-                        self._log.warning("session", "respond_failed", session_id=self._id,
-                                          decision_id=did, reason="submit_unconfirmed")
-                    return RespondOutcome("respond_failed", decision_id=did,
-                                          answered_decision_id=did, snapshot=self.snapshot())
             if not is_blocked:
                 # Only a delivered-agent respond appends a user marker; a write_timeout must not
                 # advance the transcript. A modal records the chosen option's LABEL (not the bare id).
