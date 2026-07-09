@@ -180,16 +180,19 @@ def _session(tmp_path, frames=(), handle=None, spec=None, step=1.0, logger=_REAL
 
 def _drive_confirm(sess, monkeypatch, handle):
     """nelix-s7v: the free-text respond() submit-confirm reads the MONITOR-OWNED _last_render cache
-    and NEVER calls _handle.render() on the RPC thread (PtySession.pump() mutates that renderer
-    unlocked, so a render() there would race the monitor). This helper models the monitor tick that
-    owns render(): seed the cache from the scripted handle's first frame, then hook the confirm's
-    inter-poll wait (daemon.session.time.sleep) to pull the handle's NEXT frame into the cache. The
-    confirm then observes the SAME frame progression the handle scripts — routed through the cache,
-    single-threaded and deterministic — instead of rendering it on the RPC thread."""
-    sess._last_render = handle.render()
+    (never rendering on the RPC thread) and observes it ONLY once the render generation advances past
+    the value captured at submit — so it rests on POST-submit evidence, never a stale pre-submit
+    frame. Model the monitor tick that owns render() AND that generation: on each confirm inter-poll
+    wait (daemon.session.time.sleep) render the handle's NEXT frame into the cache and bump
+    _render_gen under the lock — exactly what _loop_once does. The confirm then observes the handle's
+    frame progression as genuine post-submit evidence, single-threaded and deterministic. No pre-seed:
+    the pre-submit cache stays whatever the monitor last rendered, so the generation guard genuinely
+    WAITS for the first tick delivered here (the real wait is exercised, not manufactured away)."""
     real_sleep = time.sleep
     def advance(*_a):
-        sess._last_render = handle.render()
+        with sess._lock:
+            sess._last_render = handle.render()
+            sess._render_gen += 1
         real_sleep(0.02)          # keep the poll cadence real (honest deadline, not a hot spin)
     monkeypatch.setattr("daemon.session.time.sleep", advance)
 
@@ -795,13 +798,13 @@ def test_respond_free_text_resumes_when_answer_leaves_box(monkeypatch, tmp_path)
     assert sess._dialog.last_user_input_offset() > offset_before   # confirmed -> marker appended
 
 
-def test_free_text_confirm_reads_cache_without_calling_the_live_renderer(tmp_path):
+def test_free_text_confirm_reads_cache_without_calling_the_live_renderer(monkeypatch, tmp_path):
     """nelix-s7v thread-safety AC (mirrors nelix-5r3's modal-path spy): PtySession.pump() mutates the
         renderer via _feed() OUTSIDE Session._lock, so the free-text respond() submit-confirm — which
         runs on the RPC thread — MUST NOT call _handle.render() against that live renderer (a read
         concurrent with pump's unlocked mutation). _confirm_submit reads the MONITOR-OWNED _last_render
         cache instead. Spy the handle's render() and assert respond() invokes it ZERO times while
-        confirming a free-text answer. RED (pre-fix): _confirm_submit called self._handle.render() ->
+        confirming a free-text answer. RED (pre-s7v): _confirm_submit called self._handle.render() ->
         the spy records >=1 call; GREEN: 0 calls (the confirm reads the cache under self._lock)."""
     box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
@@ -810,9 +813,18 @@ def test_free_text_confirm_reads_cache_without_calling_the_live_renderer(tmp_pat
     dec = sess.snapshot()["decision"]
     assert dec["prompt_kind"] == "free_text", "the box must surface as a free_text pause"
     did = dec["decision_id"]
-    # The monitor's last tick cached a 'moved' (working) frame, so the confirm resolves from the cache
-    # alone. Spy render() so the test FAILS if the confirm reaches for the live renderer on this thread.
-    sess._last_render = "✶ Working… (esc to interrupt)"
+    # Model the monitor delivering a POST-submit 'moved' frame: on the confirm's inter-poll wait, bump
+    # the render generation + cache a working frame under the lock — WITHOUT calling handle.render()
+    # (the monitor owns render off-thread; here we only need the cache write it would produce). The
+    # confirm then resolves from the cache. Spy render() so the test FAILS if the confirm renders.
+    real_sleep = time.sleep
+
+    def monitor_tick(*_a):
+        with sess._lock:
+            sess._last_render = "✶ Working… (esc to interrupt)"
+            sess._render_gen += 1
+        real_sleep(0.0)
+    monkeypatch.setattr("daemon.session.time.sleep", monitor_tick)
     calls = {"n": 0}
     _real_render = sess._handle.render
 
@@ -828,6 +840,33 @@ def test_free_text_confirm_reads_cache_without_calling_the_live_renderer(tmp_pat
         f"the free-text confirm must read the cache without rendering (made {calls['n']} render call(s))")
     assert out.status == "resumed", (
         f"the confirm must resolve from the cached moved frame (got {out.status})")
+
+
+def test_free_text_confirm_does_not_confirm_off_a_stale_pre_submit_frame(tmp_path):
+    """nelix-s7v fix-wave FRESHNESS AC: reading the monitor-owned cache without a freshness guard
+        could confirm off a frame the monitor rendered BEFORE the answer was typed. Rendering on the
+        RPC thread used to give a frame captured AT confirm time (a happens-after the keystroke); the
+        cache alone lost that. Seed the cache with a STALE 'moved' (working) frame — the state BEFORE
+        the submit — and let NO post-submit monitor tick occur (the render generation never advances).
+        The confirm must NOT read the stale frame as evidence: it waits for a post-submit frame (a
+        strictly greater generation) and, getting none, times out into respond_failed. RED (381c874,
+        no guard): _confirm_submit reads the stale 'moved' frame and false-resumes; GREEN: respond_failed."""
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
+    dec = sess.snapshot()["decision"]
+    assert dec["prompt_kind"] == "free_text", "the box must surface as a free_text pause"
+    did = dec["decision_id"]
+    offset_before = sess._dialog.last_user_input_offset()
+    # A stale PRE-submit 'moved' frame is already cached; NOTHING bumps _render_gen after the submit,
+    # so no post-submit frame ever exists. The confirm must refuse to confirm off this stale frame.
+    sess._last_render = "✶ Working… (esc to interrupt)"
+    out = sess.respond("do the next thing", decision_id=did)
+    assert out.status == "respond_failed", (
+        f"must NOT confirm off a stale pre-submit frame — wait for post-submit evidence (got {out.status})")
+    assert sess._decision is None                     # claimed, not left half-pending
+    assert sess._dialog.last_user_input_offset() == offset_before   # unconfirmed -> no user marker
 
 
 def test_answering_reemitted_blocked_clears_pending(tmp_path):
