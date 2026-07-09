@@ -117,12 +117,17 @@ class BeliefEngine:
         # key -> suppressed (no phantom re-publish), while a genuinely new gate has a DIFFERENT key ->
         # published (answerable). No epoch-level ambiguity and no hook-ordering / tool-progress
         # assumption. Cleared at each epoch boundary. See on_submit + the waiting_for_user branch.
+        # A repeated IDENTICAL gate (an allow-once approval then re-running the same command) shares its
+        # predecessor's fingerprint, so its tombstone is LIFTED by the fresh working PreToolUse that
+        # precedes its PermissionRequest (a new-invocation signal — see the working-hook branch).
         # RESIDUALS: (1) a waiting_for_user hook with NO tool_input — only the legacy permission
         # Notification path; PermissionRequest / PreToolUse[AskUserQuestion] both carry it — falls back
         # to the epoch key, which cannot distinguish a second same-kind gate from a straggler in one
-        # epoch. (2) two BYTE-IDENTICAL gates (same tool_name + tool_input) in one epoch share a
-        # fingerprint, so the second is read as a straggler of the first — narrow and unusual (identical
-        # consecutive tool calls); the best achievable without a per-gate id, which Claude does not give.
+        # epoch. (2) a repeated identical gate whose PermissionRequest arrives BEFORE any new-invocation
+        # PreToolUse signal for that gate — a Bash gate whose second PermissionRequest is reordered ahead
+        # of its own PreToolUse, or a repeated identical AskUserQuestion (whose PreToolUse IS the pause,
+        # not a working signal) — is genuinely indistinguishable from a straggler of the answered gate
+        # and is suppressed. Truly minimal without a per-gate id, which Claude's PermissionRequest lacks.
         self._hook_answered_ids = set()
         self._idle_published_epoch = None  # epoch whose Stop already published idle (idempotency)
         # precedence & lost-hook reconciliation (Task 7): process-exit > hook > bounded screen.
@@ -292,6 +297,14 @@ class BeliefEngine:
         # open turn. After a Stop with no new UserPromptSubmit it is a late straggler -> ignored (the
         # session must stay idle, not be dragged back to busy by trailing tool events).
         if self._turn_open:
+            # nelix-f7y: a fresh PreToolUse carrying a gate fingerprint is a NEW-INVOCATION signal (only
+            # PreToolUse carries gate_fp here). If that fingerprint is tombstoned, the agent is invoking
+            # the SAME gate AGAIN (an allow-once approval + a re-run of the identical command), so LIFT
+            # the tombstone -> the gate's next PermissionRequest publishes a fresh answerable decision
+            # instead of being swallowed as a straggler. A gate's OWN first PreToolUse precedes its first
+            # PermissionRequest, so its fingerprint is not yet answered -> discard is a harmless no-op.
+            if hobs.gate_fp is not None:
+                self._hook_answered_ids.discard(f"hook_gate:{hobs.gate_fp}")
             self._state.control_state = "busy"
             self._state.phase = "busy"
         return actions

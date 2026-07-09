@@ -1143,6 +1143,43 @@ def test_reordered_second_gate_still_answerable_no_terminal_oversuppression(tmp_
     assert sess.snapshot()["control_state"] == "busy"
 
 
+def test_repeated_identical_gate_in_normal_order_is_answerable(tmp_path):
+    """A REPEATED IDENTICAL gate in NORMAL hook order must be answerable (nelix-f7y wave 4). Realistic:
+        an allow-ONCE approval, then the agent runs the EXACT SAME gated command again (a retry / a test
+        loop). Same tool_input -> same fingerprint, so pause 2 would collide with pause 1's answered
+        tombstone — EXCEPT gate 2's fresh PreToolUse[Bash] (a NEW-INVOCATION signal, delivered in normal
+        order BEFORE its PermissionRequest) lifts that fingerprint's tombstone, so the second
+        PermissionRequest publishes a FRESH respondable decision. BOTH gates use the REAL byte-identical
+        bash_gate.jsonl tool_input. RED on 16e37c6 (the working PreToolUse dropped the fingerprint, so
+        the tombstone was never lifted -> pause 2 suppressed -> no decision -> terminal hang). GREEN:
+        the fresh PreToolUse lifts the tombstone -> pause 2 answerable."""
+    sess, ev, fire = _f7y_session(tmp_path)
+
+    # ---- gate 1: a Bash permission gate, answered (allow once) ----
+    fire("UserPromptSubmit")
+    fire("PreToolUse", tool_name="Bash", tool_input=_BASH_TI)
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI)
+    did1 = sess.snapshot()["decision"]["decision_id"]
+    assert sess.respond("1", decision_id=did1).status == "resumed", "gate 1 must be answerable"
+    assert sess.snapshot().get("decision") is None
+
+    # ---- gate 2: the EXACT SAME command again, NORMAL hook order (PostToolUse -> PreToolUse -> Perm) ----
+    fire("PostToolUse", tool_name="Bash", tool_input=_BASH_TI)   # gate 1's tool ran (carries no fingerprint)
+    fire("PreToolUse", tool_name="Bash", tool_input=_BASH_TI)    # NEW invocation of the SAME cmd -> lifts tombstone
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI)
+
+    dec2 = sess.snapshot().get("decision")
+    assert dec2 is not None, (
+        "a repeated identical gate in normal order (its fresh PreToolUse a new-invocation signal) must "
+        "publish a FRESH respondable decision — RED (16e37c6): the working PreToolUse dropped the "
+        "fingerprint, the tombstone stood, and pause 2 was suppressed into a terminal hang")
+    assert dec2["kind"] == "waiting_for_user" and dec2["prompt_kind"] == "permission_choice"
+    assert ev.pending("s1") is not None, "the repeated gate must be in the respondable queue"
+    assert dec2["decision_id"] != did1, "it is a FRESH decision, not the answered gate 1"
+    assert sess.respond("1", decision_id=dec2["decision_id"]).status == "resumed", (
+        "the repeated identical gate must be answerable end-to-end")
+
+
 def test_askuserquestion_collision_dedups_by_fingerprint(tmp_path):
     """nelix-32f collision dedup under per-gate keying, on the REAL captured shape: ONE physical
         AskUserQuestion modal emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice) AND

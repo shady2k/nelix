@@ -102,7 +102,13 @@ def normalize_claude_hook(ev: HookEvent) -> HookObservation:
         return HookObservation(kind="working", closes_turn=False, opens_turn=False,
                                clears_pending=False, raw_event=event)
 
-    # Every other tool-lifecycle event (Pre/PostToolUse, PostToolUseFailure, ...) is the agent
-    # actively working.
+    # Every other tool-lifecycle event (Pre/PostToolUse, PostToolUseFailure, ...) is the agent actively
+    # working. A plain (non-AskUserQuestion) PreToolUse ALSO carries the gate fingerprint: it is a fresh
+    # NEW-INVOCATION signal, so the engine uses it to LIFT the answered-gate tombstone for that
+    # fingerprint — a repeated identical gate (an allow-once approval then re-running the same command)
+    # must be answerable again, not swallowed as a straggler (nelix-f7y). PostToolUse and failures carry
+    # NO fingerprint: they belong to a gate already answered, never a new invocation, so they must not
+    # lift a tombstone (else a late straggler PermissionRequest could re-publish a phantom).
+    gate_fp = gate_fingerprint(ev.tool_name, ev.tool_input) if event == "PreToolUse" else None
     return HookObservation(kind="working", closes_turn=False, opens_turn=False,
-                           clears_pending=False, raw_event=event)
+                           clears_pending=False, raw_event=event, gate_fp=gate_fp)
