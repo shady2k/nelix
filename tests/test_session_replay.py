@@ -1035,3 +1035,56 @@ def test_second_same_kind_permission_pause_in_one_epoch_is_answerable(tmp_path):
     # end-to-end: the orchestrator can actually answer the second pause.
     out2 = sess.respond("1", decision_id=dec2["decision_id"])
     assert out2.status == "resumed", f"pause 2 must be answerable end-to-end (got {out2.status})"
+
+
+def test_straggler_of_answered_pause_does_not_publish_phantom(tmp_path):
+    """RED on the first f7y fix (1232e34, unconditional clear): after a Bash permission pause is
+        ANSWERED, a late duplicate / straggler PermissionRequest of THAT SAME pause — delivered while
+        the epoch is still OPEN (no Stop), with NO intervening tool progress (no PostToolUse+PreToolUse)
+        — must NOT publish a PHANTOM respondable decision. Hook HTTP delivery is reorderable (the
+        nelix-32f collision models exactly this), so this straggler is real. The unconditional clear
+        reopened the dedup hole shifted to after the answer: on_hook finds no pending key, the
+        closed-turn guard does not apply (epoch still open), so the late duplicate is minted as a fresh
+        pause and a phantom decision is published — the same phantom-decision class that once leaked a
+        stray '1' into a live prod session. GREEN with the answered-pause tombstone: the re-publish for
+        the answered key is suppressed until tool progress (or epoch close) lifts the tombstone."""
+    from daemon.hooks import HookEvent
+    menu = (_PERM / "run-command-menu.txt").read_text()
+    obs = ClaudeDriver().observe(
+        menu, ObservationCtx(last_submitted_text=None, child_alive=True, exit_code=None))
+    assert obs.prompt_kind == "permission_choice" and [o.id for o in obs.options] == ["1", "2", "3"], (
+        "fixture must be a real Bash permission gate (permission_choice, options 1/2/3)")
+
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([menu], clock=clock, step=0.0)
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"
+
+    def fire(event, tool_name=None):
+        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name))
+        sess._loop_once()
+
+    # pause 1: a Bash permission gate, published and answered end-to-end.
+    fire("UserPromptSubmit")
+    fire("PreToolUse", tool_name="Bash")
+    fire("PermissionRequest", tool_name="Bash")
+    dec1 = sess.snapshot().get("decision")
+    assert dec1 is not None and dec1["prompt_kind"] == "permission_choice", "pause 1 must be a permission pause"
+    did1 = dec1["decision_id"]
+    assert sess.respond("1", decision_id=did1).status == "resumed", "pause 1 must be answerable"
+    assert sess.snapshot().get("decision") is None            # answered -> cleared
+
+    # A late duplicate / straggler PermissionRequest of the ALREADY-ANSWERED pause 1, delivered with
+    # NO intervening tool progress (no PostToolUse + new PreToolUse) and while the epoch is still open.
+    writes_before = len(sess._handle.writes)
+    fire("PermissionRequest", tool_name="Bash")
+
+    snap = sess.snapshot()
+    assert snap.get("decision") is None, (
+        "a late straggler of the ANSWERED pause must NOT publish a phantom decision — RED (1232e34): "
+        "the unconditional clear lets the duplicate mint a fresh phantom respondable decision")
+    assert ev.pending("s1") is None, "no phantom decision may enter the respondable queue"
+    assert snap["control_state"] != "awaiting_user", (
+        "the answered pause's straggler must not resurrect awaiting_user (the agent already resumed)")
+    # and nothing was typed into the PTY off a phantom (the stray-keystroke leak this class caused).
+    assert sess._handle.writes[writes_before:] == [], "a suppressed straggler types nothing"

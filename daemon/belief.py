@@ -110,6 +110,11 @@ class BeliefEngine:
         self._turn_open = False           # a turn is running (between open and its close)
         self._hook_pending_key = None     # currently-published hook waiting_for_user, for withdrawal
         self._hook_pending_kind = None    # its effective prompt_kind (modal_choice wins, nelix-32f)
+        # nelix-f7y: a tombstone for the pause just ANSWERED whose epoch is still open and which has
+        # seen NO tool progress since. It suppresses a re-publish for that SAME key (a late duplicate /
+        # straggler of the answered pause) WITHOUT blocking a genuinely fresh subsequent gate: any tool
+        # progress (a plain working hook / clears_pending) or an epoch boundary lifts it. See on_submit.
+        self._hook_answered_key = None
         self._idle_published_epoch = None  # epoch whose Stop already published idle (idempotency)
         # precedence & lost-hook reconciliation (Task 7): process-exit > hook > bounded screen.
         self._last_hook_at = None          # clock of the most recent hook (lost-hook deadlines)
@@ -186,6 +191,7 @@ class BeliefEngine:
             self._turn_open = True
             self._hook_pending_key = None
             self._hook_pending_kind = None
+            self._hook_answered_key = None          # nelix-f7y: a new epoch retires the answered-pause tombstone
             self._state.control_state = "busy"
             self._state.phase = "busy"
             return actions
@@ -197,6 +203,7 @@ class BeliefEngine:
                 return actions
             self._turn_open = False
             self._idle_published_epoch = self._turn_epoch
+            self._hook_answered_key = None                       # nelix-f7y: epoch closed -> retire the tombstone
             if self._hook_pending_key is not None:               # a pending prompt is moot once idle
                 actions.append(Withdraw(decision_key=self._hook_pending_key, reason="superseded"))
                 self._hook_pending_key = None
@@ -215,6 +222,7 @@ class BeliefEngine:
         if hobs.clears_pending:
             if self._turn_closed():
                 return actions
+            self._hook_answered_key = None          # nelix-f7y: tool progress -> the next gate is fresh
             if self._hook_pending_key is not None:
                 actions.append(Withdraw(decision_key=self._hook_pending_key, reason="prompt_left"))
                 self._hook_pending_key = None
@@ -252,6 +260,17 @@ class BeliefEngine:
                 self._state.control_state = "awaiting_user"
                 self._state.phase = "pause_candidate"
                 return actions
+            if self._hook_answered_key == decision_key:
+                # nelix-f7y: this epoch's pause was already ANSWERED and NO tool progress has happened
+                # since (the tombstone is still standing). A waiting_for_user for the SAME key is a late
+                # duplicate / straggler of that answered pause (reordered hook delivery), NOT a fresh
+                # gate — suppress the re-publish so no PHANTOM respondable decision is minted (which the
+                # orchestrator would answer, leaking a stray keystroke into the resumed turn). The agent
+                # already resumed on the answer, so the true state is busy, not awaiting_user.
+                self._turn_open = True
+                self._state.control_state = "busy"
+                self._state.phase = "busy"
+                return actions
             self._hook_pending_key = decision_key
             self._hook_pending_kind = effective_kind
             self._turn_open = True
@@ -264,6 +283,9 @@ class BeliefEngine:
         # open turn. After a Stop with no new UserPromptSubmit it is a late straggler -> ignored (the
         # session must stay idle, not be dragged back to busy by trailing tool events).
         if self._turn_open:
+            # nelix-f7y: the agent resumed tool work after the answer -> lift the answered-pause
+            # tombstone, so a subsequent same-kind gate is (correctly) read as a FRESH answerable pause.
+            self._hook_answered_key = None
             self._state.control_state = "busy"
             self._state.phase = "busy"
         return actions
@@ -314,13 +336,18 @@ class BeliefEngine:
         now = self._clock.now()
         self._published_key = None
         self._published_kind = None
-        # nelix-f7y: the answer resolves the hook pause too, so drop its pending-pause key. The
-        # `hook_pause:{epoch}` slot exists ONLY to dedup a pause's OWN duplicate/straggler hook (the
-        # AskUserQuestion PreToolUse/PermissionRequest collision, nelix-32f) BEFORE it is answered.
-        # Once answered, the NEXT waiting_for_user hook in the SAME epoch is a FRESH pause (a permission
-        # gate has no PostToolUse[AskUserQuestion] to clear the slot), and must NOT be swallowed by the
-        # "same key already published" guard in on_hook — clearing it here lets on_hook mint a fresh
-        # respondable decision the orchestrator can answer.
+        # nelix-f7y: the answer resolves the hook pause, so free the pending-pause slot — a genuinely
+        # FRESH subsequent same-kind gate in the SAME epoch (a permission gate has no
+        # PostToolUse[AskUserQuestion] to clear the slot) must NOT be swallowed by on_hook's "same key
+        # already published" guard. But clearing it OUTRIGHT would reopen the nelix-32f duplicate-hook
+        # hole shifted to after the answer: a late duplicate / straggler of THIS answered pause
+        # (hook delivery is reorderable) would then be read as a fresh pause and publish a PHANTOM
+        # respondable decision. So TOMBSTONE the answered key instead: on_hook suppresses a re-publish
+        # for that same key until tool progress (a working / clears_pending hook) or an epoch boundary
+        # lifts the tombstone — the discriminator between "the answered pause's own straggler" (no tool
+        # progress since the answer) and "a fresh gate" (preceded by the agent resuming tool work).
+        if self._hook_pending_key is not None:
+            self._hook_answered_key = self._hook_pending_key
         self._hook_pending_key = None
         self._hook_pending_kind = None
         self._candidate_fp = None
