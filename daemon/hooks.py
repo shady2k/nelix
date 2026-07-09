@@ -8,6 +8,8 @@ means (working / waiting_for_user / idle and the turn-boundary flags); all tempo
 and precedence are the core's (daemon.belief.BeliefEngine), which is why this module carries no
 timestamps and no state.
 """
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -21,7 +23,6 @@ class HookEvent:
     tool_input: dict = field(default_factory=dict)
     is_interrupt: bool = False
     notification: Optional[str] = None   # matcher/message for Notification events
-    tool_use_id: Optional[str] = None    # per-tool-call id: SAME across one invocation's hooks (nelix-f7y)
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,23 @@ class HookObservation:
     interrupted: bool = False
     prompt_kind: Optional[str] = None   # "permission_choice"|"modal_choice"|"free_text"|None
     raw_event: str = ""
-    tool_use_id: Optional[str] = None   # stable per-gate id for a waiting_for_user pause (nelix-f7y)
+    gate_fp: Optional[str] = None   # per-gate fingerprint of a waiting_for_user pause (nelix-f7y)
+
+
+def gate_fingerprint(tool_name: Optional[str], tool_input: Optional[dict]) -> Optional[str]:
+    """A stable per-gate identity derived from the tool call ITSELF: a hash of tool_name + the
+    canonical (key-sorted) tool_input. Both hooks of ONE physical gate carry IDENTICAL
+    tool_name/tool_input — the collision's PreToolUse[AskUserQuestion] and its PermissionRequest both
+    carry the SAME {questions:[...]}, a Bash gate's PreToolUse and PermissionRequest both the SAME
+    {command,...} — so they share a fingerprint (dedup); different gates carry different tool_input (so
+    a genuinely new gate is distinct). This is the ONLY per-gate identity available: Claude's
+    PermissionRequest hook carries NO tool_use_id (only PreToolUse does), so cross-hook id correlation
+    is impossible; the body fingerprint needs neither a shared id nor any hook-ordering assumption
+    (nelix-f7y). Returns None when tool_input is absent/empty (defensive; real gates always carry it)."""
+    if not tool_input:
+        return None
+    canonical = json.dumps(tool_input, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(f"{tool_name or ''}\x00{canonical}".encode()).hexdigest()[:16]
 
 
 def normalize_claude_hook(ev: HookEvent) -> HookObservation:
@@ -53,20 +70,21 @@ def normalize_claude_hook(ev: HookEvent) -> HookObservation:
         return HookObservation(kind="working", closes_turn=False, opens_turn=True,
                                clears_pending=False, raw_event=event)
 
-    # A tool wants permission -> the agent is blocked on the user. Carry the tool_use_id: the belief
-    # engine keys the pause by it (per-gate), so a straggler of THIS gate dedups (same id) while a
-    # genuinely new gate is distinct (different id) — no epoch-level ambiguity (nelix-f7y).
+    # A tool wants permission -> the agent is blocked on the user. Carry the per-gate fingerprint: the
+    # belief engine keys the pause by it, so a straggler of THIS gate dedups (identical tool_input ->
+    # same fingerprint) while a genuinely new gate is distinct (different tool_input) — no epoch-level
+    # ambiguity, no hook-ordering assumption, and no need for a shared id the PermissionRequest lacks.
     if event == "PermissionRequest":
         return HookObservation(kind="waiting_for_user", closes_turn=False, opens_turn=False,
                                clears_pending=False, prompt_kind="permission_choice",
-                               raw_event=event, tool_use_id=ev.tool_use_id)
+                               raw_event=event, gate_fp=gate_fingerprint(ev.tool_name, ev.tool_input))
 
     # AskUserQuestion: PreToolUse raises the modal (waiting); PostToolUse resolves it (back to work).
     if ev.tool_name == "AskUserQuestion":
         if event == "PreToolUse":
             return HookObservation(kind="waiting_for_user", closes_turn=False, opens_turn=False,
                                    clears_pending=False, prompt_kind="modal_choice",
-                                   raw_event=event, tool_use_id=ev.tool_use_id)
+                                   raw_event=event, gate_fp=gate_fingerprint(ev.tool_name, ev.tool_input))
         if event == "PostToolUse":
             return HookObservation(kind="working", closes_turn=False, opens_turn=False,
                                    clears_pending=True, raw_event=event)

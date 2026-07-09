@@ -1,10 +1,14 @@
-# Ground-truth hook sequence synthesized from daemon-20260704-201855-44106.log
-# `hook_applied` events for session s-9610d25c @ 2026-07-04T20:57:20 (nelix hook-prompt-kind collision).
+# Hook sequence for the nelix-32f AskUserQuestion collision (session s-9610d25c @ 20:57:20).
 #
-# A single on-screen AskUserQuestion modal ("Next step", 6 options) emitted BOTH:
-#   1. PreToolUse[AskUserQuestion]  -> prompt_kind=modal_choice   (dec-cac4e8f5)
-#   2. PermissionRequest            -> prompt_kind=permission_choice (dec-0903ad69, SUPERSEDED #1)
-# See tests/golden/claude/_regression/s-9610d25c-askuserquestion-collision.raw for the matching screen.
+# A single on-screen AskUserQuestion modal emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice)
+# AND PermissionRequest (-> permission_choice). The daemon-20260704-201855-44106.log only retained
+# event NAMES (the daemon discards tool bodies), so the tool_input here is sourced from a REAL live
+# Claude Code 2.1.206 AskUserQuestion capture (tests/golden/claude/_hooks/askq_collision.jsonl) — the
+# REAL SHAPE: both hooks carry the SAME tool_input, PreToolUse carries a tool_use_id, PermissionRequest
+# does NOT. The matching SCREEN is the real 6-option "Next step" modal in
+# s-9610d25c-askuserquestion-collision.raw/.capture (that capture supplies the on-screen options).
+# belief keys the pause by a fingerprint of tool_name+tool_input, IDENTICAL across the two hooks -> ONE
+# stable decision (dedup); it never depended on a shared id (the PermissionRequest has none).
 {"hook_event_name": "UserPromptSubmit"}
-{"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion"}
-{"hook_event_name": "PermissionRequest"}
+{"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "Which do you choose?", "header": "Fruit", "options": [{"label": "Apple", "description": "Choose Apple."}, {"label": "Banana", "description": "Choose Banana."}], "multiSelect": false}]}, "tool_use_id": "toolu_01CJqWsVh7KRATroety7uCkh"}
+{"hook_event_name": "PermissionRequest", "tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "Which do you choose?", "header": "Fruit", "options": [{"label": "Apple", "description": "Choose Apple."}, {"label": "Banana", "description": "Choose Banana."}], "multiSelect": false}]}}

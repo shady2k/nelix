@@ -1,0 +1,8 @@
+# REAL captured hooks — live Claude Code 2.1.206, one gated Bash command (nelix-f7y).
+# Verbatim tool bodies (only personal session_id/transcript_path/cwd stripped). Same shape as the
+# AskUserQuestion collision: PreToolUse has tool_use_id, PermissionRequest has the SAME tool_input
+# but NO tool_use_id. Different gates carry different tool_input -> different fingerprints.
+{"hook_event_name": "UserPromptSubmit", "prompt_id": "409f645d-6006-4358-93be-440c4b57b805"}
+{"prompt_id": "409f645d-6006-4358-93be-440c4b57b805", "permission_mode": "default", "effort": {"level": "xhigh"}, "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "curl -s https://example.com -o /dev/null && echo fetched", "description": "Fetch example.com and confirm"}, "tool_use_id": "toolu_01QaeyniR9iKc32orwfkPdfe"}
+{"prompt_id": "409f645d-6006-4358-93be-440c4b57b805", "permission_mode": "default", "effort": {"level": "xhigh"}, "hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "curl -s https://example.com -o /dev/null && echo fetched", "description": "Fetch example.com and confirm"}, "permission_suggestions": [{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "curl -s https://example.com -o /dev/null"}], "behavior": "allow", "destination": "localSettings"}]}
+{"prompt_id": "409f645d-6006-4358-93be-440c4b57b805", "hook_event_name": "Notification", "message": "Claude needs your permission", "notification_type": "permission_prompt"}

@@ -245,8 +245,7 @@ def make_server(manager, transport, logger=None):
                            tool_name=body.get("tool_name"),
                            tool_input=body.get("tool_input") or {},
                            is_interrupt=bool(body.get("is_interrupt")),
-                           notification=body.get("message") or body.get("matcher"),
-                           tool_use_id=body.get("tool_use_id"))
+                           notification=body.get("message") or body.get("matcher"))
             sess.on_hook(ev)
             self._send(204, None)
 

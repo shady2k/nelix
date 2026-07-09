@@ -954,34 +954,60 @@ def test_predelivery_bodyless_modal_target_aborts_not_submitted(tmp_path, monkey
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# nelix-f7y — a SECOND same-kind gate in one turn-epoch, keyed by per-gate tool_use_id
+# nelix-f7y — a SECOND same-kind gate in one turn-epoch, keyed by a per-gate tool_input FINGERPRINT
 # ─────────────────────────────────────────────────────────────────────────────
 # nelix-32f keyed the hook pause by `hook_pause:{epoch}` (one respondable pause per epoch, to collapse
 # the AskUserQuestion PreToolUse[AskUserQuestion]/PermissionRequest collision to ONE stable decision).
 # An epoch-level key fundamentally cannot tell "a duplicate of the answered gate" from "a genuinely new
-# gate" using hooks alone, which produced a symmetric pair of P2 bugs across the earlier fix waves:
+# gate", which produced a symmetric pair of P2 bugs across the earlier fix waves:
 #   * clear-the-key-outright (1232e34)  -> a straggler of the answered gate PHANTOMs a decision.
 #   * epoch tombstone (35f10a7)         -> a genuine second gate whose PermissionRequest is reordered
-#                                          before its PreToolUse (or a DENIED pause 1 with no PostToolUse)
-#                                          is OVER-suppressed -> terminal hang (no self-heal: hook-active
-#                                          tick() publishes no screen decision).
-# Root fix (wave 2): key the pause by Claude's `tool_use_id` — the per-tool-invocation id that is STABLE
-# across a single invocation's hooks (so the collision's two hooks share it -> dedup) and DIFFERENT for
-# a new invocation (so a fresh gate is always distinct -> published, with NO ordering assumption). The
-# answered set (`_hook_answered_ids`) then suppresses only a straggler of an ALREADY-ANSWERED gate (same
-# id), never a real new gate (different id). tool_use_id is documented present on PreToolUse /
-# PermissionRequest / PostToolUse (Claude Code hooks reference); the RPC route threads it through
-# HookEvent -> HookObservation.
+#                                          before its PreToolUse (or a DENIED pause 1) is OVER-suppressed
+#                                          -> terminal hang.
+#   * key by tool_use_id (62772e4)      -> EMPIRICALLY BROKEN: the REAL captured PermissionRequest hook
+#                                          carries NO tool_use_id (only PreToolUse does), so the collision's
+#                                          two hooks got DIFFERENT keys -> the nelix-32f dedup regressed.
+# Root fix (wave 3): key the pause by a FINGERPRINT of (tool_name, tool_input) — hooks.gate_fingerprint.
+# Both hooks of ONE physical gate carry IDENTICAL tool_name + tool_input (the collision's two hooks both
+# carry the SAME {questions:[...]}; a Bash gate's PreToolUse and PermissionRequest both the SAME
+# {command,...}) -> SAME fingerprint -> dedup; different gates carry different tool_input -> distinct
+# fingerprints -> a fresh gate always publishes, regardless of hook ordering. The answered set
+# (`_hook_answered_ids`) suppresses only a straggler of an already-answered gate (same fingerprint).
+# The tool_input identity is derivable from the PermissionRequest body ALONE — no cross-hook id
+# correlation, no ordering assumption — which is what the tool_use_id approach could not do.
 #
-# The HOOK SEQUENCE (real Claude hook shapes, incl. the real per-gate tool_use_id normalize_claude_hook
-# now carries) is the subject under test. The on-screen option source is the REAL captured Bash "run a
-# command" permission menu (tests/golden/claude/permission_prompt/run-command-menu.txt ->
-# permission_choice, options 1/2/3), which respond() hydrates from; the golden corpus has no other
-# Bash-gate frame and fabricating a screen frame is disallowed by the project's real-capture rule.
+# The Bash tool_input bodies below are the REAL live Claude Code 2.1.206 captures
+# (tests/golden/claude/_hooks/bash_gate.jsonl); the on-screen option source is the REAL captured Bash
+# "run a command" permission menu (permission_prompt/run-command-menu.txt), which respond() hydrates
+# from. Fabricating a screen frame is disallowed by the project's real-capture rule.
+
+_HOOKS = Path(__file__).resolve().parent / "golden" / "claude" / "_hooks"
+
+
+def _gate_tool_input(fixture):
+    """The REAL captured PermissionRequest tool_input from a golden _hooks fixture (the per-gate body
+    the fingerprint keys on) — verbatim from a live capture, so tests exercise the real identity."""
+    import json
+    for line in (_HOOKS / fixture).read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        body = json.loads(s)
+        if body.get("hook_event_name") == "PermissionRequest":
+            return body["tool_input"]
+    raise AssertionError(f"{fixture} has no PermissionRequest line")
+
+
+# REAL captured tool_input bodies (verbatim from the live captures) — the identity the fingerprint keys
+# on. _BASH_TI_2 is a SECOND, genuinely different Bash gate (real shape, a different command).
+_BASH_TI = _gate_tool_input("bash_gate.jsonl")
+_BASH_TI_2 = {"command": "ls -la /tmp", "description": "List the tmp directory"}
+_ASKQ_TI = _gate_tool_input("askq_collision.jsonl")
+
 
 def _f7y_session(tmp_path):
     """A delivered, hook-active Session over the REAL Bash 'run a command' permission menu, with a
-    `fire(event, tool_name, tool_use_id)` helper that drives the real hook path (on_hook queue ->
+    `fire(event, tool_name, tool_input)` helper that drives the real hook path (on_hook queue ->
     _drain_hooks -> engine, then the screen tick that enriches hook-derived options from the menu).
     Returns (sess, ev, fire)."""
     from daemon.hooks import HookEvent
@@ -996,9 +1022,9 @@ def _f7y_session(tmp_path):
     sess._handle._dialog = sess._dialog
     sess._task_delivery = "delivered"                 # gates are mid-turn (post-delivery)
 
-    def fire(event, tool_name=None, tool_use_id=None):
+    def fire(event, tool_name=None, tool_input=None):
         sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name,
-                               tool_use_id=tool_use_id))
+                               tool_input=tool_input or {}))
         sess._loop_once()
 
     return sess, ev, fire
@@ -1006,19 +1032,19 @@ def _f7y_session(tmp_path):
 
 def test_second_same_kind_permission_pause_in_one_epoch_is_answerable(tmp_path):
     """A genuine SECOND same-kind Bash permission gate in ONE turn epoch must be answerable — the
-        original nelix-f7y AC. Real hook shapes with distinct per-gate tool_use_ids:
-          UserPromptSubmit -> PreToolUse[Bash tu1] -> PermissionRequest[tu1] (pause 1, answered)
-          -> PostToolUse[Bash tu1] -> PreToolUse[Bash tu2] -> PermissionRequest[tu2] (pause 2)
-        The second PermissionRequest (a DIFFERENT tool_use_id) must publish a FRESH respondable decision
-        the orchestrator can answer. RED on the pre-fix code (epoch-only key): pause 2 is swallowed by
-        the same-key guard / over-suppressed by the epoch tombstone -> no decision. GREEN: distinct
-        tool_use_id -> fresh permission_choice decision, respond() resumes."""
+        original nelix-f7y AC. Real hook shapes with distinct per-gate tool_input:
+          UserPromptSubmit -> PreToolUse[Bash cmdA] -> PermissionRequest[cmdA] (pause 1, answered)
+          -> PostToolUse[Bash cmdA] -> PreToolUse[Bash cmdB] -> PermissionRequest[cmdB] (pause 2)
+        The second PermissionRequest (DIFFERENT tool_input -> different fingerprint) must publish a FRESH
+        respondable decision the orchestrator can answer. RED on the pre-fingerprint code: pause 2 is
+        swallowed / over-suppressed -> no decision. GREEN: different fingerprint -> fresh
+        permission_choice decision, respond() resumes."""
     sess, ev, fire = _f7y_session(tmp_path)
 
     # ---- pause 1: a Bash permission gate, published and answered end-to-end ----
     fire("UserPromptSubmit")                                   # open the turn (hook_mode -> active, epoch 1)
-    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate1")
-    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate1")   # pause 1
+    fire("PreToolUse", tool_name="Bash", tool_input=_BASH_TI)  # plain working (only PermissionRequest pauses)
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI)   # pause 1
     dec1 = sess.snapshot().get("decision")
     assert dec1 is not None and dec1["kind"] == "waiting_for_user", "pause 1 must be a respondable pause"
     assert dec1["prompt_kind"] == "permission_choice"
@@ -1027,14 +1053,15 @@ def test_second_same_kind_permission_pause_in_one_epoch_is_answerable(tmp_path):
     assert out1.status == "resumed", f"pause 1 must be answerable (got {out1.status})"
     assert sess.snapshot().get("decision") is None            # answered -> cleared
 
-    # ---- pause 2: a SECOND Bash permission gate (distinct tool_use_id) in the SAME turn epoch ----
-    fire("PostToolUse", tool_name="Bash", tool_use_id="toolu_gate1")   # gate 1's tool ran (plain working)
-    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate2")
-    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate2")   # pause 2 — fresh gate
+    # ---- pause 2: a SECOND Bash permission gate (DIFFERENT command) in the SAME turn epoch ----
+    fire("PostToolUse", tool_name="Bash", tool_input=_BASH_TI)   # gate 1's tool ran (plain working)
+    fire("PreToolUse", tool_name="Bash", tool_input=_BASH_TI_2)
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI_2)   # pause 2 — fresh gate
 
     dec2 = sess.snapshot().get("decision")
     assert dec2 is not None, (
-        "a genuinely new gate (distinct tool_use_id) must publish a FRESH respondable decision")
+        "a genuinely new gate (different tool_input -> different fingerprint) must publish a FRESH "
+        "respondable decision")
     assert dec2["kind"] == "waiting_for_user" and dec2["prompt_kind"] == "permission_choice"
     assert dec2["requires_response"] is True
     assert ev.pending("s1") is not None, "the fresh pause must be in the respondable queue"
@@ -1045,32 +1072,32 @@ def test_second_same_kind_permission_pause_in_one_epoch_is_answerable(tmp_path):
 
 
 def test_straggler_of_answered_pause_does_not_publish_phantom(tmp_path):
-    """A late duplicate / straggler of the ALREADY-ANSWERED gate (the SAME tool_use_id) must NOT
-        publish a PHANTOM respondable decision — the wave-1 AC, now keyed per-gate. After pause 1 is
-        answered, a straggler PermissionRequest carrying the SAME tool_use_id (reordered/duplicated hook
-        delivery) with NO intervening tool progress is suppressed by the answered-id set. RED on
-        1232e34 (unconditional clear): the duplicate mints a fresh phantom decision — the class that
-        once leaked a stray '1' into a live prod session. GREEN: same id -> suppressed, nothing typed."""
+    """A late duplicate / straggler of the ALREADY-ANSWERED gate (the SAME tool_input) must NOT publish
+        a PHANTOM respondable decision — the wave-1 AC, now keyed per-gate by fingerprint. After pause 1
+        is answered, a straggler PermissionRequest carrying the SAME tool_input (reordered/duplicated
+        hook delivery) with NO intervening tool progress is suppressed by the answered-id set. RED on
+        1232e34 (unconditional clear): the duplicate mints a fresh phantom decision — the class that once
+        leaked a stray '1' into a live prod session. GREEN: same fingerprint -> suppressed, nothing typed."""
     sess, ev, fire = _f7y_session(tmp_path)
 
     # pause 1: a Bash permission gate, published and answered end-to-end.
     fire("UserPromptSubmit")
-    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate1")
-    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate1")
+    fire("PreToolUse", tool_name="Bash", tool_input=_BASH_TI)
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI)
     dec1 = sess.snapshot().get("decision")
     assert dec1 is not None and dec1["prompt_kind"] == "permission_choice", "pause 1 must be a permission pause"
     did1 = dec1["decision_id"]
     assert sess.respond("1", decision_id=did1).status == "resumed", "pause 1 must be answerable"
     assert sess.snapshot().get("decision") is None            # answered -> cleared
 
-    # A late duplicate / straggler PermissionRequest of the ALREADY-ANSWERED gate (SAME tool_use_id),
+    # A late duplicate / straggler PermissionRequest of the ALREADY-ANSWERED gate (SAME tool_input),
     # delivered with NO intervening tool progress and while the epoch is still open.
     writes_before = len(sess._handle.writes)
-    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate1")
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI)
 
     snap = sess.snapshot()
     assert snap.get("decision") is None, (
-        "a straggler of the ANSWERED gate (same tool_use_id) must NOT publish a phantom decision")
+        "a straggler of the ANSWERED gate (same tool_input -> same fingerprint) must NOT publish a phantom")
     assert ev.pending("s1") is None, "no phantom decision may enter the respondable queue"
     assert snap["control_state"] != "awaiting_user", (
         "the answered gate's straggler must not resurrect awaiting_user (the agent already resumed)")
@@ -1079,29 +1106,27 @@ def test_straggler_of_answered_pause_does_not_publish_phantom(tmp_path):
 
 
 def test_reordered_second_gate_still_answerable_no_terminal_oversuppression(tmp_path):
-    """SYMMETRIC regression (nelix-f7y wave 2, Codex-traced terminal hang): a GENUINE second same-kind
-        gate whose PermissionRequest is REORDERED to arrive BEFORE its own PreToolUse (hook delivery is
-        reorderable) MUST still publish a respondable decision the orchestrator can answer. On 35f10a7
-        the epoch tombstone standing from the answered pause 1 matches the second gate's epoch key and
-        SUPPRESSES it (busy, no publish); the later PreToolUse lifts the tombstone but the real gate was
-        already dropped -> nelix has NO respondable decision while the agent is blocked on a live
-        permission prompt, and there is no self-heal (hook-active tick() never publishes a screen
-        decision) -> terminal hang. RED on 35f10a7: no decision after the reordered PermissionRequest.
-        GREEN: the second gate's DISTINCT tool_use_id is not in the answered-id set -> published +
-        answerable regardless of hook order."""
+    """SYMMETRIC regression (Codex-traced terminal hang): a GENUINE second same-kind gate whose
+        PermissionRequest is REORDERED to arrive BEFORE its own PreToolUse (hook delivery is reorderable)
+        MUST still publish a respondable decision the orchestrator can answer. On 35f10a7 the epoch
+        tombstone standing from the answered pause 1 matched the second gate's epoch key and SUPPRESSED
+        it -> nelix had NO respondable decision while the agent was blocked on a live permission prompt,
+        with no self-heal (hook-active tick() never publishes a screen decision) -> terminal hang. RED on
+        35f10a7: no decision after the reordered PermissionRequest. GREEN: the second gate's DIFFERENT
+        tool_input -> DIFFERENT fingerprint, not in the answered set -> published, regardless of order."""
     sess, ev, fire = _f7y_session(tmp_path)
 
     # pause 1: answered end-to-end.
     fire("UserPromptSubmit")
-    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate1")
-    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate1")
+    fire("PreToolUse", tool_name="Bash", tool_input=_BASH_TI)
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI)
     did1 = sess.snapshot()["decision"]["decision_id"]
     assert sess.respond("1", decision_id=did1).status == "resumed", "pause 1 must be answerable"
     assert sess.snapshot().get("decision") is None
 
     # gate 2, REORDERED: its PermissionRequest is delivered BEFORE its PreToolUse. No PostToolUse for
-    # gate 1 has arrived either (models a denied/slow gate 1). The second gate has a DISTINCT tool_use_id.
-    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_gate2")   # reordered: permission first
+    # gate 1 has arrived either (models a denied/slow gate 1). The second gate has DIFFERENT tool_input.
+    fire("PermissionRequest", tool_name="Bash", tool_input=_BASH_TI_2)   # reordered: permission first
     dec2 = sess.snapshot().get("decision")
     assert dec2 is not None, (
         "a genuine second gate whose PermissionRequest is reordered before its PreToolUse must STILL "
@@ -1114,25 +1139,56 @@ def test_reordered_second_gate_still_answerable_no_terminal_oversuppression(tmp_
     assert out2.status == "resumed", f"the reordered gate must be answerable (got {out2.status})"
 
     # the late PreToolUse for gate 2 arrives afterwards -> plain working, must not disturb the resume.
-    fire("PreToolUse", tool_name="Bash", tool_use_id="toolu_gate2")
+    fire("PreToolUse", tool_name="Bash", tool_input=_BASH_TI_2)
     assert sess.snapshot()["control_state"] == "busy"
 
 
-def test_askuserquestion_collision_dedups_by_tool_use_id(tmp_path):
-    """nelix-32f collision dedup, preserved under per-gate keying: ONE physical AskUserQuestion modal
-        emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice) AND PermissionRequest (->
-        permission_choice) — the SAME tool invocation, so the SAME tool_use_id. The two hooks MUST
-        collapse to EXACTLY ONE respondable decision (stable decision_id, prompt_kind modal_choice), not
-        two. Real hook shapes carrying the shared tool_use_id."""
+def test_askuserquestion_collision_dedups_by_fingerprint(tmp_path):
+    """nelix-32f collision dedup under per-gate keying, on the REAL captured shape: ONE physical
+        AskUserQuestion modal emits BOTH PreToolUse[AskUserQuestion] (-> modal_choice) AND
+        PermissionRequest (-> permission_choice). The REAL PermissionRequest carries NO tool_use_id (this
+        is the fact that broke 62772e4) but DOES carry the SAME tool_input as the PreToolUse -> SAME
+        fingerprint -> the two hooks collapse to EXACTLY ONE respondable decision (stable decision_id,
+        modal_choice). The key is the fingerprint branch (hook_gate:...), not the epoch fallback."""
     sess, ev, fire = _f7y_session(tmp_path)
     fire("UserPromptSubmit")
-    fire("PreToolUse", tool_name="AskUserQuestion", tool_use_id="toolu_modal")   # -> modal_choice
+    fire("PreToolUse", tool_name="AskUserQuestion", tool_input=_ASKQ_TI)   # -> modal_choice
     d1 = sess.snapshot().get("decision")
     assert d1 is not None and d1["prompt_kind"] == "modal_choice", "the modal hook must publish modal_choice"
-    fire("PermissionRequest", tool_name="Bash", tool_use_id="toolu_modal")       # colliding hook, SAME id
+    # REAL SHAPE: the colliding PermissionRequest carries the SAME tool_input but NO tool_use_id.
+    fire("PermissionRequest", tool_name="AskUserQuestion", tool_input=_ASKQ_TI)
     d2 = sess.snapshot().get("decision")
     assert d2 is not None, "the collision must leave ONE pending decision"
     assert d2["decision_id"] == d1["decision_id"], (
-        "the colliding hook (same tool_use_id) must NOT supersede -> stable decision_id")
+        "the colliding hook (same fingerprint) must NOT supersede -> stable decision_id")
     assert d2["prompt_kind"] == "modal_choice", "modal_choice (the more specific reading) survives"
     assert ev.pending("s1") is not None
+    # the pause went through the FINGERPRINT branch, not the epoch fallback.
+    assert sess._engine._hook_pending_key.startswith("hook_gate:"), (
+        f"the collision must key by the tool_input fingerprint (got {sess._engine._hook_pending_key!r})")
+
+
+def test_collision_dedups_on_verbatim_real_capture(tmp_path):
+    """The nelix-32f collision deduped on the 100% VERBATIM real capture, via replay_hooks over
+        tests/golden/claude/_hooks/askq_collision.jsonl (live Claude Code 2.1.206 bodies: PreToolUse +
+        PermissionRequest with identical tool_input, PermissionRequest with NO tool_use_id, plus the
+        permission Notification). Exactly ONE respondable modal_choice decision survives — proving the
+        fingerprint dedup on real data, and that replay_hooks carries tool_input into the fingerprint key
+        (hook_gate:...), not a fallback. RED on 62772e4 is shown separately (its tool_use_id key splits
+        the collision once the PermissionRequest's missing id is delivered faithfully)."""
+    sess, ev, clock = _wire(tmp_path, Spec())
+    modal = capture_frames("s-9610d25c-askuserquestion-collision.capture")[-1]
+    sess._handle = RawReplayHandle([modal], clock=clock, step=0.0)
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"
+    replay_hooks(sess, _HOOKS / "askq_collision.jsonl")
+
+    dec = sess.snapshot().get("decision")
+    assert dec is not None, "the collision must leave exactly ONE pending decision"
+    assert dec["prompt_kind"] == "modal_choice", (
+        f"the real collision must dedup to ONE modal_choice decision (got {dec.get('prompt_kind')!r})")
+    assert dec["requires_response"] is True and ev.pending("s1") is not None
+    # replay carried the real tool_input into the fingerprint branch (not the epoch fallback).
+    assert sess._engine._hook_pending_key.startswith("hook_gate:"), (
+        f"replay_hooks must carry tool_input so the pause keys by fingerprint "
+        f"(got {sess._engine._hook_pending_key!r})")
