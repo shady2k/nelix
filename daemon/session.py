@@ -152,9 +152,10 @@ class Session:
         # nelix-s7v FRESHNESS guard: a monotonic generation the monitor bumps every time it writes
         # _last_render (under self._lock). Directly rendering on the RPC thread used to give the confirm
         # a FRESH frame at confirm time (a happens-after the keystroke); the cache alone lost that, so a
-        # stale PRE-submit frame could be read as confirm evidence. _confirm_submit captures this value
-        # after _press_enter() and observes the cache ONLY once the generation exceeds it — i.e. the
-        # monitor has re-rendered AT LEAST once post-submit. Never wraps in practice (bounded by uptime).
+        # stale PRE-submit frame could be read as confirm evidence. respond() captures this value BEFORE
+        # the keystroke write and _confirm_submit observes the cache ONLY once the generation exceeds it
+        # — so EVERY render at/after the write is eligible (no post-submit frame is excluded) while a
+        # pre-submit frame (gen <= captured) is never trusted. Never wraps in practice (bounded by uptime).
         self._render_gen = 0
         # _task_delivery synchronization (I1): the ONLY genuinely cross-thread transition is the
         # monitor's pending->"delivered" write, which the RPC-thread respond() reads to gate a
@@ -1430,8 +1431,12 @@ class Session:
 
     # respond's submit-confirm poll interval (read-only cache reads; the monitor owns pump()/render()).
     _CONFIRM_POLL = 0.1
+    # nelix-s7v: floor for the free-text confirm window. The confirm needs at least one POST-submit
+    # monitor render, and the monitor renders once per _loop_once tick (pump(0.1)); this floor (~3 pump
+    # intervals) keeps a misconfigured sub-tick respond_confirm_seconds from timing out before any tick.
+    _CONFIRM_MIN_SECONDS = 0.3
 
-    def _confirm_submit(self, deadline):
+    def _confirm_submit(self, deadline, submit_gen):
         # Confirm a free-text submit LANDED, read-only. This runs on the RPC thread, so it MUST NOT
         # call _handle.render(): PtySession.pump() mutates that renderer via _feed() OUTSIDE self._lock,
         # so an RPC-thread render() would race the monitor's unlocked mutation (nelix-s7v; the same
@@ -1439,15 +1444,19 @@ class Session:
         # MONITOR-OWNED _last_render cache and observes THAT frame — observe() is pure (no renderer
         # access), so it stays safe on this thread.
         #
-        # FRESHNESS (nelix-s7v fix-wave): rendering on the RPC thread used to give a frame rendered AT
-        # confirm time — a happens-after the keystroke. The cache alone lost that: a monitor tick that
-        # ran BEFORE the answer was typed could leave a stale "moved" frame in the cache, and observing
-        # it would false-confirm (or false-abort) off PRE-submit state. So we capture the render
-        # generation AFTER _press_enter() (respond() already pressed Enter before calling us) and
-        # observe the cache ONLY once the generation exceeds it — i.e. the monitor has re-rendered at
-        # least once post-submit. The monitor is the SOLE renderer; the confirm WAITS for its
-        # post-submit re-observation (mirrors nelix-5r3 / the single-writer PTY discipline). A stale or
-        # empty cache is never read as confirmation.
+        # FRESHNESS (nelix-s7v): rendering on the RPC thread used to give a frame rendered AT confirm
+        # time — a happens-after the keystroke. The cache alone lost that: a monitor tick that ran
+        # BEFORE the answer was typed could leave a stale "moved" frame in the cache, and observing it
+        # would false-confirm (or false-abort) off PRE-submit state. So respond() captures the render
+        # generation BEFORE the keystroke write and passes it here as submit_gen; we observe the cache
+        # ONLY once the generation exceeds it — i.e. the monitor has re-rendered at least once with the
+        # keystroke's effects reachable. Capturing BEFORE the write (not at confirm entry) is what makes
+        # this complete: EVERY render at or after the write has generation > submit_gen and is eligible,
+        # so a single evidence tick landing right after Enter (even one that then exits the child) is
+        # never excluded. A render between the capture and the write landing shows the still-PENDING
+        # free_text box (no echo, not "moved"), so it can never false-confirm. The monitor is the SOLE
+        # renderer; the confirm WAITS for its post-submit re-observation (mirrors nelix-5r3 / the
+        # single-writer PTY discipline). A stale or empty cache is never read as confirmation.
         #
         # The submit is confirmed ONLY on POSITIVE post-write evidence: the answer echoed then LEFT the
         # input box, or the turn MOVED to a high-confidence state. Absence of evidence is never a
@@ -1463,8 +1472,6 @@ class Session:
         # modal/permission question, or a terminal child — NEVER an ambiguous `unknown`/blank repaint
         # frame (a transient redraw dropping the footer would otherwise false-confirm a stranded echo).
         # The belief engine's bounded echo-suppression is the async backstop for anything past this.
-        with self._lock:
-            submit_gen = self._render_gen
         saw_echo = False
         while True:
             with self._lock:
@@ -1739,6 +1746,18 @@ class Session:
             # on timeout the answer did not land (executor wedged) -> report it, don't re-type.
             # Non-draining (the monitor owns pump(); draining here would race it).
             deadline = time.monotonic() + self._spec.respond_write_seconds
+            # nelix-s7v (freshness): capture the render generation BEFORE the keystroke write, so EVERY
+            # monitor render that could reflect the submit (rendered at or after the write) has a
+            # STRICTLY GREATER generation and is eligible confirm evidence. Capturing AFTER the write
+            # (the fix-wave-1 bug) let a monitor tick in the Enter->capture window bump the generation
+            # past a valid post-submit frame, EXCLUDING it — a false-abort when that tick is the only
+            # evidence (e.g. the answer exits the child, so no later tick ever arrives). A render
+            # between this capture and the write landing shows the still-PENDING free_text box (no echo,
+            # not "moved"), so it can never false-confirm — the confirm just keeps waiting. Only the
+            # free-text path below reads this; the modal path never confirms. Captured under the lock
+            # (the monitor writes _render_gen under it) so it is a clean snapshot.
+            with self._lock:
+                submit_gen = self._render_gen
             try:
                 if is_modal:
                     # The driver presses the digit + confirm (one sequence): never prose into a menu.
@@ -1766,8 +1785,13 @@ class Session:
             # echo would then suppress every wake (nelix-sud). A modal/blocked selection is a single
             # high-confidence keypress with no lingering text echo, so it keeps the prompt behaviour.
             if decision.get("prompt_kind") == "free_text":
-                confirm_deadline = time.monotonic() + self._spec.respond_confirm_seconds
-                if not self._confirm_submit(confirm_deadline):
+                # nelix-s7v: the confirm now needs at least one POST-submit monitor render (pump(0.1)
+                # per _loop_once tick), so floor the window at a few pump intervals — a misconfigured
+                # sub-tick respond_confirm_seconds would otherwise time out before any tick could
+                # arrive and false-abort a landed answer. The 6.0s default is unaffected.
+                confirm_deadline = time.monotonic() + max(self._spec.respond_confirm_seconds,
+                                                          self._CONFIRM_MIN_SECONDS)
+                if not self._confirm_submit(confirm_deadline, submit_gen):
                     if self._log is not None:
                         self._log.warning("session", "respond_failed", session_id=self._id,
                                           decision_id=did, reason="submit_unconfirmed")

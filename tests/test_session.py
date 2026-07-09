@@ -869,6 +869,53 @@ def test_free_text_confirm_does_not_confirm_off_a_stale_pre_submit_frame(tmp_pat
     assert sess._dialog.last_user_input_offset() == offset_before   # unconfirmed -> no user marker
 
 
+class ExitOnSubmitHandle(FakeHandle):
+    """The answer lands and its ONLY post-submit render happens right after Enter: writing the submit
+    key performs exactly ONE monitor tick as a side effect (caches an evidence frame + bumps the render
+    generation), and nothing renders afterward — the child has moved on / exited. The single-threaded
+    stand-in for the monitor observing the child's response to our keystroke, with no later tick."""
+    def __init__(self, sess, evidence):
+        super().__init__([evidence])
+        self._sess = sess
+        self._evidence = evidence
+        self._ticked = False
+
+    def write(self, data, timeout=None, drain_output=False):
+        self.writes.append(data)
+        if data == "\r" and not self._ticked:      # Enter landed -> the one post-submit monitor tick
+            self._ticked = True
+            with self._sess._lock:
+                self._sess._last_render = self._evidence
+                self._sess._render_gen += 1
+
+
+def test_free_text_confirm_confirms_on_evidence_tick_landing_right_after_enter(tmp_path):
+    """nelix-s7v fix-wave-2 capture-ordering AC: submit_gen must be captured BEFORE the keystroke
+        write. If it were captured AFTER (fix-wave-1), a monitor tick landing between Enter and the
+        capture would bump the generation past a valid post-submit frame, EXCLUDING it — and when that
+        single tick is the ONLY post-submit evidence (the answer moves/exits the child, then nothing
+        renders again) the landed answer false-aborts. Here writing Enter performs exactly ONE
+        post-submit tick (a 'moved' frame + a generation bump) and nothing renders afterward, so the
+        confirm MUST still confirm. RED (b6749d4, capture after the write): submit_gen == that tick's
+        generation -> excluded -> respond_failed; GREEN (capture before the write): eligible -> resumed."""
+    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    sess, ev = _session(tmp_path, ["working esc to interrupt", box, box, box])
+    sess._loop()
+    sess._stop.clear()                                # a real respond runs while the monitor is live
+    dec = sess.snapshot()["decision"]
+    assert dec["prompt_kind"] == "free_text", "the box must surface as a free_text pause"
+    did = dec["decision_id"]
+    offset_before = sess._dialog.last_user_input_offset()
+    # Writing Enter delivers the ONE post-submit evidence frame (the turn moved to working) + bumps the
+    # render generation, then nothing renders again — the single-evidence-tick-right-after-Enter case.
+    sess._handle = ExitOnSubmitHandle(sess, "✶ Working… (esc to interrupt)")
+    out = sess.respond("do the next thing", decision_id=did)
+    assert out.status == "resumed", (
+        f"a landed answer whose only post-submit render lands right after Enter must confirm "
+        f"(got {out.status}) — submit_gen must be captured BEFORE the write")
+    assert sess._dialog.last_user_input_offset() > offset_before   # confirmed -> user marker appended
+
+
 def test_answering_reemitted_blocked_clears_pending(tmp_path):
     # Answering a decision the backstop re-emitted must clear pending() for ALL its events, not just
     # the latest — otherwise pending() surfaces a stale earlier event for the resolved decision.
