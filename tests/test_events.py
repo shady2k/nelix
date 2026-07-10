@@ -69,6 +69,18 @@ def test_wait_event_requires_session_id():
         q.wait_event(after_seq=0, timeout=0.1)
 
 
+def test_wait_event_rejects_explicit_none_or_empty_session_id():
+    # Dropping the default catches OMISSION (TypeError); a top-of-function guard also refuses an
+    # EXPLICIT None or empty session_id (ValueError). Together there is NO session_id=None variant at
+    # all — the primitive is structurally incapable of a global wait, not merely by convention.
+    import pytest
+    q = EventQueue()
+    with pytest.raises(ValueError):
+        q.wait_event(after_seq=0, timeout=0.1, session_id=None)
+    with pytest.raises(ValueError):
+        q.wait_event(after_seq=0, timeout=0.1, session_id="")
+
+
 def test_publish_carries_range_and_hint_under_lock():
     from daemon.events import EventQueue
     q = EventQueue()
