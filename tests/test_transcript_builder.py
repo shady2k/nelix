@@ -97,6 +97,61 @@ def test_two_identical_rows_in_one_frame_both_committed():
     assert d.lines.count("dup") == 2
 
 
+def test_two_identical_rows_committed_via_finalize():
+    """finalize() (the visible-tail stop path) must ALSO commit two GENUINE identical rows, not
+    collapse them — the redraw-remnant dedup (nelix-4q8) must never lose legitimate duplicate content
+    (duplicate code lines, repeated table rows). Adjacent identical rows have no chrome between them,
+    so both are real. (test_two_identical_rows_in_one_frame_both_committed exercises the EVICTION
+    path; this locks the same invariant on the finalize path the redraw fix touches.)"""
+    d = _Dialog(); b = TranscriptBuilder(d, _Driver(), 4, stable=2, grace=2)
+    b.observe(_frame(["dup", "dup"], 4))
+    b.finalize()
+    assert d.lines.count("dup") == 2
+
+
+def test_partial_redraw_remnant_below_chrome_dropped():
+    """A line that re-appears BELOW a chrome boundary (a volatile row) as a stale repaint remnant is
+    dropped, keeping the topmost real occurrence (nelix-4q8: a modal painting over a block leaves the
+    block's tail lingering below the modal border in one torn frame)."""
+    d = _Dialog(); b = TranscriptBuilder(d, _Driver(), 6, stable=2, grace=2)
+    b.observe(_frame(["real", "SPIN x", "real"], 6))   # 'real' repeats with chrome ('SPIN x') between
+    b.finalize()
+    assert d.lines.count("real") == 1
+
+
+def test_duplicate_separated_by_content_is_kept():
+    """Two identical rows separated only by other CONTENT (no chrome between) are a genuine repeat,
+    NOT a redraw remnant, so BOTH commit — the dedup is scoped to chrome-separated duplicates only."""
+    d = _Dialog(); b = TranscriptBuilder(d, _Driver(), 6, stable=2, grace=2)
+    b.observe(_frame(["x", "y", "x"], 6))
+    b.finalize()
+    assert d.lines.count("x") == 2
+
+
+def test_repeat_across_rule_separator_is_kept_real_driver():
+    """nelix-4q8 finding 5: a bare RULE / separator row (====, ─, ━ box-drawing) is transcript-volatile
+    but is NOT a modal/prompt boundary — it also occurs inside legitimate streamed content (markdown
+    dividers, table borders, code). An exact content line repeated ACROSS such a separator must NOT be
+    dropped as a redraw remnant. Uses the REAL ClaudeDriver so is_prompt_chrome / _RULE_ROW run."""
+    from daemon.drivers.claude import ClaudeDriver
+    for sep in ("=" * 40, "─" * 40, "━" * 30):     # ===, ─── (light), ━━━ (heavy box-draw)
+        d = _Dialog(); b = TranscriptBuilder(d, ClaudeDriver(), 6, stable=2, grace=2)
+        b.observe(_frame(["foo", sep, "foo"], 6))
+        b.finalize()
+        assert d.lines.count("foo") == 2, f"repeat across a {sep[0]!r} separator was wrongly dropped"
+
+
+def test_remnant_below_prompt_chrome_dropped_real_driver():
+    """The genuine partial-redraw boundary IS the active-prompt chrome (a ❯ option-select row here):
+    a line repeated below it is a stale repaint remnant and IS dropped. The unit counterpart of the
+    real-capture s-9610d25c boundary, exercised with the REAL ClaudeDriver's is_prompt_chrome."""
+    from daemon.drivers.claude import ClaudeDriver
+    d = _Dialog(); b = TranscriptBuilder(d, ClaudeDriver(), 6, stable=2, grace=2)
+    b.observe(_frame(["real", "❯ 1. Pick me", "real"], 6))   # ❯ option-select row between
+    b.finalize()
+    assert d.lines.count("real") == 1
+
+
 def test_agent_transition_marker_appears_once_per_span():
     """‹agent› should appear exactly once per agent span, not per committed line."""
     d = _Dialog(); b = TranscriptBuilder(d, _Driver(), 3, stable=2, grace=2)
