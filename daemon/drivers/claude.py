@@ -180,6 +180,20 @@ class ClaudeDriver:
             return True
         return False
 
+    def is_prompt_chrome(self, row):
+        # The subset of transcript-volatile chrome that belongs to the ACTIVE input / choice-modal
+        # region that OVERPAINTS streamed content — the ❯ input & option-select rows, the working
+        # spinner, the "esc to interrupt" / "shift+tab to cycle" affordances. The transcript coalescer
+        # uses THIS (not is_transcript_volatile) as the partial-redraw BOUNDARY: in a torn frame a
+        # stale remnant of an already-shown line lingers BELOW this chrome. It deliberately EXCLUDES
+        # bare RULE / separator rows (═══, box borders) — those also occur inside legitimate streamed
+        # content (markdown / tables / code), so treating one as a repaint boundary would drop a real
+        # repeated line across a separator (nelix-4q8). The modal's own border is a rule too, but its
+        # ❯ option rows sit in the same region and carry the boundary, so excluding rules loses nothing.
+        if not row.strip() or _RULE_ROW.match(row):
+            return False
+        return self.is_transcript_volatile(row)
+
     # ---- private observation helpers (folded from the old predicates) ----
     def _working_line(self, frame):
         for line in frame.split("\n"):

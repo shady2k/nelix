@@ -36,10 +36,39 @@ class TranscriptBuilder:
         self._frame_no = 0
         self._tracked = []           # list[_Obj] — content lines believed on screen now
 
+    def _content_rows(self, rows):
+        # The committable content lines of a frame (non-blank, non-chrome), with PARTIAL-REDRAW
+        # REMNANTS dropped. When a choice modal / prompt paints over streamed content from the TOP
+        # DOWN, one captured frame is TORN: a line already shown above re-appears LOWER as a stale
+        # leftover the repaint has not overwritten yet — separated from the real occurrence by the
+        # active-prompt CHROME (its ❯ input / option-select / spinner rows). Committing that torn frame
+        # would append the line twice (regression s-9610d25c: the "…do you want me to act now?" tail
+        # committed as lines 67-86 then again 87-102). Such a lower duplicate is dropped, keeping the
+        # TOPMOST (real) occurrence. The discriminator is deliberately narrow: an EXACT (whitespace-
+        # sensitive) repeat with PROMPT chrome between the two occurrences. `is_prompt_chrome` (when
+        # the driver provides it) EXCLUDES bare rule/separator rows (═══, box borders) so a genuine
+        # repeated content line across a markdown/table separator is NOT dropped; adjacent identical
+        # rows and repeats separated only by other CONTENT have no prompt chrome between them and are
+        # kept; cross-frame / cross-turn repeats never enter one frame's window at all.
+        is_chrome = getattr(self._driver, "is_prompt_chrome", self._driver.is_transcript_volatile)
+        skip = [bool(r.strip()) and self._driver.is_transcript_volatile(r) for r in rows]
+        chrome = [bool(r.strip()) and is_chrome(r) for r in rows]
+        out = []
+        first_y = {}                                   # exact text -> y of its first kept occurrence
+        for y, row in enumerate(rows):
+            if not row.strip() or skip[y]:
+                continue
+            text = row.rstrip()
+            prev = first_y.get(text)
+            if prev is not None and any(chrome[prev + 1:y]):
+                continue                               # redraw remnant below an active-prompt boundary
+            out.append((y, row))
+            first_y.setdefault(text, y)
+        return out
+
     def observe(self, frame):
         fno = self._frame_no
-        content = [(y, row) for y, row in enumerate(frame.rows)
-                   if row.strip() and not self._driver.is_transcript_volatile(row)]
+        content = self._content_rows(frame.rows)
         unmatched = set(range(len(self._tracked)))     # indices into the pre-frame _tracked prefix
         for y, row in content:
             n = _norm(row)
