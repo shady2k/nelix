@@ -345,6 +345,89 @@ def test_respond_hydrates_without_calling_the_live_renderer(tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# nelix-wuh — a STALE modal cache must never hydrate a DIFFERENT modal (cross-modal race)
+# ─────────────────────────────────────────────────────────────────────────────
+# Codex re-review of nelix-5r3: _last_modal_options was keyed ONLY by "latest observed modal
+# options", not by the modal's identity. Worst-case race: modal A is observed+cached, A is ANSWERED,
+# then a DIFFERENT modal B's hook publishes its options=[] decision BEFORE the monitor's first
+# observe of B (no non-modal frame between, so the cache is never cleared). If B's option id happens
+# to exist in A's cached options, respond() hydrated B from A's cache, validation passed, and
+# select_option typed A's id (A's LABEL) into B — a wrong answer / A's label in B's transcript.
+# The fix keys the cache by the modal GENERATION (threaded onto the decision) so a cache captured for
+# one modal can never hydrate a later, different modal's decision.
+
+def test_stale_modal_cache_never_hydrates_a_different_modal(tmp_path):
+    """RED before nelix-wuh: modal A (6-option AskUserQuestion, ids 1-6) is observed+cached, then
+        ANSWERED; a DIFFERENT modal B (the real T7 3-option menu, ids 1-3) publishes its options=[]
+        hook decision before the monitor observes B. A and B SHARE id "1", so the option-id set alone
+        cannot stop A's stale cache from hydrating B — only the cache's modal-identity guard can.
+        Pre-fix respond("1", B) hydrated B from A's stale cache and returned 'resumed' (A's option
+        typed into B). GREEN: the cache's generation no longer matches B, so the hydrate is refused
+        and the valid-looking id is rejected 'invalid_option' (self-healing — the orchestrator
+        re-pulls + responds once the monitor enriches B with B's own options). Real captures only:
+        both modal frames come from recorded fixtures; nothing is fabricated."""
+    from daemon.hooks import HookEvent
+    frames_a = capture_frames("s-9610d25c-askuserquestion-collision.capture")
+    modal_a = frames_a[-1]
+    assert "Next step" in modal_a and "Enter to select" in modal_a, "A must be the 6-option modal"
+    modal_b = capture_frames("s-beb967e9.capture")[-1]
+
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([modal_a], clock=clock)
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"                 # both modals are mid-turn (post-delivery)
+
+    # NON-VACUITY: A and B are genuinely DIFFERENT real modals whose option sets SHARE id "1".
+    ctx = sess._obs_ctx()
+    obs_a = sess._driver.observe(modal_a, ctx)
+    obs_b = sess._driver.observe(modal_b, ctx)
+    ids_a = [o.id for o in obs_a.options]
+    ids_b = [o.id for o in obs_b.options]
+    assert ids_a == ["1", "2", "3", "4", "5", "6"], "A is the real 6-option modal"
+    assert obs_b.prompt_kind in ("modal_choice", "permission_choice") and "1" in ids_b, (
+        f"B is a real DIFFERENT modal that shares id '1' with A (B ids={ids_b})")
+    # distinct per-gate tool_input -> distinct gate_fp -> B is a genuinely NEW gate (not an answered
+    # duplicate of A), keyed on each capture's real option labels.
+    ti_a = {"questions": [{"question": "A", "options": [o.label for o in obs_a.options]}]}
+    ti_b = {"questions": [{"question": "B", "options": [o.label for o in obs_b.options]}]}
+
+    def fire(event, tool_name=None, tool_input=None):
+        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name,
+                               tool_input=tool_input or {}))
+        sess._drain_hooks()
+
+    fire("UserPromptSubmit")
+    sess._loop_once()                                 # monitor observes A -> caches A's options
+    assert [o["id"] for o in sess._last_modal_options] == ids_a, "monitor cached modal A's options"
+
+    fire("PreToolUse", tool_name="AskUserQuestion", tool_input=ti_a)   # publish modal A
+    dec_a = sess.snapshot()["decision"]
+    assert dec_a["prompt_kind"] == "modal_choice" and dec_a["options"] == []
+    out_a = sess.respond("1", decision_id=dec_a["decision_id"])
+    assert out_a.status == "resumed", f"answering A must succeed (got {out_a.status})"   # A answered
+
+    # A is answered; the cache STILL holds A's options (no non-modal frame observed since). Modal B's
+    # hook now publishes its options=[] decision, beating the monitor's first observe of B.
+    fire("PreToolUse", tool_name="AskUserQuestion", tool_input=ti_b)   # publish DIFFERENT modal B
+    dec_b = sess.snapshot()["decision"]
+    assert dec_b is not None and dec_b["decision_id"] != dec_a["decision_id"], (
+        "B must be a NEW modal decision, distinct from the answered A")
+    assert dec_b["prompt_kind"] in ("modal_choice", "permission_choice") and dec_b["options"] == [], (
+        "B is hook-derived: no options until the monitor enriches it")
+    # the stale cache STILL holds A's options, and "1" IS one of them -> the ONLY guard left is the
+    # cache's modal-identity check.
+    assert [o["id"] for o in sess._last_modal_options] == ids_a and "1" in ids_a
+
+    writes_before = list(sess._handle.writes)
+    out_b = sess.respond("1", decision_id=dec_b["decision_id"])
+    assert out_b.status == "invalid_option", (
+        f"A's stale cache must NOT hydrate B: a valid-looking id is rejected until B is enriched "
+        f"(got {out_b.status}; pre-fix this was 'resumed' — A's option typed into B)")
+    assert sess._handle.writes == writes_before, "respond(B) must type NOTHING (no A-derived keystroke)"
+    assert sess.snapshot()["decision"]["decision_id"] == dec_b["decision_id"], "B stays pending"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # delivery — confirm-once + terminal publication over the REAL paste-echo capture (s-b8a30317)
 # ─────────────────────────────────────────────────────────────────────────────
 # s-b8a30317-delivery is the real paste-delivery byte stream: an input box appears, then the pasted
