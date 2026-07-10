@@ -35,6 +35,21 @@ def _mgr(spec=None, limit=5, driver_factory=None, logger=None):
     return m, captured
 
 
+@pytest.fixture(autouse=True)
+def _no_live_model_discovery(monkeypatch):
+    """nelix-atb: force-skip nelix-kwr's pre-flight model discovery for every test in this module.
+
+    These tests assert the per-session model argv fold + shape validation (they precede the
+    pre-flight in _spawn). The live Anthropic /v1/models pre-flight is out of scope here and MUST
+    NOT run: when the shell carries ANTHROPIC_* auth (e.g. a zai/GLM remap env) it goes over the
+    network and turns these unit tests into spurious ModelUnavailable failures. No-op it so the
+    module is deterministic and offline regardless of the ambient environment.
+    (The one test that OPTS OUT — test_preflight_never_goes_live_even_with_auth — installs a
+    sentinel discover to prove the pre-flight never reaches the network even under this no-op.)"""
+    monkeypatch.setattr(SessionManager, "_check_model_available",
+                        lambda self, spec, executor_name, model: None)
+
+
 # ---- argv fold (last-wins) -------------------------------------------------------------
 def test_model_appends_driver_flag_and_value():
     m, cap = _mgr(make_spec(args=["--foo"], driver="claude"))
@@ -103,6 +118,28 @@ def test_max_length_boundary_accepted():
 
 def test_model_rejected_is_a_value_error_subclass():
     assert issubclass(ModelRejected, ValueError)
+
+
+# ---- nelix-atb: pre-flight model discovery must NEVER go live in a unit test ------------
+# nelix-kwr added a pre-flight (SessionManager._check_model_available) that, when real Anthropic
+# auth is present in the env (ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY), goes over the network to
+# validate the model against /v1/models. Offline it skips (auth absent -> no_auth). In an authed
+# shell (e.g. a zai/GLM remap env) that turned these fold/shape unit tests into spurious
+# ModelUnavailable failures. This module asserts the argv fold + shape only, so the pre-flight must
+# never touch the network regardless of the ambient env. Sentinel: if the pre-flight ever reaches
+# the discovery call, blow up loudly (deterministic — this opens no real socket).
+def test_preflight_never_goes_live_even_with_auth(monkeypatch):
+    called = []
+    def _boom_discover(*a, **k):
+        called.append((a, k))
+        raise AssertionError("pre-flight model discovery went LIVE in a unit test")
+    monkeypatch.setattr("daemon.manager.discover", _boom_discover)   # captured by ModelCache at ctor
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "dummy-token")        # the condition that goes live
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://localhost:1")
+    m, cap = _mgr(make_spec(args=[], driver="claude"))
+    m.start(EXECUTOR, "t", "/tmp", model="GLM-4.7")     # non-alias -> would otherwise reach discovery
+    assert not called, "pre-flight must not invoke live model discovery in a unit test"
+    assert cap[0].spec.args == ["--model", "GLM-4.7"]
 
 
 # ---- driver capability (via getattr, no AttributeError) --------------------------------
