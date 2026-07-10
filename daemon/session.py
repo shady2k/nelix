@@ -143,6 +143,17 @@ class Session:
         # concurrently -> renderer access is NOT thread-safe. respond() hydrates a hook-derived modal
         # decision (options=[]) from THIS cache (read under self._lock), never from the live renderer.
         self._last_modal_options = None
+        # nelix-wuh: the cache is keyed by the modal GENERATION it was captured in (_last_modal_epoch)
+        # so a stale cache can NEVER hydrate a DIFFERENT modal. _modal_epoch is a counter (read/written
+        # under self._lock) bumped once per genuinely-new modal/permission decision published; each such
+        # decision is stamped with the epoch it was published under. The observe stamps the cache with
+        # the epoch of the modal it belongs to — the pending modal decision's epoch if one is already
+        # pending (hook published before this observe), else the counter the next publish will use — so
+        # cache and decision share an epoch REGARDLESS of observe-vs-publish ordering. respond() hydrates
+        # only when the cache's epoch equals THIS decision's epoch (same generation = no OTHER new modal
+        # published between the cache capture and this decision).
+        self._modal_epoch = 0
+        self._last_modal_epoch = None
         # _task_delivery synchronization (I1): the ONLY genuinely cross-thread transition is the
         # monitor's pending->"delivered" write, which the RPC-thread respond() reads to gate a
         # pre-delivery blocked answer — that write and that read are both made under self._lock, so
@@ -698,15 +709,29 @@ class Session:
         # OUTSIDE Session._lock, so an RPC-thread render() would race it). Cache the latest
         # modal/permission options the monitor observed so respond() can hydrate a hook-derived
         # decision (options=[]) WITHOUT touching the live renderer. Cleared to None whenever the
-        # latest frame is not a modal/permission, so a stale cache can never hydrate a fresh modal
-        # decision with another prompt's options. Read/written under self._lock (single monitor
+        # latest frame is not a modal/permission. nelix-wuh: also TAG the cache with the GENERATION of
+        # the modal it belongs to, so respond() can prove the cache belongs to the SAME modal as the
+        # decision it hydrates — a stale cache from an earlier (since answered/superseded) modal has a
+        # different epoch and can never hydrate a different prompt's options, even when the monitor has
+        # not yet observed a non-modal frame between the two. The epoch must match the decision this
+        # cache will serve REGARDLESS of observe-vs-publish ordering: if that modal decision is ALREADY
+        # pending (the hook drained+published before this observe, the real _loop_once order), reuse ITS
+        # epoch; otherwise the modal has not published yet (observe-before-publish, nelix-5r3), so use
+        # the counter the next publish will stamp+bump. Read/written under self._lock (single monitor
         # writer, RPC-thread reader in _hydrate_respond_options).
         with self._lock:
             if (obs is not None and obs.prompt_kind in ("modal_choice", "permission_choice")
                     and obs.options):
                 self._last_modal_options = [{"id": o.id, "label": o.label} for o in obs.options]
+                d = self._decision
+                if (d is not None and d.get("prompt_kind") in ("modal_choice", "permission_choice")
+                        and d.get("modal_epoch") is not None):
+                    self._last_modal_epoch = d["modal_epoch"]
+                else:
+                    self._last_modal_epoch = self._modal_epoch
             else:
                 self._last_modal_options = None
+                self._last_modal_epoch = None
 
     def _hydrate_respond_options(self, decision):
         # nelix-5r3: a hook-derived modal/permission decision is published with options=[] (hooks
@@ -724,9 +749,15 @@ class Session:
         if decision.get("options"):
             return
         with self._lock:
+            # nelix-wuh: hydrate ONLY from a cache captured in the SAME modal generation as THIS
+            # decision. A stale cache (an earlier modal, since answered/superseded) carries a DIFFERENT
+            # epoch and must NEVER hydrate a different modal — even when the id the caller sent happens
+            # to exist in the stale options. The decision mutation happens UNDER the lock (single-writer
+            # with the monitor's cache write); same fill-empty-only, in-place-mutation rule as before.
             cached = self._last_modal_options
-        if cached:
-            decision["options"] = [dict(o) for o in cached]
+            if (cached and self._last_modal_epoch is not None
+                    and self._last_modal_epoch == decision.get("modal_epoch")):
+                decision["options"] = [dict(o) for o in cached]
 
     def _apply_actions(self, actions, obs):
         # Translate the engine's revocable decisions into events / PTY writes. The engine is pure;
@@ -1048,6 +1079,20 @@ class Session:
                 # this answer targets (not merely "a modal"). Internal identity (never exposed), like
                 # decision_key; None for any non-modal decision.
                 decision["modal_dedup"] = modal_dedup
+                # nelix-wuh: stamp the modal GENERATION so respond()'s cache hydrate can prove the
+                # monitor-owned _last_modal_options cache belongs to THIS modal (same epoch), not a
+                # different one already answered/superseded. A re-emit keeps its decision's epoch (a
+                # held answer + any same-generation cache stay bound); a genuinely-new modal/permission
+                # decision takes the current epoch and BUMPS it, so any LATER new modal gets a higher
+                # epoch than a cache captured before it. Non-modal respondable decisions carry no
+                # generation (None) — the cache is modal-only. Internal identity (never exposed).
+                if is_reemit:
+                    decision["modal_epoch"] = cur.get("modal_epoch")
+                elif prompt_kind in ("modal_choice", "permission_choice"):
+                    decision["modal_epoch"] = self._modal_epoch
+                    self._modal_epoch += 1
+                else:
+                    decision["modal_epoch"] = None
 
         # _install records what it actually did here (off the lock) so the decision lifecycle (nelix-jwv:
         # published / superseded) is logged AFTER the publish, never holding a lock across log I/O.
@@ -1372,7 +1417,7 @@ class Session:
                 # decision_key + modal_dedup are internal identity (never exposed); decision_id is the
                 # public guard token.  The text was captured at publish time via tail() and is frozen.
                 dec = {k: v for k, v in self._decision.items()
-                       if k not in ("decision_key", "modal_dedup")}
+                       if k not in ("decision_key", "modal_dedup", "modal_epoch")}
                 snap["decision"] = dec
             # async_question is its OWN field, entirely independent of decision above: an executor
             # can be mid-question AND mid-blocking-decision at once (own slot, own supersede-free
