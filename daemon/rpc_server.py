@@ -61,14 +61,18 @@ class _BadRequest(Exception):
         self.msg = msg
 
 
-def make_server(manager, transport, logger=None):
+def make_server(manager, transport, logger=None, *, clock=time.monotonic):
     is_unix = transport.kind == "unix"
     token = transport.token
-    hook_limiter = _HookRateLimiter()      # per-session flood guard for /hook (shared across threads)
+    # `clock` is the monotonic time source both flood-guard buckets refill against. It defaults to
+    # the real clock in production; tests inject a frozen/controlled clock so bucket exhaustion is
+    # decided purely by request COUNT, never by wall-clock timing that a busy machine could flake
+    # (see test_message_route.py::test_message_bucket_exhausted_returns_429, nelix-3s3).
+    hook_limiter = _HookRateLimiter(clock=clock)   # per-session flood guard for /hook (shared across threads)
     # A SEPARATE instance (same class/config) for /message: distinct bucket per sid so an executor
     # flooding questions/notes can never starve /hook delivery (spec — see
     # test_message_limiter_separate_from_hooks).
-    msg_limiter = _HookRateLimiter()
+    msg_limiter = _HookRateLimiter(clock=clock)
 
     class Handler(BaseHTTPRequestHandler):
         def _auth(self):
