@@ -12,7 +12,12 @@ from urllib.parse import urlparse
 
 import pytest
 
-from daemon.rpc_server import make_server, _HOOK_RATE_CAPACITY as MSG_LIMIT
+from daemon.rpc_server import (
+    make_server,
+    _HookRateLimiter,
+    _HOOK_RATE_CAPACITY as MSG_LIMIT,
+    _HOOK_RATE_REFILL as MSG_REFILL,
+)
 from daemon.transport import Transport
 
 SECRET = "sek"
@@ -70,12 +75,29 @@ class FakeManager:
         return n
 
 
-@pytest.fixture
-def server():
+def _start_server(**make_server_kwargs):
+    """Boot a real make_server on an ephemeral TCP port in a daemon thread; return (srv, base_url)."""
     mgr = FakeManager()
-    srv = make_server(mgr, Transport.tcp("127.0.0.1", 0, TOKEN))
+    srv = make_server(mgr, Transport.tcp("127.0.0.1", 0, TOKEN), **make_server_kwargs)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
+    return srv, base
+
+
+@pytest.fixture
+def server():
+    srv, base = _start_server()
+    yield base
+    srv.shutdown()
+
+
+@pytest.fixture
+def frozen_clock_server():
+    """Like `server`, but the rate-limit buckets read a FROZEN clock (time never advances). Bucket
+    exhaustion is then decided purely by request COUNT, so a busy machine's wall-clock refill can
+    never mask it — the rate-limit tests become deterministic under load (nelix-3s3). make_server
+    just threads the injectable clock the token bucket already accepts down into both limiters."""
+    srv, base = _start_server(clock=lambda: 0.0)
     yield base
     srv.shutdown()
 
@@ -176,20 +198,56 @@ def test_question_unknown_session_race_404(server):
     assert st == 404 and body["error"] == "unknown_session"
 
 
-def test_message_limiter_separate_from_hooks(server):
-    # Exhaust the message bucket for s1 ...
+def test_message_limiter_separate_from_hooks(frozen_clock_server):
+    # Frozen clock ⇒ the message bucket drains by COUNT (no wall-clock refill), so this exhaustion
+    # step is deterministic under load.
     for _ in range(MSG_LIMIT + 2):
-        post(server, "/message/s1", {"kind": "note", "summary": "x"})
-    # ... a /hook POST for the SAME session must still pass: message spam must never starve hooks.
-    st, _ = post_hook(server, "/hook/s1", {"hook_event_name": "Stop"})
+        post(frozen_clock_server, "/message/s1", {"kind": "note", "summary": "x"})
+    # ... a /hook POST for the SAME session must still pass: message spam must never starve hooks
+    # (a SEPARATE bucket, never drained here).
+    st, _ = post_hook(frozen_clock_server, "/hook/s1", {"hook_event_name": "Stop"})
     assert st == 204
 
 
-def test_message_bucket_exhausted_returns_429(server):
+def test_message_bucket_exhausted_returns_429(frozen_clock_server):
+    # nelix-3s3: the message-plane token bucket has capacity MSG_LIMIT and refills over wall-clock
+    # time. The original test drove MSG_LIMIT+2 real HTTP POSTs and relied on them completing before
+    # the bucket refilled a whole token — a busy machine could refill enough between POSTs to let the
+    # last one through (200, not 429), flaking the gate. `frozen_clock_server` freezes the bucket's
+    # clock so NO refill can occur: MSG_LIMIT tokens drain, then every further POST is denied. The
+    # outcome now depends only on request COUNT, so timing pressure can never flake it.
     last = None
     for _ in range(MSG_LIMIT + 2):
-        last, _ = post(server, "/message/s1", {"kind": "note", "summary": "x"})
+        last, _ = post(frozen_clock_server, "/message/s1", {"kind": "note", "summary": "x"})
     assert last == 429
+
+
+def test_message_bucket_exhaustion_is_clock_driven():
+    # Root-cause regression lock for nelix-3s3 (unit-level, no wall-clock): the token bucket's
+    # exhaustion is decided by its injected clock, which is exactly WHY the route test flaked on a
+    # real clock and why freezing it fixes the flake.
+    #  - FROZEN clock: no refill ⇒ exactly MSG_LIMIT allowed, then denied forever (deterministic 429).
+    #  - ADVANCING clock (a busy machine: enough wall-clock elapses between POSTs to refill >1 token
+    #    per drain): the bucket never fully exhausts, so a post past MSG_LIMIT is still allowed —
+    #    that is the "429 not returned" flake the route test used to be exposed to.
+    sid = "s1"
+    frozen = _HookRateLimiter(clock=lambda: 0.0)
+    verdicts = [frozen.allow(sid) for _ in range(MSG_LIMIT + 2)]
+    assert verdicts[:MSG_LIMIT] == [True] * MSG_LIMIT      # first MSG_LIMIT drain the bucket
+    assert verdicts[MSG_LIMIT:] == [False, False]          # everything past capacity is denied
+
+    ticks = {"t": 0.0}
+    def advancing():
+        # 2/MSG_REFILL seconds per call refills ~2 tokens for every 1 drained — the bucket climbs
+        # back to capacity instead of emptying, mirroring a machine slow enough that more than a
+        # full token refills between POSTs.
+        ticks["t"] += 2.0 / MSG_REFILL
+        return ticks["t"]
+    refilling = _HookRateLimiter(clock=advancing)
+    assert refilling.allow(sid) is True                    # refills faster than it drains ...
+    for _ in range(MSG_LIMIT + 5):
+        refilling.allow(sid)
+    assert refilling.allow(sid) is True                    # ... so it is still not exhausted (the flake)
 
 
 def test_message_oversized_body_is_413(server):
