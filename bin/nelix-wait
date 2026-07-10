@@ -28,8 +28,14 @@ def main():
     ap.add_argument("--state-file", dest="state_file", required=True,
                     help="Path to the supervisor state file (written by nelix on start)")
     ap.add_argument("--after", type=int, default=0)
-    ap.add_argument("--session-id", dest="session_id", default=None)
+    ap.add_argument("--session-id", dest="session_id", required=True,
+                    help="Session to scope the wait to (REQUIRED: a session_id-less /wait is a "
+                         "global wait that would deliver another session's event to this waiter)")
     args = ap.parse_args()
+    if not args.session_id:
+        # required=True rejects an absent flag; also refuse an empty value so the executor's waiter
+        # can never fall back to a global (cross-session) wait. Mirrors the daemon's /wait guard.
+        ap.error("--session-id must be non-empty")
 
     try:
         transport = _discover(args.state_file)
@@ -43,9 +49,9 @@ def main():
     after = args.after
     try:
         while True:
-            path = f"/wait?after_seq={after}"
-            if args.session_id:
-                path += f"&session_id={args.session_id}"
+            # session_id is guaranteed present (required arg) — always scope the wait so a
+            # cross-session event never wakes this waiter.
+            path = f"/wait?after_seq={after}&session_id={args.session_id}"
             try:
                 _st, body = client._call("GET", path, timeout=40)
                 evt = body.get("event")

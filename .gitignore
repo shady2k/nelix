@@ -18,7 +18,7 @@ docs/HANDOFF.md
 # Python
 __pycache__/
 *.py[cod]
-.venv/
+.venv
 venv/
 *.egg-info/
 

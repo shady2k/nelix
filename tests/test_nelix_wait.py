@@ -76,7 +76,7 @@ def test_nelix_wait_reissues_then_prints_event(tmp_path):
     ])
     sf = _write_state(tmp_path, _tcp_state(8790))
     try:
-        out = _run_wait(sf, ["--after", "0"])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s1"])
     finally:
         srv.shutdown()
     rec = json.loads(out.strip())
@@ -100,7 +100,7 @@ def test_nelix_wait_doorbell_omits_executor_output(tmp_path):
     ])
     sf = _write_state(tmp_path, _tcp_state(8795))
     try:
-        out = _run_wait(sf, ["--after", "0"])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s1"])
     finally:
         srv.shutdown()
     rec = json.loads(out.strip())
@@ -125,7 +125,7 @@ def test_nelix_wait_doorbell_stays_small_with_huge_screen_excerpt(tmp_path):
     ])
     sf = _write_state(tmp_path, _tcp_state(8796))
     try:
-        out = _run_wait(sf, ["--after", "0"])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s1"])
     finally:
         srv.shutdown()
     assert len(out) < 300, f"doorbell too big ({len(out)} bytes): would be truncatable"
@@ -178,11 +178,24 @@ def test_nelix_wait_reads_token_from_state_file(tmp_path):
     # token lives inside the state file — no env var needed
     sf = _write_state(tmp_path, _tcp_state(8792, token="filetok"))
     try:
-        out = _run_wait(sf, ["--after", "0"], env={"PATH": "/usr/bin:/bin"})  # NO NELIX_RPC_TOKEN
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s2"],
+                        env={"PATH": "/usr/bin:/bin"})  # NO NELIX_RPC_TOKEN
     finally:
         srv.shutdown()
     assert seen["tok"] == "filetok"   # token read from the state file and sent in the header
     assert json.loads(out.strip())["session_id"] == "s2"
+
+
+def test_nelix_wait_requires_session_id(tmp_path):
+    # --session-id is MANDATORY: without it the waiter must NOT fall back to a global
+    # (cross-session) /wait — it exits nonzero with a clear error instead of ever waiting.
+    sf = _write_state(tmp_path, _tcp_state(1))   # endpoint irrelevant: the arg guard fires first
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "bin" / "nelix-wait"),
+         "--state-file", str(sf), "--after", "0"],
+        env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=10)
+    assert proc.returncode != 0
+    assert "session-id" in proc.stderr.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +209,7 @@ def test_nelix_wait_exits_cleanly_when_daemon_unreachable(tmp_path):
     sf = _write_state(tmp_path, _tcp_state(1))   # port 1 is unreachable
     out = subprocess.check_output(
         [sys.executable, str(ROOT / "bin" / "nelix-wait"),
-         "--state-file", str(sf), "--after", "0"],
+         "--state-file", str(sf), "--after", "0", "--session-id", "s1"],
         env={"PATH": "/usr/bin:/bin"}, timeout=10, text=True)
     assert json.loads(out.strip()) == {"kind": "none"}
 
@@ -206,7 +219,7 @@ def test_nelix_wait_exits_cleanly_when_state_file_missing(tmp_path):
     missing = tmp_path / "no-such-file.json"
     out = subprocess.check_output(
         [sys.executable, str(ROOT / "bin" / "nelix-wait"),
-         "--state-file", str(missing), "--after", "0"],
+         "--state-file", str(missing), "--after", "0", "--session-id", "s1"],
         env={"PATH": "/usr/bin:/bin"}, timeout=10, text=True)
     assert json.loads(out.strip()) == {"kind": "none"}
 
@@ -216,7 +229,7 @@ def test_nelix_wait_exits_cleanly_when_unix_socket_absent(tmp_path):
     sf = _write_state(tmp_path, {"transport": "unix", "path": str(tmp_path / "ghost.sock")})
     out = subprocess.check_output(
         [sys.executable, str(ROOT / "bin" / "nelix-wait"),
-         "--state-file", str(sf), "--after", "0"],
+         "--state-file", str(sf), "--after", "0", "--session-id", "s1"],
         env={"PATH": "/usr/bin:/bin"}, timeout=10, text=True)
     assert json.loads(out.strip()) == {"kind": "none"}
 
@@ -258,7 +271,7 @@ def test_nelix_wait_discovers_unix_endpoint_and_prints_doorbell(tmp_path, unix_s
     sf = _write_state(tmp_path, {"transport": "unix", "path": unix_sock})
 
     try:
-        out = _run_wait(sf, ["--after", "0"])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s1"])
     finally:
         srv.shutdown()
 
@@ -295,7 +308,7 @@ def test_nelix_wait_graceful_interrupt(tmp_path):
     try:
         proc = subprocess.Popen(
             [sys.executable, str(ROOT / "bin" / "nelix-wait"),
-             "--state-file", str(sf), "--after", "0"],
+             "--state-file", str(sf), "--after", "0", "--session-id", "s1"],
             env={"PATH": "/usr/bin:/bin"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         assert hit.wait(timeout=5), "Server never received request"

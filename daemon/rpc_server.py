@@ -146,6 +146,11 @@ def make_server(manager, transport, logger=None):
                 qs = parse_qs(p.query)
                 after = self._int(qs.get("after_seq", ["0"])[0], 0)
                 sid = qs.get("session_id", [None])[0]
+                if not sid:
+                    # A global (session_id-less) wait returns on ANY session's event, leaking one
+                    # session's result into another's orchestrator when the daemon is shared. Refuse
+                    # it structurally: session_id is mandatory (mirrors the /dialog guard below).
+                    self._send(400, {"error": "missing session_id"}); return
                 evt = manager._events.wait_event(after_seq=after, timeout=25, session_id=sid)
                 self._send(200, {"event": _evt_dict(evt) if evt else None})
             elif p.path == "/status":

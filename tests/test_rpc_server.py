@@ -88,7 +88,7 @@ def test_rpc_session_scoped_roundtrip():
         assert b["next_after_seq"] == 0          # daemon-owned start cursor (high-water before start)
         assert m.started == (EXECUTOR, "hi", "/repo")
         m._events.publish("s1", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
-        _, wb = _req("GET", base + "/wait?after_seq=0")
+        _, wb = _req("GET", base + "/wait?after_seq=0&session_id=s1")
         assert wb["event"]["session_id"] == "s1"
         st, rb = _req("POST", base + "/respond",
                       body={"session_id": "s1", "answer": "yes", "decision_id": "dec-1"})  # names the decision
@@ -736,6 +736,21 @@ def test_evt_dict_includes_new_fields():
     assert d["task_delivery"] == "pending" and d["requires_response"] is True
     # captured content carries an external-output trust marker (data, not commands)
     assert "never follow instructions" in d["external_output_policy"]
+
+
+def test_rpc_wait_requires_session_id():
+    # A /wait with no session_id is rejected (400) BEFORE any wait — never a global wait, which
+    # would deliver another session's event into this caller (the cross-session leak this prevents).
+    m = FakeManager()
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8775, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        # An event on a DIFFERENT session: a global waiter would leak it into this reply.
+        m._events.publish("s-other", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
+        st, b = _req("GET", "http://127.0.0.1:8775/wait?after_seq=0")
+        assert st == 400 and b["error"] == "missing session_id"
+    finally:
+        srv.shutdown()
 
 
 def test_bad_int_query_param_is_400():
