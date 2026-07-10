@@ -364,8 +364,9 @@ def test_stale_modal_cache_never_hydrates_a_different_modal(tmp_path):
         Pre-fix respond("1", B) hydrated B from A's stale cache and returned 'resumed' (A's option
         typed into B). GREEN: the cache's generation no longer matches B, so the hydrate is refused
         and the valid-looking id is rejected 'invalid_option' (self-healing — the orchestrator
-        re-pulls + responds once the monitor enriches B with B's own options). Real captures only:
-        both modal frames come from recorded fixtures; nothing is fabricated."""
+        re-pulls + responds once the monitor enriches B with B's own options). The two modal FRAMES
+        come from recorded fixtures; the hook tool_input dicts are synthesized in-test (hooks are not
+        part of frame captures) purely to give A and B distinct gate fingerprints."""
     from daemon.hooks import HookEvent
     frames_a = capture_frames("s-9610d25c-askuserquestion-collision.capture")
     modal_a = frames_a[-1]
@@ -425,6 +426,59 @@ def test_stale_modal_cache_never_hydrates_a_different_modal(tmp_path):
         f"(got {out_b.status}; pre-fix this was 'resumed' — A's option typed into B)")
     assert sess._handle.writes == writes_before, "respond(B) must type NOTHING (no A-derived keystroke)"
     assert sess.snapshot()["decision"]["decision_id"] == dec_b["decision_id"], "B stays pending"
+
+
+def test_hydrate_succeeds_when_hook_publishes_before_the_monitor_observes(tmp_path):
+    """nelix-wuh regression guard (Codex CHANGES-NEEDED on the first epoch fix): the cache-generation
+        key MUST serve the legit nelix-5r3 hydrate in BOTH orderings. The real _loop_once drains hooks
+        (publish) BEFORE it observes+caches, so a single modal X can be PUBLISHED first (options=[],
+        epoch stamped) and only THEN observed+cached; a respond(X, valid id) landing after the cache is
+        set but before _enrich_hook_modal_options fills the decision MUST still hydrate and succeed.
+        The first fix stamped the cache with the POST-bump counter, so in this publish-before-observe
+        ordering the cache epoch (E+1) no longer matched the decision (E) and a VALID answer to the SAME
+        modal X was rejected invalid_option — the exact hydrate this cache exists to serve. RED against
+        that code; GREEN once the cache borrows the pending decision's epoch. Complements
+        test_respond_hydrates_options_when_it_beats_screen_enrichment (the observe-BEFORE-publish
+        ordering). Real capture frame; synthesized hook tool_input (hooks are not in frame captures)."""
+    from daemon.hooks import HookEvent
+    modal = capture_frames("s-9610d25c-askuserquestion-collision.capture")[-1]
+    assert "Next step" in modal and "Enter to select" in modal
+
+    sess, ev, clock = _wire(tmp_path, Spec())
+    sess._handle = RawReplayHandle([modal], clock=clock)
+    sess._handle._dialog = sess._dialog
+    sess._task_delivery = "delivered"
+
+    obs = sess._driver.observe(modal, sess._obs_ctx())
+    ids = [o.id for o in obs.options]
+    assert ids == ["1", "2", "3", "4", "5", "6"]
+    ti = {"questions": [{"question": "X", "options": [o.label for o in obs.options]}]}
+
+    def fire(event, tool_name=None, tool_input=None):
+        sess.on_hook(HookEvent(session_id=sess._id, event=event, tool_name=tool_name,
+                               tool_input=tool_input or {}))
+        sess._drain_hooks()
+
+    fire("UserPromptSubmit")
+    # PUBLISH-BEFORE-OBSERVE: the hook publishes modal X's options=[] decision FIRST (the real
+    # _loop_once drains hooks before it observes) — no observe/cache has run yet.
+    fire("PreToolUse", tool_name="AskUserQuestion", tool_input=ti)
+    dec = sess.snapshot()["decision"]
+    assert dec["prompt_kind"] == "modal_choice" and dec["options"] == [], "X published with no options"
+    assert sess._last_modal_options is None, "the monitor has not observed/cached X yet"
+
+    # The monitor now observes X's frame and CACHES its options; respond(X) lands in the window BEFORE
+    # _enrich_hook_modal_options fills the decision (both run back-to-back in _loop_once, but respond is
+    # on the RPC thread and can interleave between them). Cache via the real monitor method, un-enriched.
+    sess._cache_last_modal_options(obs)
+    assert [o["id"] for o in sess._last_modal_options] == ids, "monitor cached X's options"
+    assert sess.snapshot()["decision"]["options"] == [], "enrichment has NOT run; decision still empty"
+
+    out = sess.respond("1", decision_id=dec["decision_id"])
+    assert out.status == "resumed", (
+        f"a valid answer to the SAME modal X must hydrate from the cache and succeed regardless of "
+        f"observe-vs-publish ordering (got {out.status}; the post-bump-counter fix wrongly rejected it)")
+    assert "1\r" in sess._handle.writes, "select_option typed digit+CR (the modal path, not free text)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
