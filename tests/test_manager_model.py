@@ -12,6 +12,10 @@ from daemon.events import EventQueue
 from daemon.manager import SessionManager, ModelRejected
 from daemon.obs import Logger
 
+# Captured at import, BEFORE the module autouse fixture below patches it to a no-op. The one guard
+# test that exercises the REAL pre-flight restores this so it isn't testing the stub (nelix-atb).
+_REAL_CHECK_MODEL_AVAILABLE = SessionManager._check_model_available
+
 
 class _CapSession:
     """Captures the ExecutorSpec the manager builds for this session."""
@@ -33,6 +37,21 @@ def _mgr(spec=None, limit=5, driver_factory=None, logger=None):
     m = SessionManager(specs, EventQueue(), session_factory=sf, concurrency_limit=limit,
                        driver_factory=driver_factory, logger=logger)
     return m, captured
+
+
+@pytest.fixture(autouse=True)
+def _no_live_model_discovery(monkeypatch):
+    """nelix-atb: force-skip nelix-kwr's pre-flight model discovery for every test in this module.
+
+    These tests assert the per-session model argv fold + shape validation (they precede the
+    pre-flight in _spawn). The live Anthropic /v1/models pre-flight is out of scope here and MUST
+    NOT run: when the shell carries ANTHROPIC_* auth (e.g. a zai/GLM remap env) it goes over the
+    network and turns these unit tests into spurious ModelUnavailable failures. No-op it so the
+    module is deterministic and offline regardless of the ambient environment.
+    (test_real_preflight_no_auth_path_stays_offline deliberately restores the REAL method — via
+    _REAL_CHECK_MODEL_AVAILABLE — to exercise the genuine no_auth fail-open path.)"""
+    monkeypatch.setattr(SessionManager, "_check_model_available",
+                        lambda self, spec, executor_name, model: None)
 
 
 # ---- argv fold (last-wins) -------------------------------------------------------------
@@ -103,6 +122,31 @@ def test_max_length_boundary_accepted():
 
 def test_model_rejected_is_a_value_error_subclass():
     assert issubclass(ModelRejected, ValueError)
+
+
+# ---- nelix-atb: the REAL pre-flight's no_auth path must stay offline ---------------------
+# nelix-kwr's pre-flight (SessionManager._check_model_available) validates the model against the
+# Anthropic /v1/models endpoint ONLY when auth is present; with no auth it takes a fail-open skip
+# (auth_of -> None -> `no_auth`) BEFORE any network call. That skip is what keeps these fold/shape
+# unit tests offline in a clean shell. This guard exercises the GENUINE method (opting out of the
+# module autouse no-op) and proves the no_auth path never reaches discovery. It is NOT vacuous: the
+# sentinel discover WOULD fire (AssertionError) if the manager's `if kind is None` no_auth guard
+# were removed — and fires today if auth is present (which is exactly why the module no-ops it).
+def test_real_preflight_no_auth_path_stays_offline(monkeypatch):
+    # Put the REAL method back (the autouse fixture already stubbed it to a no-op for this test).
+    monkeypatch.setattr(SessionManager, "_check_model_available", _REAL_CHECK_MODEL_AVAILABLE)
+    reached = []
+    def _boom_discover(*a, **k):
+        reached.append((a, k))
+        raise AssertionError("pre-flight model discovery went LIVE in a unit test")
+    monkeypatch.setattr("daemon.manager.discover", _boom_discover)   # captured by ModelCache at ctor
+    # Force the no_auth condition regardless of the ambient shell (auth_of reads exactly these two).
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    m, cap = _mgr(make_spec(args=[], driver="claude"))
+    m.start(EXECUTOR, "t", "/tmp", model="GLM-4.7")     # non-alias -> reaches the auth check, then skips
+    assert not reached, "no_auth pre-flight must skip BEFORE the network"
+    assert cap[0].spec.args == ["--model", "GLM-4.7"]
 
 
 # ---- driver capability (via getattr, no AttributeError) --------------------------------
