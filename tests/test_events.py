@@ -55,8 +55,18 @@ def test_wait_event_blocks_then_returns():
     def producer():
         time.sleep(0.05); q.publish("s1", "claude", "done", "x", "done_candidate")
     threading.Thread(target=producer, daemon=True).start()
-    assert q.wait_event(after_seq=0, timeout=2).seq == 1
-    assert q.wait_event(after_seq=1, timeout=0.1) is None
+    assert q.wait_event(after_seq=0, timeout=2, session_id="s1").seq == 1
+    assert q.wait_event(after_seq=1, timeout=0.1, session_id="s1") is None
+
+
+def test_wait_event_requires_session_id():
+    # session_id is a REQUIRED parameter: the wait primitive must be STRUCTURALLY incapable of a
+    # global (cross-session) wait, which would deliver one session's event to another's orchestrator.
+    # Omitting it is a programming error (TypeError), never a silent global wait.
+    import pytest
+    q = EventQueue()
+    with pytest.raises(TypeError):
+        q.wait_event(after_seq=0, timeout=0.1)
 
 
 def test_publish_carries_range_and_hint_under_lock():

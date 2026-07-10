@@ -95,7 +95,12 @@ class EventQueue:
                 return e
         return None
 
-    def wait_event(self, after_seq, timeout, session_id=None):
+    def wait_event(self, after_seq, timeout, session_id):
+        # session_id is REQUIRED (no default): a global wait returns on ANY session's event, so a
+        # session_id-less waiter would deliver one session's event to another's orchestrator on a
+        # shared daemon. Removing the default makes that variant structurally impossible — omitting
+        # session_id raises TypeError, not a silent global wait. (latest_seq/pending/latest_after
+        # keep their None default: those are non-blocking QUERIES, not deliver-and-consume waits.)
         deadline = time.time() + timeout
         with self._cv:
             while True:

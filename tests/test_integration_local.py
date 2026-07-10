@@ -25,7 +25,7 @@ def test_local_task_reaches_decision_and_creates_file(tmp_path):
     after = 0
     deadline = time.time() + 180
     while time.time() < deadline:
-        evt = _call("GET", f"/wait?after_seq={after}").get("event")
+        evt = _call("GET", f"/wait?after_seq={after}&session_id={sid}").get("event")
         if evt is None:
             continue
         after = evt["seq"]
