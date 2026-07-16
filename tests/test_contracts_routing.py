@@ -33,5 +33,28 @@ def test_unknown_operation_raises_rather_than_defaulting():
         classify("delete_everything")
 
 
-def test_every_operation_maps_to_a_declared_class():
+def test_the_operation_set_is_exactly_the_contract():
+    # An authoritative set, asserted by equality. The old version iterated the dict's own
+    # values, so a MISSING operation could never fail it — which is how /hook and /message
+    # went absent.
+    assert set(OPERATION_CLASS) == {
+        "start",
+        "respond", "stop", "restart", "screen", "dialog", "ack_terminal", "hook", "message",
+        "status", "wait",
+        "generation_install", "generation_activate", "generation_retire", "generation_list",
+        "capabilities",
+    }
     assert set(OPERATION_CLASS.values()) <= ALL_CLASSES
+
+
+@pytest.mark.parametrize("op", ["hook", "message"])
+def test_the_executor_facing_plane_routes_by_session(op):
+    # A worker's hook must reach ITS generation. Note these authenticate by per-session
+    # secret, NOT by owner_id — routing them is this table's job; authorising them is not.
+    assert classify(op) == routing.SESSION_KEYED
+
+
+def test_capabilities_is_router_local_not_fanned_out():
+    # Fanning capabilities out would merge N generations' answers into one, which is exactly
+    # the thing a per-session capability check exists to avoid.
+    assert classify("capabilities") == routing.OPERATOR

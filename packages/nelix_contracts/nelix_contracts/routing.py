@@ -24,12 +24,20 @@ OPERATION_CLASS = {
     "screen": SESSION_KEYED,
     "dialog": SESSION_KEYED,
     "ack_terminal": SESSION_KEYED,
+    # The executor-facing plane. These route by session like any other session-keyed call,
+    # but they authenticate by PER-SESSION SECRET, not by owner_id — a worker is not a
+    # caller. Routing them here does not make them owner-gated.
+    "hook": SESSION_KEYED,
+    "message": SESSION_KEYED,
     "status": FAN_OUT,
     "wait": FAN_OUT,
     "generation_install": OPERATOR,
     "generation_activate": OPERATOR,
     "generation_retire": OPERATOR,
     "generation_list": OPERATOR,
+    # Router-local: it answers from its own registry. Fanning it out would merge N
+    # generations' answers into one, defeating per-session capability checks.
+    "capabilities": OPERATOR,
 }
 
 
