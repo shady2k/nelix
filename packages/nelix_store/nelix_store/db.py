@@ -10,13 +10,17 @@ WAL is on so a reader never blocks a writer — the board is read constantly whi
 generations write.
 """
 import contextlib
+import errno
 import fcntl
+import math
 import os
 import sqlite3
 import time
 from pathlib import Path
 
-from nelix_contracts.errors import STORE_CORRUPT, STORE_UNAVAILABLE, STORE_UNSUPPORTED, NelixError
+from nelix_contracts.errors import (
+    INVALID_REQUEST, STORE_CORRUPT, STORE_UNAVAILABLE, STORE_UNSUPPORTED, NelixError,
+)
 
 DB_FILENAME = "nelix.db"
 SCHEMA_VERSION = 1
@@ -88,7 +92,17 @@ def _bootstrap_lock(root: Path, timeout: float):
     A bounded NON-blocking flock loop, not a blocking acquire: a wedged holder must surface
     as store_unavailable, not as a hang. The kernel releases the lock if a holder dies, so
     this is crash-safe. Held only across bootstrap, released before the connection is used.
+
+    Only lock CONTENTION (EACCES/EAGAIN — another opener holds it) and EINTR (a signal
+    interrupted the syscall; retrying is simply correct) spin to the deadline. Anything else
+    — locking not supported on this filesystem, a bad descriptor — is not a condition more
+    waiting can fix, so it fails immediately instead of spinning the full timeout for no
+    reason.
     """
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or \
+            not math.isfinite(timeout) or timeout < 0:
+        raise NelixError(INVALID_REQUEST,
+                         f"timeout must be a finite, non-negative number: {timeout!r}")
     path = root / LOCK_FILENAME
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     deadline = time.monotonic() + timeout
@@ -97,7 +111,13 @@ def _bootstrap_lock(root: Path, timeout: float):
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except OSError:
+            except OSError as e:
+                if e.errno == errno.EINTR:
+                    continue
+                if e.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise NelixError(
+                        STORE_UNSUPPORTED,
+                        f"cannot lock the database bootstrap file: {e}") from None
                 if time.monotonic() >= deadline:
                     raise NelixError(
                         STORE_UNAVAILABLE,

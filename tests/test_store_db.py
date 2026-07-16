@@ -63,37 +63,48 @@ def test_the_reservation_key_is_unique_per_owner(tmp_path):
 
 
 def test_concurrent_first_open_across_processes_never_fails(tmp_path):
-    # PROCESSES, not threads: generations are separate processes and the bootstrap lock is
-    # inter-process. rev 3's thread-only test could not exercise the mechanism it guards.
+    # PROCESSES, not threads: generations are separate processes and the lock is
+    # inter-process.
     #
-    # The gate file is a real barrier — without it, process start-up jitter means they never
-    # collide and the test proves nothing.
-    root = tmp_path / "store"
-    gate = tmp_path / "gate"
-    code = (
-        "import time, pathlib\n"
-        "from nelix_store import db\n"
-        f"gate = pathlib.Path({str(gate)!r})\n"
-        "while not gate.exists():\n"
-        "    time.sleep(0.005)\n"
-        f"c = db.connect({str(root)!r})\n"
-        "c.close()\n"
-        "print('ok')\n"
-    )
-    procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True) for _ in range(8)]
-    try:
-        time.sleep(1.0)          # let every process reach the gate
-        gate.touch()
-        outs = [p.communicate(timeout=60) for p in procs]
-    finally:
-        for p in procs:
-            if p.poll() is None:
-                p.kill()
-    failures = [f"rc={p.returncode}: {err.strip()}"
-                for p, (_out, err) in zip(procs, outs) if p.returncode != 0]
-    assert failures == [], f"concurrent first open failed: {failures}"
-    assert all(out.strip() == "ok" for out, _err in outs)
+    # TWO things make this a real negative control, both learned the hard way:
+    #   * a REAL barrier, not a latch — each child publishes a ready marker and the parent
+    #     waits for all of them. The previous version slept 1s and ASSUMED.
+    #   * REPETITION over fresh directories — the collision window is narrow, so one round
+    #     caught a removed lock only ~40% of the time. More processes does not help (8/16/32
+    #     measured, no trend); more rounds does.
+    rounds = 10
+    for attempt in range(rounds):
+        root = tmp_path / f"store{attempt}"
+        gate = tmp_path / f"gate{attempt}"
+        ready = tmp_path / f"ready{attempt}"
+        ready.mkdir()
+        code = (
+            "import os, sys, time, pathlib\n"
+            "from nelix_store import db\n"
+            f"pathlib.Path({str(ready)!r}, str(os.getpid())).touch()\n"
+            f"gate = pathlib.Path({str(gate)!r})\n"
+            "while not gate.exists():\n"
+            "    time.sleep(0.002)\n"
+            f"c = db.connect({str(root)!r})\n"
+            "c.close()\n"
+            "print('ok')\n"
+        )
+        procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) for _ in range(8)]
+        try:
+            deadline = time.monotonic() + 30
+            while len(list(ready.iterdir())) < 8:
+                assert time.monotonic() < deadline, "children never reported ready"
+                time.sleep(0.01)
+            gate.touch()                       # a real barrier: all eight are at the line
+            outs = [p.communicate(timeout=60) for p in procs]
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+        failures = [f"round {attempt} rc={p.returncode}: {err.strip()}"
+                    for p, (_out, err) in zip(procs, outs) if p.returncode != 0]
+        assert failures == [], f"concurrent first open failed: {failures}"
 
 
 def test_concurrent_version_stamping_is_atomic(tmp_path):

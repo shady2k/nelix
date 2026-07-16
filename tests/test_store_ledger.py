@@ -98,9 +98,9 @@ def test_exactly_one_reservation_survives_a_race(tmp_path):
             lg = StartLedger(tmp_path, clock=lambda: 1000.0)
         except BaseException as e:          # noqa: BLE001 - account for EVERYTHING
             errs.append(f"open: {type(e).__name__}: {e}")
-            barrier.wait()
+            barrier.wait(timeout=30)
             return
-        barrier.wait()
+        barrier.wait(timeout=30)
         try:
             results.append(reserve(lg).session_id)
         except BaseException as e:          # noqa: BLE001
@@ -108,7 +108,9 @@ def test_exactly_one_reservation_survives_a_race(tmp_path):
         finally:
             lg.close()
 
-    threads = [threading.Thread(target=go) for _ in range(8)]
+    # daemon=True: on the hang path, a non-daemon thread wedged on a timeout-less barrier
+    # keeps pytest alive forever (measured: 210s to fail, then the process never exits).
+    threads = [threading.Thread(target=go, daemon=True) for _ in range(8)]
     for t in threads:
         t.start()
     for t in threads:
@@ -117,7 +119,9 @@ def test_exactly_one_reservation_survives_a_race(tmp_path):
     assert all(not t.is_alive() for t in threads), "a thread hung"
     assert len(results) + len(errs) == 8, "a thread vanished without a result or an error"
     assert errs == [], f"threads failed: {errs}"
-    assert len(results) == 8, "every caller sending the same fingerprint must succeed"
+    # `assert len(results) == 8` (rev 5 had it) is dropped: it follows from the two
+    # assertions above (len(results) + len(errs) == 8, and errs == []), never fired under any
+    # mutation, and a test line with zero detection power is noise pretending to be a guard.
     assert len(set(results)) == 1, f"the race minted {len(set(results))} sessions"
 
 

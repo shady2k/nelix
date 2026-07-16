@@ -28,11 +28,17 @@ _SESSION_SELECT = (
     "SELECT s.session_id, st.owner_id, st.orchestration_id, st.generation_id, s.state, "
     "s.executor, s.task, s.cwd, s.model, s.created_at, s.schema_version "
     "FROM sessions s JOIN starts st ON st.session_id = s.session_id")
+# f1k-rev5: this used to also `JOIN sessions s ON s.session_id = t.session_id`. It selected
+# no column and could not filter anything: every terminal row is created by put_terminal only
+# after joining sessions+starts itself (UNKNOWN_SESSION otherwise), and nothing in this
+# package ever deletes a sessions row — so under this package's own writers, terminal implies
+# sessions implies starts, unconditionally. Deleted rather than kept as unexercised defence
+# against a hypothetical writer that opens the file without going through db.connect()'s
+# `PRAGMA foreign_keys=ON` connection.
 _TERMINAL_SELECT = (
     "SELECT t.session_id, st.owner_id, st.orchestration_id, st.generation_id, "
     "t.terminal_kind, t.summary, t.ended_at, t.acknowledged_at, t.schema_version "
-    "FROM terminal t JOIN sessions s ON s.session_id = t.session_id "
-    "JOIN starts st ON st.session_id = t.session_id")
+    "FROM terminal t JOIN starts st ON st.session_id = t.session_id")
 
 # transition_session's CAS UPDATE has no owner_id column to filter on directly (identity
 # lives in starts, not sessions) — expressed as a subquery so the owner check stays part of
