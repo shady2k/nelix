@@ -173,6 +173,17 @@ class StartLedger:
                     return
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  "start already failed for a different reason")
+            # The MIRROR of create_session's failed-start guard. Both orders must be safe:
+            # fail-then-create is refused there; create-then-fail is refused here. The router
+            # cannot arbitrate — it calls fail() on a forward timeout without knowing whether
+            # the generation's create_session committed a moment before. Measured: 44/200
+            # races left a live session AND a failed start, and a retry then reports a durable
+            # failure while a worker is running.
+            if self._conn.execute("SELECT 1 FROM sessions WHERE session_id=?",
+                                  (session_id,)).fetchone() is not None:
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 f"start {session_id} already acquired a session; it cannot "
+                                 f"be failed")
             self._conn.execute(
                 "UPDATE starts SET state='failed', reason=? WHERE session_id=?",
                 (reason, session_id))

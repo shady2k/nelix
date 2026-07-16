@@ -255,6 +255,92 @@ def test_the_ledger_survives_a_restart(tmp_path):
     lg2.close()
 
 
+def test_a_start_that_already_acquired_a_session_cannot_be_failed(ledger, tmp_path):
+    # Direction B, the mirror of create_session's guard. The router calls fail() on a forward
+    # timeout — and cannot know whether the generation's create_session committed a moment
+    # earlier. If fail() wins, the retry reports a durable failure while a worker is running,
+    # and the caller dispatches a SECOND one.
+    from nelix_store.store import Store
+    store = Store(tmp_path, clock=lambda: 1000.0)
+    try:
+        r = reserve(ledger)
+        ledger.assign_generation(r.session_id, GID)
+        store.create_session(r.session_id, state="running", executor="coder", task="t",
+                             cwd="/repo", model=None, created_at=100.0)
+        with pytest.raises(NelixError) as ei:
+            ledger.fail(r.session_id, "forward timed out")
+        assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+        # The start stays recoverable on its assigned generation, not poisoned.
+        assert reserve(ledger).state == "starting"
+    finally:
+        store.close()
+
+
+def test_a_session_and_a_failed_start_never_coexist_under_a_race(tmp_path):
+    # The measured shape: 44/200 races left both. Whichever transaction wins, the OTHER must
+    # refuse — BEGIN IMMEDIATE serializes them but does not decide the winner, so both sides
+    # need a guard.
+    from nelix_store.store import Store
+
+    rounds, violations = 30, []
+    for attempt in range(rounds):
+        root = tmp_path / f"r{attempt}"
+        lg = StartLedger(root, clock=lambda: 1000.0)
+        store = Store(root, clock=lambda: 1000.0)
+        try:
+            r = lg.reserve(idempotency_key="k1", owner_id="hermes:local",
+                           orchestration_id=OID, request_fingerprint=FP)
+            lg.assign_generation(r.session_id, GID)
+        finally:
+            lg.close()
+            store.close()
+
+        barrier = threading.Barrier(2)
+
+        def creator():
+            s = Store(root, clock=lambda: 1000.0)
+            barrier.wait(timeout=30)
+            try:
+                s.create_session(r.session_id, state="running", executor="coder", task="t",
+                                 cwd="/repo", model=None, created_at=100.0)
+            except NelixError:
+                pass                       # losing is fine; coexisting is not
+            finally:
+                s.close()
+
+        def failer():
+            l2 = StartLedger(root, clock=lambda: 1000.0)
+            barrier.wait(timeout=30)
+            try:
+                l2.fail(r.session_id, "forward timed out")
+            except NelixError:
+                pass
+            finally:
+                l2.close()
+
+        threads = [threading.Thread(target=creator, daemon=True),
+                   threading.Thread(target=failer, daemon=True)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert all(not t.is_alive() for t in threads), "a thread hung"
+
+        check = StartLedger(root, clock=lambda: 1000.0)
+        try:
+            state = check._conn.execute(
+                "SELECT state FROM starts WHERE session_id=?", (r.session_id,)
+            ).fetchone()["state"]
+            has_session = check._conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id=?", (r.session_id,)).fetchone()
+        finally:
+            check.close()
+        if state == "failed" and has_session:
+            violations.append(attempt)
+    assert violations == [], (
+        f"{len(violations)}/{rounds} races left a live session AND a failed start: {violations}")
+
+
 def test_a_session_id_mint_collision_does_not_crash_reserve(tmp_path):
     # A minted-id collision raises IntegrityError on the PRIMARY KEY, not on the owner/key
     # UNIQUE — so rev 2's fall-through SELECT found no row and dereferenced None.
