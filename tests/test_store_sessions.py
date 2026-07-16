@@ -48,13 +48,39 @@ def test_a_session_cannot_be_created_for_a_start_that_does_not_exist(store):
 def test_a_session_inherits_its_identity_from_its_start(store, ledger):
     # The caller supplies NO owner/orchestration/generation — there is no way for them to
     # disagree with the start, because they are never given a chance to.
-    r = ledger.reserve(idempotency_key="k1", owner_id="hermes:local",
-                       orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(r.session_id, GID)
-    store.create_session(r.session_id, state="starting", executor="coder", task="t",
+    #
+    # TWO owners, each with their own start + session, and DISTINCT orchestration/generation
+    # ids: a single owner cannot catch a join hardcoded to a constant owner (e.g.
+    # `_SESSION_SELECT` joining `starts` on `st.owner_id = 'hermes:local'` instead of
+    # `st.session_id = s.session_id`) — with only one owner in the store, that literal is
+    # indistinguishable from a correct join. This mirrors the same gap documented for
+    # `_TERMINAL_SELECT` in f1k-rev4-report.md (mutation 4); `_SESSION_SELECT` has the
+    # identical join shape, so it carries the identical risk.
+    oid_b = "o-" + "4" * 32
+    gid_b = "g-" + "5" * 32
+
+    r_a = ledger.reserve(idempotency_key="k-a", owner_id="hermes:local",
+                         orchestration_id=OID, request_fingerprint="fp")
+    ledger.assign_generation(r_a.session_id, GID)
+    store.create_session(r_a.session_id, state="starting", executor="coder", task="t",
                          cwd="/repo", model=None, created_at=100.0)
-    rec = store.get_session(r.session_id, owner_id="hermes:local")
-    assert (rec.owner_id, rec.orchestration_id, rec.generation_id) == ("hermes:local", OID, GID)
+
+    r_b = ledger.reserve(idempotency_key="k-b", owner_id="claude-code:1",
+                         orchestration_id=oid_b, request_fingerprint="fp")
+    ledger.assign_generation(r_b.session_id, gid_b)
+    store.create_session(r_b.session_id, state="starting", executor="coder", task="t",
+                         cwd="/repo", model=None, created_at=100.0)
+
+    rec_a = store.get_session(r_a.session_id, owner_id="hermes:local")
+    assert (rec_a.owner_id, rec_a.orchestration_id, rec_a.generation_id) == (
+        "hermes:local", OID, GID)
+
+    rec_b = store.get_session(r_b.session_id, owner_id="claude-code:1")
+    assert (rec_b.owner_id, rec_b.orchestration_id, rec_b.generation_id) == (
+        "claude-code:1", oid_b, gid_b)
+
+    assert [s.session_id for s in store.list_sessions("hermes:local")] == [r_a.session_id]
+    assert [s.session_id for s in store.list_sessions("claude-code:1")] == [r_b.session_id]
 
 
 def test_a_session_cannot_be_created_before_its_generation_is_assigned(store, ledger):

@@ -60,14 +60,30 @@ def test_a_terminal_record_inherits_its_owner_from_its_session(store, ledger):
     # THE Critical: rev 3 accepted owner_id on put_terminal, so a terminal record could be
     # filed under a DIFFERENT owner than its session — and that owner's board would then
     # show someone else's result. The parameter is gone; there is nothing to disagree with.
-    r = ledger.reserve(idempotency_key="k1", owner_id="hermes:local",
-                       orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(r.session_id, GID)
-    store.create_session(r.session_id, state="running", executor="coder", task="t",
-                         cwd="/repo", model=None, created_at=100.0)
-    store.put_terminal(r.session_id, terminal_kind="done", summary="all green", ended_at=5.0)
-    assert store.get_terminal(r.session_id, owner_id="hermes:local").owner_id == "hermes:local"
-    assert store.list_terminal("claude-code:1") == []
+    #
+    # TWO owners, each with their own session + terminal record: a single owner cannot catch
+    # a join hardcoded to a constant owner (e.g. `_TERMINAL_SELECT` joining `starts` on
+    # `st.owner_id = 'hermes:local'` instead of `st.session_id = t.session_id`) — with only
+    # one owner in the store, that literal is indistinguishable from a correct join. A second
+    # owner makes the mismatch observable: rev4's f1k-rev4-report.md documents exactly this
+    # gap (mutation 4) and a reproduction with a second owner ("claude-code:1") showing the
+    # second owner's result coming back mislabeled as the first owner's.
+    sid_a = started_session(store, ledger, owner="hermes:local", key="k-a")
+    store.put_terminal(sid_a, terminal_kind="done", summary="A's result", ended_at=5.0)
+
+    sid_b = started_session(store, ledger, owner="claude-code:1", key="k-b")
+    store.put_terminal(sid_b, terminal_kind="done", summary="B's result", ended_at=6.0)
+
+    rec_a = store.get_terminal(sid_a, owner_id="hermes:local")
+    assert (rec_a.owner_id, rec_a.session_id, rec_a.summary) == (
+        "hermes:local", sid_a, "A's result")
+
+    rec_b = store.get_terminal(sid_b, owner_id="claude-code:1")
+    assert (rec_b.owner_id, rec_b.session_id, rec_b.summary) == (
+        "claude-code:1", sid_b, "B's result")
+
+    assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid_a]
+    assert [r.session_id for r in store.list_terminal("claude-code:1")] == [sid_b]
 
 
 def test_an_unacknowledged_result_survives_far_past_the_old_300s_ttl(store, ledger, clock):
