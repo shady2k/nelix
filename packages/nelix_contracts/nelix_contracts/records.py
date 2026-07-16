@@ -1,0 +1,148 @@
+"""Durable record schemas. Pure: dataclasses + (de)serialisation, no I/O, no clock.
+
+This is the ON-DISK contract. Generations eliminate live-state compatibility; they do NOT
+eliminate durable-data schema compatibility (design §5) — an older generation and a newer
+one read the same store. So: the version travels with every record, and reading a FUTURE
+version fails closed.
+"""
+import math
+from dataclasses import asdict, dataclass
+
+from .errors import INVALID_REQUEST, OWNER_MISMATCH, SCHEMA_TOO_NEW, NelixError
+from .ids import (
+    InvalidId, validate_generation_id, validate_orchestration_id, validate_owner_id,
+    validate_session_id,
+)
+
+SCHEMA_VERSION = 1
+
+
+def _check_version(d):
+    version = d.get("schema_version")
+    if not isinstance(version, int):
+        raise NelixError(INVALID_REQUEST, "record has no schema_version")
+    if version > SCHEMA_VERSION:
+        raise NelixError(SCHEMA_TOO_NEW,
+                         f"record schema {version} is newer than this build supports "
+                         f"({SCHEMA_VERSION}); refusing to misread it")
+
+
+def _text(value, name):
+    if not isinstance(value, str):
+        raise NelixError(INVALID_REQUEST, f"{name} must be a string: {value!r}")
+    return value
+
+
+def _timestamp(value, name, *, optional=False):
+    if value is None:
+        if optional:
+            return None
+        raise NelixError(INVALID_REQUEST, f"{name} is required")
+    # bool is an int subclass — True would silently become 1.0.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise NelixError(INVALID_REQUEST, f"{name} must be a number: {value!r}")
+    if not math.isfinite(value):
+        raise NelixError(INVALID_REQUEST, f"{name} must be finite: {value!r}")
+    return float(value)
+
+
+def _version(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise NelixError(INVALID_REQUEST, f"schema_version must be a positive int: {value!r}")
+    if value > SCHEMA_VERSION:
+        raise NelixError(SCHEMA_TOO_NEW,
+                         f"record schema {value} is newer than this build supports "
+                         f"({SCHEMA_VERSION}); refusing to misread it")
+    return value
+
+
+def _ids(session_id, owner_id, orchestration_id, generation_id):
+    try:
+        validate_session_id(session_id)
+        validate_owner_id(owner_id)
+        validate_orchestration_id(orchestration_id)
+        validate_generation_id(generation_id)
+    except InvalidId as e:
+        raise NelixError(INVALID_REQUEST, str(e)) from None
+
+
+@dataclass(frozen=True)
+class SessionRecord:
+    session_id: str
+    owner_id: str
+    orchestration_id: str
+    generation_id: str
+    state: str
+    executor: str
+    task: str
+    cwd: str
+    model: str | None
+    created_at: float
+    schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self):
+        _version(self.schema_version)
+        _ids(self.session_id, self.owner_id, self.orchestration_id, self.generation_id)
+        for name in ("state", "executor", "task", "cwd"):
+            _text(getattr(self, name), name)
+        if self.model is not None:
+            _text(self.model, "model")
+        _timestamp(self.created_at, "created_at")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SessionRecord":
+        if not isinstance(d, dict):
+            raise NelixError(INVALID_REQUEST, "record must be an object")
+        _check_version(d)          # SCHEMA_TOO_NEW before any field is interpreted
+        try:
+            return cls(**d)
+        except TypeError as e:
+            raise NelixError(INVALID_REQUEST, f"malformed record: {e}") from None
+
+
+@dataclass(frozen=True)
+class TerminalRecord:
+    session_id: str
+    owner_id: str
+    orchestration_id: str
+    generation_id: str
+    terminal_kind: str
+    summary: str
+    ended_at: float
+    acknowledged_at: float | None = None
+    schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self):
+        _version(self.schema_version)
+        _ids(self.session_id, self.owner_id, self.orchestration_id, self.generation_id)
+        _text(self.terminal_kind, "terminal_kind")
+        _text(self.summary, "summary")
+        _timestamp(self.ended_at, "ended_at")
+        _timestamp(self.acknowledged_at, "acknowledged_at", optional=True)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TerminalRecord":
+        if not isinstance(d, dict):
+            raise NelixError(INVALID_REQUEST, "record must be an object")
+        _check_version(d)          # SCHEMA_TOO_NEW before any field is interpreted
+        try:
+            return cls(**d)
+        except TypeError as e:
+            raise NelixError(INVALID_REQUEST, f"malformed record: {e}") from None
+
+
+def assert_owner(record, owner_id: str) -> None:
+    """The guard behind EVERY caller-facing route — reads included (design §7).
+
+    `dialog` reads a transcript off disk and `screen` queries the live manager, so knowing a
+    session id must never be sufficient to reach either. NOTE this is a CORRECTNESS
+    namespace, not authentication: all local callers share one uid and can assert any owner.
+    """
+    if record.owner_id != owner_id:
+        raise NelixError(OWNER_MISMATCH, "session belongs to another owner")

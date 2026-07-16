@@ -1,0 +1,268 @@
+"""The one SQLite database under NELIX_HOME.
+
+Why SQLite and not JSON files: every hard invariant here is a TRANSACTION — reserve exactly
+once under a race, compare-and-set an acknowledgement, create-but-never-overwrite, keep two
+writers from clobbering each other. Hand-rolled across files these were wrong in four
+separate ways; in a transactional store they are free. sqlite3 is stdlib, so the
+stdlib-only constraint still holds.
+
+WAL is on so a reader never blocks a writer — the board is read constantly while
+generations write.
+"""
+import contextlib
+import errno
+import fcntl
+import functools
+import math
+import os
+import sqlite3
+import time
+from pathlib import Path
+
+from nelix_contracts.errors import (
+    INVALID_REQUEST, STORE_CORRUPT, STORE_UNAVAILABLE, STORE_UNSUPPORTED, NelixError,
+)
+
+DB_FILENAME = "nelix.db"
+SCHEMA_VERSION = 1
+
+# prune_terminal's ROW_NUMBER() window function needs SQLite >= 3.25 (2018). Asserted at
+# open because the daemon runs a different interpreter than the test venv — a feature that
+# exists in CI and not in production is the nelix-cb0 failure mode.
+MIN_SQLITE = (3, 25, 0)
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- The ONE authoritative row for a session's identity. Everything else references it.
+CREATE TABLE IF NOT EXISTS starts (
+    session_id          TEXT PRIMARY KEY,
+    owner_id            TEXT NOT NULL,
+    orchestration_id    TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    state               TEXT NOT NULL,
+    generation_id       TEXT,
+    reason              TEXT,
+    created_at          REAL NOT NULL,
+    UNIQUE (owner_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS starts_by_owner ON starts (owner_id);
+
+-- Live/runtime fields ONLY. Identity comes from starts by join — it is never stored twice,
+-- so the two can never disagree.
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id     TEXT PRIMARY KEY REFERENCES starts (session_id),
+    state          TEXT NOT NULL,
+    executor       TEXT NOT NULL,
+    task           TEXT NOT NULL,
+    cwd            TEXT NOT NULL,
+    model          TEXT,
+    created_at     REAL NOT NULL,
+    schema_version INTEGER NOT NULL
+);
+
+-- Terminal-result fields ONLY.
+CREATE TABLE IF NOT EXISTS terminal (
+    session_id      TEXT PRIMARY KEY REFERENCES sessions (session_id),
+    terminal_kind   TEXT NOT NULL,
+    summary         TEXT NOT NULL,
+    ended_at        REAL NOT NULL,
+    acknowledged_at REAL,
+    schema_version  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS terminal_by_ended ON terminal (ended_at);
+"""
+
+LOCK_FILENAME = ".db-init.lock"
+
+
+@contextlib.contextmanager
+def _bootstrap_lock(root: Path, timeout: float):
+    """Serialize database BOOTSTRAP across processes — never ordinary use.
+
+    `PRAGMA journal_mode=WAL` takes a brief EXCLUSIVE lock to convert the journal of a fresh
+    file, and SQLite deliberately does not run the busy handler for some lock upgrades (it
+    would risk deadlock) — so no `busy_timeout` value fixes it, as rev 3 proved at ~20-25%
+    failure. Checking the mode first is TOCTOU: every opener can see non-WAL before any of
+    them converts.
+
+    A bounded NON-blocking flock loop, not a blocking acquire: a wedged holder must surface
+    as store_unavailable, not as a hang. The kernel releases the lock if a holder dies, so
+    this is crash-safe. Held only across bootstrap, released before the connection is used.
+
+    Only lock CONTENTION (EACCES/EAGAIN — another opener holds it) and EINTR (a signal
+    interrupted the syscall; retrying is simply correct) spin to the deadline. Anything else
+    — locking not supported on this filesystem, a bad descriptor — is not a condition more
+    waiting can fix, so it fails immediately instead of spinning the full timeout for no
+    reason.
+    """
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or \
+            not math.isfinite(timeout) or timeout < 0:
+        raise NelixError(INVALID_REQUEST,
+                         f"timeout must be a finite, non-negative number: {timeout!r}")
+    path = root / LOCK_FILENAME
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno == errno.EINTR:
+                    # Retrying on EINTR is correct, but not rechecking the deadline made the
+                    # advertised bound untrue under a signal storm.
+                    if time.monotonic() >= deadline:
+                        raise NelixError(STORE_UNAVAILABLE,
+                                         f"timed out after {timeout}s waiting for the "
+                                         f"database bootstrap lock") from None
+                    continue
+                if e.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise NelixError(
+                        STORE_UNSUPPORTED,
+                        f"cannot lock the database bootstrap file: {e}") from None
+                if time.monotonic() >= deadline:
+                    raise NelixError(
+                        STORE_UNAVAILABLE,
+                        f"timed out after {timeout}s waiting for the database bootstrap lock"
+                    ) from None
+                time.sleep(0.01)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+# Classify by the ERROR CODE, not the exception class: sqlite3 raises OperationalError for
+# transient contention AND for permanent schema defects, so mapping the class wholesale to
+# retryable makes a missing column retry forever.
+#
+# Named constants, not magic numbers — and an HONEST policy per primary result code. The old
+# comment claimed everything outside these sets proved corruption; a full disk is not damage,
+# and telling an operator their data is corrupt when they need to free space is the worst kind
+# of wrong answer.
+_UNAVAILABLE_CODES = frozenset({
+    sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_CANTOPEN,
+    sqlite3.SQLITE_IOERR, sqlite3.SQLITE_FULL, sqlite3.SQLITE_NOMEM,
+    sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_PROTOCOL,
+})
+_UNSUPPORTED_CODES = frozenset({
+    sqlite3.SQLITE_READONLY, sqlite3.SQLITE_PERM, sqlite3.SQLITE_AUTH,
+})
+
+
+def classify_sqlite_error(exc) -> NelixError:
+    """Map a sqlite3 exception onto this package's error contract.
+
+    Retryability is a MACHINE contract: a caller branches on it. Getting it wrong either
+    retries a permanent defect forever or escalates a transient one to a human.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    base = None if code is None else code & 0xFF      # strip the extended-code high bits
+    if base in _UNAVAILABLE_CODES:
+        return NelixError(STORE_UNAVAILABLE, f"database unavailable: {exc}")
+    if base in _UNSUPPORTED_CODES:
+        return NelixError(STORE_UNSUPPORTED, f"database not writable here: {exc}")
+    # Everything else — corruption, malformed SQL, a missing column, not-a-database, or an
+    # UNRECOGNISED code — is treated as a durable/structural problem AS A CONSERVATIVE DEFAULT,
+    # not because it is proven damage. Non-retryable by design.
+    return NelixError(STORE_CORRUPT, f"database error: {exc}")
+
+
+def translates_sqlite(fn):
+    """Wrap a public method so no raw sqlite3 exception can cross the package boundary."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        try:
+            return fn(*a, **k)
+        except NelixError:
+            raise
+        except sqlite3.Error as e:
+            raise classify_sqlite_error(e) from None
+    return wrapper
+
+
+def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
+    if sqlite3.sqlite_version_info < MIN_SQLITE:
+        raise NelixError(STORE_UNSUPPORTED,
+                         f"SQLite {'.'.join(map(str, MIN_SQLITE))}+ required "
+                         f"(found {sqlite3.sqlite_version})")
+    path = Path(root)
+    conn = None
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # mkdir's mode applies only when it CREATES the dir; an existing NELIX_HOME keeps its
+        # permissions, and SQLite's -wal/-shm sidecars are created per umask. The directory
+        # is the only thing protecting them.
+        path.chmod(0o700)
+        with _bootstrap_lock(path, timeout):
+            # connect() is INSIDE the try: a bad path or a permission failure must not escape
+            # raw either (rev 3 left it outside, so its own "no raw sqlite errors" claim was
+            # untrue).
+            conn = sqlite3.connect(path / DB_FILENAME, isolation_level=None, timeout=timeout)
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(mode).lower() != "wal":
+                actual = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                if str(actual).lower() != "wal":
+                    # WAL needs shared-memory + locking semantics a network filesystem does
+                    # not provide, and no lock of ours can supply them. nelix is single-host
+                    # by design; fail loudly rather than run without durability guarantees.
+                    raise NelixError(
+                        STORE_UNSUPPORTED,
+                        f"could not enable WAL (journal_mode={actual!r}); NELIX_HOME must be "
+                        f"on a host-local filesystem")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(_SCHEMA)
+            _check_or_stamp_version(conn)
+        return conn
+    except NelixError:
+        if conn is not None:
+            conn.close()
+        raise
+    except sqlite3.Error as e:
+        if conn is not None:
+            conn.close()
+        raise classify_sqlite_error(e) from None
+    except OSError as e:
+        if conn is not None:
+            conn.close()
+        raise NelixError(STORE_UNAVAILABLE, f"could not open the database: {e}") from None
+
+
+def _check_or_stamp_version(conn):
+    """Stamp-or-verify in ONE atomic step.
+
+    rev 2 did SELECT-then-INSERT with no transaction, so eight concurrent first-opens raced:
+    6/320 hit `UNIQUE constraint failed: meta.key`, 3/320 hit `database is locked`. That is
+    the very check-then-write class this store moved to SQLite to abolish — reintroduced one
+    layer underneath the code that abolished it. INSERT OR IGNORE makes the database the
+    arbiter, exactly like reservations' UNIQUE constraint.
+    """
+    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+                 (str(SCHEMA_VERSION),))
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    try:
+        found = int(row["value"])
+    except (TypeError, ValueError):
+        raise NelixError(STORE_CORRUPT,
+                         f"database version stamp is unreadable: {row['value']!r}") from None
+    if found > SCHEMA_VERSION:
+        # An OLDER generation must not open a NEWER generation's database and misread it.
+        raise NelixError(STORE_CORRUPT,
+                         f"database schema {found} is newer than this build supports "
+                         f"({SCHEMA_VERSION}); refusing to open it")
+    if found < SCHEMA_VERSION:
+        # There is no migration machinery yet, and CREATE TABLE IF NOT EXISTS does not add
+        # columns to an existing table — so proceeding would mean believing in a schema the
+        # file does not physically have.
+        raise NelixError(STORE_CORRUPT,
+                         f"database schema {found} predates this build ({SCHEMA_VERSION}) "
+                         f"and no migration exists; refusing to open it")
