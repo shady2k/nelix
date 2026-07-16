@@ -102,7 +102,8 @@ class StartLedger:
                 # unlikely and which we must not paper over.
                 raise NelixError(STORE_CORRUPT,
                                  "reservation insert failed on an unexpected constraint")
-            if row["request_fingerprint"] != request_fingerprint:
+            if (row["request_fingerprint"] != request_fingerprint
+                    or row["orchestration_id"] != orchestration_id):
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  "idempotency key was used for a different request")
             return _row_to_reservation(row, replay=True)

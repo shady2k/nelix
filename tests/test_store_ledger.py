@@ -64,6 +64,18 @@ def test_the_same_key_with_a_different_request_is_a_conflict(ledger):
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
 
 
+def test_the_same_key_and_fingerprint_but_a_different_orchestration_is_a_conflict(ledger):
+    # The ledger does not build the fingerprint, so it must not assume a caller folded every
+    # semantic field into it. It compares what it HOLDS.
+    OTHER = "o-" + "5" * 32
+    ledger.reserve(idempotency_key="k1", owner_id="hermes:local", orchestration_id=OID,
+                   request_fingerprint=FP)
+    with pytest.raises(NelixError) as ei:
+        ledger.reserve(idempotency_key="k1", owner_id="hermes:local",
+                       orchestration_id=OTHER, request_fingerprint=FP)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+
+
 def test_distinct_keys_mint_distinct_sessions(ledger):
     assert reserve(ledger, key="k1").session_id != reserve(ledger, key="k2").session_id
 
