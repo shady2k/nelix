@@ -11,6 +11,7 @@ Two rules that look similar and are not:
 
 The clock is injectable: tests freeze it rather than sleep (the nelix-3s3 pattern).
 """
+import math
 import sqlite3
 import time
 
@@ -88,6 +89,7 @@ class Store:
         self._conn = connect(root, timeout=timeout)
         self._clock = clock
 
+    @translates_sqlite
     def close(self):
         self._conn.close()
 
@@ -272,8 +274,11 @@ class Store:
         schema is still bounded rather than growing forever behind a read this build cannot
         perform.
         """
-        if not isinstance(max_age_seconds, (int, float)) or max_age_seconds < 0:
-            raise NelixError(INVALID_REQUEST, "max_age_seconds must be >= 0")
+        if (isinstance(max_age_seconds, bool) or not isinstance(max_age_seconds, (int, float))
+                or not math.isfinite(max_age_seconds) or max_age_seconds < 0):
+            raise NelixError(INVALID_REQUEST,
+                             f"max_age_seconds must be a finite, non-negative number: "
+                             f"{max_age_seconds!r}")
         if isinstance(max_count, bool) or not isinstance(max_count, int) or max_count < 0:
             raise NelixError(INVALID_REQUEST, "max_count must be a non-negative int")
         now = float(self._clock())

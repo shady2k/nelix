@@ -73,6 +73,7 @@ class StartLedger:
         self._clock = clock
         self._mint = mint
 
+    @translates_sqlite
     def close(self):
         self._conn.close()
 

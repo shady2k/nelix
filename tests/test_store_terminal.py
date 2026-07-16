@@ -349,3 +349,12 @@ def _try_prune(store):
         return store.prune_terminal(max_age_seconds=0, max_count=100)
     except NelixError as e:
         return e.code
+
+
+@pytest.mark.parametrize("bad", [True, float("nan"), float("inf")])
+def test_prune_rejects_a_nonsense_max_age(store, bad):
+    # NaN is the sharp one: every (now - ended_at) > NaN comparison is False, so age pruning
+    # SILENTLY stops working — the bound looks configured and does nothing.
+    with pytest.raises(NelixError) as ei:
+        store.prune_terminal(max_age_seconds=bad, max_count=1)
+    assert ei.value.code == errors.INVALID_REQUEST

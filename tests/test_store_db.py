@@ -328,3 +328,46 @@ def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatc
     finally:
         monkeypatch.undo()
         store.close()
+
+
+@pytest.mark.parametrize("code,expected", [
+    (sqlite3.SQLITE_FULL, errors.STORE_UNAVAILABLE),        # a full disk is not damage
+    (sqlite3.SQLITE_NOMEM, errors.STORE_UNAVAILABLE),
+    (sqlite3.SQLITE_INTERRUPT, errors.STORE_UNAVAILABLE),
+    (sqlite3.SQLITE_BUSY, errors.STORE_UNAVAILABLE),
+    (sqlite3.SQLITE_LOCKED, errors.STORE_UNAVAILABLE),
+    (sqlite3.SQLITE_READONLY, errors.STORE_UNSUPPORTED),
+    (sqlite3.SQLITE_PERM, errors.STORE_UNSUPPORTED),
+    (sqlite3.SQLITE_AUTH, errors.STORE_UNSUPPORTED),
+    (sqlite3.SQLITE_CORRUPT, errors.STORE_CORRUPT),
+    (sqlite3.SQLITE_NOTADB, errors.STORE_CORRUPT),
+    (sqlite3.SQLITE_ERROR, errors.STORE_CORRUPT),           # missing column / bad SQL
+])
+def test_sqlite_result_codes_map_to_the_right_party(code, expected):
+    # A full disk classified as non-retryable corruption sends the operator to check their
+    # data when they should be freeing space.
+    e = sqlite3.OperationalError("x")
+    e.sqlite_errorcode = code
+    assert db.classify_sqlite_error(e).code == expected
+
+
+def test_close_does_not_leak_a_raw_sqlite_error(tmp_path):
+    # "no raw sqlite3 exception escapes any public method" was not true: close() is public and
+    # was undecorated, so a wrong-thread close leaked a raw ProgrammingError.
+    from nelix_store.store import Store
+
+    store = Store(tmp_path, clock=lambda: 1000.0)
+    boom = []
+
+    def closer():
+        try:
+            store.close()
+        except NelixError:
+            boom.append("nelix")
+        except BaseException as e:          # noqa: BLE001
+            boom.append(f"RAW {type(e).__name__}")
+
+    t = threading.Thread(target=closer)
+    t.start()
+    t.join(timeout=10)
+    assert not [b for b in boom if b.startswith("RAW")], f"close leaked: {boom}"

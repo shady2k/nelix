@@ -114,6 +114,12 @@ def _bootstrap_lock(root: Path, timeout: float):
                 break
             except OSError as e:
                 if e.errno == errno.EINTR:
+                    # Retrying on EINTR is correct, but not rechecking the deadline made the
+                    # advertised bound untrue under a signal storm.
+                    if time.monotonic() >= deadline:
+                        raise NelixError(STORE_UNAVAILABLE,
+                                         f"timed out after {timeout}s waiting for the "
+                                         f"database bootstrap lock") from None
                     continue
                 if e.errno not in (errno.EACCES, errno.EAGAIN):
                     raise NelixError(
@@ -135,14 +141,18 @@ def _bootstrap_lock(root: Path, timeout: float):
 # Classify by the ERROR CODE, not the exception class: sqlite3 raises OperationalError for
 # transient contention AND for permanent schema defects, so mapping the class wholesale to
 # retryable makes a missing column retry forever.
+#
+# Named constants, not magic numbers — and an HONEST policy per primary result code. The old
+# comment claimed everything outside these sets proved corruption; a full disk is not damage,
+# and telling an operator their data is corrupt when they need to free space is the worst kind
+# of wrong answer.
 _UNAVAILABLE_CODES = frozenset({
-    5,    # SQLITE_BUSY
-    6,    # SQLITE_LOCKED
-    10,   # SQLITE_IOERR — transient I/O
-    14,   # SQLITE_CANTOPEN
+    sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_CANTOPEN,
+    sqlite3.SQLITE_IOERR, sqlite3.SQLITE_FULL, sqlite3.SQLITE_NOMEM,
+    sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_PROTOCOL,
 })
 _UNSUPPORTED_CODES = frozenset({
-    8,    # SQLITE_READONLY — the environment, not the data
+    sqlite3.SQLITE_READONLY, sqlite3.SQLITE_PERM, sqlite3.SQLITE_AUTH,
 })
 
 
@@ -158,8 +168,9 @@ def classify_sqlite_error(exc) -> NelixError:
         return NelixError(STORE_UNAVAILABLE, f"database unavailable: {exc}")
     if base in _UNSUPPORTED_CODES:
         return NelixError(STORE_UNSUPPORTED, f"database not writable here: {exc}")
-    # Everything else — corruption, malformed SQL, a missing column, not-a-database — is a
-    # durable/structural problem. Non-retryable by design.
+    # Everything else — corruption, malformed SQL, a missing column, not-a-database, or an
+    # UNRECOGNISED code — is treated as a durable/structural problem AS A CONSERVATIVE DEFAULT,
+    # not because it is proven damage. Non-retryable by design.
     return NelixError(STORE_CORRUPT, f"database error: {exc}")
 
 
