@@ -301,15 +301,29 @@ def test_a_corrupt_terminal_row_does_not_blind_an_owner(store, ledger):
 
 
 def test_a_prune_cannot_land_between_the_ack_and_its_reread(tmp_path):
-    # rev 6's version raced prune from a free-running thread, which essentially NEVER lands in
-    # the window between the CAS and the re-read: it caught the transaction's removal 0/5, and
-    # left all 103 store tests green. This puts prune EXACTLY in the window instead.
+    # !! THIS TEST DOES NOT WORK YET — DO NOT TRUST IT AS A GUARD. Bead: see below. !!
+    # Measured 0/5: removing ack_terminal's outer transaction does NOT fail it. The commit
+    # that added it (3368b0e) claims "a seam that actually catches"; that claim is FALSE and
+    # this comment is the correction.
     #
-    # The seam: spy on the public get_terminal and, on its SECOND call — after the CAS, before
-    # the re-read — synchronously start a prune on another connection. With the transaction,
-    # prune blocks on ack's write lock and cannot interleave. Without it, the CAS
-    # auto-committed, the row became prunable, and the re-read raises. That is precisely the
-    # defect the transaction exists for.
+    # THE INTENT (which is sound): spy on the public get_terminal and, on its SECOND call —
+    # after the CAS, before the re-read — run a prune on another connection. With the
+    # transaction, prune hits ack's write lock and cannot interleave; without it, the CAS has
+    # auto-committed, the row is prunable, and the re-read raises. That is exactly the defect
+    # the transaction exists for.
+    #
+    # WHY IT FAILS, diagnosed: the pruner Store is built on this thread but its prune runs on
+    # a SPAWNED one, and db.connect() never sets check_same_thread=False — so the call raises
+    # a raw sqlite3.ProgrammingError (misclassified as STORE_CORRUPT, since ProgrammingError
+    # carries no sqlite_errorcode and falls to the conservative default) and prune never
+    # reaches SQLite's locking at all. It races nothing, in either the shipped or the mutated
+    # code.
+    #
+    # THE FIX, and it is smaller than the bug: drop the thread entirely. The spy already runs
+    # on this thread inside ack_terminal, so call prune SYNCHRONOUSLY from it using a pruner
+    # Store built on this thread. No thread affinity to violate; the pruner's BEGIN IMMEDIATE
+    # meets ack's write lock and, at busy_timeout=0, returns store_unavailable at once. The
+    # thread was never needed — it only hid the bug.
     from nelix_store.ledger import StartLedger
     from nelix_store.store import Store
 
