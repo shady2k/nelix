@@ -3,3 +3,4 @@ ptyprocess==0.7.0
 pytest==8.3.4
 pyyaml==6.0.3
 -e ./packages/nelix_contracts
+-e ./packages/nelix_store
