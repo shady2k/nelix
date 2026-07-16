@@ -262,3 +262,69 @@ def test_a_filesystem_that_cannot_do_wal_is_permanent_not_retryable(tmp_path, mo
     with pytest.raises(NelixError) as ei:
         db.connect(tmp_path)
     assert ei.value.code == errors.STORE_UNSUPPORTED
+
+
+def test_busy_is_unavailable_and_retryable():
+    e = sqlite3.OperationalError("database is locked")
+    e.sqlite_errorcode = 5           # SQLITE_BUSY
+    err = db.classify_sqlite_error(e)
+    assert err.code == errors.STORE_UNAVAILABLE
+    assert err.retryable is True
+
+
+def test_a_missing_column_is_corrupt_not_an_infinite_retry():
+    # SQLite raises OperationalError for permanent schema defects too. Mapping the CLASS
+    # wholesale to retryable means a broken database is retried forever.
+    e = sqlite3.OperationalError("no such column: nope")
+    e.sqlite_errorcode = 1           # SQLITE_ERROR
+    err = db.classify_sqlite_error(e)
+    assert err.code == errors.STORE_CORRUPT
+    assert err.retryable is False
+
+
+def test_a_corrupt_file_is_corrupt():
+    e = sqlite3.DatabaseError("database disk image is malformed")
+    e.sqlite_errorcode = 11          # SQLITE_CORRUPT
+    assert db.classify_sqlite_error(e).code == errors.STORE_CORRUPT
+
+
+def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatch):
+    # rev 5 translated only connect(). Every other method leaked raw sqlite3 exceptions under
+    # contention — through a package whose contract is "callers branch on code".
+    #
+    # NOTE (f1k-rev6): the brief's original version of this test did
+    # `monkeypatch.setattr(store._conn, "execute", boom)` directly on the live
+    # sqlite3.Connection instance. Verified: that raises `AttributeError: 'sqlite3.Connection'
+    # object attribute 'execute' is read-only` immediately (same root cause already documented
+    # above on `test_a_filesystem_that_cannot_do_wal_is_permanent_not_retryable` — a
+    # C-extension type with no instance __dict__) — and unlike that test, patching cannot move
+    # to a Connection subclass via `factory=` here, because `store._conn` is already
+    # constructed by the time this test runs; `sqlite3.Connection.execute = ...` at the class
+    # level also fails (`TypeError: cannot set 'execute' attribute of immutable type
+    # 'sqlite3.Connection'`, verified). The interception moves one level up instead: `Store` is
+    # an ordinary Python object, so `monkeypatch.setattr(store, "_conn", ...)` swaps in a thin
+    # proxy that raises on execute() and delegates everything else to the real connection. The
+    # simulated scenario and assertions are unchanged.
+    from nelix_store.store import Store
+
+    class _BoomConnection:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, *a, **k):
+            e = sqlite3.OperationalError("database is locked")
+            e.sqlite_errorcode = 5
+            raise e
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    store = Store(tmp_path, clock=lambda: 1000.0)
+    try:
+        monkeypatch.setattr(store, "_conn", _BoomConnection(store._conn))
+        with pytest.raises(NelixError) as ei:
+            store.get_session("s-" + "1" * 32, owner_id="hermes:local")
+        assert ei.value.code == errors.STORE_UNAVAILABLE
+    finally:
+        monkeypatch.undo()
+        store.close()

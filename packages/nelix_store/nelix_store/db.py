@@ -12,6 +12,7 @@ generations write.
 import contextlib
 import errno
 import fcntl
+import functools
 import math
 import os
 import sqlite3
@@ -131,6 +132,50 @@ def _bootstrap_lock(root: Path, timeout: float):
         os.close(fd)
 
 
+# Classify by the ERROR CODE, not the exception class: sqlite3 raises OperationalError for
+# transient contention AND for permanent schema defects, so mapping the class wholesale to
+# retryable makes a missing column retry forever.
+_UNAVAILABLE_CODES = frozenset({
+    5,    # SQLITE_BUSY
+    6,    # SQLITE_LOCKED
+    10,   # SQLITE_IOERR — transient I/O
+    14,   # SQLITE_CANTOPEN
+})
+_UNSUPPORTED_CODES = frozenset({
+    8,    # SQLITE_READONLY — the environment, not the data
+})
+
+
+def classify_sqlite_error(exc) -> NelixError:
+    """Map a sqlite3 exception onto this package's error contract.
+
+    Retryability is a MACHINE contract: a caller branches on it. Getting it wrong either
+    retries a permanent defect forever or escalates a transient one to a human.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    base = None if code is None else code & 0xFF      # strip the extended-code high bits
+    if base in _UNAVAILABLE_CODES:
+        return NelixError(STORE_UNAVAILABLE, f"database unavailable: {exc}")
+    if base in _UNSUPPORTED_CODES:
+        return NelixError(STORE_UNSUPPORTED, f"database not writable here: {exc}")
+    # Everything else — corruption, malformed SQL, a missing column, not-a-database — is a
+    # durable/structural problem. Non-retryable by design.
+    return NelixError(STORE_CORRUPT, f"database error: {exc}")
+
+
+def translates_sqlite(fn):
+    """Wrap a public method so no raw sqlite3 exception can cross the package boundary."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        try:
+            return fn(*a, **k)
+        except NelixError:
+            raise
+        except sqlite3.Error as e:
+            raise classify_sqlite_error(e) from None
+    return wrapper
+
+
 def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
     if sqlite3.sqlite_version_info < MIN_SQLITE:
         raise NelixError(STORE_UNSUPPORTED,
@@ -171,16 +216,10 @@ def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
         if conn is not None:
             conn.close()
         raise
-    except sqlite3.OperationalError as e:
-        if conn is not None:
-            conn.close()
-        # Busy / locked / cannot-open: the store is UNAVAILABLE, not damaged. Non-retryable
-        # STORE_CORRUPT here would send a caller to a human for a condition that clears.
-        raise NelixError(STORE_UNAVAILABLE, f"database unavailable: {e}") from None
     except sqlite3.Error as e:
         if conn is not None:
             conn.close()
-        raise NelixError(STORE_CORRUPT, f"could not open the database: {e}") from None
+        raise classify_sqlite_error(e) from None
     except OSError as e:
         if conn is not None:
             conn.close()

@@ -34,7 +34,7 @@ from nelix_contracts.ids import (
     validate_owner_id,
 )
 
-from .db import connect
+from .db import connect, translates_sqlite
 
 _COLS = ("session_id, owner_id, orchestration_id, idempotency_key, request_fingerprint, "
          "state, generation_id, reason, created_at")
@@ -64,6 +64,7 @@ class StartLedger:
     def close(self):
         self._conn.close()
 
+    @translates_sqlite
     def reserve(self, *, idempotency_key, owner_id, orchestration_id,
                 request_fingerprint) -> Reservation:
         try:
@@ -113,6 +114,7 @@ class StartLedger:
             raise NelixError(UNKNOWN_SESSION, f"no reservation for {session_id}")
         return row
 
+    @translates_sqlite
     def assign_generation(self, session_id: str, generation_id: str) -> None:
         """Record the chosen generation BEFORE the request reaches it. Idempotent for the
         same generation; a different one while still starting is a conflict."""
@@ -132,6 +134,7 @@ class StartLedger:
             self._conn.execute("UPDATE starts SET generation_id=? WHERE session_id=?",
                                (generation_id, session_id))
 
+    @translates_sqlite
     def commit(self, session_id: str, generation_id: str) -> None:
         """Mark the start succeeded — on the generation it was ASSIGNED to, and no other.
 
@@ -158,6 +161,7 @@ class StartLedger:
             self._conn.execute("UPDATE starts SET state='started' WHERE session_id=?",
                                (session_id,))
 
+    @translates_sqlite
     def fail(self, session_id: str, reason: str) -> None:
         """Record a failed start. Idempotent for the same reason; a DIFFERENT reason is a
         conflict — a durable failure result must not be rewritten under a replay."""
@@ -188,6 +192,7 @@ class StartLedger:
                 "UPDATE starts SET state='failed', reason=? WHERE session_id=?",
                 (reason, session_id))
 
+    @translates_sqlite
     def lookup(self, idempotency_key: str, *, owner_id: str) -> "Reservation | None":
         """Owner-guarded: rev 1's lookup took no owner at all, so it handed any caller
         another owner's session_id, state and generation."""

@@ -20,7 +20,7 @@ from nelix_contracts.errors import (
 )
 from nelix_contracts.records import SCHEMA_VERSION, SessionRecord, TerminalRecord
 
-from .db import connect
+from .db import connect, translates_sqlite
 
 # Identity is JOINED from starts, never stored in these tables (nelix-555). Three
 # independent copies could disagree; one row cannot disagree with itself.
@@ -73,6 +73,7 @@ class Store:
         self._conn.close()
 
     # ---- sessions -------------------------------------------------------------
+    @translates_sqlite
     def create_session(self, session_id: str, *, state: str, executor: str, task: str,
                        cwd: str, model, created_at: float) -> None:
         """Create the runtime row for an assigned, NOT-failed start.
@@ -117,6 +118,7 @@ class Store:
                                      f"session already exists: {session_id}") from None
                 raise NelixError(STORE_CORRUPT, f"session insert failed: {e}") from None
 
+    @translates_sqlite
     def transition_session(self, session_id: str, *, owner_id: str, state: str,
                            expected_state=None) -> None:
         """Move ONLY the state, and only for the owner. Everything else is identity.
@@ -145,6 +147,7 @@ class Store:
         raise NelixError(IDEMPOTENCY_CONFLICT,
                          f"{session_id} is not in the expected state {expected_state!r}")
 
+    @translates_sqlite
     def get_session(self, session_id: str, *, owner_id: str) -> SessionRecord:
         row = self._conn.execute(f"{_SESSION_SELECT} WHERE s.session_id=?",
                                  (session_id,)).fetchone()
@@ -154,6 +157,7 @@ class Store:
             raise NelixError(OWNER_MISMATCH, "session belongs to another owner")
         return SessionRecord.from_dict(dict(row))   # fails closed on a future schema
 
+    @translates_sqlite
     def list_sessions(self, owner_id: str) -> list:
         rows = self._conn.execute(
             f"{_SESSION_SELECT} WHERE st.owner_id=? AND s.schema_version=? "
@@ -164,6 +168,7 @@ class Store:
     # ---- terminal records -----------------------------------------------------
     # These OUTLIVE their generation: the record must be here before the live session is
     # removed (design §5's ordering invariant).
+    @translates_sqlite
     def put_terminal(self, session_id: str, *, terminal_kind: str, summary: str,
                      ended_at: float) -> None:
         """Publish the terminal result. Identity is the session's.
@@ -200,6 +205,7 @@ class Store:
                 "acknowledged_at, schema_version) VALUES (?,?,?,?,?,?)",
                 (session_id, terminal_kind, summary, ended_at, None, SCHEMA_VERSION))
 
+    @translates_sqlite
     def get_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
         row = self._conn.execute(f"{_TERMINAL_SELECT} WHERE t.session_id=?",
                                  (session_id,)).fetchone()
@@ -209,6 +215,7 @@ class Store:
             raise NelixError(OWNER_MISMATCH, "session belongs to another owner")
         return TerminalRecord.from_dict(dict(row))
 
+    @translates_sqlite
     def list_terminal(self, owner_id: str) -> list:
         rows = self._conn.execute(
             f"{_TERMINAL_SELECT} WHERE st.owner_id=? AND t.schema_version=? "
@@ -216,6 +223,7 @@ class Store:
         records, _skipped = _read_rows(rows, TerminalRecord)
         return records
 
+    @translates_sqlite
     def ack_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
         """Idempotent: a repeated ack returns the SAME record with its ORIGINAL timestamp.
 
@@ -233,6 +241,7 @@ class Store:
                 "AND acknowledged_at IS NULL", (float(self._clock()), session_id))
             return self.get_terminal(session_id, owner_id=owner_id)
 
+    @translates_sqlite
     def prune_terminal(self, *, max_age_seconds: float, max_count: int) -> int:
         """Drop acknowledged records; bound the rest by age, and by count PER OWNER.
 
