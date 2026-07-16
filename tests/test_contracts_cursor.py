@@ -135,3 +135,36 @@ def test_advance_rejects_a_non_integral_seq(seq):
 def test_advance_rejects_a_malformed_generation_id():
     with pytest.raises(NelixError):
         new_cursor(EPOCH, 1).advance("not-a-generation", "ea", 1)
+
+
+def test_a_cursor_cannot_be_constructed_invalid():
+    # records.py validates in __post_init__ so a record is always valid by construction.
+    # Cursor did not, so the MappingProxy and the validation only protected the helper path.
+    with pytest.raises(NelixError):
+        Cursor(router_epoch=EPOCH, topology_revision=-3, positions={})
+    with pytest.raises(NelixError):
+        Cursor(router_epoch=None, topology_revision=1, positions={})
+    with pytest.raises(NelixError):
+        Cursor(router_epoch=EPOCH, topology_revision=1, positions={"not-a-gen": ("e", 1)})
+    with pytest.raises(NelixError):
+        Cursor(router_epoch=EPOCH, topology_revision=1, positions={GEN_A: ("e", -1)})
+
+
+def test_a_directly_constructed_cursor_still_has_immutable_positions():
+    c = Cursor(router_epoch=EPOCH, topology_revision=1, positions={GEN_A: ("ea", 1)})
+    with pytest.raises(TypeError):
+        c.positions[GEN_A] = ("wrong", 9)
+
+
+def test_decode_does_not_coerce_a_fractional_topology_revision():
+    token = _token({"v": 1, "re": EPOCH, "tr": 1.9, "p": {}})
+    with pytest.raises(NelixError) as ei:
+        decode(token, router_epoch=EPOCH, topology_revision=1)
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+def test_json_true_is_not_cursor_version_one():
+    # True == 1 in Python, so a bare equality check accepts `true` as the version.
+    token = _token({"v": True, "re": EPOCH, "tr": 1, "p": {}})
+    with pytest.raises(NelixError):
+        decode(token, router_epoch=EPOCH, topology_revision=1)

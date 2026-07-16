@@ -30,6 +30,32 @@ class Cursor:
     topology_revision: int
     positions: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
 
+    def __post_init__(self):
+        if not isinstance(self.router_epoch, str) or not self.router_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"router_epoch must be a non-empty string: {self.router_epoch!r}")
+        if (isinstance(self.topology_revision, bool)
+                or not isinstance(self.topology_revision, int)
+                or self.topology_revision < 0):
+            raise NelixError(INVALID_REQUEST,
+                             f"topology_revision must be a non-negative int: "
+                             f"{self.topology_revision!r}")
+        for generation_id, position in dict(self.positions).items():
+            try:
+                validate_generation_id(generation_id)
+            except InvalidId as e:
+                raise NelixError(INVALID_REQUEST, str(e)) from None
+            if (not isinstance(position, tuple) or len(position) != 2
+                    or not isinstance(position[0], str)
+                    or isinstance(position[1], bool)
+                    or not isinstance(position[1], int) or position[1] < 0):
+                raise NelixError(INVALID_REQUEST,
+                                 f"position for {generation_id} must be (str, non-negative "
+                                 f"int): {position!r}")
+        # Freeze whatever we were handed, so a caller who passed a plain dict cannot mutate
+        # the cursor afterwards. object.__setattr__ because the dataclass is frozen.
+        object.__setattr__(self, "positions", MappingProxyType(dict(self.positions)))
+
     def position_for(self, generation_id):
         """The (generation_epoch, seq) consumed for `generation_id`, or None if this cursor
         has never seen it — meaning: start from that generation's beginning."""
@@ -97,7 +123,7 @@ def decode(token, *, router_epoch: str, topology_revision: int) -> Cursor:
     # shape we cannot parse; reporting that as "malformed request" blames the caller for our
     # own upgrade. (rev 1 checked this last, so it only ever fired when the bump changed
     # nothing.)
-    if obj.get("v") != _V:
+    if obj.get("v") is not _V:          # `is not`: True == 1, and JSON true is not our version
         raise NelixError(CURSOR_EXPIRED, "cursor version is no longer supported")
     try:
         raw_positions = obj["p"]
@@ -112,8 +138,16 @@ def decode(token, *, router_epoch: str, topology_revision: int) -> Cursor:
                 raise ValueError("seq must be a non-negative int")
             validate_generation_id(g)
             positions[g] = (str(v[0]), seq)
+        # NOTE: named distinctly from the `topology_revision` PARAMETER above (the caller's
+        # current value) — reusing that name here shadowed it, so the router-mismatch check
+        # below silently compared the decoded value against itself and never fired.
+        decoded_topology_revision = obj["tr"]
+        if (isinstance(decoded_topology_revision, bool)
+                or not isinstance(decoded_topology_revision, int)):
+            raise ValueError("topology_revision must be an int")
         cursor = Cursor(router_epoch=str(obj["re"]),
-                        topology_revision=int(obj["tr"]), positions=_freeze(positions))
+                        topology_revision=decoded_topology_revision,
+                        positions=_freeze(positions))
     except Exception:
         raise NelixError(INVALID_REQUEST, "malformed cursor") from None
     if cursor.router_epoch != str(router_epoch):
