@@ -71,3 +71,67 @@ def test_malformed_token_is_an_invalid_request(bad):
 def test_positions_survive_json_key_ordering():
     c = new_cursor(EPOCH, 1).advance(GEN_B, "eb", 1).advance(GEN_A, "ea", 2)
     assert decode(encode(c), router_epoch=EPOCH, topology_revision=1) == c
+
+
+import json, base64
+
+
+def _token(payload):
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def test_a_future_version_token_expires_even_when_its_body_changed_shape():
+    # THE bug rev 1 shipped: the version check ran after the body parse, so a v2 token whose
+    # positions grew a field reported invalid_request (caller's fault) instead of
+    # cursor_expired (refetch the board). A version bump that changes nothing is not a
+    # version bump worth having.
+    token = _token({"v": 2, "re": EPOCH, "tr": 1, "p": {GEN_A: ["ea", 5, "extra"]}})
+    with pytest.raises(NelixError) as ei:
+        decode(token, router_epoch=EPOCH, topology_revision=1)
+    assert ei.value.code == errors.CURSOR_EXPIRED
+
+
+def test_a_future_version_token_missing_a_field_still_expires():
+    token = _token({"v": 2, "re": EPOCH, "tr": 1})
+    with pytest.raises(NelixError) as ei:
+        decode(token, router_epoch=EPOCH, topology_revision=1)
+    assert ei.value.code == errors.CURSOR_EXPIRED
+
+
+def test_positions_cannot_be_mutated_through_a_frozen_cursor():
+    # frozen=True is shallow: it protects the attribute binding, not the dict behind it.
+    c = new_cursor(EPOCH, 1).advance(GEN_A, "ea", 5)
+    with pytest.raises(TypeError):
+        c.positions[GEN_A] = ("wrong", -1)
+
+
+def test_advance_refuses_to_rewind_a_component():
+    # A cursor that can go backwards re-delivers events the caller already handled.
+    c = new_cursor(EPOCH, 1).advance(GEN_A, "ea", 10)
+    with pytest.raises(NelixError) as ei:
+        c.advance(GEN_A, "ea", 3)
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+def test_advance_allows_the_same_seq_again():
+    # Idempotent re-delivery of the same position is not a rewind.
+    c = new_cursor(EPOCH, 1).advance(GEN_A, "ea", 10)
+    assert c.advance(GEN_A, "ea", 10).position_for(GEN_A) == ("ea", 10)
+
+
+def test_advance_accepts_a_reset_seq_when_the_generation_epoch_changes():
+    # A generation restarted: new epoch, its seq legitimately restarts from 1.
+    c = new_cursor(EPOCH, 1).advance(GEN_A, "ea", 10)
+    assert c.advance(GEN_A, "eb", 1).position_for(GEN_A) == ("eb", 1)
+
+
+@pytest.mark.parametrize("seq", [-1, 1.9, "3", None, True])
+def test_advance_rejects_a_non_integral_seq(seq):
+    with pytest.raises(NelixError):
+        new_cursor(EPOCH, 1).advance(GEN_A, "ea", seq)
+
+
+def test_advance_rejects_a_malformed_generation_id():
+    with pytest.raises(NelixError):
+        new_cursor(EPOCH, 1).advance("not-a-generation", "ea", 1)
