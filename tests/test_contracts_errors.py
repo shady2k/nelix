@@ -59,3 +59,11 @@ def test_nelix_error_is_an_exception_carrying_its_message():
         raise NelixError(errors.UNKNOWN_SESSION, "no such session")
     assert str(ei.value) == "no such session"
     assert ei.value.code == "unknown_session"
+
+
+def test_store_unavailable_is_retryable_and_distinct_from_corrupt():
+    # Busy is not broken. STORE_CORRUPT is non-retryable and means "your durable state is
+    # damaged"; a caller that merely lost a lock race must back off and retry, not escalate.
+    assert errors.STORE_UNAVAILABLE != errors.STORE_CORRUPT
+    assert NelixError(errors.STORE_UNAVAILABLE, "m").retryable is True
+    assert NelixError(errors.STORE_CORRUPT, "m").retryable is False
