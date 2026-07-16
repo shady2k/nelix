@@ -300,66 +300,52 @@ def test_a_corrupt_terminal_row_does_not_blind_an_owner(store, ledger):
     assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid]
 
 
-def test_an_ack_in_flight_is_not_destroyed_by_a_concurrent_prune(tmp_path):
-    # The existing concurrent test races ack against ACK, which the CAS already covers — so
-    # removing ack's outer BEGIN IMMEDIATE left it green. This races ack against PRUNE, the
-    # defect the transaction was actually added for: prune landing between the CAS and the
-    # re-read made an ack that DURABLY SUCCEEDED report unknown_session.
+def test_a_prune_cannot_land_between_the_ack_and_its_reread(tmp_path):
+    # rev 6's version raced prune from a free-running thread, which essentially NEVER lands in
+    # the window between the CAS and the re-read: it caught the transaction's removal 0/5, and
+    # left all 103 store tests green. This puts prune EXACTLY in the window instead.
     #
-    # !! THIS TEST HAS NO DEMONSTRATED DETECTION POWER — DO NOT TRUST IT AS A GUARD. !!
-    # Measured: removing ack_terminal's outer transaction leaves this green 5/5, and leaves
-    # all 103 store tests green. It CANNOT distinguish "prune won cleanly" from "ack succeeded
-    # then reported failure", because ack_terminal raises UNKNOWN_SESSION for both, and
-    # nothing in the schema stamps an ack-in-progress marker prune could observe. It documents
-    # the scenario; it does not prove the transaction. Tracked as its own bead — closing it
-    # needs a schema-level marker, not a better test. Kept, with this warning, rather than
-    # deleted, so the scenario is not forgotten; but a green run here means nothing.
-    from nelix_store.store import Store
+    # The seam: spy on the public get_terminal and, on its SECOND call — after the CAS, before
+    # the re-read — synchronously start a prune on another connection. With the transaction,
+    # prune blocks on ack's write lock and cannot interleave. Without it, the CAS
+    # auto-committed, the row became prunable, and the re-read raises. That is precisely the
+    # defect the transaction exists for.
     from nelix_store.ledger import StartLedger
+    from nelix_store.store import Store
 
-    rounds, bad = 25, []
-    for attempt in range(rounds):
-        root = tmp_path / f"p{attempt}"
-        lg = StartLedger(root, clock=lambda: 1000.0)
-        store = Store(root, clock=lambda: 1000.0)
-        try:
-            sid = _live_session(store, lg)
-            store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
-        finally:
-            lg.close()
-            store.close()
+    lg = StartLedger(tmp_path, clock=lambda: 1000.0)
+    acker = Store(tmp_path, clock=lambda: 1000.0)
+    try:
+        sid = _live_session(acker, lg)
+        acker.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
 
-        barrier, outcome = threading.Barrier(2), []
+        # busy_timeout=0: the pruner must FAIL FAST when ack holds the write lock, rather than
+        # wait for it — otherwise "blocked" and "succeeded" look the same to the test.
+        pruner = Store(tmp_path, clock=lambda: 1000.0, timeout=0.0)
+        calls, pruned = [], []
+        real_get = acker.get_terminal
 
-        def acker():
-            s = Store(root, clock=lambda: 1000.0)
-            barrier.wait(timeout=30)
-            try:
-                s.ack_terminal(sid, owner_id="hermes:local")
-                outcome.append("acked")
-            except NelixError as e:
-                outcome.append(e.code)
-            finally:
-                s.close()
+        def spy(session_id, *, owner_id):
+            record = real_get(session_id, owner_id=owner_id)
+            calls.append(session_id)
+            if len(calls) == 2:                     # between the CAS and the re-read
+                t = threading.Thread(
+                    target=lambda: pruned.append(_try_prune(pruner)), daemon=True)
+                t.start()
+                t.join(timeout=0.5)
+            return record
 
-        def pruner():
-            s = Store(root, clock=lambda: 1000.0)
-            barrier.wait(timeout=30)
-            try:
-                s.prune_terminal(max_age_seconds=0, max_count=100)
-            finally:
-                s.close()
+        acker.get_terminal = spy
+        record = acker.ack_terminal(sid, owner_id="hermes:local")   # must NOT raise
+        assert record.acknowledged_at == 1000.0
+        pruner.close()
+    finally:
+        lg.close()
+        acker.close()
 
-        threads = [threading.Thread(target=acker, daemon=True),
-                   threading.Thread(target=pruner, daemon=True)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
-        assert all(not t.is_alive() for t in threads), "a thread hung"
-        # Either the ack won (acked) or prune got there first (a clean unknown_session BEFORE
-        # the ack began). What must never happen is an ack that succeeded and then reported
-        # failure — which is what an untransacted read/CAS/re-read produced.
-        if outcome and outcome[0] not in ("acked", errors.UNKNOWN_SESSION):
-            bad.append((attempt, outcome[0]))
-    assert bad == [], f"ack reported something impossible: {bad}"
+
+def _try_prune(store):
+    try:
+        return store.prune_terminal(max_age_seconds=0, max_count=100)
+    except NelixError as e:
+        return e.code

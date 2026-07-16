@@ -65,8 +65,8 @@ def _read_rows(rows, record_type):
 
 
 class Store:
-    def __init__(self, root, *, clock=time.time):
-        self._conn = connect(root)
+    def __init__(self, root, *, clock=time.time, timeout: float = 30.0):
+        self._conn = connect(root, timeout=timeout)
         self._clock = clock
 
     def close(self):
