@@ -12,10 +12,11 @@ Two rules that look similar and are not:
 
 The clock is injectable: tests freeze it rather than sleep (the nelix-3s3 pattern).
 """
+import sqlite3
 import time
 
 from nelix_contracts.errors import (
-    DUPLICATE_START, INVALID_REQUEST, OWNER_MISMATCH, UNKNOWN_SESSION, NelixError,
+    DUPLICATE_START, INVALID_REQUEST, OWNER_MISMATCH, STORE_CORRUPT, UNKNOWN_SESSION, NelixError,
 )
 from nelix_contracts.records import SCHEMA_VERSION, SessionRecord, TerminalRecord
 
@@ -46,11 +47,14 @@ class Store:
                 (record.session_id, record.owner_id, record.orchestration_id,
                  record.generation_id, record.state, record.executor, record.task,
                  record.cwd, record.model, record.created_at, record.schema_version))
-        except Exception as e:
-            if type(e).__name__ == "IntegrityError":
-                raise NelixError(DUPLICATE_START,
-                                 f"session already exists: {record.session_id}") from None
-            raise
+        except sqlite3.IntegrityError as e:
+            # Only a PK conflict is a duplicate start. Anything else (NOT NULL, CHECK) is a
+            # bug in the caller's record, and telling them "already exists" would send them
+            # down the wrong path.
+            if "UNIQUE" not in str(e) and "PRIMARY KEY" not in str(e):
+                raise NelixError(STORE_CORRUPT, f"session insert failed: {e}") from None
+            raise NelixError(DUPLICATE_START,
+                             f"session already exists: {record.session_id}") from None
 
     def transition_session(self, session_id: str, *, owner_id: str, state: str) -> None:
         """Move ONLY the state, and only for the owner. Everything else is identity."""

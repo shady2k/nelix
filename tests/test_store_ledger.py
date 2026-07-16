@@ -243,3 +243,17 @@ def test_the_ledger_survives_a_restart(tmp_path):
     lg2 = StartLedger(tmp_path, clock=lambda: 2000.0)
     assert lg2.lookup("k1", owner_id="hermes:local").session_id == first.session_id
     lg2.close()
+
+
+def test_a_session_id_mint_collision_does_not_crash_reserve(tmp_path):
+    # A minted-id collision raises IntegrityError on the PRIMARY KEY, not on the owner/key
+    # UNIQUE — so rev 2's fall-through SELECT found no row and dereferenced None.
+    collide = "s-" + "c" * 32
+    lg = StartLedger(tmp_path, clock=lambda: 1000.0, mint=lambda: collide)
+    lg.reserve(idempotency_key="k1", owner_id="hermes:local", orchestration_id=OID,
+               request_fingerprint=FP)
+    with pytest.raises(NelixError) as ei:      # a NelixError, never a raw TypeError
+        lg.reserve(idempotency_key="k2", owner_id="hermes:local", orchestration_id=OID,
+                   request_fingerprint=FP)
+    assert ei.value.code in (errors.STORE_CORRUPT, errors.DUPLICATE_START)
+    lg.close()

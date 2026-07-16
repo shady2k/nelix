@@ -93,3 +93,15 @@ def test_one_future_schema_row_does_not_brick_an_owners_board(store):
     with pytest.raises(NelixError) as ei:
         store.get_session("s-" + "8" * 32, owner_id="hermes:local")
     assert ei.value.code == errors.SCHEMA_TOO_NEW
+
+
+def test_a_non_duplicate_integrity_failure_is_not_reported_as_a_duplicate_start(store):
+    # NOT NULL is not a duplicate. Mapping every IntegrityError to DUPLICATE_START tells the
+    # caller to stop retrying a start that never conflicted.
+    import sqlite3
+    with pytest.raises(sqlite3.IntegrityError):
+        store._conn.execute(
+            "INSERT INTO sessions (session_id, owner_id, orchestration_id, generation_id,"
+            " state, executor, task, cwd, model, created_at, schema_version)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (SID, None, OID, GID, "starting", "coder", "t", "/repo", None, 1.0, 1))

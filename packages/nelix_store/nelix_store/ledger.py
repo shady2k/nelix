@@ -22,11 +22,12 @@ Keys are namespaced PER OWNER: (hermes:local, "deploy") and (claude-code:1, "dep
 independent operations. There is deliberately no global key index — rev 1 had one, and it
 both contradicted the namespacing and raced.
 """
+import sqlite3
 import time
 from dataclasses import dataclass
 
 from nelix_contracts.errors import (
-    IDEMPOTENCY_CONFLICT, INVALID_REQUEST, UNKNOWN_SESSION, NelixError,
+    IDEMPOTENCY_CONFLICT, INVALID_REQUEST, STORE_CORRUPT, UNKNOWN_SESSION, NelixError,
 )
 from nelix_contracts.ids import (
     InvalidId, new_session_id, validate_generation_id, validate_orchestration_id,
@@ -87,18 +88,22 @@ class StartLedger:
                      request_fingerprint, "starting", None, None, float(self._clock())))
                 return Reservation(session_id=session_id, state="starting",
                                    generation_id=None, reason=None, replay=False)
-            except Exception as e:
-                if type(e).__name__ != "IntegrityError":
-                    raise
+            except sqlite3.IntegrityError:
+                pass
             # The UNIQUE constraint fired: this (owner, key) is already reserved. Return the
             # ORIGINAL operation — never re-pick the active generation.
             row = self._conn.execute(
                 f"SELECT {_COLS} FROM reservations WHERE owner_id=? AND idempotency_key=?",
                 (owner_id, idempotency_key)).fetchone()
+            if row is None:
+                # The IntegrityError was NOT the owner/key constraint — the only other
+                # candidate is a session_id PK collision, which uuid4 makes astronomically
+                # unlikely and which we must not paper over.
+                raise NelixError(STORE_CORRUPT,
+                                 "reservation insert failed on an unexpected constraint")
             if row["request_fingerprint"] != request_fingerprint:
-                raise NelixError(
-                    IDEMPOTENCY_CONFLICT,
-                    "idempotency key was used for a different request")
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 "idempotency key was used for a different request")
             return _row_to_reservation(row, replay=True)
 
     def _require(self, session_id):
