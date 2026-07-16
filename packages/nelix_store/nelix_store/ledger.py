@@ -152,10 +152,16 @@ class StartLedger:
             row = self._require(session_id)
             if row["state"] == "failed":
                 raise NelixError(IDEMPOTENCY_CONFLICT, "cannot commit a failed start")
-            if row["generation_id"] is None:
-                raise NelixError(IDEMPOTENCY_CONFLICT,
-                                 "cannot commit a start that was never assigned a generation")
+            # ONE guard, not two. `generation_id is None` was a separate check, but deleting
+            # it changed nothing — the comparison below already fires (None != anything) with
+            # the same code, so it could never be individually detected. A branch whose
+            # deletion cannot change behaviour is not a guard; it is a diagnostic. Keep the
+            # diagnostic, drop the pretence.
             if row["generation_id"] != generation_id:
+                if row["generation_id"] is None:
+                    raise NelixError(IDEMPOTENCY_CONFLICT,
+                                     "cannot commit a start that was never assigned a "
+                                     "generation")
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  "start was assigned to a different generation")
             # state only — the binding is assign_generation's alone.

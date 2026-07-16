@@ -270,6 +270,61 @@ def test_the_ledger_survives_a_restart(tmp_path):
     lg2.close()
 
 
+def test_assign_generation_refuses_a_started_start(ledger):
+    # assign_generation had NO refusal test at all — every test used it as happy-path setup.
+    # Deleting its guards left the suite green while the ledger would rebind a RUNNING worker
+    # to a different generation: the router then forwards the retry to the wrong backend,
+    # which is the second worker this whole component exists to prevent.
+    r = reserve(ledger)
+    ledger.assign_generation(r.session_id, GID)
+    ledger.commit(r.session_id, GID)
+    with pytest.raises(NelixError) as ei:
+        ledger.assign_generation(r.session_id, GID2)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+    assert reserve(ledger).generation_id == GID          # unchanged
+
+
+def test_assign_generation_refuses_a_failed_start(ledger):
+    r = reserve(ledger)
+    ledger.fail(r.session_id, "bad cwd")
+    with pytest.raises(NelixError) as ei:
+        ledger.assign_generation(r.session_id, GID)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+    assert reserve(ledger).generation_id is None
+
+
+def test_assign_generation_refuses_a_rebind(ledger):
+    # The setup reaches ONLY the rebind guard: state is still "starting", so the state guard
+    # passes. Deleting the rebind guard therefore makes this SUCCEED rather than raise the
+    # same code from a sibling — which is what makes it individually detectable.
+    r = reserve(ledger)
+    ledger.assign_generation(r.session_id, GID)
+    with pytest.raises(NelixError) as ei:
+        ledger.assign_generation(r.session_id, GID2)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+    assert reserve(ledger).generation_id == GID
+
+
+def test_assign_generation_is_idempotent_for_the_same_generation(ledger):
+    r = reserve(ledger)
+    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID)
+    assert reserve(ledger).generation_id == GID
+
+
+def test_assign_generation_rejects_a_malformed_generation(ledger):
+    r = reserve(ledger)
+    with pytest.raises(NelixError) as ei:
+        ledger.assign_generation(r.session_id, "not-a-generation")
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+def test_assign_generation_rejects_an_unknown_session(ledger):
+    with pytest.raises(NelixError) as ei:
+        ledger.assign_generation("s-" + "9" * 32, GID)
+    assert ei.value.code == errors.UNKNOWN_SESSION
+
+
 def test_a_start_that_already_acquired_a_session_cannot_be_failed(ledger, tmp_path):
     # Direction B, the mirror of create_session's guard. The router calls fail() on a forward
     # timeout — and cannot know whether the generation's create_session committed a moment
