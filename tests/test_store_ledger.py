@@ -175,6 +175,60 @@ def test_commit_of_an_unknown_session_is_rejected(ledger):
     assert ei.value.code == errors.UNKNOWN_SESSION
 
 
+def test_commit_without_a_prior_assignment_is_refused(ledger):
+    # The generation must be persisted BEFORE forwarding. A commit that invents one means
+    # the request went somewhere the ledger never recorded.
+    r = reserve(ledger)
+    with pytest.raises(NelixError) as ei:
+        ledger.commit(r.session_id, GID)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+
+
+def test_commit_cannot_rebind_an_assigned_generation_while_still_starting(ledger):
+    # THE rev 2 hole: the guard only fired once state was already "started", so the window
+    # assign_generation exists for was exactly the window it did not cover.
+    r = reserve(ledger)
+    ledger.assign_generation(r.session_id, GID)
+    with pytest.raises(NelixError) as ei:
+        ledger.commit(r.session_id, GID2)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+    assert reserve(ledger).generation_id == GID     # unchanged
+
+
+def test_commit_rejects_a_malformed_generation(ledger):
+    r = reserve(ledger)
+    ledger.assign_generation(r.session_id, GID)
+    with pytest.raises(NelixError) as ei:
+        ledger.commit(r.session_id, "not-a-generation")
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+def test_failing_twice_with_the_same_reason_is_idempotent(ledger):
+    r = reserve(ledger)
+    ledger.fail(r.session_id, "bad cwd")
+    ledger.fail(r.session_id, "bad cwd")
+    assert reserve(ledger).reason == "bad cwd"
+
+
+def test_failing_twice_with_a_different_reason_is_a_conflict(ledger):
+    # A durable failure result must not be overwritten — a replay would report a reason the
+    # caller never saw.
+    r = reserve(ledger)
+    ledger.fail(r.session_id, "bad cwd")
+    with pytest.raises(NelixError) as ei:
+        ledger.fail(r.session_id, "something else")
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+    assert reserve(ledger).reason == "bad cwd"
+
+
+@pytest.mark.parametrize("reason", [None, "", 42])
+def test_fail_rejects_a_malformed_reason(ledger, reason):
+    r = reserve(ledger)
+    with pytest.raises(NelixError) as ei:
+        ledger.fail(r.session_id, reason)
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
 @pytest.mark.parametrize("key", [None, 123, "", {}])
 def test_a_malformed_idempotency_key_is_a_contract_error_not_a_crash(ledger, key):
     with pytest.raises(NelixError):

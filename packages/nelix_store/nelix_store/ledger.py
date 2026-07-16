@@ -128,24 +128,46 @@ class StartLedger:
                                (generation_id, session_id))
 
     def commit(self, session_id: str, generation_id: str) -> None:
+        """Mark the start succeeded — on the generation it was ASSIGNED to, and no other.
+
+        `commit` never writes generation_id. Only `assign_generation` binds it, and it does
+        so BEFORE the request is forwarded; a commit that could rebind would reopen the exact
+        lost-response ambiguity the assignment exists to close.
+        """
+        try:
+            validate_generation_id(generation_id)
+        except InvalidId as e:
+            raise NelixError(INVALID_REQUEST, str(e)) from None
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             row = self._require(session_id)
             if row["state"] == "failed":
                 raise NelixError(IDEMPOTENCY_CONFLICT, "cannot commit a failed start")
-            if row["state"] == "started" and row["generation_id"] != generation_id:
+            if row["generation_id"] is None:
                 raise NelixError(IDEMPOTENCY_CONFLICT,
-                                 "already started on a different generation")
-            self._conn.execute(
-                "UPDATE reservations SET state='started', generation_id=? WHERE session_id=?",
-                (generation_id, session_id))
+                                 "cannot commit a start that was never assigned a generation")
+            if row["generation_id"] != generation_id:
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 "start was assigned to a different generation")
+            # state only — the binding is assign_generation's alone.
+            self._conn.execute("UPDATE reservations SET state='started' WHERE session_id=?",
+                               (session_id,))
 
     def fail(self, session_id: str, reason: str) -> None:
+        """Record a failed start. Idempotent for the same reason; a DIFFERENT reason is a
+        conflict — a durable failure result must not be rewritten under a replay."""
+        if not isinstance(reason, str) or not reason:
+            raise NelixError(INVALID_REQUEST, f"reason must be a non-empty string: {reason!r}")
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             row = self._require(session_id)
             if row["state"] == "started":
                 raise NelixError(IDEMPOTENCY_CONFLICT, "cannot fail an already-started start")
+            if row["state"] == "failed":
+                if row["reason"] == reason:
+                    return
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 "start already failed for a different reason")
             self._conn.execute(
                 "UPDATE reservations SET state='failed', reason=? WHERE session_id=?",
                 (reason, session_id))
