@@ -19,9 +19,25 @@ def test_unknown_code_is_rejected_at_construction():
         NelixError("whoops_not_a_code", "x")
 
 
-def test_every_code_declares_retryability():
-    for code in ALL_CODES:
-        assert isinstance(NelixError(code, "m").retryable, bool)
+def test_every_public_code_constant_declares_retryability():
+    # Scan the MODULE's string constants, not ALL_CODES — ALL_CODES is derived from the same
+    # dict this is meant to check, so iterating it can never catch a missing entry.
+    declared = {v for k, v in vars(errors).items()
+                if k.isupper() and not k.startswith("_") and isinstance(v, str)}
+    assert declared == set(ALL_CODES), (
+        f"code constants without a retryability entry: {declared - set(ALL_CODES)}; "
+        f"entries without a constant: {set(ALL_CODES) - declared}")
+
+
+def test_idempotency_conflict_is_distinct_from_duplicate_start():
+    # A replay of the SAME request is a success. A replay of the same KEY with a DIFFERENT
+    # request is a conflict. They are different conditions and must not share a code.
+    assert errors.IDEMPOTENCY_CONFLICT != errors.DUPLICATE_START
+    assert NelixError(errors.IDEMPOTENCY_CONFLICT, "m").retryable is False
+
+
+def test_store_corrupt_does_not_blame_the_caller():
+    assert NelixError(errors.STORE_CORRUPT, "m").retryable is False
 
 
 def test_transient_backend_conditions_are_retryable():

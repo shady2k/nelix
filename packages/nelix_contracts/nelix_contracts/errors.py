@@ -16,6 +16,8 @@ GENERATION_UNAVAILABLE = "generation_unavailable"
 ORPHAN_REAPED = "orphan_reaped"
 INVALID_REQUEST = "invalid_request"
 SCHEMA_TOO_NEW = "schema_too_new"
+IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+STORE_CORRUPT = "store_corrupt"
 
 # retryable=True means: the SAME call, unchanged, may succeed later.
 # It is deliberately False for the cursor conditions — they mean "refetch the board and
@@ -33,6 +35,8 @@ _RETRYABLE = {
     ORPHAN_REAPED: False,
     INVALID_REQUEST: False,
     SCHEMA_TOO_NEW: False,
+    IDEMPOTENCY_CONFLICT: False,
+    STORE_CORRUPT: False,
 }
 
 ALL_CODES = frozenset(_RETRYABLE)
