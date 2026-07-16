@@ -411,6 +411,25 @@ def test_a_session_and_a_failed_start_never_coexist_under_a_race(tmp_path):
         f"{len(violations)}/{rounds} races left a live session AND a failed start: {violations}")
 
 
+def test_a_corrupt_ledger_row_does_not_reach_the_caller_as_a_valid_reservation(ledger):
+    # _row_to_reservation copied straight from SQLite with no validation, so a malformed
+    # generation id would arrive at the router looking like a valid Reservation and be routed.
+    r = reserve(ledger)
+    ledger._conn.execute("UPDATE starts SET generation_id='not-a-generation' WHERE session_id=?",
+                         (r.session_id,))
+    with pytest.raises(NelixError) as ei:
+        ledger.lookup("k1", owner_id="hermes:local")
+    assert ei.value.code == errors.STORE_CORRUPT
+
+
+def test_an_impossible_ledger_state_is_store_corrupt(ledger):
+    r = reserve(ledger)
+    ledger._conn.execute("UPDATE starts SET state='banana' WHERE session_id=?", (r.session_id,))
+    with pytest.raises(NelixError) as ei:
+        ledger.lookup("k1", owner_id="hermes:local")
+    assert ei.value.code == errors.STORE_CORRUPT
+
+
 def test_a_session_id_mint_collision_does_not_crash_reserve(tmp_path):
     # A minted-id collision raises IntegrityError on the PRIMARY KEY, not on the owner/key
     # UNIQUE — so rev 2's fall-through SELECT found no row and dereferenced None.

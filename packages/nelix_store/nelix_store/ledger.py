@@ -31,7 +31,7 @@ from nelix_contracts.errors import (
 )
 from nelix_contracts.ids import (
     InvalidId, new_session_id, validate_generation_id, validate_orchestration_id,
-    validate_owner_id,
+    validate_owner_id, validate_session_id,
 )
 
 from .db import connect, translates_sqlite
@@ -50,6 +50,18 @@ class Reservation:
 
 
 def _row_to_reservation(row, *, replay: bool) -> Reservation:
+    """Validate on the way OUT of storage. rev 6 copied these fields straight from SQLite, so
+    a malformed generation id or an impossible state reached the router looking valid — and
+    the router routes on exactly these."""
+    try:
+        validate_session_id(row["session_id"])
+        if row["generation_id"] is not None:
+            validate_generation_id(row["generation_id"])
+    except InvalidId as e:
+        raise NelixError(STORE_CORRUPT, f"stored reservation is unreadable: {e}") from None
+    if row["state"] not in ("starting", "started", "failed"):
+        raise NelixError(STORE_CORRUPT,
+                         f"stored reservation has an impossible state: {row['state']!r}")
     return Reservation(session_id=row["session_id"], state=row["state"],
                        generation_id=row["generation_id"], reason=row["reason"],
                        replay=replay)

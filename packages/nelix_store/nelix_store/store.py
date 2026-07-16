@@ -15,8 +15,8 @@ import sqlite3
 import time
 
 from nelix_contracts.errors import (
-    DUPLICATE_START, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, OWNER_MISMATCH, STORE_CORRUPT,
-    UNKNOWN_SESSION, NelixError,
+    DUPLICATE_START, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, OWNER_MISMATCH, SCHEMA_TOO_NEW,
+    STORE_CORRUPT, UNKNOWN_SESSION, NelixError,
 )
 from nelix_contracts.records import SCHEMA_VERSION, SessionRecord, TerminalRecord
 
@@ -62,6 +62,25 @@ def _read_rows(rows, record_type):
         except NelixError:
             skipped += 1     # future schema, corrupt affinity, anything: not our caller's problem
     return out, skipped
+
+
+def _decode_stored(record_type, row):
+    """Decode a row read from DURABLE STORAGE.
+
+    Same decoder, different party at fault: `from_dict`'s INVALID_REQUEST means "the caller
+    handed me nonsense", which is the right answer for a contract boundary — and the wrong one
+    here, because this row came off our own disk. A caller told "your request is invalid" goes
+    and fixes their request; the damage is ours.
+
+    SCHEMA_TOO_NEW passes through untouched: "written by a newer build" is a distinct,
+    actionable condition, not damage.
+    """
+    try:
+        return record_type.from_dict(dict(row))
+    except NelixError as e:
+        if e.code == SCHEMA_TOO_NEW:
+            raise
+        raise NelixError(STORE_CORRUPT, f"stored record is unreadable: {e.message}") from None
 
 
 class Store:
@@ -155,7 +174,7 @@ class Store:
             raise NelixError(UNKNOWN_SESSION, f"no such session: {session_id}")
         if row["owner_id"] != owner_id:
             raise NelixError(OWNER_MISMATCH, "session belongs to another owner")
-        return SessionRecord.from_dict(dict(row))   # fails closed on a future schema
+        return _decode_stored(SessionRecord, row)   # fails closed on a future schema
 
     @translates_sqlite
     def list_sessions(self, owner_id: str) -> list:
@@ -213,7 +232,7 @@ class Store:
             raise NelixError(UNKNOWN_SESSION, f"no terminal record: {session_id}")
         if row["owner_id"] != owner_id:
             raise NelixError(OWNER_MISMATCH, "session belongs to another owner")
-        return TerminalRecord.from_dict(dict(row))
+        return _decode_stored(TerminalRecord, row)
 
     @translates_sqlite
     def list_terminal(self, owner_id: str) -> list:

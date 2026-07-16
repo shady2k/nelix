@@ -265,3 +265,24 @@ def test_transition_can_be_conditional_on_the_expected_state(store, ledger):
                                  expected_state="starting")   # stale
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
     assert store.get_session(sid, owner_id="hermes:local").state == "running"
+
+
+def test_a_corrupt_stored_row_is_store_corrupt_not_the_callers_fault(store, ledger):
+    # from_dict is a contract decoder: INVALID_REQUEST is right for a caller's bad input. But
+    # a row read from DURABLE STORAGE that will not decode means the STORE is damaged. Telling
+    # the caller "your request is invalid" sends them to fix the wrong thing.
+    sid = started_session(store, ledger)
+    store._conn.execute("UPDATE sessions SET created_at='yesterday' WHERE session_id=?", (sid,))
+    with pytest.raises(NelixError) as ei:
+        store.get_session(sid, owner_id="hermes:local")
+    assert ei.value.code == errors.STORE_CORRUPT
+
+
+def test_a_future_schema_row_still_reports_schema_too_new_not_corrupt(store, ledger):
+    # SCHEMA_TOO_NEW must survive the reclassification: "written by a newer build" is a
+    # different, actionable condition from "damaged".
+    sid = started_session(store, ledger)
+    store._conn.execute("UPDATE sessions SET schema_version=99 WHERE session_id=?", (sid,))
+    with pytest.raises(NelixError) as ei:
+        store.get_session(sid, owner_id="hermes:local")
+    assert ei.value.code == errors.SCHEMA_TOO_NEW
