@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from nelix_contracts import errors
@@ -31,14 +33,14 @@ def clock():
 
 @pytest.fixture
 def store(tmp_path, clock):
-    return Store(tmp_path, clock=clock)
+    s = Store(tmp_path, clock=clock)
+    yield s
+    s.close()
 
 
 def test_an_unacknowledged_result_survives_far_past_the_old_300s_ttl(store, clock):
-    # THE defect this fixes: the live daemon expires terminal snapshots after
-    # terminal_snapshot_ttl=300.0 and sweeps them on every global status, so a harness away
-    # for six minutes came back to a vanished result. "Come back later" is the product's
-    # whole promise.
+    # The defect this package exists to kill: the live daemon expires terminal snapshots
+    # after terminal_snapshot_ttl=300.0, so a harness away six minutes lost the result.
     sid = "s-" + "1" * 32
     store.put_terminal(make_terminal(sid, ended_at=1000.0))
     clock.t = 1000.0 + 3600
@@ -47,14 +49,52 @@ def test_an_unacknowledged_result_survives_far_past_the_old_300s_ttl(store, cloc
 
 
 def test_ack_is_idempotent(store, clock):
-    # The owner may retry an ack after a lost reply; the second must be a success, not an error.
     sid = "s-" + "1" * 32
     store.put_terminal(make_terminal(sid))
     first = store.ack_terminal(sid, owner_id="hermes:local")
     clock.t = 2000.0
     second = store.ack_terminal(sid, owner_id="hermes:local")
     assert first.acknowledged_at == 1000.0
-    assert second.acknowledged_at == 1000.0     # not re-stamped
+    assert second.acknowledged_at == 1000.0
+
+
+def test_a_retried_put_never_erases_an_acknowledgement(store):
+    # The generation may re-publish a terminal record after the owner already acked it.
+    # rev 1's unconditional write reset acknowledged_at to None.
+    sid = "s-" + "1" * 32
+    store.put_terminal(make_terminal(sid))
+    store.ack_terminal(sid, owner_id="hermes:local")
+    store.put_terminal(make_terminal(sid))
+    assert store.get_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
+
+
+def test_concurrent_acks_agree_on_one_timestamp(tmp_path):
+    # rev 1's ack was a read-modify-write: two callers both saw None, both stamped, and the
+    # later write won — so "the original timestamp never changes" was false under the only
+    # conditions that matter. Sequential tests cannot see this.
+    ticks = iter(range(1, 10_000))
+    store = Store(tmp_path, clock=lambda: float(next(ticks)))
+    sid = "s-" + "1" * 32
+    store.put_terminal(make_terminal(sid))
+    store.close()
+
+    results, barrier = [], threading.Barrier(8)
+
+    def ack():
+        s = Store(tmp_path, clock=lambda: float(next(ticks)))
+        barrier.wait()
+        try:
+            results.append(s.ack_terminal(sid, owner_id="hermes:local").acknowledged_at)
+        finally:
+            s.close()
+
+    threads = [threading.Thread(target=ack) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(results) == 8
+    assert len(set(results)) == 1, f"acks disagreed on the timestamp: {sorted(set(results))}"
 
 
 def test_prune_removes_acknowledged_records(store):
@@ -67,7 +107,6 @@ def test_prune_removes_acknowledged_records(store):
 
 
 def test_prune_reaps_an_abandoned_record_past_max_age(store):
-    # An owner that never returns must not grow storage forever.
     store.put_terminal(make_terminal("s-" + "1" * 32, ended_at=0.0))
     assert store.prune_terminal(max_age_seconds=500, max_count=100) == 1
 
@@ -76,8 +115,34 @@ def test_prune_bounds_by_count_dropping_oldest_first(store):
     for i in range(5):
         store.put_terminal(make_terminal(f"s-{i}" + "0" * 31, ended_at=float(i)))
     assert store.prune_terminal(max_age_seconds=86400, max_count=2) == 3
-    kept = sorted(r.ended_at for r in store.list_terminal("hermes:local"))
-    assert kept == [3.0, 4.0]
+    assert sorted(r.ended_at for r in store.list_terminal("hermes:local")) == [3.0, 4.0]
+
+
+def test_a_noisy_owner_cannot_evict_a_quiet_owners_unacked_result(store):
+    # THE rev 1 Critical, probe-proven by review: the count bound was applied across ALL
+    # owners, so one owner's churn deleted another's unacknowledged result — violating both
+    # "unacked results survive" and "owner is a correctness namespace".
+    store.put_terminal(make_terminal("s-" + "9" * 32, owner="quiet:1", ended_at=1.0))
+    for i in range(5):
+        store.put_terminal(make_terminal(f"s-{i}" + "7" * 31, owner="noisy:1",
+                                         ended_at=float(100 + i)))
+    store.prune_terminal(max_age_seconds=86400, max_count=3)
+    assert store.get_terminal("s-" + "9" * 32, owner_id="quiet:1").ended_at == 1.0
+    assert len(store.list_terminal("noisy:1")) == 3
+
+
+def test_prune_ties_break_deterministically(store):
+    for sid in ("s-" + "a" * 32, "s-" + "b" * 32, "s-" + "c" * 32):
+        store.put_terminal(make_terminal(sid, ended_at=5.0))
+    store.prune_terminal(max_age_seconds=86400, max_count=1)
+    assert [r.session_id for r in store.list_terminal("hermes:local")] == ["s-" + "c" * 32]
+
+
+@pytest.mark.parametrize("kwargs", [{"max_age_seconds": -1, "max_count": 1},
+                                    {"max_age_seconds": 1, "max_count": -1}])
+def test_prune_rejects_nonsense_bounds(store, kwargs):
+    with pytest.raises(NelixError):
+        store.prune_terminal(**kwargs)
 
 
 def test_terminal_reads_are_owner_filtered(store):
