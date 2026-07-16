@@ -226,8 +226,9 @@ def test_a_failed_start_cannot_acquire_a_session(store, ledger):
         store.create_session(r.session_id, state="running", executor="coder", task="t",
                              cwd="/repo", model=None, created_at=100.0)
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
-    with pytest.raises(NelixError):
+    with pytest.raises(NelixError) as ei2:
         store.get_session(r.session_id, owner_id="hermes:local")
+    assert ei2.value.code == errors.UNKNOWN_SESSION
 
 
 @pytest.mark.parametrize("field,bad", [

@@ -180,15 +180,17 @@ def test_failing_an_already_started_session_is_refused(ledger):
     r = reserve(ledger)
     ledger.assign_generation(r.session_id, GID)
     ledger.commit(r.session_id, GID)
-    with pytest.raises(NelixError):
+    with pytest.raises(NelixError) as ei:
         ledger.fail(r.session_id, "too late")
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
 
 
 def test_committing_an_already_failed_session_is_refused(ledger):
     r = reserve(ledger)
     ledger.fail(r.session_id, "bad cwd")
-    with pytest.raises(NelixError):
+    with pytest.raises(NelixError) as ei:
         ledger.commit(r.session_id, GID)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
 
 
 def test_commit_of_an_unknown_session_is_rejected(ledger):
@@ -253,9 +255,10 @@ def test_fail_rejects_a_malformed_reason(ledger, reason):
 
 @pytest.mark.parametrize("key", [None, 123, "", {}])
 def test_a_malformed_idempotency_key_is_a_contract_error_not_a_crash(ledger, key):
-    with pytest.raises(NelixError):
+    with pytest.raises(NelixError) as ei:
         ledger.reserve(idempotency_key=key, owner_id="hermes:local",
                        orchestration_id=OID, request_fingerprint=FP)
+    assert ei.value.code == errors.INVALID_REQUEST
 
 
 def test_the_ledger_survives_a_restart(tmp_path):

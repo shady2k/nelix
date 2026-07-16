@@ -57,14 +57,19 @@ def test_republishing_the_same_terminal_result_is_idempotent(store, ledger):
     assert store.get_terminal(sid, owner_id="hermes:local").terminal_kind == "done"
 
 
-def test_republishing_a_DIFFERENT_terminal_result_is_a_conflict(store, ledger):
-    # ledger.fail() raises on exactly this shape ("a durable failure result must not be
-    # rewritten under a replay"). Two durable-result writers in one package must not answer
-    # the same question in opposite ways.
+@pytest.mark.parametrize("field,value", [
+    ("terminal_kind", "error"),
+    ("summary", "a different summary"),
+    ("ended_at", 99.0),
+])
+def test_republishing_with_any_canonical_field_changed_is_a_conflict(store, ledger, field, value):
+    # One field at a time. The old test changed all three at once, so a mutant comparing only
+    # terminal_kind stayed green — the invariant was only a third guarded.
     sid = _live_session(store, ledger)
-    store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
+    base = dict(terminal_kind="done", summary="all green", ended_at=5.0)
+    store.put_terminal(sid, **base)
     with pytest.raises(NelixError) as ei:
-        store.put_terminal(sid, terminal_kind="error", summary="crashed", ended_at=6.0)
+        store.put_terminal(sid, **{**base, field: value})
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
     assert store.get_terminal(sid, owner_id="hermes:local").terminal_kind == "done"
 
@@ -75,6 +80,22 @@ def test_republishing_after_an_ack_neither_conflicts_nor_erases_the_ack(store, l
     store.ack_terminal(sid, owner_id="hermes:local")
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
     assert store.get_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("terminal_kind", None), ("terminal_kind", 42), ("summary", 5),
+    ("ended_at", "soon"), ("ended_at", float("nan")), ("ended_at", float("inf")),
+    ("ended_at", True),
+])
+def test_put_terminal_rejects_a_malformed_field(store, ledger, field, bad):
+    # The TerminalRecord(...) construction inside the transaction had no test at all: no case
+    # ever passed a malformed terminal field, so deleting it changed nothing.
+    sid = _live_session(store, ledger)
+    fields = dict(terminal_kind="done", summary="ok", ended_at=1.0)
+    fields[field] = bad
+    with pytest.raises(NelixError) as ei:
+        store.put_terminal(sid, **fields)
+    assert ei.value.code == errors.INVALID_REQUEST
 
 
 def _live_session(store, ledger, owner="hermes:local", key="k1", **over):
@@ -186,8 +207,9 @@ def test_prune_removes_acknowledged_records(store, ledger):
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=100.0)
     store.ack_terminal(sid, owner_id="hermes:local")
     assert store.prune_terminal(max_age_seconds=86400, max_count=100) == 1
-    with pytest.raises(NelixError):
+    with pytest.raises(NelixError) as ei:
         store.get_terminal(sid, owner_id="hermes:local")
+    assert ei.value.code == errors.UNKNOWN_SESSION
 
 
 def test_prune_reaps_an_abandoned_record_past_max_age(store, ledger):
@@ -237,8 +259,9 @@ def test_prune_ties_break_deterministically(store, ledger):
 @pytest.mark.parametrize("kwargs", [{"max_age_seconds": -1, "max_count": 1},
                                     {"max_age_seconds": 1, "max_count": -1}])
 def test_prune_rejects_nonsense_bounds(store, kwargs):
-    with pytest.raises(NelixError):
+    with pytest.raises(NelixError) as ei:
         store.prune_terminal(**kwargs)
+    assert ei.value.code == errors.INVALID_REQUEST
 
 
 def test_terminal_reads_are_owner_filtered(store, ledger):
@@ -275,3 +298,68 @@ def test_a_corrupt_terminal_row_does_not_blind_an_owner(store, ledger):
         " acknowledged_at, schema_version) VALUES (?,?,?,?,?,?)",
         (other_sid, "done", "s", "soon", None, 1))
     assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid]
+
+
+def test_an_ack_in_flight_is_not_destroyed_by_a_concurrent_prune(tmp_path):
+    # The existing concurrent test races ack against ACK, which the CAS already covers — so
+    # removing ack's outer BEGIN IMMEDIATE left it green. This races ack against PRUNE, the
+    # defect the transaction was actually added for: prune landing between the CAS and the
+    # re-read made an ack that DURABLY SUCCEEDED report unknown_session.
+    #
+    # !! THIS TEST HAS NO DEMONSTRATED DETECTION POWER — DO NOT TRUST IT AS A GUARD. !!
+    # Measured: removing ack_terminal's outer transaction leaves this green 5/5, and leaves
+    # all 103 store tests green. It CANNOT distinguish "prune won cleanly" from "ack succeeded
+    # then reported failure", because ack_terminal raises UNKNOWN_SESSION for both, and
+    # nothing in the schema stamps an ack-in-progress marker prune could observe. It documents
+    # the scenario; it does not prove the transaction. Tracked as its own bead — closing it
+    # needs a schema-level marker, not a better test. Kept, with this warning, rather than
+    # deleted, so the scenario is not forgotten; but a green run here means nothing.
+    from nelix_store.store import Store
+    from nelix_store.ledger import StartLedger
+
+    rounds, bad = 25, []
+    for attempt in range(rounds):
+        root = tmp_path / f"p{attempt}"
+        lg = StartLedger(root, clock=lambda: 1000.0)
+        store = Store(root, clock=lambda: 1000.0)
+        try:
+            sid = _live_session(store, lg)
+            store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+        finally:
+            lg.close()
+            store.close()
+
+        barrier, outcome = threading.Barrier(2), []
+
+        def acker():
+            s = Store(root, clock=lambda: 1000.0)
+            barrier.wait(timeout=30)
+            try:
+                s.ack_terminal(sid, owner_id="hermes:local")
+                outcome.append("acked")
+            except NelixError as e:
+                outcome.append(e.code)
+            finally:
+                s.close()
+
+        def pruner():
+            s = Store(root, clock=lambda: 1000.0)
+            barrier.wait(timeout=30)
+            try:
+                s.prune_terminal(max_age_seconds=0, max_count=100)
+            finally:
+                s.close()
+
+        threads = [threading.Thread(target=acker, daemon=True),
+                   threading.Thread(target=pruner, daemon=True)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert all(not t.is_alive() for t in threads), "a thread hung"
+        # Either the ack won (acked) or prune got there first (a clean unknown_session BEFORE
+        # the ack began). What must never happen is an ack that succeeded and then reported
+        # failure — which is what an untransacted read/CAS/re-read produced.
+        if outcome and outcome[0] not in ("acked", errors.UNKNOWN_SESSION):
+            bad.append((attempt, outcome[0]))
+    assert bad == [], f"ack reported something impossible: {bad}"
