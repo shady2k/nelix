@@ -169,15 +169,25 @@ def test_one_future_schema_row_does_not_brick_an_owners_board(store, ledger):
 
 
 def test_a_non_duplicate_integrity_failure_is_not_reported_as_a_duplicate_start(store, ledger):
-    # NOT NULL is not a duplicate. Mapping every IntegrityError to DUPLICATE_START tells the
-    # caller to stop retrying a start that never conflicted.
+    # f1k-rev5: this used to assert STORE_CORRUPT — a reviewer found that classification
+    # wrong. state=None is MALFORMED CALLER INPUT, not durable-state damage; the party at
+    # fault is the caller, so the code must be INVALID_REQUEST (Global Constraints: "caller's
+    # malformed input -> INVALID_REQUEST"). Before this task, state=None reached SQLite's NOT
+    # NULL constraint and came back as a raw sqlite3.IntegrityError, mapped here to
+    # STORE_CORRUPT because it wasn't a UNIQUE/PRIMARY KEY violation. Now create_session
+    # constructs a SessionRecord BEFORE writing, so state=None is caught by validation and
+    # never reaches SQLite at all — the non-duplicate-IntegrityError branch this test
+    # exercised is no longer reachable through the public API with any NOT-NULL column, since
+    # every one of them (state, executor, task, cwd, created_at) is now record-validated
+    # first. That branch is retained in store.py purely as defence for a corruption mode this
+    # test can no longer trigger; nothing here still exercises it.
     r = ledger.reserve(idempotency_key="k1", owner_id="hermes:local",
                        orchestration_id=OID, request_fingerprint="fp")
     ledger.assign_generation(r.session_id, GID)
     with pytest.raises(NelixError) as ei:
         store.create_session(r.session_id, state=None, executor="coder", task="t",
                              cwd="/repo", model=None, created_at=1.0)
-    assert ei.value.code == errors.STORE_CORRUPT
+    assert ei.value.code == errors.INVALID_REQUEST
 
 
 def test_a_corrupt_row_does_not_blind_an_owner_to_their_healthy_rows(store, ledger):
@@ -201,6 +211,48 @@ def test_transition_rejects_a_state_the_records_layer_would_reject(store, ledger
         store.transition_session(sid, owner_id="hermes:local", state=42)
     assert ei.value.code == errors.INVALID_REQUEST
     assert store.get_session(sid, owner_id="hermes:local").state == "starting"
+
+
+def test_a_failed_start_cannot_acquire_a_session(store, ledger):
+    # THE Critical. The router calls fail() when a forward times out — exactly when the
+    # generation may have created the session anyway. If the store accepts the session, the
+    # caller retries the key, the ledger says "failed", the caller believes nothing started,
+    # and dispatches a SECOND WORKER. That is the fatal case ledger.py's docstring names.
+    r = ledger.reserve(idempotency_key="k1", owner_id="hermes:local",
+                       orchestration_id=OID, request_fingerprint="fp")
+    ledger.assign_generation(r.session_id, GID)
+    ledger.fail(r.session_id, "forward timed out")
+    with pytest.raises(NelixError) as ei:
+        store.create_session(r.session_id, state="running", executor="coder", task="t",
+                             cwd="/repo", model=None, created_at=100.0)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+    with pytest.raises(NelixError):
+        store.get_session(r.session_id, owner_id="hermes:local")
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("executor", 42), ("task", 42), ("cwd", None), ("model", 42),
+    ("created_at", "yesterday"), ("created_at", float("nan")),
+    ("created_at", float("inf")), ("state", 42),
+])
+def test_create_session_rejects_a_malformed_field(store, ledger, field, bad):
+    # rev 3 made records validate every field so corruption surfaces at its CAUSE. rev 4's
+    # scalar API wrote caller values straight to SQLite, where TEXT affinity coerces 42 to
+    # '42' and 'yesterday' persists in a REAL column — then explodes far away in list_*.
+    sid = _assigned_start(ledger)
+    fields = dict(state="starting", executor="coder", task="t", cwd="/repo",
+                  model=None, created_at=100.0)
+    fields[field] = bad
+    with pytest.raises(NelixError) as ei:
+        store.create_session(sid, **fields)
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+def _assigned_start(ledger, owner="hermes:local", key="k9"):
+    r = ledger.reserve(idempotency_key=key, owner_id=owner, orchestration_id=OID,
+                       request_fingerprint="fp")
+    ledger.assign_generation(r.session_id, GID)
+    return r.session_id
 
 
 def test_transition_can_be_conditional_on_the_expected_state(store, ledger):

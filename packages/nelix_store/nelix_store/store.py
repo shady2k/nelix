@@ -69,22 +69,36 @@ class Store:
     # ---- sessions -------------------------------------------------------------
     def create_session(self, session_id: str, *, state: str, executor: str, task: str,
                        cwd: str, model, created_at: float) -> None:
-        """Create the runtime row for an ALREADY-ASSIGNED start.
+        """Create the runtime row for an assigned, NOT-failed start.
 
-        Note what this does NOT take: owner, orchestration, generation. They are read from
-        the start row, so a session physically cannot disagree with the reservation that
-        created it — which is what let rev 3 file a session under a different owner.
+        Takes no owner/orchestration/generation: they are read from the start row, so a
+        session physically cannot disagree with the reservation that created it.
         """
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             start = self._conn.execute(
-                "SELECT generation_id, state FROM starts WHERE session_id=?",
-                (session_id,)).fetchone()
+                "SELECT owner_id, orchestration_id, generation_id, state "
+                "FROM starts WHERE session_id=?", (session_id,)).fetchone()
             if start is None:
                 raise NelixError(UNKNOWN_SESSION, f"no start for session {session_id}")
             if start["generation_id"] is None:
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  f"start {session_id} has no assigned generation yet")
+            # The router calls fail() when a forward times out — exactly when the generation
+            # may have created the session anyway. Accepting the session here would let the
+            # caller retry the key, be told "failed", and dispatch a SECOND worker.
+            if start["state"] == "failed":
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 f"start {session_id} already failed; it may not acquire a "
+                                 f"session")
+            # Construct the record as VALIDATION before writing (rev 4's scalar API dropped
+            # this, and SQLite's TEXT affinity would coerce the mistake into durable state).
+            # Identity comes from the start, so it cannot disagree.
+            SessionRecord(session_id=session_id, owner_id=start["owner_id"],
+                          orchestration_id=start["orchestration_id"],
+                          generation_id=start["generation_id"], state=state,
+                          executor=executor, task=task, cwd=cwd, model=model,
+                          created_at=created_at)
             try:
                 self._conn.execute(
                     "INSERT INTO sessions (session_id, state, executor, task, cwd, model, "
