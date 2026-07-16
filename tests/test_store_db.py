@@ -15,7 +15,7 @@ def test_connect_creates_the_schema(tmp_path):
     conn = db.connect(tmp_path)
     names = {r["name"] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"sessions", "terminal", "reservations", "meta"} <= names
+    assert {"sessions", "terminal", "starts", "meta"} <= names
 
 
 def test_rows_come_back_addressable_by_column_name(tmp_path):
@@ -51,7 +51,7 @@ def test_a_future_database_schema_fails_closed(tmp_path):
 
 def test_the_reservation_key_is_unique_per_owner(tmp_path):
     conn = db.connect(tmp_path)
-    ins = ("INSERT INTO reservations (session_id, owner_id, orchestration_id, "
+    ins = ("INSERT INTO starts (session_id, owner_id, orchestration_id, "
            "idempotency_key, request_fingerprint, state, generation_id, reason, created_at) "
            "VALUES (?,?,?,?,?,?,?,?,?)")
     conn.execute(ins, ("s-1", "o1", "orch", "k1", "fp", "starting", None, None, 1.0))

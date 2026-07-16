@@ -32,35 +32,8 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id       TEXT PRIMARY KEY,
-    owner_id         TEXT NOT NULL,
-    orchestration_id TEXT NOT NULL,
-    generation_id    TEXT NOT NULL,
-    state            TEXT NOT NULL,
-    executor         TEXT NOT NULL,
-    task             TEXT NOT NULL,
-    cwd              TEXT NOT NULL,
-    model            TEXT,
-    created_at       REAL NOT NULL,
-    schema_version   INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS sessions_by_owner ON sessions (owner_id);
-
-CREATE TABLE IF NOT EXISTS terminal (
-    session_id       TEXT PRIMARY KEY,
-    owner_id         TEXT NOT NULL,
-    orchestration_id TEXT NOT NULL,
-    generation_id    TEXT NOT NULL,
-    terminal_kind    TEXT NOT NULL,
-    summary          TEXT NOT NULL,
-    ended_at         REAL NOT NULL,
-    acknowledged_at  REAL,
-    schema_version   INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS terminal_by_owner ON terminal (owner_id, ended_at);
-
-CREATE TABLE IF NOT EXISTS reservations (
+-- The ONE authoritative row for a session's identity. Everything else references it.
+CREATE TABLE IF NOT EXISTS starts (
     session_id          TEXT PRIMARY KEY,
     owner_id            TEXT NOT NULL,
     orchestration_id    TEXT NOT NULL,
@@ -70,11 +43,33 @@ CREATE TABLE IF NOT EXISTS reservations (
     generation_id       TEXT,
     reason              TEXT,
     created_at          REAL NOT NULL,
-    -- The reservation invariant, enforced by the DATABASE rather than by a
-    -- check-then-write the application could interleave: one operation per
-    -- (owner, key). Two owners reusing the same key STRING are independent.
     UNIQUE (owner_id, idempotency_key)
 );
+CREATE INDEX IF NOT EXISTS starts_by_owner ON starts (owner_id);
+
+-- Live/runtime fields ONLY. Identity comes from starts by join — it is never stored twice,
+-- so the two can never disagree.
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id     TEXT PRIMARY KEY REFERENCES starts (session_id),
+    state          TEXT NOT NULL,
+    executor       TEXT NOT NULL,
+    task           TEXT NOT NULL,
+    cwd            TEXT NOT NULL,
+    model          TEXT,
+    created_at     REAL NOT NULL,
+    schema_version INTEGER NOT NULL
+);
+
+-- Terminal-result fields ONLY.
+CREATE TABLE IF NOT EXISTS terminal (
+    session_id      TEXT PRIMARY KEY REFERENCES sessions (session_id),
+    terminal_kind   TEXT NOT NULL,
+    summary         TEXT NOT NULL,
+    ended_at        REAL NOT NULL,
+    acknowledged_at REAL,
+    schema_version  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS terminal_by_ended ON terminal (ended_at);
 """
 
 LOCK_FILENAME = ".db-init.lock"

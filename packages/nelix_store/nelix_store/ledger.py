@@ -83,7 +83,7 @@ class StartLedger:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
-                    f"INSERT INTO reservations ({_COLS}) VALUES (?,?,?,?,?,?,?,?,?)",
+                    f"INSERT INTO starts ({_COLS}) VALUES (?,?,?,?,?,?,?,?,?)",
                     (session_id, owner_id, orchestration_id, idempotency_key,
                      request_fingerprint, "starting", None, None, float(self._clock())))
                 return Reservation(session_id=session_id, state="starting",
@@ -93,7 +93,7 @@ class StartLedger:
             # The UNIQUE constraint fired: this (owner, key) is already reserved. Return the
             # ORIGINAL operation — never re-pick the active generation.
             row = self._conn.execute(
-                f"SELECT {_COLS} FROM reservations WHERE owner_id=? AND idempotency_key=?",
+                f"SELECT {_COLS} FROM starts WHERE owner_id=? AND idempotency_key=?",
                 (owner_id, idempotency_key)).fetchone()
             if row is None:
                 # The IntegrityError was NOT the owner/key constraint — the only other
@@ -108,7 +108,7 @@ class StartLedger:
 
     def _require(self, session_id):
         row = self._conn.execute(
-            f"SELECT {_COLS} FROM reservations WHERE session_id=?", (session_id,)).fetchone()
+            f"SELECT {_COLS} FROM starts WHERE session_id=?", (session_id,)).fetchone()
         if row is None:
             raise NelixError(UNKNOWN_SESSION, f"no reservation for {session_id}")
         return row
@@ -129,7 +129,7 @@ class StartLedger:
             if row["generation_id"] not in (None, generation_id):
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  "reservation is already assigned to another generation")
-            self._conn.execute("UPDATE reservations SET generation_id=? WHERE session_id=?",
+            self._conn.execute("UPDATE starts SET generation_id=? WHERE session_id=?",
                                (generation_id, session_id))
 
     def commit(self, session_id: str, generation_id: str) -> None:
@@ -155,7 +155,7 @@ class StartLedger:
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  "start was assigned to a different generation")
             # state only — the binding is assign_generation's alone.
-            self._conn.execute("UPDATE reservations SET state='started' WHERE session_id=?",
+            self._conn.execute("UPDATE starts SET state='started' WHERE session_id=?",
                                (session_id,))
 
     def fail(self, session_id: str, reason: str) -> None:
@@ -174,13 +174,13 @@ class StartLedger:
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  "start already failed for a different reason")
             self._conn.execute(
-                "UPDATE reservations SET state='failed', reason=? WHERE session_id=?",
+                "UPDATE starts SET state='failed', reason=? WHERE session_id=?",
                 (reason, session_id))
 
     def lookup(self, idempotency_key: str, *, owner_id: str) -> "Reservation | None":
         """Owner-guarded: rev 1's lookup took no owner at all, so it handed any caller
         another owner's session_id, state and generation."""
         row = self._conn.execute(
-            f"SELECT {_COLS} FROM reservations WHERE owner_id=? AND idempotency_key=?",
+            f"SELECT {_COLS} FROM starts WHERE owner_id=? AND idempotency_key=?",
             (owner_id, idempotency_key)).fetchone()
         return None if row is None else _row_to_reservation(row, replay=True)

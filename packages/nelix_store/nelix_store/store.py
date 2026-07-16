@@ -22,10 +22,22 @@ from nelix_contracts.records import SCHEMA_VERSION, SessionRecord, TerminalRecor
 
 from .db import connect
 
-_SESSION_COLS = ("session_id, owner_id, orchestration_id, generation_id, state, executor, "
-                 "task, cwd, model, created_at, schema_version")
-_TERMINAL_COLS = ("session_id, owner_id, orchestration_id, generation_id, terminal_kind, "
-                  "summary, ended_at, acknowledged_at, schema_version")
+# Identity is JOINED from starts, never stored in these tables (nelix-555). Three
+# independent copies could disagree; one row cannot disagree with itself.
+_SESSION_SELECT = (
+    "SELECT s.session_id, st.owner_id, st.orchestration_id, st.generation_id, s.state, "
+    "s.executor, s.task, s.cwd, s.model, s.created_at, s.schema_version "
+    "FROM sessions s JOIN starts st ON st.session_id = s.session_id")
+_TERMINAL_SELECT = (
+    "SELECT t.session_id, st.owner_id, st.orchestration_id, st.generation_id, "
+    "t.terminal_kind, t.summary, t.ended_at, t.acknowledged_at, t.schema_version "
+    "FROM terminal t JOIN sessions s ON s.session_id = t.session_id "
+    "JOIN starts st ON st.session_id = t.session_id")
+
+# transition_session's CAS UPDATE has no owner_id column to filter on directly (identity
+# lives in starts, not sessions) — expressed as a subquery so the owner check stays part of
+# the SAME atomic UPDATE rather than a separate check-then-write.
+_OWNS_SESSION = "session_id IN (SELECT session_id FROM starts WHERE owner_id=?)"
 
 
 def _read_rows(rows, record_type):
@@ -55,24 +67,35 @@ class Store:
         self._conn.close()
 
     # ---- sessions -------------------------------------------------------------
-    def create_session(self, record: SessionRecord) -> None:
-        """Exclusive create. NEVER an overwrite: identity (owner, orchestration, generation,
-        task, cwd, created_at) is immutable, and a blind replace could hand the session to a
-        different owner."""
-        try:
-            self._conn.execute(
-                f"INSERT INTO sessions ({_SESSION_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (record.session_id, record.owner_id, record.orchestration_id,
-                 record.generation_id, record.state, record.executor, record.task,
-                 record.cwd, record.model, record.created_at, record.schema_version))
-        except sqlite3.IntegrityError as e:
-            # Only a PK conflict is a duplicate start. Anything else (NOT NULL, CHECK) is a
-            # bug in the caller's record, and telling them "already exists" would send them
-            # down the wrong path.
-            if "UNIQUE" not in str(e) and "PRIMARY KEY" not in str(e):
+    def create_session(self, session_id: str, *, state: str, executor: str, task: str,
+                       cwd: str, model, created_at: float) -> None:
+        """Create the runtime row for an ALREADY-ASSIGNED start.
+
+        Note what this does NOT take: owner, orchestration, generation. They are read from
+        the start row, so a session physically cannot disagree with the reservation that
+        created it — which is what let rev 3 file a session under a different owner.
+        """
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            start = self._conn.execute(
+                "SELECT generation_id, state FROM starts WHERE session_id=?",
+                (session_id,)).fetchone()
+            if start is None:
+                raise NelixError(UNKNOWN_SESSION, f"no start for session {session_id}")
+            if start["generation_id"] is None:
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 f"start {session_id} has no assigned generation yet")
+            try:
+                self._conn.execute(
+                    "INSERT INTO sessions (session_id, state, executor, task, cwd, model, "
+                    "created_at, schema_version) VALUES (?,?,?,?,?,?,?,?)",
+                    (session_id, state, executor, task, cwd, model, created_at,
+                     SCHEMA_VERSION))
+            except sqlite3.IntegrityError as e:
+                if "UNIQUE" in str(e) or "PRIMARY KEY" in str(e):
+                    raise NelixError(DUPLICATE_START,
+                                     f"session already exists: {session_id}") from None
                 raise NelixError(STORE_CORRUPT, f"session insert failed: {e}") from None
-            raise NelixError(DUPLICATE_START,
-                             f"session already exists: {record.session_id}") from None
 
     def transition_session(self, session_id: str, *, owner_id: str, state: str,
                            expected_state=None) -> None:
@@ -89,11 +112,12 @@ class Store:
             raise NelixError(INVALID_REQUEST, f"state must be a non-empty string: {state!r}")
         if expected_state is None:
             cur = self._conn.execute(
-                "UPDATE sessions SET state=? WHERE session_id=? AND owner_id=?",
+                f"UPDATE sessions SET state=? WHERE session_id=? AND {_OWNS_SESSION}",
                 (state, session_id, owner_id))
         else:
             cur = self._conn.execute(
-                "UPDATE sessions SET state=? WHERE session_id=? AND owner_id=? AND state=?",
+                f"UPDATE sessions SET state=? WHERE session_id=? AND {_OWNS_SESSION} "
+                "AND state=?",
                 (state, session_id, owner_id, expected_state))
         if cur.rowcount:
             return
@@ -102,9 +126,8 @@ class Store:
                          f"{session_id} is not in the expected state {expected_state!r}")
 
     def get_session(self, session_id: str, *, owner_id: str) -> SessionRecord:
-        row = self._conn.execute(
-            f"SELECT {_SESSION_COLS} FROM sessions WHERE session_id=?", (session_id,)
-        ).fetchone()
+        row = self._conn.execute(f"{_SESSION_SELECT} WHERE s.session_id=?",
+                                 (session_id,)).fetchone()
         if row is None:
             raise NelixError(UNKNOWN_SESSION, f"no such session: {session_id}")
         if row["owner_id"] != owner_id:
@@ -113,28 +136,31 @@ class Store:
 
     def list_sessions(self, owner_id: str) -> list:
         rows = self._conn.execute(
-            f"SELECT {_SESSION_COLS} FROM sessions WHERE owner_id=? AND schema_version=? "
-            "ORDER BY created_at, session_id", (owner_id, SCHEMA_VERSION)).fetchall()
+            f"{_SESSION_SELECT} WHERE st.owner_id=? AND s.schema_version=? "
+            "ORDER BY s.created_at, s.session_id", (owner_id, SCHEMA_VERSION)).fetchall()
         records, _skipped = _read_rows(rows, SessionRecord)
         return records
 
     # ---- terminal records -----------------------------------------------------
     # These OUTLIVE their generation: the record must be here before the live session is
     # removed (design §5's ordering invariant).
-    def put_terminal(self, record: TerminalRecord) -> None:
-        """Insert-if-absent. A re-published record must never erase an acknowledgement the
-        owner already made."""
-        self._conn.execute(
-            f"INSERT INTO terminal ({_TERMINAL_COLS}) VALUES (?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(session_id) DO NOTHING",
-            (record.session_id, record.owner_id, record.orchestration_id,
-             record.generation_id, record.terminal_kind, record.summary,
-             record.ended_at, record.acknowledged_at, record.schema_version))
+    def put_terminal(self, session_id: str, *, terminal_kind: str, summary: str,
+                     ended_at: float) -> None:
+        """Insert-if-absent. Identity is the session's; a re-publish never erases an ack."""
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if self._conn.execute("SELECT 1 FROM sessions WHERE session_id=?",
+                                  (session_id,)).fetchone() is None:
+                raise NelixError(UNKNOWN_SESSION, f"no such session: {session_id}")
+            self._conn.execute(
+                "INSERT INTO terminal (session_id, terminal_kind, summary, ended_at, "
+                "acknowledged_at, schema_version) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(session_id) DO NOTHING",
+                (session_id, terminal_kind, summary, ended_at, None, SCHEMA_VERSION))
 
     def get_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
-        row = self._conn.execute(
-            f"SELECT {_TERMINAL_COLS} FROM terminal WHERE session_id=?", (session_id,)
-        ).fetchone()
+        row = self._conn.execute(f"{_TERMINAL_SELECT} WHERE t.session_id=?",
+                                 (session_id,)).fetchone()
         if row is None:
             raise NelixError(UNKNOWN_SESSION, f"no terminal record: {session_id}")
         if row["owner_id"] != owner_id:
@@ -143,8 +169,8 @@ class Store:
 
     def list_terminal(self, owner_id: str) -> list:
         rows = self._conn.execute(
-            f"SELECT {_TERMINAL_COLS} FROM terminal WHERE owner_id=? AND schema_version=? "
-            "ORDER BY ended_at, session_id", (owner_id, SCHEMA_VERSION)).fetchall()
+            f"{_TERMINAL_SELECT} WHERE st.owner_id=? AND t.schema_version=? "
+            "ORDER BY t.ended_at, t.session_id", (owner_id, SCHEMA_VERSION)).fetchall()
         records, _skipped = _read_rows(rows, TerminalRecord)
         return records
 
@@ -185,8 +211,9 @@ class Store:
             removed += self._conn.execute(
                 "DELETE FROM terminal WHERE session_id IN ("
                 "  SELECT session_id FROM ("
-                "    SELECT session_id, ROW_NUMBER() OVER ("
-                "      PARTITION BY owner_id ORDER BY ended_at DESC, session_id DESC"
-                "    ) AS rn FROM terminal"
+                "    SELECT t.session_id, ROW_NUMBER() OVER ("
+                "      PARTITION BY st.owner_id ORDER BY t.ended_at DESC, t.session_id DESC"
+                "    ) AS rn FROM terminal t "
+                "    JOIN starts st ON st.session_id = t.session_id"
                 "  ) WHERE rn > ?)", (max_count,)).rowcount
         return removed
