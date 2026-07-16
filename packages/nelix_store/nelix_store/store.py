@@ -19,7 +19,9 @@ from nelix_contracts.errors import (
     DUPLICATE_START, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, OWNER_MISMATCH, SCHEMA_TOO_NEW,
     STORE_CORRUPT, UNKNOWN_SESSION, NelixError,
 )
-from nelix_contracts.records import SCHEMA_VERSION, SessionRecord, TerminalRecord
+from nelix_contracts.records import (
+    SCHEMA_VERSION, SessionRecord, TerminalRecord, timestamp,
+)
 
 from .db import connect, translates_sqlite
 
@@ -281,7 +283,14 @@ class Store:
                              f"{max_age_seconds!r}")
         if isinstance(max_count, bool) or not isinstance(max_count, int) or max_count < 0:
             raise NelixError(INVALID_REQUEST, "max_count must be a non-negative int")
-        now = float(self._clock())
+        # Validating max_age_seconds above and then reading `now` from an UNCHECKED clock
+        # leaves the identical hole: a NaN now makes every (now - ended_at) > max_age
+        # comparison False, so nothing is ever reaped by age while the bound looks
+        # configured. +inf is worse — it reaps every record, acknowledged or not. Same rule
+        # as every stored timestamp, so it is the same helper, not a second copy of it.
+        # invalid_request names the right party: the clock is this Store's own construction
+        # argument, and no retry of the same call can fix it (retryable=False).
+        now = timestamp(self._clock(), "clock")
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             removed = self._conn.execute(

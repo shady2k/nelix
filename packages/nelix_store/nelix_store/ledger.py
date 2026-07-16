@@ -39,6 +39,23 @@ from .db import connect, translates_sqlite
 _COLS = ("session_id, owner_id, orchestration_id, idempotency_key, request_fingerprint, "
          "state, generation_id, reason, created_at")
 
+# Caller-supplied TEXT, stored durably, with no delete path for a reservation — so an
+# unbounded one is unbounded database growth. Bounded in BYTES, not characters: SQLite stores
+# UTF-8, so a character bound would let an astral-plane key cost 4x its advertised limit.
+# A key is an identifier and a fingerprint is a digest of the request (a hex sha512 is 128
+# bytes); both limits are far above any honest producer and far below "grow the db at will".
+MAX_IDEMPOTENCY_KEY_BYTES = 256
+MAX_REQUEST_FINGERPRINT_BYTES = 1024
+
+
+def _bounded_text(value, name, limit):
+    if not isinstance(value, str) or not value:
+        raise NelixError(INVALID_REQUEST, f"{name} must be a non-empty string: {value!r}")
+    size = len(value.encode("utf-8"))
+    if size > limit:
+        raise NelixError(INVALID_REQUEST,
+                         f"{name} must be at most {limit} bytes, got {size}")
+
 
 @dataclass(frozen=True)
 class Reservation:
@@ -85,12 +102,9 @@ class StartLedger:
             validate_orchestration_id(orchestration_id)
         except InvalidId as e:
             raise NelixError(INVALID_REQUEST, str(e)) from None
-        if not isinstance(idempotency_key, str) or not idempotency_key:
-            raise NelixError(INVALID_REQUEST,
-                             f"idempotency_key must be a non-empty string: "
-                             f"{idempotency_key!r}")
-        if not isinstance(request_fingerprint, str) or not request_fingerprint:
-            raise NelixError(INVALID_REQUEST, "request_fingerprint must be a non-empty string")
+        _bounded_text(idempotency_key, "idempotency_key", MAX_IDEMPOTENCY_KEY_BYTES)
+        _bounded_text(request_fingerprint, "request_fingerprint",
+                      MAX_REQUEST_FINGERPRINT_BYTES)
 
         session_id = self._mint()
         with self._conn:

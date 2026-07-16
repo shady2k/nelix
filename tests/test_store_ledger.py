@@ -4,7 +4,9 @@ import pytest
 
 from nelix_contracts import errors
 from nelix_contracts.errors import NelixError
-from nelix_store.ledger import StartLedger
+from nelix_store.ledger import (
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_REQUEST_FINGERPRINT_BYTES, StartLedger,
+)
 
 OID = "o-" + "2" * 32
 GID = "g-" + "3" * 32
@@ -187,6 +189,10 @@ def test_failing_an_already_started_session_is_refused(ledger):
 
 def test_committing_an_already_failed_session_is_refused(ledger):
     r = reserve(ledger)
+    # Assign FIRST, so the commit below matches the assigned generation and the
+    # collapsed-generation guard passes. Without this the generation guard fires instead
+    # (None != GID) with the same code, and deleting the failed-check leaves this test green.
+    ledger.assign_generation(r.session_id, GID)
     ledger.fail(r.session_id, "bad cwd")
     with pytest.raises(NelixError) as ei:
         ledger.commit(r.session_id, GID)
@@ -259,6 +265,49 @@ def test_a_malformed_idempotency_key_is_a_contract_error_not_a_crash(ledger, key
         ledger.reserve(idempotency_key=key, owner_id="hermes:local",
                        orchestration_id=OID, request_fingerprint=FP)
     assert ei.value.code == errors.INVALID_REQUEST
+
+
+@pytest.mark.parametrize("fp", [None, 123, "", {}])
+def test_a_malformed_request_fingerprint_is_a_contract_error_not_a_crash(ledger, fp):
+    # The mirror of the key check above, which had no test at all: deleting reserve's
+    # fingerprint validator left the entire ledger suite green. The fingerprint is what
+    # replay COMPARES, so an unvalidated one decides whether a retry spawns a second worker.
+    with pytest.raises(NelixError) as ei:
+        ledger.reserve(idempotency_key="k1", owner_id="hermes:local",
+                       orchestration_id=OID, request_fingerprint=fp)
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+def test_an_oversized_idempotency_key_is_refused(ledger):
+    # Unbounded, a caller grows the db without limit: the key is stored durably and there is
+    # no delete path for a reservation.
+    with pytest.raises(NelixError) as ei:
+        ledger.reserve(idempotency_key="k" * (MAX_IDEMPOTENCY_KEY_BYTES + 1),
+                       owner_id="hermes:local", orchestration_id=OID, request_fingerprint=FP)
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+def test_an_oversized_request_fingerprint_is_refused(ledger):
+    with pytest.raises(NelixError) as ei:
+        ledger.reserve(idempotency_key="k1", owner_id="hermes:local", orchestration_id=OID,
+                       request_fingerprint="f" * (MAX_REQUEST_FINGERPRINT_BYTES + 1))
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+def test_the_bound_is_on_bytes_not_characters(ledger):
+    # SQLite stores UTF-8, so a character bound would let an astral-plane key cost 4x its
+    # advertised limit. One character under the limit, four bytes over it.
+    with pytest.raises(NelixError) as ei:
+        ledger.reserve(idempotency_key="\U0001f600" * (MAX_IDEMPOTENCY_KEY_BYTES // 4) + "k",
+                       owner_id="hermes:local", orchestration_id=OID, request_fingerprint=FP)
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+def test_a_key_at_the_limit_is_accepted(ledger):
+    # The bound must refuse what is OVER it, not what is AT it.
+    r = ledger.reserve(idempotency_key="k" * MAX_IDEMPOTENCY_KEY_BYTES, owner_id="hermes:local",
+                       orchestration_id=OID, request_fingerprint="f" * MAX_REQUEST_FINGERPRINT_BYTES)
+    assert r.state == "starting"
 
 
 def test_the_ledger_survives_a_restart(tmp_path):

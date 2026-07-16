@@ -1,3 +1,6 @@
+import errno
+import fcntl
+import os
 import sqlite3
 import subprocess
 import sys
@@ -349,6 +352,64 @@ def test_sqlite_result_codes_map_to_the_right_party(code, expected):
     e = sqlite3.OperationalError("x")
     e.sqlite_errorcode = code
     assert db.classify_sqlite_error(e).code == expected
+
+
+def _connect_off_thread(tmp_path, timeout):
+    """Run connect() on a thread and report (code, elapsed), or nothing if it never returned.
+
+    Off-thread deliberately: these tests exist to pin a DEADLINE, and a deadline check whose
+    deletion turns the loop infinite must surface as a failed assertion, not as a wedged
+    pytest that has to be killed.
+    """
+    out = []
+
+    def go():
+        start = time.monotonic()
+        try:
+            db.connect(tmp_path, timeout=timeout)
+            out.append(("returned-without-raising", time.monotonic() - start))
+        except NelixError as e:
+            out.append((e.code, time.monotonic() - start))
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(timeout=30)
+    return out
+
+
+def test_a_wedged_bootstrap_holder_times_out_within_its_bound(tmp_path):
+    # The timeout had NO negative control at all: nothing wedged a holder, so the advertised
+    # bound was never once exercised. flock is per open file DESCRIPTION, not per process, so
+    # a second fd here contends exactly as another opener's would — no subprocess needed.
+    fd = os.open(tmp_path / db.LOCK_FILENAME, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        out = _connect_off_thread(tmp_path, 0.3)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert out, "connect() never returned against a wedged holder: the bound is not a bound"
+    code, elapsed = out[0]
+    assert code == errors.STORE_UNAVAILABLE      # a wedged holder is unavailable, not corrupt
+    assert elapsed >= 0.3, "returned before the deadline: it did not wait for the lock"
+    assert elapsed < 10, f"overran its {0.3}s bound: {elapsed}s"
+
+
+def test_a_signal_storm_cannot_spin_past_the_advertised_bound(tmp_path, monkeypatch):
+    # Retrying on EINTR is correct — a signal interrupted the syscall. Not rechecking the
+    # deadline on that branch is not: a process taking signals continuously would spin past
+    # the bound indefinitely. A real signal storm is not deterministic; every flock call
+    # failing EINTR is the same branch with none of the timing luck.
+    def always_eintr(fd, op):
+        raise OSError(errno.EINTR, "interrupted system call")
+
+    monkeypatch.setattr(db.fcntl, "flock", always_eintr)
+    out = _connect_off_thread(tmp_path, 0.3)
+    assert out, "connect() never returned under continuous EINTR: it spun past its bound"
+    code, elapsed = out[0]
+    assert code == errors.STORE_UNAVAILABLE
+    assert elapsed >= 0.3, "returned before the deadline"
+    assert elapsed < 10, f"overran its {0.3}s bound: {elapsed}s"
 
 
 def test_close_does_not_leak_a_raw_sqlite_error(tmp_path):

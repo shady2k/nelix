@@ -372,3 +372,20 @@ def test_prune_rejects_a_nonsense_max_age(store, bad):
     with pytest.raises(NelixError) as ei:
         store.prune_terminal(max_age_seconds=bad, max_count=1)
     assert ei.value.code == errors.INVALID_REQUEST
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), True,
+                                 "not-a-number", None])
+def test_prune_rejects_a_nonsense_clock(tmp_path, bad):
+    # The SAME defect as the max_age guard above, re-entering through the injected clock:
+    # validating the parameter and then reading `now` from an unchecked clock leaves the
+    # identical hole. NaN reaps NOTHING (every comparison False) while the bound looks
+    # configured; +inf is worse and reaps EVERY record including unacknowledged ones; a
+    # non-numeric clock escaped store.py as a raw ValueError/TypeError, not a contract error.
+    store = Store(tmp_path, clock=lambda: bad)
+    try:
+        with pytest.raises(NelixError) as ei:
+            store.prune_terminal(max_age_seconds=60, max_count=100)
+        assert ei.value.code == errors.INVALID_REQUEST
+    finally:
+        store.close()
