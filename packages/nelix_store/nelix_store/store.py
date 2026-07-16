@@ -160,16 +160,38 @@ class Store:
     # removed (design §5's ordering invariant).
     def put_terminal(self, session_id: str, *, terminal_kind: str, summary: str,
                      ended_at: float) -> None:
-        """Insert-if-absent. Identity is the session's; a re-publish never erases an ack."""
+        """Publish the terminal result. Identity is the session's.
+
+        Idempotent for the SAME result; a DIFFERENT result is a conflict — the same policy
+        ledger.fail() already applies to the same question. Silently discarding a
+        conflicting retry (rev 4) reports success while keeping the old result, and no
+        higher layer can repair that afterwards.
+        """
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
-            if self._conn.execute("SELECT 1 FROM sessions WHERE session_id=?",
-                                  (session_id,)).fetchone() is None:
+            start = self._conn.execute(
+                "SELECT st.owner_id, st.orchestration_id, st.generation_id FROM sessions s "
+                "JOIN starts st ON st.session_id = s.session_id WHERE s.session_id=?",
+                (session_id,)).fetchone()
+            if start is None:
                 raise NelixError(UNKNOWN_SESSION, f"no such session: {session_id}")
+            # Validate before writing; identity from the join cannot disagree.
+            TerminalRecord(session_id=session_id, owner_id=start["owner_id"],
+                           orchestration_id=start["orchestration_id"],
+                           generation_id=start["generation_id"],
+                           terminal_kind=terminal_kind, summary=summary, ended_at=ended_at)
+            existing = self._conn.execute(
+                "SELECT terminal_kind, summary, ended_at FROM terminal WHERE session_id=?",
+                (session_id,)).fetchone()
+            if existing is not None:
+                if (existing["terminal_kind"], existing["summary"], existing["ended_at"]) == (
+                        terminal_kind, summary, ended_at):
+                    return                      # same result: idempotent, ack untouched
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 f"{session_id} already ended as {existing['terminal_kind']!r}")
             self._conn.execute(
                 "INSERT INTO terminal (session_id, terminal_kind, summary, ended_at, "
-                "acknowledged_at, schema_version) VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(session_id) DO NOTHING",
+                "acknowledged_at, schema_version) VALUES (?,?,?,?,?,?)",
                 (session_id, terminal_kind, summary, ended_at, None, SCHEMA_VERSION))
 
     def get_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
@@ -189,17 +211,21 @@ class Store:
         return records
 
     def ack_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
-        """Compare-and-set, so concurrent acks agree on ONE timestamp: the UPDATE only fires
-        while acknowledged_at IS NULL. rev 1 read-modify-wrote this and the later writer won.
+        """Idempotent: a repeated ack returns the SAME record with its ORIGINAL timestamp.
+
+        The whole operation is one transaction: rev 4 read, CAS'd and re-read without one, so
+        a prune landing between the CAS and the re-read made an ack that DURABLY SUCCEEDED
+        report unknown_session.
         """
-        record = self.get_terminal(session_id, owner_id=owner_id)   # owner guard first
-        if record.acknowledged_at is not None:
-            return record
-        self._conn.execute(
-            "UPDATE terminal SET acknowledged_at=? WHERE session_id=? "
-            "AND acknowledged_at IS NULL", (float(self._clock()), session_id))
-        # Re-read: whoever won the CAS, everyone returns the same stamp.
-        return self.get_terminal(session_id, owner_id=owner_id)
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            record = self.get_terminal(session_id, owner_id=owner_id)   # owner guard first
+            if record.acknowledged_at is not None:
+                return record
+            self._conn.execute(
+                "UPDATE terminal SET acknowledged_at=? WHERE session_id=? "
+                "AND acknowledged_at IS NULL", (float(self._clock()), session_id))
+            return self.get_terminal(session_id, owner_id=owner_id)
 
     def prune_terminal(self, *, max_age_seconds: float, max_count: int) -> int:
         """Drop acknowledged records; bound the rest by age, and by count PER OWNER.

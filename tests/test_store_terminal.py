@@ -50,6 +50,37 @@ def started_session(store, ledger, owner="hermes:local", key="k1", **over):
     return r.session_id
 
 
+def test_republishing_the_same_terminal_result_is_idempotent(store, ledger):
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
+    store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
+    assert store.get_terminal(sid, owner_id="hermes:local").terminal_kind == "done"
+
+
+def test_republishing_a_DIFFERENT_terminal_result_is_a_conflict(store, ledger):
+    # ledger.fail() raises on exactly this shape ("a durable failure result must not be
+    # rewritten under a replay"). Two durable-result writers in one package must not answer
+    # the same question in opposite ways.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
+    with pytest.raises(NelixError) as ei:
+        store.put_terminal(sid, terminal_kind="error", summary="crashed", ended_at=6.0)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+    assert store.get_terminal(sid, owner_id="hermes:local").terminal_kind == "done"
+
+
+def test_republishing_after_an_ack_neither_conflicts_nor_erases_the_ack(store, ledger):
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
+    store.ack_terminal(sid, owner_id="hermes:local")
+    store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
+    assert store.get_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
+
+
+def _live_session(store, ledger, owner="hermes:local", key="k1", **over):
+    return started_session(store, ledger, owner=owner, key=key, state="running", **over)
+
+
 def test_a_terminal_record_cannot_exist_without_its_session(store):
     with pytest.raises(NelixError) as ei:
         store.put_terminal("s-" + "9" * 32, terminal_kind="done", summary="s", ended_at=1.0)
