@@ -1,5 +1,8 @@
 import sqlite3
+import subprocess
+import sys
 import threading
+import time
 
 import pytest
 
@@ -59,34 +62,115 @@ def test_the_reservation_key_is_unique_per_owner(tmp_path):
     conn.execute(ins, ("s-3", "o2", "orch", "k1", "fp", "starting", None, None, 1.0))
 
 
-def test_concurrent_first_open_never_leaks_a_raw_sqlite_exception(tmp_path):
-    # A reviewer measured 9 failures in 320 concurrent opens of a fresh store: 6 IntegrityError
-    # on meta.key, 3 "database is locked". Both escaped raw. An upgrade IS a new generation
-    # booting beside the old, so this is the designed topology, not an exotic case.
-    barrier = threading.Barrier(8)
-    conns, errs = [], []
+def test_concurrent_first_open_across_processes_never_fails(tmp_path):
+    # PROCESSES, not threads: generations are separate processes and the bootstrap lock is
+    # inter-process. rev 3's thread-only test could not exercise the mechanism it guards.
+    #
+    # The gate file is a real barrier — without it, process start-up jitter means they never
+    # collide and the test proves nothing.
+    root = tmp_path / "store"
+    gate = tmp_path / "gate"
+    code = (
+        "import time, pathlib\n"
+        "from nelix_store import db\n"
+        f"gate = pathlib.Path({str(gate)!r})\n"
+        "while not gate.exists():\n"
+        "    time.sleep(0.005)\n"
+        f"c = db.connect({str(root)!r})\n"
+        "c.close()\n"
+        "print('ok')\n"
+    )
+    procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) for _ in range(8)]
+    try:
+        time.sleep(1.0)          # let every process reach the gate
+        gate.touch()
+        outs = [p.communicate(timeout=60) for p in procs]
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+    failures = [f"rc={p.returncode}: {err.strip()}"
+                for p, (_out, err) in zip(procs, outs) if p.returncode != 0]
+    assert failures == [], f"concurrent first open failed: {failures}"
+    assert all(out.strip() == "ok" for out, _err in outs)
 
-    def go():
-        barrier.wait()
+
+def test_concurrent_version_stamping_is_atomic(tmp_path):
+    # This test deliberately excludes WAL conversion: the store is bootstrapped ONCE first,
+    # so the journal is already converted and the ONLY race left is the meta stamp. rev 3
+    # conflated the two, which is why its mutant "failed" 1/10 — it was failing for the WAL
+    # race, not for the guard under test, so it proved nothing either way.
+    db.connect(tmp_path).close()
+
+    conns = []
+    for _ in range(4):
+        # check_same_thread=False: each connection is created here, in the main thread, but
+        # handed to a DIFFERENT worker thread below. Without this, sqlite3's default
+        # thread-affinity check raises ProgrammingError on first use — deterministically,
+        # not a race — which proved nothing about the guard under test. (Every other
+        # concurrency test in this package has each thread open its OWN connection instead;
+        # this test can't, because the barrier proxy must wrap a specific connection object.)
+        c = sqlite3.connect(tmp_path / db.DB_FILENAME, isolation_level=None,
+                            check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        conns.append(c)
+    conns[0].execute("DELETE FROM meta")
+
+    barrier = threading.Barrier(4)
+    errs = []
+
+    def go(conn):
         try:
-            conn = db.connect(tmp_path)
-            conns.append(conn)
-            # sqlite3 connections are thread-affine (stdlib restriction, unrelated to the
-            # guard under test): closing from the main thread after join() raises
-            # ProgrammingError regardless of db.py's correctness, so each thread closes its
-            # own connection here rather than handing it to the joiner.
-            conn.close()
-        except BaseException as e:          # noqa: BLE001 - the point is to catch EVERYTHING
+            db._check_or_stamp_version(_StampBarrier(conn, barrier))
+        except BaseException as e:      # noqa: BLE001 - account for everything
             errs.append(f"{type(e).__name__}: {e}")
 
-    threads = [threading.Thread(target=go) for _ in range(8)]
+    threads = [threading.Thread(target=go, args=(c,)) for c in conns]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=30)
-    assert all(not t.is_alive() for t in threads), "a thread hung opening the database"
-    assert errs == [], f"concurrent open leaked: {errs}"
-    assert len(conns) == 8
+    try:
+        assert all(not t.is_alive() for t in threads), "a thread hung stamping the version"
+        assert errs == [], f"concurrent stamping failed: {errs}"
+        row = conns[0].execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        assert int(row["value"]) == db.SCHEMA_VERSION
+    finally:
+        for c in conns:
+            c.close()
+
+
+class _StampBarrier:
+    """Delegates to a real connection, but pauses every read of the version stamp at a
+    barrier BEFORE returning its result.
+
+    This is what makes the race DETERMINISTIC rather than probabilistic. Under rev 2's
+    SELECT-then-INSERT, all four callers reach the barrier having each observed "missing",
+    are released together, and then all four INSERT — three hit the UNIQUE constraint, every
+    run. A correct INSERT OR IGNORE inserts BEFORE it reads, so the barrier changes nothing
+    for it.
+    """
+
+    def __init__(self, conn, barrier):
+        self._conn = conn
+        self._barrier = barrier
+
+    def execute(self, sql, params=()):
+        cur = self._conn.execute(sql, params)
+        if "SELECT value FROM meta" in sql:
+            row = cur.fetchone()
+            self._barrier.wait(timeout=20)
+            return _OneRow(row)
+        return cur
+
+
+class _OneRow:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
 
 
 def test_a_future_database_schema_raises_store_corrupt_specifically(tmp_path):
