@@ -105,3 +105,36 @@ def test_a_non_duplicate_integrity_failure_is_not_reported_as_a_duplicate_start(
             " state, executor, task, cwd, model, created_at, schema_version)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (SID, None, OID, GID, "starting", "coder", "t", "/repo", None, 1.0, 1))
+
+
+def test_a_corrupt_row_does_not_blind_an_owner_to_their_healthy_rows(store):
+    # SQLite has AFFINITY, not types: a REAL column stores 'yesterday' verbatim. The row
+    # passes the schema filter and then explodes in from_dict — so rev 2's list_sessions
+    # raised and the owner lost their whole board to one bad row.
+    store.create_session(make_session(SID))
+    store._conn.execute(
+        "INSERT INTO sessions (session_id, owner_id, orchestration_id, generation_id, state,"
+        " executor, task, cwd, model, created_at, schema_version)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("s-" + "7" * 32, "hermes:local", OID, GID, "running", "coder", "t", "/repo",
+         None, "yesterday", 1))
+    assert [r.session_id for r in store.list_sessions("hermes:local")] == [SID]
+
+
+def test_transition_rejects_a_state_the_records_layer_would_reject(store):
+    store.create_session(make_session())
+    with pytest.raises(NelixError) as ei:
+        store.transition_session(SID, owner_id="hermes:local", state=42)
+    assert ei.value.code == errors.INVALID_REQUEST
+    assert store.get_session(SID, owner_id="hermes:local").state == "starting"
+
+
+def test_transition_can_be_conditional_on_the_expected_state(store):
+    store.create_session(make_session(state="starting"))
+    store.transition_session(SID, owner_id="hermes:local", state="running",
+                             expected_state="starting")
+    with pytest.raises(NelixError) as ei:
+        store.transition_session(SID, owner_id="hermes:local", state="done",
+                                 expected_state="starting")   # stale
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+    assert store.get_session(SID, owner_id="hermes:local").state == "running"

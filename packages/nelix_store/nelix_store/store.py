@@ -6,9 +6,8 @@ with it.
 
 Two rules that look similar and are not:
   * `get_*` FAILS CLOSED on a record it cannot read — the caller asked for that record.
-  * `list_*` SKIPS what it cannot read — one unreadable row must not blind an owner to their
-    own board. During an upgrade a newer generation writing v2 rows is the DESIGNED state,
-    not an error.
+  * `list_*` SKIPS any row it cannot read — future schema, corrupt affinity, anything. One
+    unreadable row must never blind an owner to their own board.
 
 The clock is injectable: tests freeze it rather than sleep (the nelix-3s3 pattern).
 """
@@ -16,7 +15,8 @@ import sqlite3
 import time
 
 from nelix_contracts.errors import (
-    DUPLICATE_START, INVALID_REQUEST, OWNER_MISMATCH, STORE_CORRUPT, UNKNOWN_SESSION, NelixError,
+    DUPLICATE_START, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, OWNER_MISMATCH, STORE_CORRUPT,
+    UNKNOWN_SESSION, NelixError,
 )
 from nelix_contracts.records import SCHEMA_VERSION, SessionRecord, TerminalRecord
 
@@ -26,6 +26,24 @@ _SESSION_COLS = ("session_id, owner_id, orchestration_id, generation_id, state, 
                  "task, cwd, model, created_at, schema_version")
 _TERMINAL_COLS = ("session_id, owner_id, orchestration_id, generation_id, terminal_kind, "
                   "summary, ended_at, acknowledged_at, schema_version")
+
+
+def _read_rows(rows, record_type):
+    """Deserialise what we can, SKIP what we cannot.
+
+    The contract (design §5 / this module's docstring) is that one unreadable row must never
+    blind an owner to their own board. rev 2 filtered only on schema_version, but SQLite has
+    AFFINITY rather than types, so a row can be the current schema and still be garbage —
+    and then the raise escaped the whole call, which is the very failure the filter existed
+    to prevent. Skip on ANY per-row failure.
+    """
+    out, skipped = [], 0
+    for row in rows:
+        try:
+            out.append(record_type.from_dict(dict(row)))
+        except NelixError:
+            skipped += 1     # future schema, corrupt affinity, anything: not our caller's problem
+    return out, skipped
 
 
 class Store:
@@ -56,15 +74,32 @@ class Store:
             raise NelixError(DUPLICATE_START,
                              f"session already exists: {record.session_id}") from None
 
-    def transition_session(self, session_id: str, *, owner_id: str, state: str) -> None:
-        """Move ONLY the state, and only for the owner. Everything else is identity."""
-        cur = self._conn.execute(
-            "UPDATE sessions SET state=? WHERE session_id=? AND owner_id=?",
-            (state, session_id, owner_id))
+    def transition_session(self, session_id: str, *, owner_id: str, state: str,
+                           expected_state=None) -> None:
+        """Move ONLY the state, and only for the owner. Everything else is identity.
+
+        `state` is validated here because SQLite's TEXT affinity would silently coerce 42 to
+        '42' and round-trip it forever — defeating the records layer's guarantee that a
+        malformed field surfaces at its cause.
+
+        `expected_state` makes the write a compare-and-set: without it, two concurrent
+        transitions are last-writer-wins and a stale one can resurrect a finished session.
+        """
+        if not isinstance(state, str) or not state:
+            raise NelixError(INVALID_REQUEST, f"state must be a non-empty string: {state!r}")
+        if expected_state is None:
+            cur = self._conn.execute(
+                "UPDATE sessions SET state=? WHERE session_id=? AND owner_id=?",
+                (state, session_id, owner_id))
+        else:
+            cur = self._conn.execute(
+                "UPDATE sessions SET state=? WHERE session_id=? AND owner_id=? AND state=?",
+                (state, session_id, owner_id, expected_state))
         if cur.rowcount:
             return
         self.get_session(session_id, owner_id=owner_id)   # raises UNKNOWN_SESSION / OWNER_MISMATCH
-        raise NelixError(INVALID_REQUEST, f"could not transition {session_id}")
+        raise NelixError(IDEMPOTENCY_CONFLICT,
+                         f"{session_id} is not in the expected state {expected_state!r}")
 
     def get_session(self, session_id: str, *, owner_id: str) -> SessionRecord:
         row = self._conn.execute(
@@ -77,12 +112,11 @@ class Store:
         return SessionRecord.from_dict(dict(row))   # fails closed on a future schema
 
     def list_sessions(self, owner_id: str) -> list:
-        # Filtered in SQL: a row this build cannot read is skipped, not raised. get_session
-        # still fails closed on that same row.
         rows = self._conn.execute(
-            f"SELECT {_SESSION_COLS} FROM sessions WHERE owner_id=? AND schema_version<=? "
+            f"SELECT {_SESSION_COLS} FROM sessions WHERE owner_id=? AND schema_version=? "
             "ORDER BY created_at, session_id", (owner_id, SCHEMA_VERSION)).fetchall()
-        return [SessionRecord.from_dict(dict(r)) for r in rows]
+        records, _skipped = _read_rows(rows, SessionRecord)
+        return records
 
     # ---- terminal records -----------------------------------------------------
     # These OUTLIVE their generation: the record must be here before the live session is
@@ -109,9 +143,10 @@ class Store:
 
     def list_terminal(self, owner_id: str) -> list:
         rows = self._conn.execute(
-            f"SELECT {_TERMINAL_COLS} FROM terminal WHERE owner_id=? AND schema_version<=? "
+            f"SELECT {_TERMINAL_COLS} FROM terminal WHERE owner_id=? AND schema_version=? "
             "ORDER BY ended_at, session_id", (owner_id, SCHEMA_VERSION)).fetchall()
-        return [TerminalRecord.from_dict(dict(r)) for r in rows]
+        records, _skipped = _read_rows(rows, TerminalRecord)
+        return records
 
     def ack_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
         """Compare-and-set, so concurrent acks agree on ONE timestamp: the UPDATE only fires

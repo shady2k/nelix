@@ -153,3 +153,30 @@ def test_terminal_reads_are_owner_filtered(store):
         store.get_terminal(sid, owner_id="claude-code:1")
     assert ei.value.code == errors.OWNER_MISMATCH
     assert store.list_terminal("claude-code:1") == []
+
+
+def test_one_future_schema_row_does_not_brick_an_owners_terminal_board(store):
+    # The untested half of rev 2's Critical fix: list_sessions was covered, list_terminal
+    # was not.
+    sid = "s-" + "1" * 32
+    store.put_terminal(make_terminal(sid))
+    store._conn.execute(
+        "INSERT INTO terminal (session_id, owner_id, orchestration_id, generation_id,"
+        " terminal_kind, summary, ended_at, acknowledged_at, schema_version)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        ("s-" + "8" * 32, "hermes:local", OID, GID, "done", "s", 200.0, None, 99))
+    assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid]
+    with pytest.raises(NelixError) as ei:
+        store.get_terminal("s-" + "8" * 32, owner_id="hermes:local")
+    assert ei.value.code == errors.SCHEMA_TOO_NEW
+
+
+def test_a_corrupt_terminal_row_does_not_blind_an_owner(store):
+    sid = "s-" + "1" * 32
+    store.put_terminal(make_terminal(sid))
+    store._conn.execute(
+        "INSERT INTO terminal (session_id, owner_id, orchestration_id, generation_id,"
+        " terminal_kind, summary, ended_at, acknowledged_at, schema_version)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        ("s-" + "7" * 32, "hermes:local", OID, GID, "done", "s", "soon", None, 1))
+    assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid]
