@@ -92,7 +92,8 @@ def test_concurrent_acks_agree_on_one_timestamp(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=30)
+    assert all(not t.is_alive() for t in threads), "a thread hung"
     assert len(results) == 8
     assert len(set(results)) == 1, f"acks disagreed on the timestamp: {sorted(set(results))}"
 

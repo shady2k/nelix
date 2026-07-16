@@ -78,17 +78,27 @@ def test_two_owners_may_use_the_same_key_string_independently(ledger):
 
 
 def test_exactly_one_reservation_survives_a_race(tmp_path):
-    # rev 1's check-then-write could interleave and mint TWO session ids for one key — two
+    # rev 2's check-then-write could interleave and mint TWO session ids for one key — two
     # workers for one task. No sequential test can see this.
+    #
+    # NOTE the assertions: rev 2 asserted only `not errs` and `len(set(results)) == 1`, which
+    # a single surviving thread satisfies. Seven threads could crash and the test still
+    # passed, its only signal a thread-exception warning this project dismisses. Every thread
+    # must be ACCOUNTED FOR.
     results, errs, barrier = [], [], threading.Barrier(8)
 
     def go():
-        lg = StartLedger(tmp_path, clock=lambda: 1000.0)
+        try:
+            lg = StartLedger(tmp_path, clock=lambda: 1000.0)
+        except BaseException as e:          # noqa: BLE001 - account for EVERYTHING
+            errs.append(f"open: {type(e).__name__}: {e}")
+            barrier.wait()
+            return
         barrier.wait()
         try:
             results.append(reserve(lg).session_id)
-        except NelixError as e:      # a loser may legitimately see a conflict
-            errs.append(e.code)
+        except BaseException as e:          # noqa: BLE001
+            errs.append(f"reserve: {type(e).__name__}: {e}")
         finally:
             lg.close()
 
@@ -96,9 +106,13 @@ def test_exactly_one_reservation_survives_a_race(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-    assert not errs, f"unexpected errors: {errs}"
-    assert len(set(results)) == 1, f"the race minted {len(set(results))} sessions: {set(results)}"
+        t.join(timeout=30)
+
+    assert all(not t.is_alive() for t in threads), "a thread hung"
+    assert len(results) + len(errs) == 8, "a thread vanished without a result or an error"
+    assert errs == [], f"threads failed: {errs}"
+    assert len(results) == 8, "every caller sending the same fingerprint must succeed"
+    assert len(set(results)) == 1, f"the race minted {len(set(results))} sessions"
 
 
 def test_lookup_is_owner_guarded(ledger):
