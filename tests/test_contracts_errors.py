@@ -67,3 +67,13 @@ def test_store_unavailable_is_retryable_and_distinct_from_corrupt():
     assert errors.STORE_UNAVAILABLE != errors.STORE_CORRUPT
     assert NelixError(errors.STORE_UNAVAILABLE, "m").retryable is True
     assert NelixError(errors.STORE_CORRUPT, "m").retryable is False
+
+
+def test_store_unsupported_is_permanent_and_distinct_from_unavailable():
+    # "Retryable" means the SAME call may succeed later. An SQLite older than 3.25 will not
+    # age forward and an NFS NELIX_HOME will not become local — retrying either forever is
+    # exactly the wrong behaviour, and STORE_CORRUPT is the wrong meaning (the database is
+    # fine; the host is not).
+    assert errors.STORE_UNSUPPORTED not in (errors.STORE_UNAVAILABLE, errors.STORE_CORRUPT)
+    assert NelixError(errors.STORE_UNSUPPORTED, "m").retryable is False
+    assert NelixError(errors.STORE_UNAVAILABLE, "m").retryable is True

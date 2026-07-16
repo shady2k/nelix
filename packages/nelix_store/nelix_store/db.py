@@ -16,7 +16,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from nelix_contracts.errors import STORE_CORRUPT, STORE_UNAVAILABLE, NelixError
+from nelix_contracts.errors import STORE_CORRUPT, STORE_UNAVAILABLE, STORE_UNSUPPORTED, NelixError
 
 DB_FILENAME = "nelix.db"
 SCHEMA_VERSION = 1
@@ -113,7 +113,7 @@ def _bootstrap_lock(root: Path, timeout: float):
 
 def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
     if sqlite3.sqlite_version_info < MIN_SQLITE:
-        raise NelixError(STORE_UNAVAILABLE,
+        raise NelixError(STORE_UNSUPPORTED,
                          f"SQLite {'.'.join(map(str, MIN_SQLITE))}+ required "
                          f"(found {sqlite3.sqlite_version})")
     path = Path(root)
@@ -139,7 +139,7 @@ def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
                     # not provide, and no lock of ours can supply them. nelix is single-host
                     # by design; fail loudly rather than run without durability guarantees.
                     raise NelixError(
-                        STORE_UNAVAILABLE,
+                        STORE_UNSUPPORTED,
                         f"could not enable WAL (journal_mode={actual!r}); NELIX_HOME must be "
                         f"on a host-local filesystem")
             conn.execute("PRAGMA synchronous=FULL")

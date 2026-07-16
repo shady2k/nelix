@@ -211,3 +211,43 @@ def test_the_sqlite_feature_floor_is_asserted_at_open(tmp_path):
     # used, not where it is tested.
     assert sqlite3.sqlite_version_info >= db.MIN_SQLITE
     db.connect(tmp_path).close()
+
+
+def test_an_unsupported_sqlite_is_permanent_not_retryable(tmp_path, monkeypatch):
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 24, 0))
+    with pytest.raises(NelixError) as ei:
+        db.connect(tmp_path)
+    assert ei.value.code == errors.STORE_UNSUPPORTED
+    assert ei.value.retryable is False
+
+
+def test_a_filesystem_that_cannot_do_wal_is_permanent_not_retryable(tmp_path, monkeypatch):
+    # Simulates a network NELIX_HOME: WAL needs shared-memory + locking semantics NFS/SMB do
+    # not provide, and no lock of ours can supply them.
+    #
+    # NOTE (f1k-rev5): the brief's original version of this test assigned `conn.execute =
+    # execute` on a live sqlite3.Connection instance. sqlite3.Connection is a C-extension
+    # type with no instance __dict__ for its methods, so that raises
+    # `AttributeError: 'sqlite3.Connection' object attribute 'execute' is read-only` before
+    # db.connect() is ever reached — the test cannot run as given. A Connection SUBCLASS can
+    # override execute() (verified), so the interception moves there via factory=; the
+    # simulated scenario and assertions are unchanged.
+    real_connect = sqlite3.connect
+
+    class _FakeWALConnection(sqlite3.Connection):
+        def execute(self, sql, params=()):
+            if "journal_mode" in sql:
+                class _R:
+                    def fetchone(self_inner):
+                        return ("delete",)      # the conversion silently did not take
+                return _R()
+            return super().execute(sql, params)
+
+    def fake_connect(*a, **kw):
+        kw.setdefault("factory", _FakeWALConnection)
+        return real_connect(*a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+    with pytest.raises(NelixError) as ei:
+        db.connect(tmp_path)
+    assert ei.value.code == errors.STORE_UNSUPPORTED

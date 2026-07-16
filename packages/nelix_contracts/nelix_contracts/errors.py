@@ -19,6 +19,7 @@ SCHEMA_TOO_NEW = "schema_too_new"
 IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 STORE_CORRUPT = "store_corrupt"
 STORE_UNAVAILABLE = "store_unavailable"
+STORE_UNSUPPORTED = "store_unsupported"
 
 # retryable=True means: the SAME call, unchanged, may succeed later.
 # It is deliberately False for the cursor conditions — they mean "refetch the board and
@@ -39,6 +40,7 @@ _RETRYABLE = {
     IDEMPOTENCY_CONFLICT: False,
     STORE_CORRUPT: False,
     STORE_UNAVAILABLE: True,     # busy / lock contention / environment: the same call may work later
+    STORE_UNSUPPORTED: False,    # a permanent environment defect: retrying cannot help
 }
 
 ALL_CODES = frozenset(_RETRYABLE)
