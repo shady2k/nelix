@@ -33,7 +33,13 @@ def _text(value, name):
     return value
 
 
-def _timestamp(value, name, *, optional=False):
+def timestamp(value, name, *, optional=False):
+    """The one rule for a moment in time, on disk or in hand.
+
+    Public because it is not only a field validator: an unchecked CLOCK read reintroduces
+    exactly what it rejects — a NaN `now` makes every comparison against it False, which
+    silently disables whatever the comparison was bounding.
+    """
     if value is None:
         if optional:
             return None
@@ -87,7 +93,7 @@ class SessionRecord:
             _text(getattr(self, name), name)
         if self.model is not None:
             _text(self.model, "model")
-        _timestamp(self.created_at, "created_at")
+        timestamp(self.created_at, "created_at")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -120,8 +126,8 @@ class TerminalRecord:
         _ids(self.session_id, self.owner_id, self.orchestration_id, self.generation_id)
         _text(self.terminal_kind, "terminal_kind")
         _text(self.summary, "summary")
-        _timestamp(self.ended_at, "ended_at")
-        _timestamp(self.acknowledged_at, "acknowledged_at", optional=True)
+        timestamp(self.ended_at, "ended_at")
+        timestamp(self.acknowledged_at, "acknowledged_at", optional=True)
 
     def to_dict(self) -> dict:
         return asdict(self)
