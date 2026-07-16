@@ -73,6 +73,8 @@ def test_concurrent_acks_agree_on_one_timestamp(tmp_path):
     # later write won — so "the original timestamp never changes" was false under the only
     # conditions that matter. Sequential tests cannot see this.
     ticks = iter(range(1, 10_000))
+    # This first Store() also bootstraps the database, so the threads below race ONLY the
+    # ack CAS — not concurrent first-open.
     store = Store(tmp_path, clock=lambda: float(next(ticks)))
     sid = "s-" + "1" * 32
     store.put_terminal(make_terminal(sid))

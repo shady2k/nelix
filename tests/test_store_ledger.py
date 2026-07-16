@@ -85,6 +85,12 @@ def test_exactly_one_reservation_survives_a_race(tmp_path):
     # a single surviving thread satisfies. Seven threads could crash and the test still
     # passed, its only signal a thread-exception warning this project dismisses. Every thread
     # must be ACCOUNTED FOR.
+    #
+    # Bootstrap ONCE, outside the race. This test's invariant is "one reservation per
+    # (owner, key)", not "concurrent first-open works" — that is test_store_db.py's job.
+    # Racing both at once is what made rev 3's mutation signal unreadable.
+    StartLedger(tmp_path, clock=lambda: 1000.0).close()
+
     results, errs, barrier = [], [], threading.Barrier(8)
 
     def go():
