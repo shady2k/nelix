@@ -187,6 +187,10 @@ def test_failing_an_already_started_session_is_refused(ledger):
 
 def test_committing_an_already_failed_session_is_refused(ledger):
     r = reserve(ledger)
+    # Assign FIRST, so the commit below matches the assigned generation and the
+    # collapsed-generation guard passes. Without this the generation guard fires instead
+    # (None != GID) with the same code, and deleting the failed-check leaves this test green.
+    ledger.assign_generation(r.session_id, GID)
     ledger.fail(r.session_id, "bad cwd")
     with pytest.raises(NelixError) as ei:
         ledger.commit(r.session_id, GID)
@@ -258,6 +262,17 @@ def test_a_malformed_idempotency_key_is_a_contract_error_not_a_crash(ledger, key
     with pytest.raises(NelixError) as ei:
         ledger.reserve(idempotency_key=key, owner_id="hermes:local",
                        orchestration_id=OID, request_fingerprint=FP)
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
+@pytest.mark.parametrize("fp", [None, 123, "", {}])
+def test_a_malformed_request_fingerprint_is_a_contract_error_not_a_crash(ledger, fp):
+    # The mirror of the key check above, which had no test at all: deleting reserve's
+    # fingerprint validator left the entire ledger suite green. The fingerprint is what
+    # replay COMPARES, so an unvalidated one decides whether a retry spawns a second worker.
+    with pytest.raises(NelixError) as ei:
+        ledger.reserve(idempotency_key="k1", owner_id="hermes:local",
+                       orchestration_id=OID, request_fingerprint=fp)
     assert ei.value.code == errors.INVALID_REQUEST
 
 
