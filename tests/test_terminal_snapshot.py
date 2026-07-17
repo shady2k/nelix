@@ -1,6 +1,7 @@
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
 from daemon.config import ExecutorSpec
+from conftest import OWNER, own
 
 
 class _FakeSession:
@@ -29,10 +30,10 @@ def _mgr(ttl=300.0, clock=None):
 def test_free_slot_captures_terminal_snapshot_and_frees_slot():
     mgr = _mgr()
     sess = _FakeSession("s-1"); sess.on_terminal = mgr._free_slot
-    mgr._sessions["s-1"] = sess
+    own("s-1"); mgr._sessions["s-1"] = sess
     mgr._free_slot("s-1")
     assert "s-1" not in mgr._sessions                       # slot freed
-    out = mgr.status()
+    out = mgr.status(owner_id=OWNER)
     assert out["recent_terminal"]["s-1"]["state"] == "crashed"
     assert out["recent_terminal"]["s-1"]["screen_excerpt"] == "boom"
 
@@ -40,29 +41,29 @@ def test_free_slot_captures_terminal_snapshot_and_frees_slot():
 def test_terminal_snapshot_pruned_after_ttl():
     t = {"now": 1000.0}
     mgr = _mgr(ttl=10.0, clock=lambda: t["now"])
-    sess = _FakeSession("s-1"); mgr._sessions["s-1"] = sess
+    sess = _FakeSession("s-1"); own("s-1"); mgr._sessions["s-1"] = sess
     mgr._free_slot("s-1")
-    assert "s-1" in mgr.status()["recent_terminal"]
+    assert "s-1" in mgr.status(owner_id=OWNER)["recent_terminal"]
     t["now"] = 1011.0                                       # past ttl
-    assert "s-1" not in mgr.status().get("recent_terminal", {})
+    assert "s-1" not in mgr.status(owner_id=OWNER).get("recent_terminal", {})
 
 
 def test_multiple_terminal_snapshots_coexist_and_prune_independently():
     t = {"now": 1000.0}
     mgr = _mgr(ttl=10.0, clock=lambda: t["now"])
     for sid in ("s-1", "s-2"):
-        mgr._sessions[sid] = _FakeSession(sid)
+        own(sid); mgr._sessions[sid] = _FakeSession(sid)
     mgr._free_slot("s-1")
     t["now"] = 1005.0
     mgr._free_slot("s-2")
     t["now"] = 1011.0                                       # s-1 expired (>10s), s-2 not (6s)
-    rt = mgr.status()["recent_terminal"]
+    rt = mgr.status(owner_id=OWNER)["recent_terminal"]
     assert "s-1" not in rt and "s-2" in rt
 
 
 def test_negative_ttl_does_not_store_terminal_snapshot():
     mgr = _mgr(ttl=-5)
-    sess = _FakeSession("s-1"); mgr._sessions["s-1"] = sess
+    sess = _FakeSession("s-1"); own("s-1"); mgr._sessions["s-1"] = sess
     mgr._free_slot("s-1")
     assert "s-1" not in mgr._sessions                       # slot freed
     assert "s-1" not in mgr._terminal                       # snapshot not stored at all
@@ -73,27 +74,27 @@ def test_negative_ttl_does_not_store_terminal_snapshot():
 def test_terminal_kind_delivery_failed_plumbed_through_status():
     mgr = _mgr()
     sess = _FakeSession("s-df", state="working", terminal_kind="delivery_failed")
-    mgr._sessions["s-df"] = sess
+    own("s-df"); mgr._sessions["s-df"] = sess
     mgr._free_slot("s-df")
-    rt = mgr.status()["recent_terminal"]
+    rt = mgr.status(owner_id=OWNER)["recent_terminal"]
     assert rt["s-df"]["terminal_kind"] == "delivery_failed"
 
 
 def test_terminal_kind_done_plumbed_through_status():
     mgr = _mgr()
     sess = _FakeSession("s-ok", state="exited", terminal_kind="done")
-    mgr._sessions["s-ok"] = sess
+    own("s-ok"); mgr._sessions["s-ok"] = sess
     mgr._free_slot("s-ok")
-    rt = mgr.status()["recent_terminal"]
+    rt = mgr.status(owner_id=OWNER)["recent_terminal"]
     assert rt["s-ok"]["terminal_kind"] == "done"
 
 
 def test_terminal_kind_crashed_plumbed_through_status():
     mgr = _mgr()
     sess = _FakeSession("s-cr", state="crashed", terminal_kind="crashed")
-    mgr._sessions["s-cr"] = sess
+    own("s-cr"); mgr._sessions["s-cr"] = sess
     mgr._free_slot("s-cr")
-    rt = mgr.status()["recent_terminal"]
+    rt = mgr.status(owner_id=OWNER)["recent_terminal"]
     assert rt["s-cr"]["terminal_kind"] == "crashed"
 
 

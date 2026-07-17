@@ -90,6 +90,13 @@ def session_meta(session_dir) -> Path:
     return Path(session_dir) / "meta.json"
 
 
+def session_owner(session_dir) -> Path:
+    """The session's durable owner record (daemon/owner.py). A SEPARATE file from session_meta,
+    not a field in it: meta.json is a best-effort capture sidecar whose writer swallows OSError,
+    and an access invariant cannot share a file with data that is allowed to go missing."""
+    return Path(session_dir) / "owner.json"
+
+
 def child_record(session_dir) -> Path:
     """Per-session reaping record (pid/pgid + fingerprints + owning daemon). Lives in the
     session dir so it shares the session's lifetime; never in a separate top-level folder."""

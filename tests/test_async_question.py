@@ -22,6 +22,7 @@ from daemon.events import EventQueue, RESPONDABLE_KINDS  # noqa: E402
 from daemon.manager import SessionManager       # noqa: E402
 from daemon.messages import AsyncQuestion, ProgressNote  # noqa: E402
 from daemon.session import Session              # noqa: E402
+from conftest import own
 
 
 class Spec:
@@ -216,7 +217,7 @@ def manager_with_busy_session(tmp_path):
     mgr = SessionManager(_demo_specs(), ev, concurrency_limit=3,
                          session_retain=0, session_max_age_days=0)
     with mgr._lock:
-        mgr._sessions[sess._id] = sess
+        own(sess._id); mgr._sessions[sess._id] = sess
     return mgr
 
 

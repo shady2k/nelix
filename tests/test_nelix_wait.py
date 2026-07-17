@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import EXECUTOR
+from conftest import EXECUTOR, OWNER, own
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,6 +64,37 @@ def _run_wait(state_file, extra_args=(), env=None, timeout=10):
         cmd, env=env or {"PATH": "/usr/bin:/bin"}, timeout=timeout, text=True)
 
 
+def test_waiter_on_another_owners_session_exits_instead_of_spinning(tmp_path, unix_sock):
+    """A waiter that can never wake must EXIT, not re-issue.
+
+    The regression pinned here is a RETRY STORM, not a leak. /wait's contract is "blocks ~25s, so
+    a null means re-issue" — so if an un-armable wait answers `200 {"event": null}`, the waiter's
+    own perfectly correct `continue` becomes an unthrottled hot loop. MEASURED at ~3400 req/s
+    against the daemon before /wait answered 404 for a session the caller does not own. The
+    isolation invariant was intact the whole time, which is exactly why a test asserting only
+    "Y saw no event" sailed past it. This one fails by TIMING OUT.
+    """
+    from daemon.events import EventQueue
+    from daemon.rpc_server import make_server
+    from daemon.transport import Transport
+
+    class M:
+        def __init__(self): self._events = EventQueue()
+        def get(self, sid): return None
+
+    own("s-mine", "harness-x")                     # owned by X...
+    srv = make_server(M(), Transport.unix(unix_sock))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    sf = _write_state(tmp_path, {"transport": "unix", "path": unix_sock})
+    try:
+        # ...and waited on by Y. It must terminate promptly, on its own.
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s-mine",
+                             "--owner-id", "harness-y"], timeout=10)
+    finally:
+        srv.shutdown()
+    assert json.loads(out.strip()) == {"kind": "none"}
+
+
 # ---------------------------------------------------------------------------
 # Doorbell shape tests (TCP transport via state file)
 # ---------------------------------------------------------------------------
@@ -76,7 +107,7 @@ def test_nelix_wait_reissues_then_prints_event(tmp_path):
     ])
     sf = _write_state(tmp_path, _tcp_state(8790))
     try:
-        out = _run_wait(sf, ["--after", "0", "--session-id", "s1"])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s1", "--owner-id", OWNER])
     finally:
         srv.shutdown()
     rec = json.loads(out.strip())
@@ -100,7 +131,7 @@ def test_nelix_wait_doorbell_omits_executor_output(tmp_path):
     ])
     sf = _write_state(tmp_path, _tcp_state(8795))
     try:
-        out = _run_wait(sf, ["--after", "0", "--session-id", "s1"])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s1", "--owner-id", OWNER])
     finally:
         srv.shutdown()
     rec = json.loads(out.strip())
@@ -125,7 +156,7 @@ def test_nelix_wait_doorbell_stays_small_with_huge_screen_excerpt(tmp_path):
     ])
     sf = _write_state(tmp_path, _tcp_state(8796))
     try:
-        out = _run_wait(sf, ["--after", "0", "--session-id", "s1"])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s1", "--owner-id", OWNER])
     finally:
         srv.shutdown()
     assert len(out) < 300, f"doorbell too big ({len(out)} bytes): would be truncatable"
@@ -151,7 +182,7 @@ def test_nelix_wait_scopes_to_session_id(tmp_path):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     sf = _write_state(tmp_path, _tcp_state(8794))
     try:
-        out = _run_wait(sf, ["--after", "0", "--session-id", "s-abc"])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s-abc", "--owner-id", OWNER])
     finally:
         srv.shutdown()
     assert "session_id=s-abc" in seen["path"]          # waiter scopes /wait to the session
@@ -178,7 +209,7 @@ def test_nelix_wait_reads_token_from_state_file(tmp_path):
     # token lives inside the state file — no env var needed
     sf = _write_state(tmp_path, _tcp_state(8792, token="filetok"))
     try:
-        out = _run_wait(sf, ["--after", "0", "--session-id", "s2"],
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s2", "--owner-id", OWNER],
                         env={"PATH": "/usr/bin:/bin"})  # NO NELIX_RPC_TOKEN
     finally:
         srv.shutdown()
@@ -209,7 +240,7 @@ def test_nelix_wait_exits_cleanly_when_daemon_unreachable(tmp_path):
     sf = _write_state(tmp_path, _tcp_state(1))   # port 1 is unreachable
     out = subprocess.check_output(
         [sys.executable, str(ROOT / "bin" / "nelix-wait"),
-         "--state-file", str(sf), "--after", "0", "--session-id", "s1"],
+         "--state-file", str(sf), "--after", "0", "--session-id", "s1", "--owner-id", OWNER],
         env={"PATH": "/usr/bin:/bin"}, timeout=10, text=True)
     assert json.loads(out.strip()) == {"kind": "none"}
 
@@ -219,7 +250,7 @@ def test_nelix_wait_exits_cleanly_when_state_file_missing(tmp_path):
     missing = tmp_path / "no-such-file.json"
     out = subprocess.check_output(
         [sys.executable, str(ROOT / "bin" / "nelix-wait"),
-         "--state-file", str(missing), "--after", "0", "--session-id", "s1"],
+         "--state-file", str(missing), "--after", "0", "--session-id", "s1", "--owner-id", OWNER],
         env={"PATH": "/usr/bin:/bin"}, timeout=10, text=True)
     assert json.loads(out.strip()) == {"kind": "none"}
 
@@ -229,7 +260,7 @@ def test_nelix_wait_exits_cleanly_when_unix_socket_absent(tmp_path):
     sf = _write_state(tmp_path, {"transport": "unix", "path": str(tmp_path / "ghost.sock")})
     out = subprocess.check_output(
         [sys.executable, str(ROOT / "bin" / "nelix-wait"),
-         "--state-file", str(sf), "--after", "0", "--session-id", "s1"],
+         "--state-file", str(sf), "--after", "0", "--session-id", "s1", "--owner-id", OWNER],
         env={"PATH": "/usr/bin:/bin"}, timeout=10, text=True)
     assert json.loads(out.strip()) == {"kind": "none"}
 
@@ -253,7 +284,7 @@ def test_nelix_wait_discovers_unix_endpoint_and_prints_doorbell(tmp_path, unix_s
             self._events = EventQueue()
         def start(self, *a): return "s1", 0
         def respond(self, *a, **k): ...
-        def status(self, sid=None, include_progress=False): return {"sessions": {}}
+        def status(self, sid=None, *, owner_id, include_progress=False): return {"sessions": {}}
         def stop(self, *a): return True
         def get(self, sid): return None
         def screen(self, *a, **k): return {}
@@ -261,6 +292,11 @@ def test_nelix_wait_discovers_unix_endpoint_and_prints_doorbell(tmp_path, unix_s
     mgr = FakeManager()
     srv = make_server(mgr, Transport.unix(unix_sock))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    # /wait only arms on a session the caller OWNS, and it asks the durable record — so this fake
+    # session needs the record a real start would have written. Without it the route correctly
+    # refuses to arm and the waiter polls forever.
+    own("s1")
 
     # Push a real event into the queue BEFORE running the waiter (it will poll once)
     mgr._events.publish(
@@ -271,7 +307,7 @@ def test_nelix_wait_discovers_unix_endpoint_and_prints_doorbell(tmp_path, unix_s
     sf = _write_state(tmp_path, {"transport": "unix", "path": unix_sock})
 
     try:
-        out = _run_wait(sf, ["--after", "0", "--session-id", "s1"])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s1", "--owner-id", OWNER])
     finally:
         srv.shutdown()
 
@@ -308,7 +344,7 @@ def test_nelix_wait_graceful_interrupt(tmp_path):
     try:
         proc = subprocess.Popen(
             [sys.executable, str(ROOT / "bin" / "nelix-wait"),
-             "--state-file", str(sf), "--after", "0", "--session-id", "s1"],
+             "--state-file", str(sf), "--after", "0", "--session-id", "s1", "--owner-id", OWNER],
             env={"PATH": "/usr/bin:/bin"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         assert hit.wait(timeout=5), "Server never received request"

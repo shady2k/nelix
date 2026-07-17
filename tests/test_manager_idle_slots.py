@@ -10,6 +10,7 @@ import pytest
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
 from daemon.config import ExecutorSpec, load_idle_retained_limit
+from conftest import OWNER
 
 
 class FakeSession:
@@ -74,12 +75,12 @@ def _manager(tmp_path, limit=2, idle_retained_limit=None):
 def test_idle_session_frees_an_active_slot(tmp_path):
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=2)
-    mgr.start("claude", "t1", cwd)
-    mgr.start("claude", "t2", cwd)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)
+    mgr.start("claude", "t2", cwd, owner_id=OWNER)
     with pytest.raises(RuntimeError, match="concurrency_limit=2 reached"):
-        mgr.start("claude", "t3", cwd)               # 2 active -> at cap
+        mgr.start("claude", "t3", cwd, owner_id=OWNER)               # 2 active -> at cap
     created[0].control_state = "idle"                # session 1 finished its turn, stays alive
-    out = mgr.start("claude", "t3", cwd)             # idle no longer occupies an active slot
+    out = mgr.start("claude", "t3", cwd, owner_id=OWNER)             # idle no longer occupies an active slot
     assert out.session_id is not None
     assert created[0].control_state == "idle"        # the idle session is still retained (not evicted)
 
@@ -88,29 +89,29 @@ def test_awaiting_user_still_counts_as_active(tmp_path):
     # A respondable pause (awaiting_user) is live work, NOT free capacity: it still holds its slot.
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=2)
-    mgr.start("claude", "t1", cwd)
-    mgr.start("claude", "t2", cwd)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)
+    mgr.start("claude", "t2", cwd, owner_id=OWNER)
     created[0].control_state = "awaiting_user"
     with pytest.raises(RuntimeError, match="concurrency_limit=2 reached"):
-        mgr.start("claude", "t3", cwd)
+        mgr.start("claude", "t3", cwd, owner_id=OWNER)
 
 
 def test_intervention_required_still_counts_as_active(tmp_path):
     # A stuck/hung agent (intervention_required) still holds a live PTY -> NOT a free slot.
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=2)
-    mgr.start("claude", "t1", cwd)
-    mgr.start("claude", "t2", cwd)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)
+    mgr.start("claude", "t2", cwd, owner_id=OWNER)
     created[0].control_state = "intervention_required"
     with pytest.raises(RuntimeError, match="concurrency_limit=2 reached"):
-        mgr.start("claude", "t3", cwd)
+        mgr.start("claude", "t3", cwd, owner_id=OWNER)
 
 
 def test_active_count_reflects_only_non_idle_sessions(tmp_path):
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=3)
-    mgr.start("claude", "t1", cwd)
-    mgr.start("claude", "t2", cwd)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)
+    mgr.start("claude", "t2", cwd, owner_id=OWNER)
     assert mgr._active_count() == 2
     created[0].control_state = "idle"
     assert mgr._active_count() == 1                  # the idle one dropped out of the active count
@@ -126,10 +127,10 @@ def test_idle_retained_limit_defaults_to_concurrency_limit(tmp_path):
 def test_idle_retained_limit_enforced(tmp_path):
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=5, idle_retained_limit=1)
-    mgr.start("claude", "t1", cwd)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)
     created[0].control_state = "idle"                # 1 idle == idle_retained_limit, active slots free
     with pytest.raises(RuntimeError, match="idle_retained_limit=1"):
-        mgr.start("claude", "t2", cwd)               # too many retained idle sessions
+        mgr.start("claude", "t2", cwd, owner_id=OWNER)               # too many retained idle sessions
 
 
 # ---- config loader ----
@@ -164,7 +165,7 @@ def test_load_idle_retained_limit_missing_file(tmp_path):
 def test_send_turn_resumes_idle_session(tmp_path):
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=2)
-    mgr.start("claude", "t1", cwd)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)
     created[0].control_state = "idle"
     out = mgr.send_turn(created[0]._id, "keep going")
     assert out.status == "resumed"
@@ -180,10 +181,10 @@ def test_send_turn_unknown_session(tmp_path):
 def test_send_turn_refused_when_active_cap_full(tmp_path):
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=2)
-    mgr.start("claude", "t1", cwd)                    # s1 busy
-    mgr.start("claude", "t2", cwd)                    # s2 busy (active=2, full)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)                    # s1 busy
+    mgr.start("claude", "t2", cwd, owner_id=OWNER)                    # s2 busy (active=2, full)
     created[0].control_state = "idle"                # s1 idle -> a slot frees
-    mgr.start("claude", "t3", cwd)                    # s3 grabs it (active=2 again: s2, s3)
+    mgr.start("claude", "t3", cwd, owner_id=OWNER)                    # s3 grabs it (active=2 again: s2, s3)
     out = mgr.send_turn(created[0]._id, "resume me")  # no active slot left to re-acquire
     assert out.status != "resumed"
     assert created[0].sent == []                      # refused before typing anything
@@ -197,9 +198,9 @@ def test_respond_on_idle_routes_to_send_turn(tmp_path):
     # Session.respond for an idle session. No decision_id is needed or sent.
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=2)
-    mgr.start("claude", "t1", cwd)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)
     created[0].control_state = "idle"
-    out = mgr.respond(created[0]._id, "next task")     # NO decision_id — legitimate idle follow-up
+    out = mgr.respond(created[0]._id, "next task", owner_id=OWNER)     # NO decision_id — legitimate idle follow-up
     assert out.status == "resumed"
     assert created[0].sent == ["next task"]           # routed through send_turn
     assert created[0].responded == []                 # respond() NOT used for an idle session
@@ -209,9 +210,9 @@ def test_respond_on_awaiting_user_uses_respond(tmp_path):
     # A respondable pause still goes through respond(), never send_turn.
     cwd = str(tmp_path)
     mgr, created = _manager(tmp_path, limit=2)
-    mgr.start("claude", "t1", cwd)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)
     created[0].control_state = "awaiting_user"
-    out = mgr.respond(created[0]._id, "1")
+    out = mgr.respond(created[0]._id, "1", owner_id=OWNER)
     assert out.status == "resumed"
     assert created[0].responded == ["1"]              # routed through respond
     assert created[0].sent == []                      # send_turn NOT used
@@ -219,4 +220,4 @@ def test_respond_on_awaiting_user_uses_respond(tmp_path):
 
 def test_respond_unknown_session_still_unknown(tmp_path):
     mgr, _ = _manager(tmp_path, limit=2)
-    assert mgr.respond("s-nope", "x").status == "unknown_session"
+    assert mgr.respond("s-nope", "x", owner_id=OWNER).status == "unknown_session"

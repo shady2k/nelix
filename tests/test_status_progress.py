@@ -7,7 +7,7 @@ default (an active-working status call with no include_progress must stay exactl
 today — nothing to read, nothing to poll for):
 
     nelix_status(include_progress) -> RpcClient.status -> GET /status?include_progress=1
-        -> manager.status(session_id, include_progress=True) -> merges Session.progress_view()
+        -> manager.status(session_id, include_progress=True, owner_id=OWNER) -> merges Session.progress_view()
 
 Two layers are exercised here: the manager (the actual merge/gate logic) and the HTTP layer
 (query-param threading). The third — the plugin tool's arg passthrough to RpcClient — moved to
@@ -25,6 +25,7 @@ from daemon.manager import SessionManager                    # noqa: E402
 from daemon.messages import ProgressNote                     # noqa: E402
 from test_async_question import _demo_specs, _make_session   # noqa: E402
 from test_rpc_server import _req, _serve                     # noqa: E402
+from conftest import OWNER, own
 
 
 # ---------------------------------------------------------------------------
@@ -38,14 +39,14 @@ def _manager_with_busy_session(tmp_path):
     mgr = SessionManager(_demo_specs(), ev, concurrency_limit=3,
                          session_retain=0, session_max_age_days=0)
     with mgr._lock:
-        mgr._sessions[sess._id] = sess
+        own(sess._id); mgr._sessions[sess._id] = sess
     return mgr, sess
 
 
 def test_manager_status_default_omits_progress_during_active_working(tmp_path):
     mgr, sess = _manager_with_busy_session(tmp_path)
     sess.append_progress_note(ProgressNote("step 1", None))
-    snap = mgr.status(sess._id)                     # default: include_progress=False
+    snap = mgr.status(sess._id, owner_id=OWNER)                     # default: include_progress=False
     assert snap["control_state"] == "busy"
     assert "progress" not in snap and "progress_total" not in snap   # anti-poll unchanged
 
@@ -53,7 +54,7 @@ def test_manager_status_default_omits_progress_during_active_working(tmp_path):
 def test_manager_status_include_progress_returns_notes_during_active_working(tmp_path):
     mgr, sess = _manager_with_busy_session(tmp_path)
     sess.append_progress_note(ProgressNote("step 1", "detail"))
-    snap = mgr.status(sess._id, include_progress=True)
+    snap = mgr.status(sess._id, include_progress=True, owner_id=OWNER)
     assert snap["control_state"] == "busy"           # still active-working -- NOT a wake point
     assert snap["progress"][-1]["summary"] == "step 1"
     assert snap["progress_total"] == 1 and snap["progress_retained"] == 1
@@ -63,9 +64,9 @@ def test_manager_status_all_sessions_board_include_progress(tmp_path):
     """The all-sessions board read (session_id=None) gets the same on/off toggle per-session."""
     mgr, sess = _manager_with_busy_session(tmp_path)
     sess.append_progress_note(ProgressNote("board view", None))
-    board_default = mgr.status()
+    board_default = mgr.status(owner_id=OWNER)
     assert "progress" not in board_default["sessions"][sess._id]
-    board = mgr.status(include_progress=True)
+    board = mgr.status(include_progress=True, owner_id=OWNER)
     assert board["sessions"][sess._id]["progress"][-1]["summary"] == "board view"
 
 
@@ -75,12 +76,12 @@ def test_manager_status_all_sessions_board_include_progress(tmp_path):
 
 class _ProgressAwareManager:
     """Records what `include_progress` value it was called with, so the test can assert the
-    query param actually reaches manager.status() rather than being silently dropped."""
+    query param actually reaches manager.status(owner_id=OWNER) rather than being silently dropped."""
     def __init__(self):
         self._events = EventQueue()
         self.seen = []
 
-    def status(self, sid=None, include_progress=False):
+    def status(self, sid=None, *, owner_id, include_progress=False):
         self.seen.append(include_progress)
         body = {"session_id": sid, "control_state": "busy"}
         if include_progress:
@@ -93,7 +94,7 @@ def test_rpc_status_default_omits_include_progress():
     m = _ProgressAwareManager()
     srv, base = _serve(m, __import__("io").StringIO())
     try:
-        st, b = _req("GET", base + "/status?session_id=s1")
+        st, b = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1")
         assert st == 200 and m.seen[-1] is False
         assert "progress" not in b
     finally:
@@ -104,7 +105,7 @@ def test_rpc_status_include_progress_query_threads_through():
     m = _ProgressAwareManager()
     srv, base = _serve(m, __import__("io").StringIO())
     try:
-        st, b = _req("GET", base + "/status?session_id=s1&include_progress=1")
+        st, b = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1&include_progress=1")
         assert st == 200 and m.seen[-1] is True
         assert b["progress"][-1]["summary"] == "hi" and b["progress_total"] == 1
     finally:

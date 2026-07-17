@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import supervisor
 from daemon.transport import Transport
 from rpc_client import RpcClient
+from conftest import OWNER
 
 NELIX_LIVE = os.environ.get("NELIX_LIVE")
 
@@ -14,7 +15,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _call(method, path, body=None):
-    return RpcClient(supervisor.endpoint())._call(method, path, body)[1]
+    return RpcClient(supervisor.endpoint(), OWNER)._call(method, path, body)[1]
 
 
 def test_local_task_reaches_decision_and_creates_file(tmp_path):
@@ -44,7 +45,7 @@ def test_supervisor_spawns_daemon_and_runs(tmp_path, monkeypatch):
     # operator must point NELIX_HOME at a root whose nelix.toml has NELIX_EXECUTOR
     transport = supervisor.ensure_running()
     try:
-        sid = RpcClient(transport).start(os.environ["NELIX_EXECUTOR"],
+        sid = RpcClient(transport, OWNER).start(os.environ["NELIX_EXECUTOR"],
                                          "create test.txt containing the word nelix",
                                          str(tmp_path))["session_id"]
         assert sid

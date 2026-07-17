@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import paths
+from daemon import owner
 from daemon.config import MSG_MAX_BODY, DEFAULT_DIALOG_PAGE_CHARS
 from daemon.dialog import DialogReader
 from daemon.env_resolver import EnvResolveError
@@ -123,6 +124,25 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             except (TypeError, ValueError):
                 raise _BadRequest(400, f"invalid integer parameter: {val!r}")
 
+        def _owner(self, val):
+            """The caller's owner_id, REQUIRED and shape-checked, on every caller-facing route.
+
+            Required with no default, and no route may skip it: a missing owner cannot be
+            resolved to "any owner" without recreating the exact bug this closes (one harness
+            reading the whole board). Absent => 400 with a message that says what to send, not a
+            silent empty result, because a caller that forgot the field should learn it forgot —
+            an empty board reads like an idle daemon.
+
+            NOT applied to /hook and /message: those authenticate with the per-session secret,
+            which is strictly stronger than an owner id (daemon/owner.py).
+            """
+            if val is None:
+                raise _BadRequest(400, "missing owner_id")
+            try:
+                return owner.validate(val)
+            except owner.OwnerRejected as e:
+                raise _BadRequest(400, str(e))
+
         def do_GET(self):
             if not self._auth():
                 return
@@ -150,30 +170,60 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 qs = parse_qs(p.query)
                 after = self._int(qs.get("after_seq", ["0"])[0], 0)
                 sid = qs.get("session_id", [None])[0]
+                owner_id = self._owner(qs.get("owner_id", [None])[0])
                 if not sid:
                     # A global (session_id-less) wait returns on ANY session's event, leaking one
                     # session's result into another's orchestrator when the daemon is shared. Refuse
                     # it structurally: session_id is mandatory (mirrors the /dialog guard below).
                     self._send(400, {"error": "missing session_id"}); return
+                # Events are NOT owner-tagged (the queue is a global ordered log), so the filter has
+                # to be here: establish ownership of `sid` BEFORE arming, and never arm otherwise.
+                # This is the "arms a waiter for every session it sees" half of the bug — a waiter
+                # is how one harness ends up answering another's decision.
+                #
+                # 404, NOT a 200 with event:null. Both keep the event in, but a waiter's whole
+                # contract is "this call blocks ~25s, so a null means re-issue" — answering an
+                # un-armable wait instantly and nullly tells every correct waiter to try again at
+                # once, forever. MEASURED before this was a 404: bin/nelix-wait spun at ~3400
+                # req/s against the daemon. An unownable session is not "no events yet", it is a
+                # wait that can NEVER return, and the caller has to be able to tell the difference.
+                if not owner.owns_session(sid, owner_id):
+                    self._send(404, {"error": "unknown session",
+                                     "hint": "unknown session, or not this owner's; a wait on it"
+                                             " would never wake. Do not retry."})
+                    return
                 evt = manager._events.wait_event(after_seq=after, timeout=25, session_id=sid)
                 self._send(200, {"event": _evt_dict(evt) if evt else None})
             elif p.path == "/status":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
+                owner_id = self._owner(qs.get("owner_id", [None])[0])
                 # Task 8: explicit on-demand progress detail, off by default (anti-poll: an
                 # active-working snapshot stays progress-free unless the caller asks for it).
                 include_progress = qs.get("include_progress", ["0"])[0].lower() in ("1", "true")
                 self._log_read("status", sid)
                 # Stamp the RPC protocol version at the wire layer (always present, regardless of
                 # session_id) so a supervisor can tell our protocol from an old daemon's.
-                self._send(200, {**manager.status(sid, include_progress=include_progress),
+                self._send(200, {**manager.status(sid, owner_id=owner_id,
+                                                  include_progress=include_progress),
                                  "rpc_protocol": RPC_PROTOCOL_VERSION})
             elif p.path == "/dialog":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
+                owner_id = self._owner(qs.get("owner_id", [None])[0])
                 self._log_read("dialog", sid)
                 if not sid:
                     self._send(400, {"error": "missing session_id"}); return
+                # THE route the session id alone must never open: everything below reads the
+                # transcript straight off DISK, so it never passes through the manager and would
+                # otherwise hand any caller the full dialog of any session whose id it holds. The
+                # gate goes here, ahead of the read — not inside DialogReader, which is also the
+                # capture tool's reader and has no business knowing about owners.
+                if not owner.owns_session(sid, owner_id):
+                    self._send(404, {"error": "unknown session",
+                                     "hint": "the session may have exited or not started;"
+                                             " call nelix_status (no session_id) to list sessions."})
+                    return
                 reader = DialogReader(paths.sessions_root() / sid)
                 if not reader.available:
                     # No transcript on disk — fall back to live session if present
@@ -206,10 +256,13 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             elif p.path == "/screen":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
+                owner_id = self._owner(qs.get("owner_id", [None])[0])
                 self._log_read("screen", sid)
                 raw = qs.get("raw", ["0"])[0].lower() in ("1", "true")
                 force = qs.get("force", ["0"])[0].lower() in ("1", "true")
-                self._send(200, manager.screen(sid, raw=raw, force=force))
+                # manager.screen owner-gates via _owned. Note `force` bypasses the anti-poll
+                # withhold, NOT the owner gate: they are checked in that order inside screen().
+                self._send(200, manager.screen(sid, owner_id=owner_id, raw=raw, force=force))
             else:
                 self._send(404, {"error": "not found"})
 
@@ -311,12 +364,22 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 self._dispatch_message(p); return
             body = self._read_json()
             if p.path == "/start":
+                owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
                     outcome = manager.start(body["executor"], body["task"], body["cwd"],
-                                            model=body.get("model"))
+                                            owner_id=owner_id, model=body.get("model"))
+                except owner.OwnerWriteFailed as e:
+                    # The owner record could not be persisted, so no session was started (spec §7:
+                    # start FAILS if the owner cannot be written). 500, not 4xx: the request was
+                    # well-formed and the daemon failed it. Caught BEFORE ValueError/RuntimeError
+                    # below so it can never be mistaken for a 409 "daemon full", which would invite
+                    # a retry loop against a disk that is not going to get emptier.
+                    if logger is not None:
+                        logger.error("rpc", "start_owner_unwritable", status=500)
+                    self._send(500, {"error": str(e)}); return
                 except ModelUnavailable as e:        # nelix-kwr: model not offered by the backend
                     self._send(400, {"error": str(e), "available_models": e.available_models}); return
-                except ModelRejected as e:           # subclass of ValueError: catch BEFORE the 409
+                except (ModelRejected, owner.OwnerRejected) as e:   # ValueError subclasses: BEFORE the 409
                     self._send(400, {"error": str(e)}); return   # bad-shape/unsupported model = client input error
                 except PtyInputRejected as e:        # subclass of ValueError: catch BEFORE it
                     self._send(400, {"error": str(e)}); return
@@ -333,8 +396,10 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                                  "session_id": outcome.session_id, "snapshot": outcome.snapshot,
                                  "next_after_seq": outcome.base_seq, "next_action": "end_turn"})
             elif p.path == "/respond":
+                owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
                     outcome = manager.respond(body["session_id"], body["answer"],
+                                              owner_id=owner_id,
                                               decision_id=body.get("decision_id"))
                 except PtyInputRejected as e:
                     self._send(400, {"error": str(e)}); return
@@ -431,8 +496,9 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                     self._send(409, {"operation": "respond", "status": "no_pending", "session_id": sid,
                                      "error": "no_pending_decision", "next_action": "fix_call"})
             elif p.path == "/stop":
+                owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
-                    outcome = manager.stop(body["session_id"])
+                    outcome = manager.stop(body["session_id"], owner_id=owner_id)
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
                 if outcome.status == "unknown_session":
@@ -444,8 +510,12 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                                      "session_id": body["session_id"], "snapshot": outcome.snapshot,
                                      "next_action": "report" if outcome.status == "stopped" else "refresh_status"})
             elif p.path == "/restart":
+                # The owner is used ONLY to authorise the restart of the OLD session. The NEW
+                # session's owner is read back off disk by the manager, never taken from this body.
+                owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
-                    outcome = manager.restart(body["session_id"], force=bool(body.get("force", False)))
+                    outcome = manager.restart(body["session_id"], owner_id=owner_id,
+                                              force=bool(body.get("force", False)))
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
                 if outcome.status == "restarted":

@@ -110,18 +110,32 @@ def hermes_wiring(home=None):
     return {"home": str(home), "profiles": profiles}
 
 
+def _disk_sessions():
+    """Session ids present under the sessions root, sorted. Best-effort: a diagnostic must not
+    raise because a directory it wanted to look at is missing."""
+    try:
+        return sorted(d.name for d in paths.sessions_root().iterdir() if d.is_dir())
+    except OSError:
+        return []
+
+
 def collect(inspector=None):
     inspector = inspector or reaper.ProcessInspector()
     transport = supervisor.endpoint()
     holder = singleton.read_holder(paths.daemon_lock())
-    sessions = []
-    if transport:
-        try:
-            from rpc_client import RpcClient
-            data = RpcClient(transport).status()
-            sessions = list(data.get("sessions", {}).keys())
-        except Exception:
-            pass
+    # The session inventory comes from DISK, not from /status.
+    #
+    # /status is owner-filtered now (daemon/owner.py) and doctor has no owner: it diagnoses the
+    # HOST, it does not drive sessions. The alternatives were both worse than reading the disk —
+    # an operator/wildcard mode on /status would hand the whole board back to any caller that
+    # asked for it, which is the exact bug owners exist to close, and guessing an owner would
+    # report one harness's world as if it were the machine's.
+    #
+    # Reading the sessions root is strictly better for a diagnostic anyway: it is the same place
+    # _scan_strays already looks, and it still answers when the daemon is DEAD — which is when
+    # doctor is actually run. The meaning shifts from "sessions this daemon admits to" to
+    # "session state on this host", which is the question being asked.
+    sessions = _disk_sessions()
     if transport is not None and transport.kind == "tcp":
         base_url = f"http://{transport.host}:{transport.port}"
     elif transport is not None:

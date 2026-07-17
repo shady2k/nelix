@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from conftest import EXECUTOR, make_spec
+from conftest import EXECUTOR, OWNER, make_spec
 from daemon.drivers import get_driver
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
@@ -66,6 +66,9 @@ def _serve(monkeypatch, tmp_path, *, spec=None, driver_factory=None, port=8801):
 
 def _req(port, body):
     import urllib.error, urllib.request
+    # /start is owner-gated (daemon/owner.py). These tests are about env/model resolution, not
+    # ownership, so the helper supplies the owner rather than every call site restating it.
+    body = {"owner_id": OWNER, **body}
     data = json.dumps(body).encode()
     r = urllib.request.Request(f"http://127.0.0.1:{port}/start", data=data, method="POST",
                                headers={"X-Nelix-Token": "t"})

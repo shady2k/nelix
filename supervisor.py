@@ -217,6 +217,18 @@ def _choose_transport() -> Transport:
     return Transport.unix(str(paths.rpc_sock()))
 
 
+# The owner the supervisor's PROBE speaks as. It owns nothing and never will: this probe wants
+# one field, `rpc_protocol`, and that stamp happens to ride /status — a route that is now
+# owner-filtered (daemon/owner.py) and so demands an owner from every caller, including one that
+# does not care about sessions at all. An empty board is exactly the right answer here.
+#
+# The cleaner shape is a dedicated liveness/version route that exposes nothing session-derived
+# and therefore needs no owner. Not done here: supervisor.py belongs to the router slice
+# (nelix-3rm, see pyproject.toml), which is reworking this surface anyway, and a new public route
+# added from this slice would be one it has to either keep or break.
+_PROBE_OWNER = "nelix-supervisor-probe"
+
+
 def _status_body(transport, timeout=2):
     """The daemon's /status JSON, or None if unreachable / non-200."""
     try:
@@ -224,7 +236,8 @@ def _status_body(transport, timeout=2):
     except ImportError:           # loaded as a top-level module (tests), not as a package
         from rpc_client import RpcClient
     try:
-        st, body = RpcClient(transport)._call("GET", "/status", timeout=timeout)
+        st, body = RpcClient(transport, _PROBE_OWNER)._call(
+            "GET", f"/status?owner_id={_PROBE_OWNER}", timeout=timeout)
         return body if st == 200 else None
     except Exception:
         return None

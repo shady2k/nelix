@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import paths                                   # noqa: E402
 import supervisor                              # noqa: E402
-from daemon import reaper                      # noqa: E402
+from daemon import owner, reaper               # noqa: E402
 from daemon.config import load_kill_grace_seconds  # noqa: E402
 
 
@@ -26,11 +26,26 @@ def reap_orphans(inspector, killer, grace):
 
 
 def reap_sid(sid):
+    """Graceful stop of ONE live session, through the daemon.
+
+    /stop is owner-gated, and the reaper has no owner of its own, so it reads the session's
+    DURABLE OWNER off disk and stops it AS that owner. That is not a bypass and the daemon grows
+    no wildcard for it: the reaper runs as the same uid as every other caller, so asserting an
+    owner is something it could always do — doing it from the recorded value just makes the
+    assertion honest and correct. No record (never started / already gc'd / torn) => fail closed
+    and refuse: `--orphans` is the path for a session the daemon can no longer speak for, and it
+    kills process groups directly rather than asking the daemon to.
+    """
     transport = supervisor.endpoint()
     if not transport:
         return {"error": "no live daemon"}
     from rpc_client import RpcClient
-    return RpcClient(transport).stop(sid)
+    owner_id = owner.owner_of(paths.sessions_root() / sid)
+    if owner_id is None:
+        return {"error": "no owner record", "session_id": sid,
+                "hint": "session unknown or its owner record is missing/malformed; "
+                        "use --orphans to reap a dead daemon's leftover process groups"}
+    return RpcClient(transport, owner_id).stop(sid)
 
 
 def main(argv=None):
