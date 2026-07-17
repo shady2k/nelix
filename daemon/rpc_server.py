@@ -14,7 +14,7 @@ from daemon.config import MSG_MAX_BODY, DEFAULT_DIALOG_PAGE_CHARS
 from daemon.dialog import DialogReader
 from daemon.env_resolver import EnvResolveError
 from daemon.errors import error_envelope
-from daemon.events import EXTERNAL_OUTPUT_POLICY
+from daemon.events import CURSOR_EXPIRED, EXTERNAL_OUTPUT_POLICY
 from daemon.generation import generation_id
 from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
@@ -236,7 +236,14 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                                              " would never wake. Do not retry."})
                     return
                 evt = manager._events.wait_event(after_seq=after, timeout=25, session_id=sid)
-                self._send(200, {"event": _evt_dict(evt) if evt else None})
+                if evt is CURSOR_EXPIRED:
+                    # The cursor fell off the back of the bounded ring: events this waiter never saw
+                    # were evicted. Answer with an EXPLICIT resync marker (not a silent event:null),
+                    # so a wake-driven caller re-pulls nelix_status instead of stalling on a doorbell
+                    # that can never ring (nelix-9a4.5 deliverable 3).
+                    self._send(200, {"event": None, "cursor_expired": True})
+                else:
+                    self._send(200, {"event": _evt_dict(evt) if evt else None})
             elif p.path == "/status":
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
