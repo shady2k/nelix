@@ -1,0 +1,46 @@
+"""Executor-facing wrapper: post an async QUESTION to the orchestrator without blocking the
+executor's own progress. POSTs `POST /message/<sid>` (daemon/rpc_server.py's `_dispatch_message`)
+over the SAME env + transport the hook curl already uses (daemon/hook_settings.py:19-23):
+NELIX_HOOK_SOCK / NELIX_HOOK_SECRET / NELIX_SESSION, injected at spawn. The executor keeps working
+per `--continuation-plan`; the answer arrives later as a fresh user turn (see
+daemon/messages.py:format_async_reply)."""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--question", required=True)
+    ap.add_argument("--continuation-plan", dest="continuation_plan", required=True)
+    ap.add_argument("--assumption", default=None)
+    ap.add_argument("--impact-if-wrong", dest="impact_if_wrong", default=None)
+    a = ap.parse_args()
+
+    body = {"kind": "question", "question": a.question, "continuation_plan": a.continuation_plan}
+    if a.assumption:
+        body["assumption"] = a.assumption
+    if a.impact_if_wrong:
+        body["impact_if_wrong"] = a.impact_if_wrong
+
+    sock = os.environ.get("NELIX_HOOK_SOCK")
+    secret = os.environ.get("NELIX_HOOK_SECRET")
+    sid = os.environ.get("NELIX_SESSION")
+    if not (sock and secret and sid):
+        print("nelix-question: not running under a nelix session", file=sys.stderr)
+        return 2
+
+    r = subprocess.run(
+        ["curl", "-s", "--max-time", "5", "--unix-socket", sock,
+         "-H", f"X-Nelix-Hook-Secret: {secret}",
+         "http://x/message/" + sid, "-d", json.dumps(body), "-w", "\n%{http_code}"],
+        capture_output=True, text=True)
+    out, _, code = r.stdout.rpartition("\n")
+    print(out)
+    return 0 if code == "200" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,6 +1,12 @@
-wasmtime==45.0.0
-ptyprocess==0.7.0
-pytest==8.3.4
-pyyaml==6.0.3
+# The DEV + TEST environment (`make install`). NOT the core's runtime deps — those live in
+# pyproject.toml and arrive with the wheel; `-e .` below pulls them in from there rather than
+# restating them, so the two can never drift. (wasmtime came out for exactly that reason;
+# ptyprocess came out because nothing under daemon/ imports it — the PTY is stdlib os.openpty +
+# os.login_tty. Measured 2026-07-17.)
+#
+# The daemon's own runtime closure stays hash-pinned in requirements-daemon.lock (supervisor.py).
+-e .
 -e ./packages/nelix_contracts
 -e ./packages/nelix_store
+pytest==8.3.4
+pyyaml==6.0.3      # bin/nelix-doctor only; not a daemon import, so not a core runtime dep

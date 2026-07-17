@@ -13,8 +13,8 @@ and every probe runs with cwd OUTSIDE the repo, PYTHONPATH scrubbed, and no `-e`
 """
 import json
 import os
+import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -38,18 +38,35 @@ def _run(cmd, **kw):
     return subprocess.run([str(c) for c in cmd], **kw)
 
 
+# Build artifacts and environments, never build INPUTS. `build/` matters most: setuptools' build_py
+# copies sources into `build/lib/` and never prunes stale entries, so a repo that was built once
+# with `shim.wasm` as package data keeps emitting wheels containing `shim.wasm` even after the
+# declaration is deleted -- the wheel is assembled from the leftovers. Building a fresh copy is what
+# makes this test's answers about the wheel true rather than historical.
+_NOT_SOURCE = shutil.ignore_patterns(
+    ".git", ".venv", "venv", "build", "dist", "*.egg-info", "__pycache__", "*.py[cod]",
+    ".pytest_cache", "spikes",
+)
+
+
 @pytest.fixture(scope="module")
 def installed(tmp_path_factory):
-    """Build the wheel, install ONLY it into a clean 3.11 venv, and hand back that interpreter.
+    """Build the wheel from a pristine copy of the tree, install ONLY it into a clean 3.11 venv,
+    and hand back that interpreter.
 
     Module-scoped: this costs a wheel build plus a venv, so it runs once and each guard below is a
     separate assertion against the same install.
     """
     tmp = tmp_path_factory.mktemp("real_wheel")
-    dist, venv = tmp / "dist", tmp / "venv"
+    src, dist, venv = tmp / "src", tmp / "dist", tmp / "venv"
     env = _clean_env()
 
-    build = _run(["uv", "build", "--wheel", "--out-dir", dist, REPO], cwd=tmp, env=env)
+    # A fresh clone of the working tree: no stale build/, and the repo is left untouched (building
+    # in place would litter it with build/ + *.egg-info).
+    shutil.copytree(REPO, src, ignore=_NOT_SOURCE, symlinks=True)
+    assert not (src / "build").exists(), "stale build/ leaked into the pristine copy"
+
+    build = _run(["uv", "build", "--wheel", "--out-dir", dist, src], cwd=tmp, env=env)
     assert build.returncode == 0, f"wheel build failed:\n{build.stdout}\n{build.stderr}"
 
     wheels = list(dist.glob("*.whl"))
@@ -160,6 +177,52 @@ print(json.dumps({"q": q}))
     r = _run([out["q"], "--question", "q", "--continuation-plan", "p"], cwd=tmp, env=env)
     assert r.returncode == 2, f"expected the not-in-a-session exit 2, got {r.returncode}: {r.stderr}"
     assert "not running under a nelix session" in r.stderr
+
+
+def test_installed_core_spawns_and_drives_a_real_pty(installed):
+    """"It runs" at its strongest: the installed core stands up its own PTY broker as a subprocess
+    and drives a real child through the master fd.
+
+    tests/test_pty_broker.py drives the same path but launches the broker with `cwd=repo` and
+    `PYTHONPATH=repo` -- from an install there is neither, so `python -m daemon.pty_broker` has to
+    resolve out of site-packages on its own. This is also what retires `ptyprocess` honestly: the
+    PTY comes up in a venv where it is not installed, because the broker uses stdlib os.openpty +
+    os.login_tty (daemon/pty_broker.py:109,57), not ptyprocess.
+    """
+    out = _probe(installed, r"""
+import json, os, subprocess, sys, time, importlib.util
+from daemon.broker_proto import send_msg, recv_msg, make_socketpair
+
+daemon_end, broker_end = make_socketpair()
+os.set_inheritable(broker_end.fileno(), True)
+# No PYTHONPATH, no cwd=repo: the installed broker must find itself.
+proc = subprocess.Popen([sys.executable, "-m", "daemon.pty_broker", str(broker_end.fileno())],
+                        pass_fds=[broker_end.fileno()])
+broker_end.close()
+try:
+    send_msg(daemon_end, {"v": 1, "argv": ["cat"], "cwd": "/", "env": dict(os.environ),
+                          "cols": 80, "rows": 24})
+    resp, master = recv_msg(daemon_end)
+    echoed = b""
+    if resp.get("status") == "ok":
+        os.write(master, b"hi\n")
+        deadline = time.time() + 5
+        while b"hi" not in echoed and time.time() < deadline:
+            time.sleep(0.05)
+            echoed += os.read(master, 4096)
+        os.close(master)
+        os.kill(resp["pid"], 9)
+    print(json.dumps({"status": resp.get("status"), "echoed": b"hi" in echoed,
+                      "own_group_leader": resp.get("pid") == resp.get("pgid"),
+                      "ptyprocess_installed": importlib.util.find_spec("ptyprocess") is not None}))
+finally:
+    daemon_end.close(); proc.terminate(); proc.wait(timeout=5)
+""")
+    assert out["status"] == "ok", f"the installed broker could not spawn: {out}"
+    assert out["echoed"] is True, "the master fd did not drive the child"
+    assert out["own_group_leader"] is True
+    assert out["ptyprocess_installed"] is False, \
+        "ptyprocess got into the install; the PTY above proves the core does not need it"
 
 
 def test_installed_core_does_not_drag_in_pytest(installed):

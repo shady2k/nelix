@@ -10,6 +10,8 @@ Task-1 gating spike) and never reads or writes the user's `~/.claude` config.
 """
 import json
 import os
+import sysconfig
+from pathlib import Path
 
 # Every hook posts its raw JSON body (`-d @-`) to POST /hook/<sid> on the daemon's RPC unix socket,
 # authenticated by the per-session secret header. Kept short-timeout and best-effort (`|| true`) so a
@@ -46,6 +48,43 @@ def claude_hook_settings_json() -> str:
     return _SETTINGS_JSON
 
 
+def _tool_path(name: str) -> str:
+    """Absolute path to an executor-facing CLI (`nelix-question`/`nelix-note`), resolved for the
+    interpreter that is ACTUALLY running -- installed or from a checkout.
+
+    Not `dirname(dirname(__file__))/bin`: that reaches the repo root only in a source tree. Once the
+    core is installed, this file is `<venv>/lib/python3.11/site-packages/daemon/hook_settings.py`,
+    so that derivation names `<site-packages>/bin/nelix-question`, which never exists -- and the old
+    code returned it anyway. The daemon then handed a worker an instruction naming a path that isn't
+    there, the worker silently never used the tool, and nobody learned why. Hence: probe, and raise.
+
+    1. `sysconfig.get_path("scripts")/<name>` -- where an installer puts a console script for THIS
+       interpreter. Correct for the install, and correct for a checkout whose venv has `-e .`
+       (requirements.txt), because that installs the same console scripts.
+    2. `<repo root>/bin/<name>` -- a checkout whose venv does NOT have the core installed. The suite
+       runs this way, and so does anyone who cloned and ran the daemon straight out of the tree.
+
+    `sysconfig` and not `Path(sys.executable).resolve().parent`, which is the obvious guess and is
+    wrong here: a uv-created venv symlinks `bin/python` at the uv-managed base CPython, so resolving
+    it walks OUT of the venv to `~/.local/share/uv/python/cpython-3.11.15-*/bin` and misses the
+    scripts entirely. That is not exotic -- it is what this repo's own `.venv` does. `sysconfig`
+    derives the script dir from `sys.prefix`, which a venv sets and a symlink cannot confuse.
+
+    PATH is deliberately not consulted at either step: nelix never mutates the executor's PATH, and
+    a `nelix-question` picked up from some unrelated PATH entry is not this core's.
+    """
+    candidates = (Path(sysconfig.get_path("scripts")) / name,
+                  Path(__file__).resolve().parents[1] / "bin" / name)
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    raise RuntimeError(
+        f"nelix: cannot locate the executor CLI {name!r}; looked at "
+        + ", ".join(str(c) for c in candidates)
+        + ". The core is installed without its console scripts, or this checkout's bin/ is gone. "
+          "Refusing to tell a worker to run a path that does not exist.")
+
+
 def executor_message_instructions() -> str:
     """Concise, static text (identical every call, like `claude_hook_settings_json()`) telling a
     hook-capable executor that `nelix-question`/`nelix-note` exist as non-blocking alternatives to
@@ -53,12 +92,11 @@ def executor_message_instructions() -> str:
     daemon/launchers/local.py (`_fold_system_prompt`), gated on the SAME hook-capable check as the
     hook `--settings` injection above -- a non-claude/hookless executor never sees it.
 
-    Bin paths are computed ABSOLUTE from the repo root (this file lives at <root>/daemon/
-    hook_settings.py, so one `dirname` off its own dir reaches <root>) and referenced by full path in
-    the instruction text so the executor's PATH is never touched."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    question = os.path.join(root, "bin", "nelix-question")
-    note = os.path.join(root, "bin", "nelix-note")
+    Tool paths are ABSOLUTE and referenced by full path in the instruction text, so the executor's
+    PATH is never touched. See `_tool_path` for where they come from -- NOT from the repo layout,
+    which is only one of the two places this code runs."""
+    question = _tool_path("nelix-question")
+    note = _tool_path("nelix-note")
     return (
         "Nelix orchestration commands are available (invoke by the absolute path shown; nelix "
         "never modifies your PATH):\n"
