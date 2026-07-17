@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass, replace
 
 import paths
+from daemon import owner
 from daemon.drivers import get_driver
 from daemon.env_resolver import EnvResolveError, resolve_env_cmds
 from daemon.events import EXTERNAL_OUTPUT_POLICY
@@ -188,9 +189,30 @@ class SessionManager:
             self._make = lambda sid, ex, spec: _default_session_factory(
                 sid, ex, spec, events, launcher_factory, driver_factory, logger)
 
-    def start(self, executor_name, task, cwd, model=None):
+    def _owned(self, session_id, owner_id):
+        """The owner-scoped session lookup behind EVERY caller-facing route (daemon/owner.py).
+
+        Returns the live Session, or None if `owner_id` does not own it — INCLUDING when the
+        session plainly exists. A non-owner gets exactly what a wrong session id gets, because
+        the owner is a NAMESPACE: another harness's session does not exist in this caller's
+        world, so "unknown session" is the honest answer and no route needs a new error shape.
+
+        `owner_id` is positional-required on every caller of this, never defaulted: a default
+        would be a shared owner, and a shared owner is the bug. The ownership question is asked
+        of the DURABLE RECORD (outside self._lock — it is disk I/O, and the answer cannot be
+        invalidated by the lock: nothing ever rewrites a session's owner).
+        """
+        if not owner.owns_session(session_id, owner_id):
+            return None
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def _owned_sids(self, session_ids, owner_id):
+        return {sid for sid in session_ids if owner.owns_session(sid, owner_id)}
+
+    def start(self, executor_name, task, cwd, *, owner_id, model=None):
         return self._spawn(executor_name, task, cwd, lineage_id=None, restarted_from=None,
-                           model=model)
+                           owner_id=owner_id, model=model)
 
     def _apply_model_override(self, spec, executor_name, model):
         """Validate + fold a per-session `model` into a fresh per-session ExecutorSpec (last-wins).
@@ -263,14 +285,19 @@ class SessionManager:
         else:
             self._logger.error("manager", event, session_id=session_id, exc_info=True)
 
-    def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, reserve=False,
-               model=None):
+    def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, owner_id,
+               reserve=False, model=None):
         # reserve=True: a slot reservation was made for us by restart() (old session popped +
         # self._reserved bumped under the lock). We OWN that reservation and must release it exactly
         # once: consume it ATOMICALLY with inserting the new session (so len(_sessions)+_reserved
         # never overcounts), or release it in `finally` if we raise before inserting.
         consumed = not reserve
         try:
+            # Shape-check the owner FIRST, before the lock and the cap checks (same reasoning as
+            # the model override): a bad owner_id is the caller's input error -> 400, never a 409
+            # "daemon full" that invites a retry. OwnerRejected subclasses ValueError; /start
+            # catches it ahead of the generic ValueError->409 branch.
+            owner.validate(owner_id)
             spec = self._specs.get(executor_name)
             if spec is None:
                 if self._logger is not None:
@@ -340,6 +367,15 @@ class SessionManager:
                               slot=f"{len(keep)}/{self._limit}")
         gc_sessions(keep, self._session_retain, self._session_max_age_days, logger=self._logger)
         try:
+            # AUTHORITATIVE, and ordered: the owner record is durable BEFORE the PTY spawns and
+            # therefore before /start can return the session id. An unwritable record raises
+            # OwnerWriteFailed and the existing teardown below un-registers the session, so a
+            # start that cannot be attributed spawns no process and returns no id — the caller
+            # never learns of a session it could not have driven anyway. (Between the insert
+            # above and this line the session is registered with no record; that window is safe
+            # because owner_of fails CLOSED — the session is invisible to everyone, including
+            # its own owner, rather than visible to all.)
+            owner.write(paths.sessions_root() / sid, owner_id)
             sess.start(task, cwd)
         except Exception as e:
             try:
@@ -352,17 +388,43 @@ class SessionManager:
             raise
         return StartOutcome(session_id=sid, base_seq=base_seq, snapshot=sess.snapshot())
 
-    def _restart_source(self, session_id):
-        """Resolve (executor, task, cwd, lineage_id, active_session_or_None, model) for a restart.
-        Source is an ACTIVE session if present, else the PERSISTED session-dir meta (the main path:
-        a crashed/done session has already been removed from _sessions). `model` is the per-session
-        override to re-apply (or None); OLD meta lacking the field defaults to None (no override, the
-        pre-nelix-9k0 behaviour). Returns None if neither source exists."""
+    def _restart_source(self, session_id, owner_id):
+        """Resolve (executor, task, cwd, lineage_id, active_session_or_None, model, stored_owner)
+        for a restart. Source is an ACTIVE session if present, else the PERSISTED session-dir meta
+        (the main path: a crashed/done session has already been removed from _sessions). `model` is
+        the per-session override to re-apply (or None); OLD meta lacking the field defaults to None
+        (no override, the pre-nelix-9k0 behaviour). Returns None if neither source exists, or if
+        `owner_id` does not own the session.
+
+        `stored_owner` comes from the DURABLE RECORD and is what the restarted session is written
+        with — the request's owner_id only ever AUTHORISES, it is never propagated. The guard doing
+        the real work is the comparison below: a session whose record is missing or malformed
+        fails closed and is refused, rather than being silently RE-OWNED by whoever asked to
+        restart it. That matters because EVERY crashed session is resolved through this path, so
+        "ownerless => free" would be the common case, not a corner.
+
+        Be honest about what is and is not proved here: once ownership is established,
+        `stored_owner` and `owner_id` are the SAME string, so spawning with one or the other is
+        indistinguishable — mutating `stored_owner` to `owner_id` leaves the whole suite green
+        (measured). Reading it off the record is therefore structural, not behavioural: it keeps
+        "the new session's owner comes from disk" true by construction if the check is ever moved
+        or relaxed. The behavioural guard is `owner.session_owned_by`, and killing that turns
+        three restart tests red.
+
+        It is `session_owned_by` and NOT `owner_of` + `==` for a reason paid for once already: a
+        hand-rolled comparison here silently reintroduced the None-matches-None skeleton key (a
+        caller passing owner_id=None matching an ownerless session), and the whole suite stayed
+        green because the RPC route validates first. One read, one primitive, one place for the
+        trap to live.
+        """
+        stored_owner = owner.session_owned_by(session_id, owner_id)
+        if stored_owner is None:      # not ours, or no trustworthy record -> fail closed
+            return None
         with self._lock:
             sess = self._sessions.get(session_id)
         if sess is not None:
             return (sess.executor, sess.task, sess.cwd,
-                    sess.lineage_id or session_id, sess, getattr(sess, "model", None))
+                    sess.lineage_id or session_id, sess, getattr(sess, "model", None), stored_owner)
         try:
             meta = json.loads(paths.session_meta(paths.sessions_root() / session_id).read_text())
         except (OSError, ValueError):
@@ -370,13 +432,13 @@ class SessionManager:
         if not meta.get("executor") or meta.get("cwd") is None:
             return None
         return (meta["executor"], meta.get("task"), meta["cwd"],
-                meta.get("lineage_id") or session_id, None, meta.get("model"))
+                meta.get("lineage_id") or session_id, None, meta.get("model"), stored_owner)
 
-    def restart(self, session_id, force=False):
-        src = self._restart_source(session_id)
+    def restart(self, session_id, *, owner_id, force=False):
+        src = self._restart_source(session_id, owner_id)
         if src is None:
             return RestartOutcome("unknown_session")
-        executor, task, cwd, lineage_id, active, model = src
+        executor, task, cwd, lineage_id, active, model, stored_owner = src
         spec = self._specs.get(executor)
         max_restarts = spec.max_restarts if spec is not None else 0
         with self._lock:
@@ -412,7 +474,8 @@ class SessionManager:
             # Re-apply the per-session model override (same-lineage recovery must not silently drop
             # it). _spawn re-validates + re-folds against the fresh original spec (idempotent).
             started = self._spawn(executor, task, cwd, lineage_id=lineage_id,
-                                  restarted_from=session_id, reserve=reserve, model=model)
+                                  restarted_from=session_id, reserve=reserve, model=model,
+                                  owner_id=stored_owner)   # INHERITED from disk, never the request
             new_sid, base_seq = started.session_id, started.base_seq
         except Exception as e:
             self._log_spawn_failure("restart_spawn_failed", session_id, e)
@@ -506,9 +569,8 @@ class SessionManager:
             return None
         return sess.append_progress_note(note)
 
-    def screen(self, session_id, raw=False, force=False):
-        with self._lock:
-            sess = self._sessions.get(session_id)
+    def screen(self, session_id, *, owner_id, raw=False, force=False):
+        sess = self._owned(session_id, owner_id)   # a non-owner reads another harness's TERMINAL
         if sess is None:
             return {"error": "unknown session"}
         # While the agent is actively working, withhold the screen (poll bait) unless explicitly
@@ -522,7 +584,12 @@ class SessionManager:
         return {"screen": sess.screen(raw=raw), "cols": sess._cols, "rows": sess._rows,
                 "external_output_policy": EXTERNAL_OUTPUT_POLICY}
 
-    def respond(self, session_id, answer, decision_id=None):
+    def respond(self, session_id, answer, *, owner_id, decision_id=None):
+        # Ownership BEFORE anything else: answering another harness's decision is nelix-v96's class
+        # at the harness boundary — the answer is typed into someone else's executor and cannot be
+        # taken back. Resolved outside the lock (disk I/O), then re-checked against live state below.
+        if not owner.owns_session(session_id, owner_id):
+            return RespondOutcome("unknown_session")
         with self._lock:
             sess = self._sessions.get(session_id)
             if sess is None:
@@ -600,14 +667,20 @@ class SessionManager:
             with self._lock:
                 self._reserved -= 1
 
-    def status(self, session_id=None, include_progress=False):
+    def status(self, session_id=None, *, owner_id, include_progress=False):
         """`include_progress` (Task 8): the explicit on-demand detail surface — merge
         `Session.progress_view()` into the returned snapshot(s) even during active-working, where
         `snapshot()` itself deliberately omits progress (anti-poll gate, session.py ~1260). Default
-        False keeps today's behavior byte-for-byte: nothing merged, no snapshot() gate bypassed."""
+        False keeps today's behavior byte-for-byte: nothing merged, no snapshot() gate bypassed.
+
+        OWNER-FILTERED on BOTH shapes. The session_id-less listing is THE board read this whole
+        slice exists for: unfiltered it returns every session on the daemon, so the reading harness
+        adopts every session it sees and arms a waiter for each. `recent_terminal` is filtered by
+        the same rule and is not an afterthought — it is the terminal INVENTORY, and an unfiltered
+        one leaks the other harness's task text and final state just as a live snapshot would.
+        """
         if session_id is not None:
-            with self._lock:
-                sess = self._sessions.get(session_id)
+            sess = self._owned(session_id, owner_id)
             if sess is None:
                 return {"error": "unknown session"}
             cursor = self._events.latest_seq(session_id)   # BEFORE snapshot: never arm past unseen
@@ -628,19 +701,39 @@ class SessionManager:
             # exp > now at read time, so a missed sweep is never a correctness issue, only bookkeeping.
             self._terminal_async = {sid: (rec, exp) for sid, (rec, exp) in self._terminal_async.items()
                                     if exp > now}
-            recent = {sid: snap for sid, (snap, exp) in self._terminal.items()}
+            recent_all = {sid: snap for sid, (snap, exp) in self._terminal.items()}
+        # Ownership is decided OUTSIDE the lock (it is disk I/O; holding manager._lock across N
+        # reads would stall every session's monitor). Safe: a session's owner never changes, so a
+        # verdict cannot go stale — the worst a concurrent start can do is not appear in this
+        # listing, which is what a snapshot taken a moment earlier would have shown anyway.
+        mine = self._owned_sids(snapshot, owner_id)
         sessions = {}
         for sid, s in snapshot.items():
+            if sid not in mine:
+                continue
             s_snap = s.snapshot()
             if include_progress:
                 s_snap.update(s.progress_view())
             sessions[sid] = {**s_snap, "seq": per_seq.get(sid, 0)}
+        recent = {sid: snap for sid, snap in recent_all.items()
+                  if owner.owns_session(sid, owner_id)}
         return {"sessions": sessions,
                 "limit": self._limit,
                 "cursor": cursor,
                 "recent_terminal": recent}
 
-    def stop(self, session_id, reason="user_stop"):
+    def stop(self, session_id, *, owner_id, reason="user_stop"):
+        """The CALLER-facing stop. Owner-gated: killing another harness's session is destructive
+        and irreversible, so a non-owner gets unknown_session and the session lives."""
+        if not owner.owns_session(session_id, owner_id):
+            return StopOutcome("unknown_session")
+        return self._stop(session_id, reason=reason)
+
+    def _stop(self, session_id, reason="user_stop"):
+        """The INTERNAL stop, with no owner gate. Reachable only from stop() (which has already
+        established ownership) and stop_all() (daemon shutdown, which owns everything by
+        definition). Kept separate so shutdown cannot be expressed as "stop as some owner", which
+        would need a wildcard owner — and a wildcard is the one thing that must not exist."""
         with self._lock:
             sess = self._sessions.get(session_id)   # look up only; DO NOT pop here
         if sess is None:
@@ -663,7 +756,8 @@ class SessionManager:
         return StopOutcome(status, snapshot=snap)
 
     def stop_all(self, reason="shutdown"):
+        # Daemon shutdown: every session goes, whoever owns it. _stop, not stop — see _stop.
         with self._lock:
             sids = list(self._sessions)
         for sid in sids:
-            self.stop(sid, reason=reason)
+            self._stop(sid, reason=reason)

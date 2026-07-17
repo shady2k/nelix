@@ -38,6 +38,7 @@ import pytest
 
 from daemon.clock import FakeClock                  # noqa: E402
 from daemon.config import ExecutorSpec               # noqa: E402
+from conftest import OWNER, own                    # noqa: E402
 from daemon.dialog import Dialog                     # noqa: E402
 from daemon.drivers.claude import ClaudeDriver       # noqa: E402
 from daemon.events import EventQueue                 # noqa: E402
@@ -152,7 +153,7 @@ def stack(tmp_path, unix_sock):
     sess._handle._dialog = sess._dialog
     sess._task_delivery = "delivered"
     with mgr._lock:
-        mgr._sessions[_SID] = sess
+        own(_SID); mgr._sessions[_SID] = sess
     sess.on_terminal = mgr._free_slot
     sess.deliver_turn = lambda text: mgr.send_turn(_SID, text)
 
@@ -186,12 +187,16 @@ def _run(script, args, env, timeout=10):
                           capture_output=True, text=True, timeout=timeout)
 
 
-def _wait_http(sock, after_seq, session_id, timeout=30):
+def _wait_http(sock, after_seq, session_id, owner_id=OWNER, timeout=30):
     """A bare, real HTTP GET /wait long-poll over the real unix socket (no client-side wrapper) —
-    exercises daemon.rpc_server's /wait route + EventQueue.wait_event directly."""
+    exercises daemon.rpc_server's /wait route + EventQueue.wait_event directly.
+
+    It builds the query by hand precisely to bypass RpcClient, so it has to carry owner_id itself:
+    /wait arms only on a session its owner asked about."""
     conn = UnixHTTPConnection(sock, timeout=timeout)
     try:
-        conn.request("GET", f"/wait?after_seq={after_seq}&session_id={session_id}")
+        conn.request("GET",
+                     f"/wait?after_seq={after_seq}&session_id={session_id}&owner_id={owner_id}")
         resp = conn.getresponse()
         body = json.loads(resp.read())
         return resp.status, body
@@ -207,7 +212,7 @@ def _wait_http(sock, after_seq, session_id, timeout=30):
 def test_full_async_message_lifecycle_through_real_daemon(stack):
     sess, mgr, ev, sid, sock = stack
     secret = sess.hook_secret                       # real per-session secret (Session.__init__)
-    rpc = RpcClient(Transport.unix(sock))
+    rpc = RpcClient(Transport.unix(sock), OWNER)
 
     _drive_busy(sess)
     before_ask = ev.latest_seq(sid)
@@ -309,7 +314,7 @@ def test_full_async_message_lifecycle_through_real_daemon(stack):
 def test_answer_delivered_immediately_when_executor_already_idle(stack):
     sess, mgr, ev, sid, sock = stack
     secret = sess.hook_secret
-    rpc = RpcClient(Transport.unix(sock))
+    rpc = RpcClient(Transport.unix(sock), OWNER)
 
     _drive_busy(sess)
     r = _run(QUESTION, ["--question", "keep the old flag?", "--continuation-plan", "assume yes"],
@@ -381,7 +386,7 @@ def test_note_does_not_satisfy_a_genuinely_armed_waiter(stack):
 def test_respond_after_executor_exits_returns_not_delivered_through_real_http(stack):
     sess, mgr, ev, sid, sock = stack
     secret = sess.hook_secret
-    rpc = RpcClient(Transport.unix(sock))
+    rpc = RpcClient(Transport.unix(sock), OWNER)
 
     _drive_busy(sess)
     r = _run(QUESTION, ["--question", "a?", "--continuation-plan", "c"], env=_env(sock, secret, sid))

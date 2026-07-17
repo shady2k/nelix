@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from conftest import EXECUTOR, make_spec
+from conftest import EXECUTOR, OWNER, make_spec
 from daemon.env_resolver import EnvResolveError, resolve_env_cmds
 from daemon.events import EventQueue
 from daemon.launchers.local import LocalLauncher
@@ -39,7 +39,7 @@ def test_spawn_env_resolve_failure_raises_and_cleans_up(monkeypatch, tmp_path):
     spec = make_spec(command="claude", args=["--foo"], driver="claude", env_cmd=dict(_LEAK))
     m = _mgr(monkeypatch, tmp_path, spec, buf)
     with pytest.raises(EnvResolveError) as ei:
-        m.start(EXECUTOR, "hi", str(tmp_path))
+        m.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER)
     assert ei.value.var == "TOK" and ei.value.reason == "non_zero_exit"
     assert not m._sessions               # the registered-but-unstarted session is torn down (slot freed)
 
@@ -49,7 +49,7 @@ def test_spawn_env_resolve_failure_logs_var_reason_without_leak(monkeypatch, tmp
     spec = make_spec(command="claude", args=["--foo"], driver="claude", env_cmd=dict(_LEAK))
     m = _mgr(monkeypatch, tmp_path, spec, buf)
     with pytest.raises(EnvResolveError):
-        m.start(EXECUTOR, "hi", str(tmp_path))
+        m.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER)
     out = buf.getvalue()
     # Redacted: neither the command string, its stdout, nor its stderr reaches any log sink.
     assert "LEAKOUT" not in out and "LEAKERR" not in out

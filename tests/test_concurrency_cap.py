@@ -33,6 +33,7 @@ def test_concurrency_limit_invalid_falls_back_to_5(tmp_path):
 
 
 from daemon.events import EventQueue
+from conftest import OWNER
 
 
 class _FakeSession:
@@ -60,9 +61,9 @@ def _manager(tmp_path, limit):
 def test_cap_admits_N_rejects_N_plus_1(tmp_path):
     mgr = _manager(tmp_path, limit=2)
     cwd = str(tmp_path)
-    mgr.start("claude", "t1", cwd)
-    mgr.start("claude", "t2", cwd)
+    mgr.start("claude", "t1", cwd, owner_id=OWNER)
+    mgr.start("claude", "t2", cwd, owner_id=OWNER)
     with pytest.raises(RuntimeError, match="concurrency_limit=2 reached"):
-        mgr.start("claude", "t3", cwd)
+        mgr.start("claude", "t3", cwd, owner_id=OWNER)
 
 

@@ -9,6 +9,7 @@ against — from nelix_status, an uncapped tool-result channel."""
 import argparse, http.client, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from daemon import owner
 from daemon.transport import Transport
 from rpc_client import RpcClient
 
@@ -31,6 +32,10 @@ def main():
     ap.add_argument("--session-id", dest="session_id", required=True,
                     help="Session to scope the wait to (REQUIRED: a session_id-less /wait is a "
                          "global wait that would deliver another session's event to this waiter)")
+    ap.add_argument("--owner-id", dest="owner_id", required=True,
+                    help="The owner this waiter speaks for (REQUIRED: /wait only arms on a "
+                         "session its owner asked about — a waiter armed on another harness's "
+                         "session is how one harness ends up answering another's decision)")
     args = ap.parse_args()
     if not args.session_id:
         # required=True rejects an absent flag; also refuse an empty value so the executor's waiter
@@ -45,22 +50,33 @@ def main():
         print(json.dumps({"kind": "none"}, ensure_ascii=False))
         return 0
 
-    client = RpcClient(transport)
+    try:
+        client = RpcClient(transport, args.owner_id)
+    except owner.OwnerRejected as e:
+        ap.error(str(e))
     after = args.after
     try:
         while True:
             # session_id is guaranteed present (required arg) — always scope the wait so a
-            # cross-session event never wakes this waiter.
-            path = f"/wait?after_seq={after}&session_id={args.session_id}"
+            # cross-session event never wakes this waiter. client.wait() builds the query,
+            # owner_id included: a hand-built URL here is how the owner param gets forgotten.
             try:
-                _st, body = client._call("GET", path, timeout=40)
-                evt = body.get("event")
+                body = client.wait(args.session_id, after_seq=after, timeout=40)
             except (OSError, ConnectionError, http.client.HTTPException):
                 # Daemon gone/unreachable (e.g. torn down, restarting). Don't crash with a
                 # traceback — exit cleanly so notify_on_complete wakes Hermes to reconcile
                 # via nelix_status instead of surfacing a scary background failure.
                 print(json.dumps({"kind": "none"}, ensure_ascii=False))
                 return 0
+            if body.get("error"):
+                # The session is unknown, or belongs to another owner — indistinguishable, by
+                # design. Either way this wait can never wake, so EXIT; re-issuing would be an
+                # unthrottled hot loop against the daemon (the `continue` below is only correct
+                # for a poll that actually blocked). Same clean exit as an unreachable daemon:
+                # Hermes reconciles via nelix_status.
+                print(json.dumps({"kind": "none"}, ensure_ascii=False))
+                return 0
+            evt = body.get("event")
             if evt is None:
                 continue                     # timeout tick — re-issue
             # Doorbell: tiny triage metadata only. status_required tells Hermes to pull the

@@ -7,7 +7,7 @@ import io
 
 import pytest
 
-from conftest import EXECUTOR, make_spec
+from conftest import EXECUTOR, OWNER, make_spec
 from daemon.events import EventQueue
 from daemon.manager import SessionManager, ModelRejected
 from daemon.obs import Logger
@@ -57,26 +57,26 @@ def _no_live_model_discovery(monkeypatch):
 # ---- argv fold (last-wins) -------------------------------------------------------------
 def test_model_appends_driver_flag_and_value():
     m, cap = _mgr(make_spec(args=["--foo"], driver="claude"))
-    m.start(EXECUTOR, "t", "/tmp", model="haiku")
+    m.start(EXECUTOR, "t", "/tmp", model="haiku", owner_id=OWNER)
     assert cap[0].spec.args == ["--foo", "--model", "haiku"]
     assert cap[0].spec.argv() == ["x", "--foo", "--model", "haiku"]
 
 
 def test_last_wins_strips_preexisting_split_form():
     m, cap = _mgr(make_spec(args=["--model", "opus", "--foo"], driver="claude"))
-    m.start(EXECUTOR, "t", "/tmp", model="haiku")
+    m.start(EXECUTOR, "t", "/tmp", model="haiku", owner_id=OWNER)
     assert cap[0].spec.args == ["--foo", "--model", "haiku"]
 
 
 def test_last_wins_strips_preexisting_equals_form():
     m, cap = _mgr(make_spec(args=["--model=opus", "--foo"], driver="claude"))
-    m.start(EXECUTOR, "t", "/tmp", model="haiku")
+    m.start(EXECUTOR, "t", "/tmp", model="haiku", owner_id=OWNER)
     assert cap[0].spec.args == ["--foo", "--model", "haiku"]
 
 
 def test_duplicate_model_flags_collapse_to_single_injected():
     m, cap = _mgr(make_spec(args=["--model", "a", "--model=b", "--foo"], driver="claude"))
-    m.start(EXECUTOR, "t", "/tmp", model="haiku")
+    m.start(EXECUTOR, "t", "/tmp", model="haiku", owner_id=OWNER)
     assert cap[0].spec.args == ["--foo", "--model", "haiku"]
     assert cap[0].spec.args.count("--model") == 1
 
@@ -85,7 +85,7 @@ def test_duplicate_model_flags_collapse_to_single_injected():
 def test_clean_model_is_forwarded_verbatim(clean):
     # A clean value is forwarded EXACTLY (no silent normalization) — the CLI is the authority.
     m, cap = _mgr(make_spec(args=[], driver="claude"))
-    m.start(EXECUTOR, "t", "/tmp", model=clean)
+    m.start(EXECUTOR, "t", "/tmp", model=clean, owner_id=OWNER)
     assert cap[0].spec.args == ["--model", clean]
 
 
@@ -93,7 +93,7 @@ def test_no_model_leaves_args_byte_identical():
     original = ["--model", "opus", "--foo"]        # even a pre-existing --model is untouched
     spec = make_spec(args=list(original), driver="claude")
     m, cap = _mgr(spec)
-    m.start(EXECUTOR, "t", "/tmp")                  # no model kwarg
+    m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)                  # no model kwarg
     assert cap[0].spec.args == original
     assert cap[0].spec is spec                      # SAME spec object: broker argv identical to pre-feature
 
@@ -110,13 +110,13 @@ def test_no_model_leaves_args_byte_identical():
 def test_bad_shape_rejected(bad):
     m, _ = _mgr(make_spec(driver="claude"))
     with pytest.raises(ModelRejected):
-        m.start(EXECUTOR, "t", "/tmp", model=bad)
+        m.start(EXECUTOR, "t", "/tmp", model=bad, owner_id=OWNER)
 
 
 def test_max_length_boundary_accepted():
     m, cap = _mgr(make_spec(args=[], driver="claude"))
     val = "x" * 128
-    m.start(EXECUTOR, "t", "/tmp", model=val)
+    m.start(EXECUTOR, "t", "/tmp", model=val, owner_id=OWNER)
     assert cap[0].spec.args == ["--model", val]
 
 
@@ -144,7 +144,7 @@ def test_real_preflight_no_auth_path_stays_offline(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     m, cap = _mgr(make_spec(args=[], driver="claude"))
-    m.start(EXECUTOR, "t", "/tmp", model="GLM-4.7")     # non-alias -> reaches the auth check, then skips
+    m.start(EXECUTOR, "t", "/tmp", model="GLM-4.7", owner_id=OWNER)     # non-alias -> reaches the auth check, then skips
     assert not reached, "no_auth pre-flight must skip BEFORE the network"
     assert cap[0].spec.args == ["--model", "GLM-4.7"]
 
@@ -162,29 +162,29 @@ class _NullModelDriver:
 def test_unsupported_driver_missing_flag_rejected():
     m, _ = _mgr(make_spec(driver="claude"), driver_factory=lambda name: _NoModelDriver())
     with pytest.raises(ModelRejected):
-        m.start(EXECUTOR, "t", "/tmp", model="haiku")
+        m.start(EXECUTOR, "t", "/tmp", model="haiku", owner_id=OWNER)
 
 
 def test_unsupported_driver_flag_none_rejected():
     m, _ = _mgr(make_spec(driver="claude"), driver_factory=lambda name: _NullModelDriver())
     with pytest.raises(ModelRejected):
-        m.start(EXECUTOR, "t", "/tmp", model="haiku")
+        m.start(EXECUTOR, "t", "/tmp", model="haiku", owner_id=OWNER)
 
 
 # ---- placement: validation precedes the concurrency cap (400 not 409) ------------------
 def test_bad_shape_rejected_even_at_capacity():
     m, _ = _mgr(make_spec(driver="claude"), limit=1)
-    m.start(EXECUTOR, "fill the one slot", "/tmp")     # daemon now at its cap
+    m.start(EXECUTOR, "fill the one slot", "/tmp", owner_id=OWNER)     # daemon now at its cap
     with pytest.raises(ModelRejected):                 # NOT RuntimeError(concurrency_limit)
-        m.start(EXECUTOR, "t", "/tmp", model="bad\nshape")
+        m.start(EXECUTOR, "t", "/tmp", model="bad\nshape", owner_id=OWNER)
 
 
 def test_unsupported_driver_rejected_even_at_capacity():
     m, _ = _mgr(make_spec(driver="claude"), limit=1,
                 driver_factory=lambda name: _NoModelDriver())
-    m.start(EXECUTOR, "fill the one slot", "/tmp")
+    m.start(EXECUTOR, "fill the one slot", "/tmp", owner_id=OWNER)
     with pytest.raises(ModelRejected):
-        m.start(EXECUTOR, "t", "/tmp", model="haiku")
+        m.start(EXECUTOR, "t", "/tmp", model="haiku", owner_id=OWNER)
 
 
 # ---- override visibility ----------------------------------------------------------------
@@ -197,7 +197,7 @@ def test_stripping_toml_pinned_model_emits_override_applied():
     buf = io.StringIO()
     m, _ = _mgr(make_spec(args=["--model", "opus"], driver="claude"),
                 logger=Logger(level="debug", stream=buf))
-    m.start(EXECUTOR, "t", "/tmp", model="haiku")
+    m.start(EXECUTOR, "t", "/tmp", model="haiku", owner_id=OWNER)
     assert "model_override_applied" in _events(buf)
 
 
@@ -205,7 +205,7 @@ def test_no_preexisting_flag_does_not_emit_override_applied():
     buf = io.StringIO()
     m, _ = _mgr(make_spec(args=["--foo"], driver="claude"),
                 logger=Logger(level="debug", stream=buf))
-    m.start(EXECUTOR, "t", "/tmp", model="haiku")     # nothing pre-existing was overridden
+    m.start(EXECUTOR, "t", "/tmp", model="haiku", owner_id=OWNER)     # nothing pre-existing was overridden
     assert "model_override_applied" not in _events(buf)
 
 
@@ -250,9 +250,9 @@ def _restart_mgr(tmp_path, monkeypatch, spec=None, limit=2):
 
 def test_restart_active_session_reinjects_same_model(tmp_path, monkeypatch):
     m = _restart_mgr(tmp_path, monkeypatch)
-    out = m.start(EXECUTOR, "task A", str(tmp_path), model="haiku")
+    out = m.start(EXECUTOR, "task A", str(tmp_path), model="haiku", owner_id=OWNER)
     assert _RestartCapSession.instances[0].spec.args == ["--foo", "--model", "haiku"]
-    r = m.restart(out.session_id)                          # active-session source path
+    r = m.restart(out.session_id, owner_id=OWNER)                          # active-session source path
     assert r.status == "restarted"
     assert _RestartCapSession.instances[1].spec.args == ["--foo", "--model", "haiku"]
 
@@ -260,23 +260,23 @@ def test_restart_active_session_reinjects_same_model(tmp_path, monkeypatch):
 def test_restart_from_persisted_meta_reinjects_same_model(tmp_path, monkeypatch):
     import paths
     m = _restart_mgr(tmp_path, monkeypatch)
-    out = m.start(EXECUTOR, "task B", str(tmp_path), model="sonnet"); sid = out.session_id
+    out = m.start(EXECUTOR, "task B", str(tmp_path), model="sonnet", owner_id=OWNER); sid = out.session_id
     # Simulate a crash: persist meta WITH the model (real _write_meta does this) and free the slot.
     paths.ensure_private_dir(paths.sessions_root() / sid)
     paths.session_meta(paths.sessions_root() / sid).write_text(
         __import__("json").dumps({"executor": EXECUTOR, "task": "task B", "cwd": str(tmp_path),
                                   "lineage_id": sid, "restarted_from": None, "model": "sonnet"}))
     m._free_slot(sid)                                      # gone from _sessions -> meta source path
-    r = m.restart(sid)
+    r = m.restart(sid, owner_id=OWNER)
     assert r.status == "restarted"
     assert _RestartCapSession.instances[-1].spec.args == ["--foo", "--model", "sonnet"]
 
 
 def test_restart_without_model_argv_matches_no_model_baseline(tmp_path, monkeypatch):
     m = _restart_mgr(tmp_path, monkeypatch)
-    out = m.start(EXECUTOR, "task C", str(tmp_path))       # NO model
+    out = m.start(EXECUTOR, "task C", str(tmp_path), owner_id=OWNER)       # NO model
     assert _RestartCapSession.instances[0].spec.args == ["--foo"]
-    r = m.restart(out.session_id)
+    r = m.restart(out.session_id, owner_id=OWNER)
     assert r.status == "restarted"
     assert _RestartCapSession.instances[1].spec.args == ["--foo"]     # byte-identical, no --model
 
@@ -284,13 +284,13 @@ def test_restart_without_model_argv_matches_no_model_baseline(tmp_path, monkeypa
 def test_restart_from_old_meta_without_model_key_is_clean(tmp_path, monkeypatch):
     import paths
     m = _restart_mgr(tmp_path, monkeypatch)
-    out = m.start(EXECUTOR, "task D", str(tmp_path)); sid = out.session_id
+    out = m.start(EXECUTOR, "task D", str(tmp_path), owner_id=OWNER); sid = out.session_id
     # OLD meta shape: no "model" key at all -> restart must default to None (no override, no crash).
     paths.ensure_private_dir(paths.sessions_root() / sid)
     paths.session_meta(paths.sessions_root() / sid).write_text(
         __import__("json").dumps({"executor": EXECUTOR, "task": "task D", "cwd": str(tmp_path),
                                   "lineage_id": sid, "restarted_from": None}))
     m._free_slot(sid)
-    r = m.restart(sid)
+    r = m.restart(sid, owner_id=OWNER)
     assert r.status == "restarted"
     assert _RestartCapSession.instances[-1].spec.args == ["--foo"]    # no override

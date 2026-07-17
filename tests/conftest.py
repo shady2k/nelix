@@ -9,6 +9,27 @@ from daemon.config import ExecutorSpec  # noqa: E402  (after sys.path insert)
 
 EXECUTOR = "demo"
 
+# The owner most tests drive as. `owner_id` is required on every caller-facing manager/RPC call
+# (daemon/owner.py), so a test that omits it is a TypeError, not a silent pass — which is the
+# point of the parameter having no default. Tests that care about ISOLATION rather than merely
+# satisfying the signature use their own two owners: see tests/test_owner_isolation.py.
+OWNER = "test-owner"
+
+
+def own(session_id, owner_id=OWNER):
+    """Write the durable owner record a real `manager.start()` would have written.
+
+    For tests that put a Session into `mgr._sessions` BY HAND. Those bypass start(), so they
+    bypass the owner write, and every owner-filtered read then hides the session — which is
+    fail-closed working correctly, not an obstacle to route around. This restores the state a
+    real start leaves behind; it does not weaken the gate. Returns the session_id so it can wrap
+    an injection inline.
+    """
+    from daemon import owner as _owner
+    import paths as _paths
+    _owner.write(_paths.sessions_root() / session_id, owner_id)
+    return session_id
+
 
 def make_spec(**overrides):
     fields = dict(command="x", args=[], env={}, driver="claude", launcher="local")

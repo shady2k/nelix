@@ -2,7 +2,7 @@ import http.client
 import json, threading, urllib.error, urllib.request
 import socket as _socket
 import pytest
-from conftest import EXECUTOR
+from conftest import EXECUTOR, OWNER, own
 from daemon.events import EventQueue
 from daemon.manager import StartOutcome, StopOutcome
 from daemon.rpc_server import make_server
@@ -14,12 +14,12 @@ class FakeManager:
     def __init__(self):
         self._events = EventQueue(); self.started = None; self.responded = []; self.stopped = []
         self.respond_status = "resumed"; self.started_model = "__unset__"
-    def start(self, executor, task, cwd, model=None):
+    def start(self, executor, task, cwd, *, owner_id, model=None):
         self.started = (executor, task, cwd); self.started_model = model
         return StartOutcome(session_id="s1", base_seq=0,
                             snapshot={"session_id": "s1", "control_state": "busy",
                                       "task_delivery": "pending", "pending": False})
-    def respond(self, session_id, answer, decision_id=None):
+    def respond(self, session_id, answer, *, owner_id, decision_id=None):
         self.responded.append((session_id, answer, decision_id)); s = self.respond_status
         if s == "resumed":
             return RespondOutcome("resumed", seq=7, decision_id="dec-1", answered_decision_id="dec-1",
@@ -34,9 +34,9 @@ class FakeManager:
                                   pending={"decision_id": "dec-1", "kind": "waiting_for_user", "text": "y/n?"})
         return RespondOutcome("stale", pending={"decision_id": "dec-1", "kind": "waiting_for_user",
                                                 "text": "y/n?"})
-    def status(self, session_id=None, include_progress=False):
+    def status(self, session_id=None, *, owner_id, include_progress=False):
         return {"sessions": {}} if session_id is None else {"state": "working"}
-    def stop(self, session_id):
+    def stop(self, session_id, *, owner_id):
         self.stopped.append(session_id)
         return StopOutcome("stopped", snapshot={"session_id": session_id,
                                                 "control_state": "terminal",
@@ -66,42 +66,47 @@ def unix_sock(tmp_path):
         pass
 
 
-def _req(method, url, token="t", body=None):
+def _req(method, url, token="t", body=None, headers=None):
+    """`headers` merges over the transport token (the /hook and /message routes need to send their
+    per-session secret). An empty response body decodes to {} rather than raising: /hook answers
+    204 No Content on success, and a helper that cannot read a success is no helper."""
     data = json.dumps(body).encode() if body is not None else None
-    r = urllib.request.Request(url, data=data, method=method, headers={"X-Nelix-Token": token})
+    hdrs = {"X-Nelix-Token": token, **(headers or {})}
+    r = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
         with urllib.request.urlopen(r, timeout=5) as resp:
-            return resp.status, json.loads(resp.read())
+            return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read())
+        return e.code, json.loads(e.read() or b"{}")
 
 
 def test_rpc_session_scoped_roundtrip():
+    own("s1")   # /wait only arms on a session the caller owns
     m = FakeManager()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8766, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:8766"
     try:
         st, b = _req("POST", base + "/start",
-                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo"})
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "owner_id": OWNER})
         assert st == 200 and b["operation"] == "start" and b["session_id"] == "s1"
         assert b["next_after_seq"] == 0          # daemon-owned start cursor (high-water before start)
         assert m.started == (EXECUTOR, "hi", "/repo")
         m._events.publish("s1", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
-        _, wb = _req("GET", base + "/wait?after_seq=0&session_id=s1")
+        _, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id=s1")
         assert wb["event"]["session_id"] == "s1"
         st, rb = _req("POST", base + "/respond",
-                      body={"session_id": "s1", "answer": "yes", "decision_id": "dec-1"})  # names the decision
+                      body={"session_id": "s1", "answer": "yes", "decision_id": "dec-1", "owner_id": OWNER})  # names the decision
         assert st == 200 and m.responded[-1] == ("s1", "yes", "dec-1")
         assert rb["operation"] == "respond" and rb["status"] == "resumed"
         assert rb["next_after_seq"] == 7 and rb["next_action"] == "end_turn"
         m.respond_status = "stale"
         st, sb = _req("POST", base + "/respond",
-                      body={"session_id": "s1", "answer": "yes", "decision_id": "dec-stale"})
+                      body={"session_id": "s1", "answer": "yes", "decision_id": "dec-stale", "owner_id": OWNER})
         assert st == 409 and sb["status"] == "stale"
         assert sb["pending"]["decision_id"] == "dec-1"               # current decision for reconcile
         assert sb["next_action"] == "fix_call"
-        st, _ = _req("POST", base + "/stop", body={"session_id": "s1"})
+        st, _ = _req("POST", base + "/stop", body={"session_id": "s1", "owner_id": OWNER})
         assert st == 200 and m.stopped == ["s1"]
     finally:
         srv.shutdown()
@@ -117,7 +122,7 @@ def test_respond_without_decision_id_returns_409_missing():
     base = "http://127.0.0.1:8788"
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s1", "answer": "yes"})       # no decision_id
+                     body={"session_id": "s1", "answer": "yes", "owner_id": OWNER})       # no decision_id
         assert st == 409 and b["operation"] == "respond"
         assert b["status"] == "missing_decision_id" and b["error"] == "missing_decision_id"
         assert b["pending"]["decision_id"] == "dec-1" and b["pending"]["text"] == "y/n?"
@@ -131,7 +136,7 @@ def test_respond_missing_answer_is_400():
     srv = make_server(FakeManager(), Transport.tcp("127.0.0.1", 8786, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("POST", "http://127.0.0.1:8786/respond", body={"session_id": "s1"})
+        st, b = _req("POST", "http://127.0.0.1:8786/respond", body={"session_id": "s1", "owner_id": OWNER})
         assert st == 400 and "missing field" in b.get("error", "") and "answer" in b["error"]
     finally:
         srv.shutdown()
@@ -139,13 +144,13 @@ def test_respond_missing_answer_is_400():
 
 class _NoPendingManager:
     def __init__(self): self._events = EventQueue()
-    def respond(self, session_id, answer, decision_id=None):
+    def respond(self, session_id, answer, *, owner_id, decision_id=None):
         return RespondOutcome("no_pending")
 
 
 class _WedgedManager:
     def __init__(self): self._events = EventQueue()
-    def respond(self, session_id, answer, decision_id=None):
+    def respond(self, session_id, answer, *, owner_id, decision_id=None):
         return RespondOutcome("write_timeout",
                               snapshot={"session_id": "s-w", "control_state": "busy", "pending": False})
 
@@ -157,7 +162,7 @@ def test_respond_write_timeout_is_503():
     buf = io.StringIO()
     srv, base = _serve(_WedgedManager(), buf)
     try:
-        st, b = _req("POST", base + "/respond", body={"session_id": "s-w", "answer": "1"})
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-w", "answer": "1", "owner_id": OWNER})
         assert st == 503 and b["status"] == "write_timeout" and b["next_action"] == "recover"
     finally:
         srv.shutdown()
@@ -166,7 +171,7 @@ def test_respond_write_timeout_is_503():
 
 class _UnconfirmedManager:
     def __init__(self): self._events = EventQueue()
-    def respond(self, session_id, answer, decision_id=None):
+    def respond(self, session_id, answer, *, owner_id, decision_id=None):
         return RespondOutcome("respond_failed", decision_id="dec-1", answered_decision_id="dec-1",
                               snapshot={"session_id": "s-u", "control_state": "busy", "pending": False})
 
@@ -179,7 +184,7 @@ def test_respond_unconfirmed_submit_is_503_recover():
     buf = io.StringIO()
     srv, base = _serve(_UnconfirmedManager(), buf)
     try:
-        st, b = _req("POST", base + "/respond", body={"session_id": "s-u", "answer": "do the thing"})
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-u", "answer": "do the thing", "owner_id": OWNER})
         assert st == 503 and b["status"] == "respond_failed" and b["next_action"] == "recover"
         assert b["error"] == "submit_unconfirmed"
         assert b["snapshot"]["pending"] is False
@@ -191,7 +196,7 @@ def test_respond_unconfirmed_submit_is_503_recover():
 
 class _AtCapacityManager:
     def __init__(self): self._events = EventQueue()
-    def respond(self, session_id, answer, decision_id=None):
+    def respond(self, session_id, answer, *, owner_id, decision_id=None):
         # An idle follow-up that can't re-acquire an active slot (concurrency cap full): the manager
         # routes it through send_turn, which returns at_capacity — an honest backpressure signal.
         return RespondOutcome("at_capacity")
@@ -205,7 +210,7 @@ def test_respond_at_capacity_is_503_honest_backpressure():
     buf = io.StringIO()
     srv, base = _serve(_AtCapacityManager(), buf)
     try:
-        st, b = _req("POST", base + "/respond", body={"session_id": "s-cap", "answer": "continue"})
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-cap", "answer": "continue", "owner_id": OWNER})
         assert st == 503
         assert b["operation"] == "respond" and b["status"] == "at_capacity"
         assert b["status"] != "no_pending" and b.get("error") != "no_pending_decision"
@@ -224,7 +229,7 @@ class _NotDeliveredManager:
         self._reason = reason
         self._snapshot = snapshot
 
-    def respond(self, session_id, answer, decision_id=None):
+    def respond(self, session_id, answer, *, owner_id, decision_id=None):
         return RespondOutcome("not_delivered", reason=self._reason, snapshot=self._snapshot)
 
 
@@ -237,7 +242,7 @@ def test_respond_not_delivered_executor_finished_is_200_refresh_status():
     srv, base = _serve(_NotDeliveredManager(reason="executor_finished"), buf)
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1"})
+                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1", "owner_id": OWNER})
         assert st == 200
         assert b["operation"] == "respond" and b["status"] == "not_delivered"
         assert b["reason"] == "executor_finished"
@@ -253,7 +258,7 @@ def test_respond_not_delivered_in_session_closing_carries_snapshot_no_reason():
     srv, base = _serve(_NotDeliveredManager(reason=None, snapshot=snap), __import__("io").StringIO())
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1"})
+                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1", "owner_id": OWNER})
         assert st == 200 and b["status"] == "not_delivered"
         assert b["reason"] is None
         assert b["snapshot"]["terminal_kind"] == "crashed"
@@ -269,7 +274,7 @@ class _QueuedManager:
     def __init__(self):
         self._events = EventQueue()
 
-    def respond(self, session_id, answer, decision_id=None):
+    def respond(self, session_id, answer, *, owner_id, decision_id=None):
         return RespondOutcome("queued",
                               snapshot={"session_id": session_id, "control_state": "busy",
                                         "pending": False})
@@ -282,7 +287,7 @@ def test_respond_queued_async_answer_is_200_not_false_no_pending():
     srv, base = _serve(_QueuedManager(), __import__("io").StringIO())
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1"})
+                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1", "owner_id": OWNER})
         assert st == 200
         assert b["operation"] == "respond" and b["status"] == "queued"
         assert b["status"] != "no_pending" and b.get("error") != "no_pending_decision"
@@ -298,7 +303,7 @@ def test_start_envelope_shape():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", "http://127.0.0.1:8790/start",
-                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo"})
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "owner_id": OWNER})
         assert st == 200 and b["operation"] == "start" and b["status"] == "started"
         assert b["session_id"] == "s1" and b["next_after_seq"] == 0
         assert b["snapshot"]["control_state"] == "busy" and b["next_action"] == "end_turn"
@@ -311,7 +316,7 @@ def test_respond_write_timeout_is_503_recover():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8801, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("POST", "http://127.0.0.1:8801/respond", body={"session_id": "s1", "answer": "x"})
+        st, b = _req("POST", "http://127.0.0.1:8801/respond", body={"session_id": "s1", "answer": "x", "owner_id": OWNER})
         assert st == 503 and b["status"] == "write_timeout" and b["next_action"] == "recover"
         assert b["snapshot"]["pending"] is False
     finally:
@@ -323,7 +328,7 @@ def test_respond_unknown_session_is_404_refresh_status():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8803, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("POST", "http://127.0.0.1:8803/respond", body={"session_id": "s1", "answer": "x"})
+        st, b = _req("POST", "http://127.0.0.1:8803/respond", body={"session_id": "s1", "answer": "x", "owner_id": OWNER})
         assert st == 404 and b["operation"] == "respond" and b["status"] == "unknown_session"
         assert b["next_action"] == "refresh_status" and b["session_id"] == "s1"
     finally:
@@ -335,7 +340,7 @@ def test_stop_confirmed_terminal_is_report():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8792, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("POST", "http://127.0.0.1:8792/stop", body={"session_id": "s1"})
+        st, b = _req("POST", "http://127.0.0.1:8792/stop", body={"session_id": "s1", "owner_id": OWNER})
         assert st == 200 and b["operation"] == "stop" and b["status"] == "stopped"
         assert b["next_action"] == "report" and b["snapshot"]["terminal_kind"] == "stopped"
     finally:
@@ -346,7 +351,7 @@ class _StopRequestedManager:
     """Manager that returns stop_requested from stop() (teardown not confirmed within join)."""
     def __init__(self):
         self._events = EventQueue()
-    def stop(self, session_id):
+    def stop(self, session_id, *, owner_id):
         return StopOutcome("stop_requested",
                            snapshot={"session_id": session_id,
                                      "control_state": "stopping", "pending": False})
@@ -356,7 +361,7 @@ def test_rpc_stop_requested_is_refresh_status():
     """/stop returning stop_requested must yield HTTP 200 with next_action='refresh_status'."""
     srv, base = _serve(_StopRequestedManager(), __import__("io").StringIO())
     try:
-        st, b = _req("POST", base + "/stop", body={"session_id": "s1"})
+        st, b = _req("POST", base + "/stop", body={"session_id": "s1", "owner_id": OWNER})
         assert st == 200 and b["operation"] == "stop"
         assert b["status"] == "stop_requested"
         assert b["next_action"] == "refresh_status"
@@ -373,7 +378,7 @@ def test_respond_no_pending_is_409_and_logs_session_id():
     srv, base = _serve(_NoPendingManager(), buf)
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s-xyz", "answer": "1", "decision_id": "dec-9"})
+                     body={"session_id": "s-xyz", "answer": "1", "decision_id": "dec-9", "owner_id": OWNER})
         assert st == 409 and b["error"] == "no_pending_decision"
     finally:
         srv.shutdown()
@@ -387,12 +392,12 @@ def test_responses_are_utf8_not_ascii_escaped():
     # screen/transcript text (Cyrillic task echo, ❯) must reach Hermes as real UTF-8,
     # not \uXXXX escapes (ensure_ascii=False in _send).
     class CyrManager:
-        def status(self, session_id=None, include_progress=False):
+        def status(self, session_id=None, *, owner_id, include_progress=False):
             return {"msg": "вторая строка ❯"}
     srv = make_server(CyrManager(), Transport.tcp("127.0.0.1", 8779, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        r = urllib.request.Request("http://127.0.0.1:8779/status?session_id=s1",
+        r = urllib.request.Request(f"http://127.0.0.1:8779/status?owner_id={OWNER}&session_id=s1",
                                    headers={"X-Nelix-Token": "t"})
         with urllib.request.urlopen(r, timeout=5) as resp:
             raw = resp.read()
@@ -418,21 +423,21 @@ def test_rpc_requires_token():
 class FakeManagerRaisesValueError:
     def __init__(self):
         self._events = EventQueue()
-    def start(self, executor, task, cwd, model=None):
+    def start(self, executor, task, cwd, *, owner_id, model=None):
         raise ValueError(f"launcher 'auto' is not implemented (post-MVP); use 'local'")
     def respond(self, *a): return None
-    def status(self, session_id=None, include_progress=False): return {}
-    def stop(self, session_id): return False
+    def status(self, session_id=None, *, owner_id, include_progress=False): return {}
+    def stop(self, session_id, *, owner_id): return False
 
 
 def test_rpc_start_threads_model_to_manager():
-    # nelix-9k0: /start reads optional body["model"] and passes it to manager.start(..., model=...).
+    # nelix-9k0: /start reads optional body["model"] and passes it to manager.start(..., model=..., owner_id=OWNER).
     m = FakeManager()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8795, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", "http://127.0.0.1:8795/start",
-                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "model": "haiku"})
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "model": "haiku", "owner_id": OWNER})
         assert st == 200
         assert m.started_model == "haiku"
     finally:
@@ -446,7 +451,7 @@ def test_rpc_start_without_model_passes_none():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", "http://127.0.0.1:8796/start",
-                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo"})
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "owner_id": OWNER})
         assert st == 200
         assert m.started_model is None
     finally:
@@ -455,12 +460,12 @@ def test_rpc_start_without_model_passes_none():
 
 class FakeManagerRejectsModel:
     def __init__(self): self._events = EventQueue()
-    def start(self, executor, task, cwd, model=None):
+    def start(self, executor, task, cwd, *, owner_id, model=None):
         from daemon.manager import ModelRejected
         raise ModelRejected("driver does not support a model override")
     def respond(self, *a): return None
-    def status(self, session_id=None, include_progress=False): return {}
-    def stop(self, session_id): return False
+    def status(self, session_id=None, *, owner_id, include_progress=False): return {}
+    def stop(self, session_id, *, owner_id): return False
 
 
 def test_rpc_start_model_rejected_returns_400():
@@ -471,7 +476,7 @@ def test_rpc_start_model_rejected_returns_400():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", "http://127.0.0.1:8797/start",
-                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "model": "bad"})
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "model": "bad", "owner_id": OWNER})
         assert st == 400, f"expected 400, got {st}"
         assert "error" in b
     finally:
@@ -480,12 +485,12 @@ def test_rpc_start_model_rejected_returns_400():
 
 class FakeManagerModelUnavailable:
     def __init__(self): self._events = EventQueue()
-    def start(self, executor, task, cwd, model=None):
+    def start(self, executor, task, cwd, *, owner_id, model=None):
         from daemon.manager import ModelUnavailable
         raise ModelUnavailable([{"id": "glm-5.2", "display_name": "GLM-5.2"}])
     def respond(self, *a): return None
-    def status(self, session_id=None, include_progress=False): return {}
-    def stop(self, session_id): return False
+    def status(self, session_id=None, *, owner_id, include_progress=False): return {}
+    def stop(self, session_id, *, owner_id): return False
 
 
 def test_start_model_unavailable_returns_400_with_list():
@@ -496,7 +501,7 @@ def test_start_model_unavailable_returns_400_with_list():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", "http://127.0.0.1:8798/start",
-                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "model": "bad"})
+                     body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "model": "bad", "owner_id": OWNER})
         assert st == 400, f"expected 400, got {st}"
         assert b["available_models"] == [{"id": "glm-5.2", "display_name": "GLM-5.2"}]
     finally:
@@ -509,7 +514,7 @@ def test_rpc_start_value_error_returns_409():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", "http://127.0.0.1:8768/start",
-                     body={"executor": "bad", "task": "hi", "cwd": "/repo"})
+                     body={"executor": "bad", "task": "hi", "cwd": "/repo", "owner_id": OWNER})
         assert st == 409, f"expected 409, got {st}"
         assert "error" in b
     finally:
@@ -532,7 +537,7 @@ class _FakeSession:
 
 class FakeManagerWithDialog:
     def __init__(self): self._events = EventQueue()
-    def status(self, sid=None, include_progress=False):
+    def status(self, sid=None, *, owner_id, include_progress=False):
         return {"session_id": "s1", "executor": EXECUTOR, "state": "idle_prompt",
                 "decision": {"kind": "waiting_for_user",
                              "text": "Proceed?", "hint": "needs_permission"}}
@@ -541,10 +546,11 @@ class FakeManagerWithDialog:
 
 def test_status_includes_decision():
     m = FakeManagerWithDialog()
+    own("s1")   # the durable owner record a real start would have written
     srv = make_server(m, Transport.tcp("127.0.0.1", 8770, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("GET", "http://127.0.0.1:8770/status?session_id=s1")
+        st, b = _req("GET", f"http://127.0.0.1:8770/status?owner_id={OWNER}&session_id=s1")
         assert st == 200 and b["decision"]["kind"] == "waiting_for_user"
         assert b["decision"]["hint"] == "needs_permission"
     finally:
@@ -553,12 +559,12 @@ def test_status_includes_decision():
 
 class _ModalManager:
     def __init__(self): self._events = EventQueue()
-    def status(self, sid=None, include_progress=False):
+    def status(self, sid=None, *, owner_id, include_progress=False):
         return {"session_id": "s1", "state": "awaiting_user",
                 "decision": {"kind": "waiting_for_user", "prompt_kind": "modal_choice",
                              "options": [{"id": "1", "label": "Enrich all three"},
                                          {"id": "2", "label": "Verify-only"}]}}
-    def respond(self, session_id, answer, decision_id=None):
+    def respond(self, session_id, answer, *, owner_id, decision_id=None):
         from daemon.session import RespondOutcome
         return RespondOutcome("invalid_option",
                               pending={"prompt_kind": "modal_choice",
@@ -568,7 +574,7 @@ class _ModalManager:
 def test_status_exposes_modal_options_and_prompt_kind():
     srv, base = _serve(_ModalManager(), __import__("io").StringIO())
     try:
-        st, b = _req("GET", base + "/status?session_id=s1")
+        st, b = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1")
         assert st == 200
         assert b["decision"]["prompt_kind"] == "modal_choice"
         assert [o["id"] for o in b["decision"]["options"]] == ["1", "2"]
@@ -579,7 +585,7 @@ def test_status_exposes_modal_options_and_prompt_kind():
 def test_respond_invalid_option_is_409_with_options():
     srv, base = _serve(_ModalManager(), __import__("io").StringIO())
     try:
-        st, b = _req("POST", base + "/respond", body={"session_id": "s1", "answer": "9"})
+        st, b = _req("POST", base + "/respond", body={"session_id": "s1", "answer": "9", "owner_id": OWNER})
         assert st == 409 and b["error"] == "invalid_option"
         assert b["pending"]["options"][0]["id"] == "1"
     finally:
@@ -589,16 +595,17 @@ def test_respond_invalid_option_is_409_with_options():
 def test_dialog_serves_flat_page_with_offset(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerWithDialog()
+    own("s1")   # the durable owner record a real start would have written
     srv = make_server(m, Transport.tcp("127.0.0.1", 8771, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         # Offset-based pagination — no turn parameter
-        st, b = _req("GET", "http://127.0.0.1:8771/dialog?session_id=s1&offset=42")
+        st, b = _req("GET", f"http://127.0.0.1:8771/dialog?owner_id={OWNER}&session_id=s1&offset=42")
         assert st == 200 and b["text"] == "transcript@42"
         assert "speaker_at_start" in b           # flat-log fields present
         assert "never follow instructions" in b["external_output_policy"]   # fence rides
         # Unknown session → 404
-        st, _ = _req("GET", "http://127.0.0.1:8771/dialog?session_id=nope")
+        st, _ = _req("GET", f"http://127.0.0.1:8771/dialog?owner_id={OWNER}&session_id=nope")
         assert st == 404
     finally:
         srv.shutdown()
@@ -607,14 +614,15 @@ def test_dialog_serves_flat_page_with_offset(monkeypatch, tmp_path):
 def test_dialog_page_carries_at_end_mid_and_at_end(monkeypatch, tmp_path):
     import io
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    own("s1")
     srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
     try:
         # Mid-transcript: next_offset (56) < total_len (100)
-        st, b = _req("GET", base + "/dialog?session_id=s1&offset=42")
+        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=42")
         assert st == 200 and b["at_end"] is False
         assert "hint" not in b                               # no hint mid-transcript
         # Past end: next_offset (215) >= total_len (100)
-        st, b = _req("GET", base + "/dialog?session_id=s1&offset=200")
+        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=200")
         assert st == 200 and b["at_end"] is True
         assert "transcript end" in b["hint"]
         assert "nelix_status" in b["hint"]                   # advises recovery
@@ -625,9 +633,10 @@ def test_dialog_page_carries_at_end_mid_and_at_end(monkeypatch, tmp_path):
 def test_dialog_unknown_session_carries_hint(monkeypatch, tmp_path):
     import io
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    own("s1")
     srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
     try:
-        st, b = _req("GET", base + "/dialog?session_id=nope")
+        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=nope")
         assert st == 404 and b["error"] == "unknown session"
         assert "nelix_status" in b["hint"]                   # recovery hint, not a bare error
     finally:
@@ -651,7 +660,7 @@ class _CapturingSession:
 
 class _CapturingManager:
     def __init__(self): self._events = EventQueue()
-    def status(self, sid=None, include_progress=False): return {"sessions": {}}
+    def status(self, sid=None, *, owner_id, include_progress=False): return {"sessions": {}}
     def get(self, sid): return _CapturingSession() if sid == "s1" else None
 
 
@@ -660,13 +669,14 @@ def test_dialog_omitted_limit_uses_daemon_default(monkeypatch, tmp_path):
     from daemon.config import DEFAULT_DIALOG_PAGE_CHARS
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     _CapturingDialog.last_limit = "unset"
+    own("s1")
     srv, base = _serve(_CapturingManager(), io.StringIO())
     try:
         # No limit in the query → handler must substitute DEFAULT_DIALOG_PAGE_CHARS.
-        _req("GET", base + "/dialog?session_id=s1&offset=0")
+        _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=0")
         assert _CapturingDialog.last_limit == DEFAULT_DIALOG_PAGE_CHARS
         # Explicit limit still honored.
-        _req("GET", base + "/dialog?session_id=s1&offset=0&limit=123")
+        _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=0&limit=123")
         assert _CapturingDialog.last_limit == 123
     finally:
         srv.shutdown()
@@ -682,11 +692,12 @@ def test_dialog_at_end_on_exact_final_page_real_reader(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     sess_dir = paths.sessions_root() / "s1"
     d = Dialog(sess_dir, tail_lines=10, spool_max_bytes=4096)
+    own("s1")
     d.add_agent_line("hello world")          # flat text becomes "‹agent›\nhello world"
     d.close()                                # flush transcript.jsonl to disk
     srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
     try:
-        st, b = _req("GET", base + "/dialog?session_id=s1&offset=0")
+        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=0")
         assert st == 200
         assert b["text"]                                    # non-empty final page
         assert b["next_offset"] == b["total_len"]           # read consumed the whole transcript
@@ -702,7 +713,7 @@ def test_rpc_start_missing_field_returns_400():
     try:
         # body missing "task" key
         st, b = _req("POST", "http://127.0.0.1:8769/start",
-                     body={"executor": EXECUTOR})
+                     body={"executor": EXECUTOR, "owner_id": OWNER})
         assert st == 400, f"expected 400, got {st}"
         assert "missing field" in b.get("error", "")
     finally:
@@ -716,7 +727,7 @@ def test_rpc_start_missing_cwd_returns_400():
     try:
         # cwd is required: a start without a working dir must be rejected, not defaulted.
         st, b = _req("POST", "http://127.0.0.1:8772/start",
-                     body={"executor": EXECUTOR, "task": "hi"})
+                     body={"executor": EXECUTOR, "task": "hi", "owner_id": OWNER})
         assert st == 400, f"expected 400, got {st}"
         assert "missing field" in b.get("error", "") and "cwd" in b.get("error", "")
     finally:
@@ -747,7 +758,7 @@ def test_rpc_wait_requires_session_id():
     try:
         # An event on a DIFFERENT session: a global waiter would leak it into this reply.
         m._events.publish("s-other", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
-        st, b = _req("GET", "http://127.0.0.1:8775/wait?after_seq=0")
+        st, b = _req("GET", f"http://127.0.0.1:8775/wait?owner_id={OWNER}&after_seq=0")
         assert st == 400 and b["error"] == "missing session_id"
     finally:
         srv.shutdown()
@@ -758,7 +769,7 @@ def test_bad_int_query_param_is_400():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8783, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("GET", "http://127.0.0.1:8783/wait?after_seq=notanint")
+        st, b = _req("GET", f"http://127.0.0.1:8783/wait?owner_id={OWNER}&after_seq=notanint")
         assert st == 400 and "integer" in b["error"]
     finally:
         srv.shutdown()
@@ -800,7 +811,7 @@ class FakeManagerWithScreen:
     _FRAME = "╭──────╮\n│ Welcome back! │\n╰──────╯\n❯ "
     def __init__(self):
         self._events = EventQueue()
-    def screen(self, session_id, raw=False, force=False):
+    def screen(self, session_id, *, owner_id, raw=False, force=False):
         from daemon.session import _clean_screen
         if session_id != "s1":
             return {"error": "unknown session"}
@@ -813,11 +824,11 @@ def test_screen_endpoint_returns_live_viewport():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8773, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("GET", "http://127.0.0.1:8773/screen?session_id=s1")
+        st, b = _req("GET", f"http://127.0.0.1:8773/screen?owner_id={OWNER}&session_id=s1")
         assert st == 200 and "screen" in b and isinstance(b["screen"], str)
         assert b["cols"] == 120 and b["rows"] == 40
         assert "│" not in b["screen"] and "Welcome back!" in b["screen"]   # cleaned by default
-        st, rb = _req("GET", "http://127.0.0.1:8773/screen?session_id=s1&raw=1")
+        st, rb = _req("GET", f"http://127.0.0.1:8773/screen?owner_id={OWNER}&session_id=s1&raw=1")
         assert st == 200 and "│" in rb["screen"]                            # raw is uncleaned
     finally:
         srv.shutdown()
@@ -827,7 +838,7 @@ class FakeManagerWorkingScreen:
     _FRAME = "doing things esc to interrupt"
     def __init__(self):
         self._events = EventQueue()
-    def screen(self, session_id, raw=False, force=False):
+    def screen(self, session_id, *, owner_id, raw=False, force=False):
         # mirror the real manager (M4): while working, withhold the screen unless force (raw alone
         # does NOT bypass withholding).
         if not force:
@@ -841,10 +852,10 @@ def test_screen_endpoint_withholds_while_working_unless_force():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8774, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("GET", "http://127.0.0.1:8774/screen?session_id=s1")
+        st, b = _req("GET", f"http://127.0.0.1:8774/screen?owner_id={OWNER}&session_id=s1")
         assert st == 200 and "screen" not in b
         assert b["control_state"] == "busy" and "End your turn" in b["message"]
-        st, fb = _req("GET", "http://127.0.0.1:8774/screen?session_id=s1&force=1")
+        st, fb = _req("GET", f"http://127.0.0.1:8774/screen?owner_id={OWNER}&session_id=s1&force=1")
         assert st == 200 and fb["screen"] == FakeManagerWorkingScreen._FRAME   # force shows it
     finally:
         srv.shutdown()
@@ -864,7 +875,7 @@ def test_unix_transport_serves_status_without_a_token(unix_sock, fake_manager):
         conn = http.client.HTTPConnection("localhost")     # host ignored; we override the socket
         conn.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         conn.sock.connect(unix_sock)
-        conn.request("GET", "/status")                      # NO X-Nelix-Token header
+        conn.request("GET", f"/status?owner_id={OWNER}")                      # NO X-Nelix-Token header
         resp = conn.getresponse()
         assert resp.status == 200
     finally:
@@ -878,11 +889,11 @@ def test_status_stamps_rpc_protocol_version(fake_manager):
     from daemon.protocol import RPC_PROTOCOL_VERSION
     srv, base = _serve(fake_manager, io.StringIO())
     try:
-        st, body = _req("GET", base + "/status")
+        st, body = _req("GET", base + f"/status?owner_id={OWNER}")
         assert st == 200
         assert body["rpc_protocol"] == RPC_PROTOCOL_VERSION
         # session-scoped status carries it too
-        _, body2 = _req("GET", base + "/status?session_id=s1")
+        _, body2 = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1")
         assert body2["rpc_protocol"] == RPC_PROTOCOL_VERSION
     finally:
         srv.shutdown()
@@ -912,7 +923,7 @@ def test_unauthorized_is_logged():
     buf = io.StringIO()
     srv, base = _serve(FakeManager(), buf)
     try:
-        st, _ = _req("GET", base + "/status", token="WRONG")
+        st, _ = _req("GET", base + f"/status?owner_id={OWNER}", token="WRONG")
         assert st == 401
     finally:
         srv.shutdown()
@@ -926,7 +937,7 @@ def test_status_read_is_logged(tmp_path):
     buf = io.StringIO()
     srv, base = _serve(FakeManager(), buf)
     try:
-        st, _ = _req("GET", base + "/status?session_id=s1")
+        st, _ = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1")
         assert st == 200
     finally:
         srv.shutdown()
@@ -946,6 +957,7 @@ def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
     from daemon.rpc_server import make_server
 
     d = Dialog(paths.sessions_root() / "s-fin", tail_lines=10, spool_max_bytes=10000)
+    own("s-fin")
     d.add_agent_line("finished output"); d.close()
 
     class _Mgr:                                   # session no longer live in the registry
@@ -954,7 +966,7 @@ def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
     threading.Thread(target=srv.handle_request, daemon=True).start()
     host, port = srv.server_address
     try:
-        req = urllib.request.Request(f"http://{host}:{port}/dialog?session_id=s-fin",
+        req = urllib.request.Request(f"http://{host}:{port}/dialog?owner_id={OWNER}&session_id=s-fin",
                                      headers={"X-Nelix-Token": "t"})
         with urllib.request.urlopen(req, timeout=5) as r:
             page = json.loads(r.read())
@@ -975,7 +987,7 @@ def test_unexpected_exception_returns_json_500_and_logs():
     m.status = _boom
     srv, base = _serve(m, buf)
     try:
-        st, body = _req("GET", base + "/status")
+        st, body = _req("GET", base + f"/status?owner_id={OWNER}")
         assert st == 500 and body["error"] == "internal"
     finally:
         srv.shutdown()
@@ -997,7 +1009,7 @@ def test_unix_foreign_uid_is_rejected(monkeypatch, unix_sock, fake_manager):
         conn = http.client.HTTPConnection("localhost")
         conn.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         conn.sock.connect(unix_sock)
-        conn.request("GET", "/status")          # NO X-Nelix-Token header
+        conn.request("GET", f"/status?owner_id={OWNER}")          # NO X-Nelix-Token header
         resp = conn.getresponse()
         resp.read()
         assert resp.status == 401
