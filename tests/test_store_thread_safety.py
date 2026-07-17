@@ -286,10 +286,21 @@ def test_many_short_lived_threads_touching_a_shared_store_leave_no_connection_gr
 
     def live_connections():
         gc.collect()
-        return sum(1 for o in gc.get_objects() if isinstance(o, sqlite3.Connection))
+        return [o for o in gc.get_objects() if isinstance(o, sqlite3.Connection)]
 
     try:
+        # POSITIVE CONTROL (nelix-91y review round 2, finding #3): the count below is
+        # vacuous — before == after == 0 passes while measuring nothing — on any platform
+        # where sqlite3.Connection simply is not gc-tracked. Pin a KNOWN-live connection
+        # (this thread's own, kept referenced for the test's whole body) and require it to
+        # show up in the counted set, both before and after, so a broken measurement
+        # technique fails loudly instead of a real leak passing silently.
+        main_conn = store._conn
         before = live_connections()
+        assert main_conn in before, (
+            "gc.get_objects() does not surface a known-live sqlite3.Connection on this "
+            "platform; the growth assertion below would pass vacuously without measuring "
+            "anything")
         for _ in range(50):
             def touch():
                 store._conn.execute("SELECT 1").fetchone()
@@ -299,9 +310,10 @@ def test_many_short_lived_threads_touching_a_shared_store_leave_no_connection_gr
             t.join(timeout=10)
             assert not t.is_alive(), "a short-lived thread hung"
         after = live_connections()
-        assert after <= before, (
-            f"live sqlite3.Connection objects grew from {before} to {after} across 50 "
-            f"short-lived threads that each opened and dropped their own connection")
+        assert main_conn in after, "the main thread's own live connection vanished from the count"
+        assert len(after) <= len(before), (
+            f"live sqlite3.Connection objects grew from {len(before)} to {len(after)} across "
+            f"50 short-lived threads that each opened and dropped their own connection")
     finally:
         store.close()
 

@@ -215,7 +215,13 @@ def test_a_brand_new_db_shared_by_many_threads_bootstraps_exactly_once(tmp_path,
         try:
             barrier.wait(timeout=30)
             conn = conns.get()
-            results.append(conn.execute("SELECT 1").fetchone()[0])
+            # A real schema table, not `SELECT 1`: `SELECT 1` passes against ANY connection,
+            # bootstrapped or not, so it proved nothing about whether the DDL had actually
+            # finished before this thread's open returned — an implementation that flipped
+            # `_bootstrapped`/released the gate BEFORE the DDL completed would still pass it.
+            # `starts` exists only once _SCHEMA has run, so a thread that observes the
+            # database before that raises "no such table" here instead of silently reading 1.
+            results.append(conn.execute("SELECT count(*) FROM starts").fetchone()[0])
         except BaseException as e:      # noqa: BLE001 - account for everything
             errs.append(f"{type(e).__name__}: {e}")
 
@@ -227,7 +233,7 @@ def test_a_brand_new_db_shared_by_many_threads_bootstraps_exactly_once(tmp_path,
 
     assert all(not t.is_alive() for t in threads), "a thread hung on its first open"
     assert errs == [], f"concurrent first opens on a brand-new db failed: {errs}"
-    assert results == [1] * n, "not every thread's first open returned a working connection"
+    assert results == [0] * n, "not every thread's first open saw a fully-bootstrapped schema"
     assert len(calls) == 1, f"expected exactly ONE full bootstrap, connect() ran {len(calls)}"
 
 
@@ -472,6 +478,41 @@ def test_a_filesystem_that_cannot_do_wal_is_permanent_not_retryable(tmp_path, mo
     with pytest.raises(NelixError) as ei:
         db.connect(tmp_path)
     assert ei.value.code == errors.STORE_UNSUPPORTED
+
+
+def test_connect_established_closes_its_new_connection_on_a_pragma_failure(
+        tmp_path, monkeypatch):
+    # nelix-91y review round 2, finding #4: connect()'s exception path closes the connection
+    # it just opened before re-raising (see connect()'s `if conn is not None: conn.close()`
+    # arms); _connect_established() did not — a PRAGMA failing AFTER the open succeeded left
+    # a live, never-closed sqlite3.Connection behind for every thread whose per-connection
+    # setup died partway through. Same factory-subclass interception as the WAL test above,
+    # aimed at the LAST pragma _connect_established sets so an earlier one has already
+    # succeeded on the leaked connection.
+    db.connect(tmp_path).close()        # bootstrap first: _connect_established assumes it
+
+    real_connect = sqlite3.connect
+    opened = []
+
+    class _BoomOnForeignKeys(sqlite3.Connection):
+        def execute(self, sql, params=()):
+            if "foreign_keys" in sql:
+                raise sqlite3.OperationalError("simulated pragma failure")
+            return super().execute(sql, params)
+
+    def fake_connect(*a, **kw):
+        kw.setdefault("factory", _BoomOnForeignKeys)
+        conn = real_connect(*a, **kw)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+    with pytest.raises(NelixError):
+        db._connect_established(tmp_path, timeout=5.0)
+
+    assert opened, "the connection under test was never opened"
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")   # a closed connection refuses any further use
 
 
 def test_busy_is_unavailable_and_retryable():
@@ -838,3 +879,72 @@ def test_close_also_stops_a_worker_thread_that_already_had_its_own_connection_op
     assert not t.is_alive(), "the worker thread hung"
     assert boom == [errors.INTERNAL_ERROR], (
         f"a worker with an already-open connection kept using a closed store: {boom}")
+
+
+def test_a_fresh_open_racing_close_raises_instead_of_opening_after_close_returns(
+        tmp_path, monkeypatch):
+    # nelix-91y review round 2, finding #1: ThreadLocalConnections.get() checked `_closed`
+    # and then, on a cache miss, opened a new connection — but the check and the open were
+    # NOT atomic. A thread could pass the check, get paused there, watch ANOTHER thread's
+    # close() run all the way to completion, and still go on to open and cache a brand-new
+    # connection AFTER close() had already returned — exactly what "a closed instance is
+    # unusable" forbids.
+    #
+    # Reproduced deterministically: _open() is patched to pause right where it is entered
+    # (before it can take its own lock or touch `_closed`), close() is run to completion
+    # during that pause, and only then is the real _open() allowed to proceed. The fix must
+    # have the real _open() observe `_closed` and raise WITHOUT ever calling connect() or
+    # _connect_established() — i.e. without opening anything.
+    conns = db.ThreadLocalConnections(tmp_path)
+    conns.get()          # bootstraps on the main thread; this thread keeps its own connection
+
+    real_open = db.ThreadLocalConnections._open
+    about_to_open, may_open = threading.Event(), threading.Event()
+
+    def paused_open(self):
+        about_to_open.set()
+        assert may_open.wait(timeout=10), "close() never ran during the pause"
+        return real_open(self)
+
+    monkeypatch.setattr(db.ThreadLocalConnections, "_open", paused_open)
+
+    opened = []
+    real_connect, real_established = db.connect, db._connect_established
+
+    def counting_connect(*a, **kw):
+        opened.append("connect")
+        return real_connect(*a, **kw)
+
+    def counting_established(*a, **kw):
+        opened.append("_connect_established")
+        return real_established(*a, **kw)
+
+    monkeypatch.setattr(db, "connect", counting_connect)
+    monkeypatch.setattr(db, "_connect_established", counting_established)
+
+    results = []
+
+    def fresh_thread():
+        try:
+            results.append(("ok", conns.get()))
+        except NelixError as e:
+            results.append(("error", e))
+
+    t = threading.Thread(target=fresh_thread)
+    t.start()
+    try:
+        assert about_to_open.wait(timeout=5), "the fresh thread never reached its first open"
+        conns.close()                 # runs to completion WHILE the fresh thread is paused
+        may_open.set()
+        t.join(timeout=10)
+        assert not t.is_alive(), "the fresh thread hung"
+        assert results, "the fresh thread produced no result at all"
+        kind, payload = results[0]
+        assert kind == "error", (
+            "a fresh thread's first open raced close() and still opened a connection after "
+            "close() had already returned")
+        assert payload.code == errors.INTERNAL_ERROR
+        assert opened == [], f"a new connection was opened during the race: {opened}"
+    finally:
+        may_open.set()
+        t.join(timeout=10)
