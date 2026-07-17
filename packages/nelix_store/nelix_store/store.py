@@ -240,8 +240,22 @@ class Store:
 
     @translates_sqlite
     def list_terminal(self, owner_id: str) -> list:
+        """The owner's BOARD: results awaiting their attention.
+
+        `AND t.acknowledged_at IS NULL` is what makes ack mean anything. Without it this
+        filtered on owner and schema_version alone, so an acknowledged result stayed on the
+        board until the pruner happened to run — "acknowledge" meant "dismiss, eventually, on
+        the GC's schedule". Dismissal (the owner's decision, at once) and reclamation (the
+        pruner's, later) are different events.
+
+        The filter is HERE and not in _TERMINAL_SELECT on purpose: get_terminal shares that
+        SELECT, a get by id is not the board, and ack_terminal re-reads through get_terminal
+        inside its own transaction — hiding acked rows there would break ack's idempotency
+        and the ack/prune seam with it.
+        """
         rows = self._conn.execute(
             f"{_TERMINAL_SELECT} WHERE st.owner_id=? AND t.schema_version=? "
+            "AND t.acknowledged_at IS NULL "
             "ORDER BY t.ended_at, t.session_id", (owner_id, SCHEMA_VERSION)).fetchall()
         records, _skipped = _read_rows(rows, TerminalRecord)
         return records
@@ -259,9 +273,18 @@ class Store:
             record = self.get_terminal(session_id, owner_id=owner_id)   # owner guard first
             if record.acknowledged_at is not None:
                 return record
+            # SQLite silently COERCES NaN to NULL on write. `float(self._clock())` therefore
+            # let a NaN clock stamp NULL — leaving this CAS's own "AND acknowledged_at IS
+            # NULL" guard still matching, the re-read returning None (VALID, the field is
+            # optional), nothing raising, and the transaction COMMITTING. Measured: ack
+            # reported SUCCESS and acknowledged nothing, silently and forever. +inf failed the
+            # opposite way (stored as-is, rejected by the re-read, rolled back) and reported
+            # OUR clock as store_corrupt. Same rule as every other timestamp, so the same
+            # helper — read here rather than at entry because a REPEATED ack returns above
+            # without needing a clock at all, and must stay idempotent regardless of one.
             self._conn.execute(
                 "UPDATE terminal SET acknowledged_at=? WHERE session_id=? "
-                "AND acknowledged_at IS NULL", (float(self._clock()), session_id))
+                "AND acknowledged_at IS NULL", (timestamp(self._clock(), "clock"), session_id))
             return self.get_terminal(session_id, owner_id=owner_id)
 
     @translates_sqlite

@@ -102,6 +102,24 @@ def _live_session(store, ledger, owner="hermes:local", key="k1", **over):
     return started_session(store, ledger, owner=owner, key=key, state="running", **over)
 
 
+def _acked_setup(tmp_path, clock):
+    """A published, UNacknowledged terminal record on a Store built with `clock`.
+
+    A nonsense clock cannot disturb the setup, which is what makes it a clean probe of the
+    ack: this Store's clock is read only by ack_terminal and prune_terminal. Identity comes
+    from a real start (the ledger keeps its own sane clock) and put_terminal's ended_at is
+    the caller's fact, not a clock read.
+    """
+    lg = StartLedger(tmp_path, clock=lambda: 1000.0)
+    try:
+        store = Store(tmp_path, clock=clock)
+        sid = _live_session(store, lg)
+        store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    finally:
+        lg.close()
+    return store, sid
+
+
 def test_a_terminal_record_cannot_exist_without_its_session(store):
     with pytest.raises(NelixError) as ei:
         store.put_terminal("s-" + "9" * 32, terminal_kind="done", summary="s", ended_at=1.0)
@@ -200,6 +218,33 @@ def test_concurrent_acks_agree_on_one_timestamp(tmp_path):
     assert all(not t.is_alive() for t in threads), "a thread hung"
     assert len(results) == 8
     assert len(set(results)) == 1, f"acks disagreed on the timestamp: {sorted(set(results))}"
+
+
+def test_acknowledging_removes_a_result_from_the_board_at_once(store, ledger):
+    # list_terminal filtered on owner and schema_version and NOTHING else — there was no
+    # acknowledged filter at all. So an acked result stayed on the owner's board until the
+    # pruner happened to run, which made "acknowledge" mean "dismiss, eventually, on the GC's
+    # schedule". Logical dismissal (ack) and physical reclamation (prune) are different
+    # events, and only the first is the owner's to decide.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid]
+    store.ack_terminal(sid, owner_id="hermes:local")
+    assert store.list_terminal("hermes:local") == [], \
+        "an acknowledged result was still on the board; only prune removed it"
+
+
+def test_acknowledging_does_not_hide_a_result_from_a_direct_get(store, ledger):
+    # The filter belongs on the BOARD, not on the shared _TERMINAL_SELECT. A get by id is not
+    # the board: ack_terminal re-reads through get_terminal inside its own transaction, and
+    # ack's idempotency (a repeated ack returns the ORIGINAL timestamp) is exactly the ability
+    # to read an acknowledged row back by id. This test passes both before and after the
+    # board filter; its job is to fail on the WRONG fix, and it does.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    store.ack_terminal(sid, owner_id="hermes:local")
+    assert store.get_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
+    assert store.ack_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
 
 
 def test_prune_removes_acknowledged_records(store, ledger):
@@ -301,29 +346,20 @@ def test_a_corrupt_terminal_row_does_not_blind_an_owner(store, ledger):
 
 
 def test_a_prune_cannot_land_between_the_ack_and_its_reread(tmp_path):
-    # !! THIS TEST DOES NOT WORK YET — DO NOT TRUST IT AS A GUARD. Bead: see below. !!
-    # Measured 0/5: removing ack_terminal's outer transaction does NOT fail it. The commit
-    # that added it (3368b0e) claims "a seam that actually catches"; that claim is FALSE and
-    # this comment is the correction.
+    # ack_terminal is one transaction: read -> CAS -> re-read. Without it, a prune landing
+    # between the CAS and the re-read makes an ack that DURABLY SUCCEEDED report
+    # unknown_session — a non-retryable error for an operation that worked.
     #
-    # THE INTENT (which is sound): spy on the public get_terminal and, on its SECOND call —
-    # after the CAS, before the re-read — run a prune on another connection. With the
-    # transaction, prune hits ack's write lock and cannot interleave; without it, the CAS has
-    # auto-committed, the row is prunable, and the re-read raises. That is exactly the defect
-    # the transaction exists for.
-    #
-    # WHY IT FAILS, diagnosed: the pruner Store is built on this thread but its prune runs on
-    # a SPAWNED one, and db.connect() never sets check_same_thread=False — so the call raises
-    # a raw sqlite3.ProgrammingError (misclassified as STORE_CORRUPT, since ProgrammingError
-    # carries no sqlite_errorcode and falls to the conservative default) and prune never
-    # reaches SQLite's locking at all. It races nothing, in either the shipped or the mutated
-    # code.
-    #
-    # THE FIX, and it is smaller than the bug: drop the thread entirely. The spy already runs
-    # on this thread inside ack_terminal, so call prune SYNCHRONOUSLY from it using a pruner
-    # Store built on this thread. No thread affinity to violate; the pruner's BEGIN IMMEDIATE
-    # meets ack's write lock and, at busy_timeout=0, returns store_unavailable at once. The
-    # thread was never needed — it only hid the bug.
+    # THE SEAM, and both halves are load-bearing:
+    #  * SYNCHRONOUS, on this thread. The pruner Store is built here, and db.connect() does not
+    #    set check_same_thread=False, so pruning from a spawned thread raises before reaching
+    #    ANY SQLite locking — it would race nothing. (Nor can the Store be built inside the
+    #    thread: connect() runs executescript(_SCHEMA), which needs a write lock the acker
+    #    holds, so it would fail at connect rather than at prune.)
+    #  * BEFORE the re-read, not after. The prune must land while ack is between its CAS and
+    #    its re-read. The previous spy did `record = real_get(...)` and only THEN counted and
+    #    pruned, so on the second call the re-read had already returned and the prune raced
+    #    nothing. Measured: with both bugs present, deleting BEGIN IMMEDIATE caught 0/5.
     from nelix_store.ledger import StartLedger
     from nelix_store.store import Store
 
@@ -333,25 +369,27 @@ def test_a_prune_cannot_land_between_the_ack_and_its_reread(tmp_path):
         sid = _live_session(acker, lg)
         acker.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
 
-        # busy_timeout=0: the pruner must FAIL FAST when ack holds the write lock, rather than
-        # wait for it — otherwise "blocked" and "succeeded" look the same to the test.
+        # busy_timeout=0: the pruner must FAIL FAST when ack holds the write lock rather than
+        # wait for it — otherwise "blocked" and "succeeded" look identical to the test.
         pruner = Store(tmp_path, clock=lambda: 1000.0, timeout=0.0)
         calls, pruned = [], []
         real_get = acker.get_terminal
 
         def spy(session_id, *, owner_id):
-            record = real_get(session_id, owner_id=owner_id)
             calls.append(session_id)
-            if len(calls) == 2:                     # between the CAS and the re-read
-                t = threading.Thread(
-                    target=lambda: pruned.append(_try_prune(pruner)), daemon=True)
-                t.start()
-                t.join(timeout=0.5)
-            return record
+            if len(calls) == 2:                  # between the CAS and the re-read
+                pruned.append(_try_prune(pruner))
+            return real_get(session_id, owner_id=owner_id)
 
         acker.get_terminal = spy
         record = acker.ack_terminal(sid, owner_id="hermes:local")   # must NOT raise
         assert record.acknowledged_at == 1000.0
+        # The ack surviving is necessary but NOT sufficient: a prune that died of an unrelated
+        # error would leave the ack intact too and look identical. Assert the prune was
+        # BLOCKED BY THE WRITE LOCK — that is the thing the transaction actually does. This
+        # assertion is what would have caught the wrong-thread bug that hid this seam for
+        # seven revisions: it returned store_corrupt, not store_unavailable.
+        assert pruned == [errors.STORE_UNAVAILABLE], f"the prune did not race the ack: {pruned}"
         pruner.close()
     finally:
         lg.close()
@@ -386,6 +424,53 @@ def test_prune_rejects_a_nonsense_clock(tmp_path, bad):
     try:
         with pytest.raises(NelixError) as ei:
             store.prune_terminal(max_age_seconds=60, max_count=100)
+        assert ei.value.code == errors.INVALID_REQUEST
+    finally:
+        store.close()
+
+
+def test_a_nonsense_clock_cannot_make_ack_a_silent_no_op(tmp_path):
+    # The SHARPEST case, and the mechanism is not the obvious one — measured, not reasoned:
+    # SQLite silently COERCES NaN to NULL on write (nan -> stored NULL; inf and -inf store
+    # as-is). So the CAS `SET acknowledged_at=NaN ... AND acknowledged_at IS NULL` stamps
+    # NULL; its own guard therefore still matches next time; the re-read returns
+    # acknowledged_at=None, which is VALID because the field is optional; nothing raises, so
+    # the transaction COMMITS. Measured end to end on 3d25a1b: ack_terminal RETURNED SUCCESS
+    # with acknowledged_at=None and the row left unacknowledged. Silently, and forever.
+    #
+    # 67c300c guarded prune_terminal's clock read and left this one, so the package rejected a
+    # nonsense clock in one method and lied about the outcome in another.
+    store, sid = _acked_setup(tmp_path, clock=lambda: float("nan"))
+    try:
+        with pytest.raises(NelixError) as ei:
+            store.ack_terminal(sid, owner_id="hermes:local")
+        assert ei.value.code == errors.INVALID_REQUEST
+        row = store._conn.execute(
+            "SELECT acknowledged_at FROM terminal WHERE session_id=?", (sid,)).fetchone()
+        assert row["acknowledged_at"] is None, "a rejected ack must not have written anything"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), True,
+                                 "not-a-number", None])
+def test_ack_rejects_a_nonsense_clock(tmp_path, bad):
+    # Measured on 3d25a1b, and the outcomes DIFFER per value — which is exactly why the guard
+    # belongs on the read rather than on any one symptom:
+    #   nan   -> success, nothing acknowledged (above)
+    #   inf   -> stored as inf, re-read's TerminalRecord rejects it, `with self._conn:` rolls
+    #            back, row left clean: ack raised STORE_CORRUPT — naming OUR construction
+    #            argument as the caller's data rotting
+    #   True  -> silently 1.0, a real acknowledgement at a fictional time (bool is an int
+    #            subclass, which is why timestamp() rejects it explicitly)
+    #   "..."/None -> raw ValueError/TypeError, straight out through the package boundary:
+    #            translates_sqlite only catches sqlite3.Error
+    # One finite clock read closes all four. invalid_request names the right party: the clock
+    # is this Store's own construction argument and no retry of the same call can fix it.
+    store, sid = _acked_setup(tmp_path, clock=lambda: bad)
+    try:
+        with pytest.raises(NelixError) as ei:
+            store.ack_terminal(sid, owner_id="hermes:local")
         assert ei.value.code == errors.INVALID_REQUEST
     finally:
         store.close()
