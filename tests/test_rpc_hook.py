@@ -26,7 +26,7 @@ class FakeManager:
         self._session = session
 
     def get(self, sid):
-        return self._session if sid == "s-1" else None
+        return self._session if sid == "s-11111111" else None
 
 
 @pytest.fixture
@@ -65,16 +65,16 @@ def _post(base, path, *, body=None, raw=None, headers=None, content_length=None)
 
 def test_hook_accepted_with_secret(server):
     base, session = server
-    st = _post(base, "/hook/s-1", body={"hook_event_name": "Stop"},
+    st = _post(base, "/hook/s-11111111", body={"hook_event_name": "Stop"},
                headers={"X-Nelix-Hook-Secret": "sek"})
     assert st == 204
     assert session.hooks[-1].event == "Stop"
-    assert session.hooks[-1].session_id == "s-1"
+    assert session.hooks[-1].session_id == "s-11111111"
 
 
 def test_hook_parses_optional_fields(server):
     base, session = server
-    st = _post(base, "/hook/s-1",
+    st = _post(base, "/hook/s-11111111",
                body={"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
                      "tool_input": {"question": "JSON or YAML?"}, "is_interrupt": True,
                      "message": "permission_prompt"},
@@ -89,7 +89,7 @@ def test_hook_parses_optional_fields(server):
 
 def test_hook_rejected_wrong_secret(server):
     base, session = server
-    st = _post(base, "/hook/s-1", body={"hook_event_name": "Stop"},
+    st = _post(base, "/hook/s-11111111", body={"hook_event_name": "Stop"},
                headers={"X-Nelix-Hook-Secret": "nope"})
     assert st == 401
     assert session.hooks == []
@@ -97,14 +97,14 @@ def test_hook_rejected_wrong_secret(server):
 
 def test_hook_missing_secret_401(server):
     base, session = server
-    st = _post(base, "/hook/s-1", body={"hook_event_name": "Stop"})
+    st = _post(base, "/hook/s-11111111", body={"hook_event_name": "Stop"})
     assert st == 401
     assert session.hooks == []
 
 
 def test_hook_unknown_session_401(server):
     base, session = server
-    st = _post(base, "/hook/s-nope", body={"hook_event_name": "Stop"},
+    st = _post(base, "/hook/s-deadbeef", body={"hook_event_name": "Stop"},
                headers={"X-Nelix-Hook-Secret": "sek"})
     assert st == 401
     assert session.hooks == []
@@ -112,14 +112,14 @@ def test_hook_unknown_session_401(server):
 
 def test_hook_body_cap_413(server):
     base, _ = server
-    st = _post(base, "/hook/s-1", headers={"X-Nelix-Hook-Secret": "sek"},
+    st = _post(base, "/hook/s-11111111", headers={"X-Nelix-Hook-Secret": "sek"},
                content_length=256 * 1024 + 1)
     assert st == 413
 
 
 def test_hook_malformed_json_400(server):
     base, _ = server
-    st = _post(base, "/hook/s-1", raw=b"{not json",
+    st = _post(base, "/hook/s-11111111", raw=b"{not json",
                headers={"X-Nelix-Hook-Secret": "sek"})
     assert st == 400
 
@@ -130,7 +130,7 @@ def test_hook_rate_limit_drops_flood(server):
     # so a same-uid process cannot flood forged lifecycle events unbounded.
     base, session = server
     hdr = {"X-Nelix-Hook-Secret": "sek"}
-    codes = [_post(base, "/hook/s-1", body={"hook_event_name": "PostToolUse"}, headers=hdr)
+    codes = [_post(base, "/hook/s-11111111", body={"hook_event_name": "PostToolUse"}, headers=hdr)
              for _ in range(400)]
     assert codes[0] == 204                                # a normal single hook is accepted
     assert 429 in codes                                  # the flood is rate-limited (dropped)

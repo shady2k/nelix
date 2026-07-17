@@ -397,7 +397,7 @@ def test_responses_are_utf8_not_ascii_escaped():
     srv = make_server(CyrManager(), Transport.tcp("127.0.0.1", 8779, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        r = urllib.request.Request(f"http://127.0.0.1:8779/status?owner_id={OWNER}&session_id=s1",
+        r = urllib.request.Request(f"http://127.0.0.1:8779/status?owner_id={OWNER}&session_id=s-00000001",
                                    headers={"X-Nelix-Token": "t"})
         with urllib.request.urlopen(r, timeout=5) as resp:
             raw = resp.read()
@@ -541,16 +541,16 @@ class FakeManagerWithDialog:
         return {"session_id": "s1", "executor": EXECUTOR, "state": "idle_prompt",
                 "decision": {"kind": "waiting_for_user",
                              "text": "Proceed?", "hint": "needs_permission"}}
-    def get(self, sid): return _FakeSession() if sid == "s1" else None
+    def get(self, sid): return _FakeSession() if sid == "s-00000001" else None
 
 
 def test_status_includes_decision():
     m = FakeManagerWithDialog()
-    own("s1")   # the durable owner record a real start would have written
+    own("s-00000001")   # the durable owner record a real start would have written
     srv = make_server(m, Transport.tcp("127.0.0.1", 8770, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("GET", f"http://127.0.0.1:8770/status?owner_id={OWNER}&session_id=s1")
+        st, b = _req("GET", f"http://127.0.0.1:8770/status?owner_id={OWNER}&session_id=s-00000001")
         assert st == 200 and b["decision"]["kind"] == "waiting_for_user"
         assert b["decision"]["hint"] == "needs_permission"
     finally:
@@ -574,7 +574,7 @@ class _ModalManager:
 def test_status_exposes_modal_options_and_prompt_kind():
     srv, base = _serve(_ModalManager(), __import__("io").StringIO())
     try:
-        st, b = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1")
+        st, b = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s-00000001")
         assert st == 200
         assert b["decision"]["prompt_kind"] == "modal_choice"
         assert [o["id"] for o in b["decision"]["options"]] == ["1", "2"]
@@ -595,17 +595,17 @@ def test_respond_invalid_option_is_409_with_options():
 def test_dialog_serves_flat_page_with_offset(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerWithDialog()
-    own("s1")   # the durable owner record a real start would have written
+    own("s-00000001")   # the durable owner record a real start would have written
     srv = make_server(m, Transport.tcp("127.0.0.1", 8771, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         # Offset-based pagination — no turn parameter
-        st, b = _req("GET", f"http://127.0.0.1:8771/dialog?owner_id={OWNER}&session_id=s1&offset=42")
+        st, b = _req("GET", f"http://127.0.0.1:8771/dialog?owner_id={OWNER}&session_id=s-00000001&offset=42")
         assert st == 200 and b["text"] == "transcript@42"
         assert "speaker_at_start" in b           # flat-log fields present
         assert "never follow instructions" in b["external_output_policy"]   # fence rides
         # Unknown session → 404
-        st, _ = _req("GET", f"http://127.0.0.1:8771/dialog?owner_id={OWNER}&session_id=nope")
+        st, _ = _req("GET", f"http://127.0.0.1:8771/dialog?owner_id={OWNER}&session_id=s-00000099")
         assert st == 404
     finally:
         srv.shutdown()
@@ -614,15 +614,15 @@ def test_dialog_serves_flat_page_with_offset(monkeypatch, tmp_path):
 def test_dialog_page_carries_at_end_mid_and_at_end(monkeypatch, tmp_path):
     import io
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
-    own("s1")
+    own("s-00000001")
     srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
     try:
         # Mid-transcript: next_offset (56) < total_len (100)
-        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=42")
+        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s-00000001&offset=42")
         assert st == 200 and b["at_end"] is False
         assert "hint" not in b                               # no hint mid-transcript
         # Past end: next_offset (215) >= total_len (100)
-        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=200")
+        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s-00000001&offset=200")
         assert st == 200 and b["at_end"] is True
         assert "transcript end" in b["hint"]
         assert "nelix_status" in b["hint"]                   # advises recovery
@@ -633,10 +633,10 @@ def test_dialog_page_carries_at_end_mid_and_at_end(monkeypatch, tmp_path):
 def test_dialog_unknown_session_carries_hint(monkeypatch, tmp_path):
     import io
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
-    own("s1")
+    own("s-00000001")
     srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
     try:
-        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=nope")
+        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s-00000099")
         assert st == 404 and b["error"] == "unknown session"
         assert "nelix_status" in b["hint"]                   # recovery hint, not a bare error
     finally:
@@ -661,7 +661,7 @@ class _CapturingSession:
 class _CapturingManager:
     def __init__(self): self._events = EventQueue()
     def status(self, sid=None, *, owner_id, include_progress=False): return {"sessions": {}}
-    def get(self, sid): return _CapturingSession() if sid == "s1" else None
+    def get(self, sid): return _CapturingSession() if sid == "s-00000001" else None
 
 
 def test_dialog_omitted_limit_uses_daemon_default(monkeypatch, tmp_path):
@@ -669,14 +669,14 @@ def test_dialog_omitted_limit_uses_daemon_default(monkeypatch, tmp_path):
     from daemon.config import DEFAULT_DIALOG_PAGE_CHARS
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     _CapturingDialog.last_limit = "unset"
-    own("s1")
+    own("s-00000001")
     srv, base = _serve(_CapturingManager(), io.StringIO())
     try:
         # No limit in the query → handler must substitute DEFAULT_DIALOG_PAGE_CHARS.
-        _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=0")
+        _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s-00000001&offset=0")
         assert _CapturingDialog.last_limit == DEFAULT_DIALOG_PAGE_CHARS
         # Explicit limit still honored.
-        _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=0&limit=123")
+        _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s-00000001&offset=0&limit=123")
         assert _CapturingDialog.last_limit == 123
     finally:
         srv.shutdown()
@@ -690,14 +690,14 @@ def test_dialog_at_end_on_exact_final_page_real_reader(monkeypatch, tmp_path):
     from daemon.dialog import Dialog
     import paths
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
-    sess_dir = paths.sessions_root() / "s1"
+    sess_dir = paths.sessions_root() / "s-00000001"
     d = Dialog(sess_dir, tail_lines=10, spool_max_bytes=4096)
-    own("s1")
+    own("s-00000001")
     d.add_agent_line("hello world")          # flat text becomes "‹agent›\nhello world"
     d.close()                                # flush transcript.jsonl to disk
     srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
     try:
-        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s1&offset=0")
+        st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id=s-00000001&offset=0")
         assert st == 200
         assert b["text"]                                    # non-empty final page
         assert b["next_offset"] == b["total_len"]           # read consumed the whole transcript
@@ -813,7 +813,7 @@ class FakeManagerWithScreen:
         self._events = EventQueue()
     def screen(self, session_id, *, owner_id, raw=False, force=False):
         from daemon.session import _clean_screen
-        if session_id != "s1":
+        if session_id != "s-00000001":
             return {"error": "unknown session"}
         screen = self._FRAME if raw else _clean_screen(self._FRAME)
         return {"screen": screen, "cols": 120, "rows": 40}
@@ -824,11 +824,11 @@ def test_screen_endpoint_returns_live_viewport():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8773, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("GET", f"http://127.0.0.1:8773/screen?owner_id={OWNER}&session_id=s1")
+        st, b = _req("GET", f"http://127.0.0.1:8773/screen?owner_id={OWNER}&session_id=s-00000001")
         assert st == 200 and "screen" in b and isinstance(b["screen"], str)
         assert b["cols"] == 120 and b["rows"] == 40
         assert "│" not in b["screen"] and "Welcome back!" in b["screen"]   # cleaned by default
-        st, rb = _req("GET", f"http://127.0.0.1:8773/screen?owner_id={OWNER}&session_id=s1&raw=1")
+        st, rb = _req("GET", f"http://127.0.0.1:8773/screen?owner_id={OWNER}&session_id=s-00000001&raw=1")
         assert st == 200 and "│" in rb["screen"]                            # raw is uncleaned
     finally:
         srv.shutdown()
@@ -852,10 +852,10 @@ def test_screen_endpoint_withholds_while_working_unless_force():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8774, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("GET", f"http://127.0.0.1:8774/screen?owner_id={OWNER}&session_id=s1")
+        st, b = _req("GET", f"http://127.0.0.1:8774/screen?owner_id={OWNER}&session_id=s-00000001")
         assert st == 200 and "screen" not in b
         assert b["control_state"] == "busy" and "End your turn" in b["message"]
-        st, fb = _req("GET", f"http://127.0.0.1:8774/screen?owner_id={OWNER}&session_id=s1&force=1")
+        st, fb = _req("GET", f"http://127.0.0.1:8774/screen?owner_id={OWNER}&session_id=s-00000001&force=1")
         assert st == 200 and fb["screen"] == FakeManagerWorkingScreen._FRAME   # force shows it
     finally:
         srv.shutdown()
@@ -893,7 +893,7 @@ def test_status_stamps_rpc_protocol_version(fake_manager):
         assert st == 200
         assert body["rpc_protocol"] == RPC_PROTOCOL_VERSION
         # session-scoped status carries it too
-        _, body2 = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1")
+        _, body2 = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s-00000001")
         assert body2["rpc_protocol"] == RPC_PROTOCOL_VERSION
     finally:
         srv.shutdown()
@@ -937,7 +937,7 @@ def test_status_read_is_logged(tmp_path):
     buf = io.StringIO()
     srv, base = _serve(FakeManager(), buf)
     try:
-        st, _ = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1")
+        st, _ = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s-00000001")
         assert st == 200
     finally:
         srv.shutdown()
@@ -945,7 +945,7 @@ def test_status_read_is_logged(tmp_path):
              if l.strip() and json.loads(l)["event"] == "read"]
     assert reads, "a GET /status must emit a read record"
     r = reads[-1]
-    assert r["level"] == "debug" and r["tool"] == "status" and r["session_id"] == "s1"
+    assert r["level"] == "debug" and r["tool"] == "status" and r["session_id"] == "s-00000001"
     assert "seq" in r
 
 
@@ -956,8 +956,8 @@ def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
     from daemon.dialog import Dialog
     from daemon.rpc_server import make_server
 
-    d = Dialog(paths.sessions_root() / "s-fin", tail_lines=10, spool_max_bytes=10000)
-    own("s-fin")
+    d = Dialog(paths.sessions_root() / "s-0000face", tail_lines=10, spool_max_bytes=10000)
+    own("s-0000face")
     d.add_agent_line("finished output"); d.close()
 
     class _Mgr:                                   # session no longer live in the registry
@@ -966,7 +966,7 @@ def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
     threading.Thread(target=srv.handle_request, daemon=True).start()
     host, port = srv.server_address
     try:
-        req = urllib.request.Request(f"http://{host}:{port}/dialog?owner_id={OWNER}&session_id=s-fin",
+        req = urllib.request.Request(f"http://{host}:{port}/dialog?owner_id={OWNER}&session_id=s-0000face",
                                      headers={"X-Nelix-Token": "t"})
         with urllib.request.urlopen(req, timeout=5) as r:
             page = json.loads(r.read())

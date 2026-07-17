@@ -88,7 +88,7 @@ class _Sess:
 class FakeManagerDialog:
     def __init__(self): self._events = EventQueue()
     def status(self, sid=None, *, owner_id, include_progress=False): return {"sessions": {}}
-    def get(self, sid): return _Sess() if sid == "s1" else None
+    def get(self, sid): return _Sess() if sid == "s-00000001" else None
 
 
 def test_rpc_client_dialog(monkeypatch, tmp_path):
@@ -97,17 +97,17 @@ def test_rpc_client_dialog(monkeypatch, tmp_path):
     # manager cannot stand in for it. That is the gate working: /dialog reads the transcript off
     # disk without consulting the manager at all, so the record is the only thing between a
     # session id and someone else's transcript.
-    owner.write(paths.sessions_root() / "s1", OWNER)
+    owner.write(paths.sessions_root() / "s-00000001", OWNER)
     m = FakeManagerDialog()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8782, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         c = RpcClient(Transport.tcp("127.0.0.1", 8782, "t"), OWNER)
         # Offset-based pagination (no turn parameter)
-        d = c.dialog("s1", offset=42)
+        d = c.dialog("s-00000001", offset=42)
         assert d["text"] == "transcript@42"
         assert "speaker_at_start" in d          # flat-log field present
-        d2 = c.dialog("s1")                     # default offset=0
+        d2 = c.dialog("s-00000001")                     # default offset=0
         assert d2["text"] == "transcript@0"
     finally:
         srv.shutdown()

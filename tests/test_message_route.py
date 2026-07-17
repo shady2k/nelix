@@ -42,12 +42,15 @@ class FakeManager:
     Manager/Session methods use (see daemon/manager.py + daemon/session.py)."""
 
     def __init__(self):
-        # "s1" is a normal live session. "s-race" is authenticatable (present for `get`, so /message
-        # auth succeeds) but absent from `_live` — it stands in for the rare post-auth race the brief
-        # documents (session freed between the auth lookup and the state-mutating call), so the two
-        # manager methods below hit their unknown_session branch even though auth passed.
-        self._sessions = {"s1": FakeSession(), "s-race": FakeSession()}
-        self._live = {"s1"}
+        # "s-11111111" is a normal live session. "s-aaaaaaaa" is authenticatable (present for
+        # `get`, so /message auth succeeds) but absent from `_live` — it stands in for the rare
+        # post-auth race the brief documents (session freed between the auth lookup and the
+        # state-mutating call), so the two manager methods below hit their unknown_session branch
+        # even though auth passed. Both are valid-shaped (`s-<hex>`): the RPC layer now shape-
+        # validates every path-prefix session id (nelix-9a4.6 review finding #3) before it ever
+        # reaches this fake, so a placeholder id has to look like a real one.
+        self._sessions = {"s-11111111": FakeSession(), "s-aaaaaaaa": FakeSession()}
+        self._live = {"s-11111111"}
         self._qseq = {}
         self._pending = {}      # sid -> {"id":..., "question":...}
         self._progress_seq = {}
@@ -127,42 +130,44 @@ def post_hook(base, path, body, secret=SECRET):
 
 
 def test_unauthorized_without_secret(server):
-    st, _ = post(server, "/message/s1", {"kind": "note", "summary": "x"}, secret=None)
+    st, _ = post(server, "/message/s-11111111", {"kind": "note", "summary": "x"}, secret=None)
     assert st == 401
 
 
 def test_unauthorized_wrong_secret(server):
-    st, _ = post(server, "/message/s1", {"kind": "note", "summary": "x"}, secret="wrong")
+    st, _ = post(server, "/message/s-11111111", {"kind": "note", "summary": "x"}, secret="wrong")
     assert st == 401
 
 
 def test_unauthorized_unknown_session(server):
     # No existence oracle: an unknown session 401s exactly like a bad secret on a known one.
-    st, _ = post(server, "/message/no-such-session", {"kind": "note", "summary": "x"})
+    # Valid-shaped (nelix-9a4.6 finding #3 shape-validates every path-prefix sid first) but not a
+    # session anyone ever started.
+    st, _ = post(server, "/message/s-deadbeef", {"kind": "note", "summary": "x"})
     assert st == 401
 
 
 def test_note_recorded(server):
-    st, body = post(server, "/message/s1", {"kind": "note", "summary": "step 2"})
+    st, body = post(server, "/message/s-11111111", {"kind": "note", "summary": "step 2"})
     assert st == 200 and body["status"] == "recorded" and body["progress_seq"] == 1
 
 
 def test_note_progress_seq_increments(server):
-    post(server, "/message/s1", {"kind": "note", "summary": "one"})
-    st, body = post(server, "/message/s1", {"kind": "note", "summary": "two"})
+    post(server, "/message/s-11111111", {"kind": "note", "summary": "one"})
+    st, body = post(server, "/message/s-11111111", {"kind": "note", "summary": "two"})
     assert st == 200 and body["progress_seq"] == 2
 
 
 def test_question_queued(server):
-    st, body = post(server, "/message/s1",
+    st, body = post(server, "/message/s-11111111",
                     {"kind": "question", "question": "a?", "continuation_plan": "coding"})
     assert st == 200 and body["status"] == "queued" and body["id"] == "q_1"
 
 
 def test_question_already_pending_409(server):
-    post(server, "/message/s1",
+    post(server, "/message/s-11111111",
          {"kind": "question", "question": "first?", "continuation_plan": "coding"})
-    st, body = post(server, "/message/s1",
+    st, body = post(server, "/message/s-11111111",
                      {"kind": "question", "question": "second?", "continuation_plan": "coding"})
     assert st == 409
     assert body["status"] == "already_pending"
@@ -170,17 +175,17 @@ def test_question_already_pending_409(server):
 
 
 def test_question_missing_continuation_plan_400(server):
-    st, body = post(server, "/message/s1", {"kind": "question", "question": "a?"})
+    st, body = post(server, "/message/s-11111111", {"kind": "question", "question": "a?"})
     assert st == 400 and "continuation_plan" in body["error"]
 
 
 def test_note_missing_summary_400(server):
-    st, body = post(server, "/message/s1", {"kind": "note"})
+    st, body = post(server, "/message/s-11111111", {"kind": "note"})
     assert st == 400 and "summary" in body["error"]
 
 
 def test_unknown_kind_400(server):
-    st, body = post(server, "/message/s1", {"kind": "bogus"})
+    st, body = post(server, "/message/s-11111111", {"kind": "bogus"})
     assert st == 400
 
 
@@ -188,12 +193,12 @@ def test_note_unknown_session_race_404(server):
     # Auth already 401s a truly-unknown session (no existence oracle); this exercises the
     # documented rare post-auth race — a session that authenticates but is gone by the time the
     # manager tries to mutate its state — which the route must map to 404, not 401 or 500.
-    st, body = post(server, "/message/s-race", {"kind": "note", "summary": "x"})
+    st, body = post(server, "/message/s-aaaaaaaa", {"kind": "note", "summary": "x"})
     assert st == 404 and body["error"] == "unknown_session"
 
 
 def test_question_unknown_session_race_404(server):
-    st, body = post(server, "/message/s-race",
+    st, body = post(server, "/message/s-aaaaaaaa",
                      {"kind": "question", "question": "a?", "continuation_plan": "coding"})
     assert st == 404 and body["error"] == "unknown_session"
 
@@ -202,10 +207,10 @@ def test_message_limiter_separate_from_hooks(frozen_clock_server):
     # Frozen clock ⇒ the message bucket drains by COUNT (no wall-clock refill), so this exhaustion
     # step is deterministic under load.
     for _ in range(MSG_LIMIT + 2):
-        post(frozen_clock_server, "/message/s1", {"kind": "note", "summary": "x"})
+        post(frozen_clock_server, "/message/s-11111111", {"kind": "note", "summary": "x"})
     # ... a /hook POST for the SAME session must still pass: message spam must never starve hooks
     # (a SEPARATE bucket, never drained here).
-    st, _ = post_hook(frozen_clock_server, "/hook/s1", {"hook_event_name": "Stop"})
+    st, _ = post_hook(frozen_clock_server, "/hook/s-11111111", {"hook_event_name": "Stop"})
     assert st == 204
 
 
@@ -218,7 +223,7 @@ def test_message_bucket_exhausted_returns_429(frozen_clock_server):
     # outcome now depends only on request COUNT, so timing pressure can never flake it.
     last = None
     for _ in range(MSG_LIMIT + 2):
-        last, _ = post(frozen_clock_server, "/message/s1", {"kind": "note", "summary": "x"})
+        last, _ = post(frozen_clock_server, "/message/s-11111111", {"kind": "note", "summary": "x"})
     assert last == 429
 
 
@@ -256,7 +261,7 @@ def test_message_oversized_body_is_413(server):
     from daemon.config import MSG_MAX_BODY
     u = urlparse(server)
     c = http.client.HTTPConnection(u.hostname, u.port, timeout=5)
-    c.putrequest("POST", "/message/s1")
+    c.putrequest("POST", "/message/s-11111111")
     c.putheader("X-Nelix-Token", TOKEN)
     c.putheader("X-Nelix-Hook-Secret", SECRET)
     c.putheader("Content-Length", str(MSG_MAX_BODY + 1))   # claim past the cap ...
