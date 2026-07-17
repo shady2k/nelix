@@ -115,6 +115,77 @@ def test_runtime_base_env_override_is_honoured(monkeypatch, tmp_path):
     assert custom in paths.router_runtime_dir().parents
 
 
+def test_router_runtime_dir_uses_the_resolved_base(monkeypatch, tmp_path):
+    """A later swap of a symlinked base must not redirect callers away from what
+    ensure_router_runtime_dir() verified and created — so the per-uid dir is always built
+    under Path.resolve()'d base, not the base's raw (possibly symlinked) text."""
+    real = tmp_path / "real-base"; real.mkdir()
+    alias = tmp_path / "alias-base"; alias.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(alias))
+    importlib.reload(paths)
+    assert real in paths.router_runtime_dir().parents
+    assert alias not in paths.router_runtime_dir().parts
+
+
+# --- NELIX_RUNTIME_BASE must itself be verified safe [review: hijack via unsafe base] ---
+
+def test_ensure_router_runtime_dir_rejects_a_relative_runtime_base(monkeypatch):
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", "relative/base")
+    importlib.reload(paths)
+    with pytest.raises(paths.RouterRuntimeBaseRejected, match="relative"):
+        paths.ensure_router_runtime_dir()
+
+
+def test_ensure_router_runtime_dir_rejects_a_non_sticky_world_writable_base(monkeypatch, tmp_path):
+    """The compromise path both reviewers found: a world-writable base WITHOUT the sticky
+    bit lets a co-resident attacker rename/replace an already-verified per-uid dir, because
+    deleting/renaming a node only needs write on its PARENT — exactly what the sticky bit
+    prevents. Must raise loudly instead of quietly building a socket/lock there."""
+    base = tmp_path / "unsafe-base"; base.mkdir(mode=0o777); os.chmod(base, 0o777)
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base))
+    importlib.reload(paths)
+    with pytest.raises(paths.RouterRuntimeBaseRejected, match="sticky"):
+        paths.ensure_router_runtime_dir()
+
+
+def test_ensure_router_runtime_dir_rejects_a_missing_base(monkeypatch, tmp_path):
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(tmp_path / "does-not-exist"))
+    importlib.reload(paths)
+    with pytest.raises(paths.RouterRuntimeBaseRejected):
+        paths.ensure_router_runtime_dir()
+
+
+def test_ensure_router_runtime_dir_accepts_a_private_owned_base(monkeypatch, tmp_path):
+    base = tmp_path / "private-base"; base.mkdir(mode=0o700); os.chmod(base, 0o700)
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base))
+    importlib.reload(paths)
+    d = paths.ensure_router_runtime_dir()
+    assert d == paths.router_runtime_dir()
+
+
+def test_ensure_router_runtime_dir_accepts_a_sticky_world_writable_base(monkeypatch, tmp_path):
+    """A world-writable base WITH the sticky bit (like the real /tmp) is exactly as safe as
+    the default and must still work."""
+    base = tmp_path / "sticky-base"; base.mkdir(mode=0o777)
+    os.chmod(base, 0o1777)
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base))
+    importlib.reload(paths)
+    d = paths.ensure_router_runtime_dir()
+    assert d == paths.router_runtime_dir()
+
+
+def test_ensure_router_runtime_dir_still_works_with_the_default_tmp_base(monkeypatch):
+    """The default base itself must clear the new safety gate: /tmp resolves to /private/tmp
+    on macOS, and IT is the directory that must be verified sticky, not the symlink /tmp."""
+    monkeypatch.delenv("NELIX_RUNTIME_BASE", raising=False)
+    importlib.reload(paths)
+    d = paths.ensure_router_runtime_dir()
+    try:
+        assert d == paths.router_runtime_dir()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)   # leave the shared per-uid parent alone
+
+
 # --- create-or-verify security helper ---------------------------------------------------
 
 def test_ensure_router_runtime_dir_creates_0700_owned_by_current_uid(monkeypatch, tmp_path):
@@ -201,6 +272,35 @@ def test_ensure_owned_private_dir_is_race_safe_under_concurrent_creation(tmp_pat
 
     assert all(isinstance(r, Path) for r in results), results
     assert oct(target.stat().st_mode & 0o777) == "0o700"
+
+
+def test_ensure_owned_private_dir_mkdir_reaches_0700_even_under_a_hostile_umask(monkeypatch, tmp_path):
+    """Regression for the reviewed umask race: under an ambient umask that strips OWNER bits
+    (e.g. 0o700), a plain `os.mkdir(path, 0o700)` transiently creates the dir at mode 0000
+    before the follow-up chmod fixes it — a window a concurrent same-uid verifier's lstat
+    could observe and wrongly reject. The fix forces umask 0o077 (which never strips owner
+    bits) around the mkdir call itself, so the mode mkdir(2) lands on is already 0700 with no
+    reliance on the chmod that follows. Proven here by spying on os.chmod: it must already
+    see 0700 the instant it is called, before it does anything itself.
+    """
+    path = tmp_path / "hostile"
+    modes_seen_before_chmod = []
+    real_chmod = os.chmod
+
+    def spying_chmod(p, mode):
+        modes_seen_before_chmod.append(stat.S_IMODE(os.lstat(p).st_mode))
+        return real_chmod(p, mode)
+
+    monkeypatch.setattr(os, "chmod", spying_chmod)
+    old_umask = os.umask(0o700)   # strips owner bits from any raw mkdir(mode) request
+    try:
+        paths.ensure_owned_private_dir(path)
+    finally:
+        os.umask(old_umask)
+
+    assert modes_seen_before_chmod == [0o700], (
+        "mkdir(2) itself must already land on 0700 under a hostile ambient umask; seeing "
+        "anything else means the internal umask override isn't wrapping the mkdir call")
 
 
 # --- the coverage hole: an actual bind at the production router_sock() path ------------

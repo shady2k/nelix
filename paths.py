@@ -103,10 +103,16 @@ ROUTER_HASH_LEN = 12
 
 
 def router_runtime_base() -> Path:
-    """The short base the router's per-uid runtime namespace hangs off. `NELIX_RUNTIME_BASE`
-    overrides it (documented above); default is the literal "/tmp", NOT resolved through any
-    symlink (macOS's /tmp -> /private/tmp is still short, but resolving buys nothing and only
-    spends bytes we deliberately kept spare)."""
+    """The base the router's per-uid runtime namespace hangs off, exactly as configured:
+    `NELIX_RUNTIME_BASE` (documented above), or the default "/tmp". Returned UNRESOLVED — this
+    accessor has no filesystem side effects, so it does not need to touch the disk to answer.
+
+    router_runtime_dir() resolves this (Path.resolve()) before building anything under it,
+    and ensure_router_runtime_dir() is what verifies the RESOLVED target is actually safe to
+    use (see RouterRuntimeBaseRejected) before anything is created there — a relative base, or
+    an existing base that is group/world-writable without the sticky bit, is refused rather
+    than silently trusted.
+    """
     val = os.environ.get("NELIX_RUNTIME_BASE", "").strip() or DEFAULT_ROUTER_RUNTIME_BASE
     return Path(val)
 
@@ -114,25 +120,43 @@ def router_runtime_base() -> Path:
 def router_runtime_dir() -> Path:
     """Short, per-uid, hash-keyed runtime directory for the router's public socket + lock.
 
-    `<base>/nelix-<uid>/<hash>`: per-uid so two users never share a node; the hash is over
-    `str(nelix_root())`, which is already canonicalised (see nelix_root's docstring), so
-    distinct $NELIX_HOMEs get distinct locations and any alias of the SAME home (symlink,
-    `~` vs absolute, a trailing `..`) always resolves to the SAME one.
+    `<resolved base>/nelix-<uid>/<hash>`: the base is resolved (`Path.resolve()`, which does
+    not require it to exist — this stays a pure accessor) so the per-uid dir is always
+    addressed by the base's REAL location, not whatever a symlink currently points at — a
+    later swap of a symlinked base cannot silently redirect a caller away from the location
+    ensure_router_runtime_dir() already verified and created. Per-uid so two users never share
+    a node; the hash is over `str(nelix_root())`, which is already canonicalised (see
+    nelix_root's docstring), so distinct $NELIX_HOMEs get distinct locations and any alias of
+    the SAME home (symlink, `~` vs absolute, a trailing `..`) always resolves to the SAME one.
+
+    This does not itself verify the base is SAFE to use (relative, or non-sticky
+    group/world-writable bases are both hazards) — see ensure_router_runtime_dir(), the only
+    sanctioned way to actually create or open anything at the location this names.
     """
     key = hashlib.sha256(str(nelix_root()).encode()).hexdigest()[:ROUTER_HASH_LEN]
-    return router_runtime_base() / f"nelix-{os.getuid()}" / key
+    return router_runtime_base().resolve() / f"nelix-{os.getuid()}" / key
 
 
 def router_sock() -> Path:
     """AF_UNIX socket node for the router's PUBLIC transport. A pure accessor like rpc_sock():
     it does not check sun_path (see sun_path_overflow — the bind site checks that) and does
-    not create anything (see ensure_router_runtime_dir for that)."""
+    not create anything (see ensure_router_runtime_dir for that).
+
+    Forward note for 3c (the router process): call ensure_router_runtime_dir() before binding
+    here, and bind symlink-safely (e.g. verify via lstat/O_NOFOLLOW immediately before the
+    bind) — a plain bind(2) follows a symlink planted after verification."""
     return router_runtime_dir() / "router.sock"
 
 
 def router_lock() -> Path:
     """The router's one-per-NELIX_HOME advisory lock (daemon/singleton.py acquires it), living
-    beside router_sock() in the same verified runtime dir."""
+    beside router_sock() in the same verified runtime dir.
+
+    Forward note for 3c: call ensure_router_runtime_dir() before
+    `daemon/singleton.py:acquire(router_lock(), ...)` — acquire() does no ownership/symlink
+    verification of its own, and opens the path with a plain `os.open` — so open it (or have
+    acquire open it) with O_NOFOLLOW so a symlink planted after verification is refused rather
+    than followed."""
     return router_runtime_dir() / "router.lock"
 
 
@@ -290,12 +314,18 @@ def ensure_owned_private_dir(path) -> Path:
     it before we ever touch it), and ensure_private_dir doesn't help — it only tightens mode
     on a directory it already trusts, and never checks ownership or rejects a symlink.
 
-    - If `path` does not exist: create it with mode 0700 AND chmod it 0700 explicitly
-      afterward. The explicit chmod is not redundant: mkdir's mode argument is masked by
-      umask, so under a pathological umask that strips owner bits, mkdir alone would not
-      reach 0700. Passing 0700 to mkdir itself still matters — it is what keeps the directory
-      at 0700 for the single syscall that creates it, with no window where a concurrent
-      verifier (a race-safe caller — see below) could observe a looser mode.
+    - If `path` does not exist: create it with mode 0700, THEN chmod it 0700 explicitly.
+      Passing 0700 to mkdir is not enough by itself: mkdir's mode argument is masked by the
+      process's ambient umask, so under a pathological umask that strips owner bits (e.g.
+      0o700, or 0o777), a plain `os.mkdir(path, 0o700)` would transiently create the
+      directory at a looser mode — 0000, in the 0o700 case — and ONLY the follow-up chmod
+      would fix it, leaving a real window where a concurrent same-uid verifier could lstat
+      the directory mid-creation and wrongly reject it for the wrong mode. To close that
+      window we force umask 0o077 (which never strips owner bits, whatever the ambient value
+      was) around the mkdir call itself, so the single mkdir(2) syscall that creates the
+      directory already lands on exactly 0700 — no window, because there is no mode the
+      directory is ever observed at other than 0700. The explicit chmod afterward is then
+      genuine belt-and-braces, not the thing actually doing the work.
     - If `path` exists: verify via `os.lstat` — NOT `stat`, which follows a symlink and would
       report the TARGET's attributes instead of the node's own — that it is a real directory
       (not a symlink, not a file), owned by `os.getuid()`, and exactly mode 0700. Any mismatch
@@ -312,6 +342,7 @@ def ensure_owned_private_dir(path) -> Path:
     directory unnoticed.
     """
     path = Path(path)
+    old_umask = os.umask(0o077)    # 0o077 never strips owner bits, whatever umask was active
     try:
         os.mkdir(path, 0o700)
     except FileExistsError:
@@ -319,6 +350,8 @@ def ensure_owned_private_dir(path) -> Path:
     else:
         os.chmod(path, 0o700)
         return path
+    finally:
+        os.umask(old_umask)
 
     st = os.lstat(path)
     if stat.S_ISLNK(st.st_mode):
@@ -338,12 +371,85 @@ def ensure_owned_private_dir(path) -> Path:
     return path
 
 
+class RouterRuntimeBaseRejected(ValueError):
+    """Raised by ensure_router_runtime_dir() when NELIX_RUNTIME_BASE itself cannot safely
+    host the router's per-uid runtime tree — see verify_router_runtime_base() for the checks.
+    Unlike RouterRuntimeDirRejected (an existing node under a good base failing its own check),
+    this is about the base's own location or permissions being unsafe before anything is even
+    created under it."""
+
+
+def verify_router_runtime_base() -> Path:
+    """Verify NELIX_RUNTIME_BASE (or the "/tmp" default) is safe to build the router's per-uid
+    runtime tree under, and return its RESOLVED path (see router_runtime_dir() — callers must
+    build under this same resolved value, never the raw configured one).
+
+    ensure_owned_private_dir() verifies the per-uid dir and its hash child, but neither of
+    those checks reaches the BASE itself. Left unchecked, a relative NELIX_RUNTIME_BASE
+    resolves ambiguously against the process's cwd, and a non-default base that is
+    group/world-writable WITHOUT the sticky bit lets a co-resident attacker rename/replace an
+    already-verified per-uid dir out from under us — deleting or renaming a node only needs
+    write permission on its PARENT, which the sticky bit is exactly what denies to everyone but
+    the file's owner (and root). The result of skipping this check would not be a mere
+    pre-creation race like the base's own docstring above describes: it would be the router's
+    socket binding, or its lock opening, inside attacker-controlled territory.
+
+    - A RELATIVE base is rejected outright: it names no fixed location, so "safe" cannot even
+      be evaluated.
+    - The base is then RESOLVED (`Path.resolve()`) before any check — the default "/tmp" is
+      itself a symlink to "/private/tmp" on macOS, and the resolved target, not the symlink
+      spelling, is what the filesystem actually enforces permissions on.
+    - The resolved base must exist and be a directory, and if it is group- or world-writable
+      (`st_mode & (S_IWGRP | S_IWOTH)`), it MUST also carry the sticky bit (`S_ISVTX`) — exactly
+      how the real `/tmp` is configured (mode 1777). A root-owned or otherwise private
+      (not group/world-writable) base needs no sticky bit: nobody but its owner can rename
+      inside it regardless.
+
+    Any failure raises RouterRuntimeBaseRejected; nothing here creates, chmods, or otherwise
+    touches the base — an operator-supplied location that fails this check must be fixed (or
+    replaced) by the operator, the same "surface the conflict, never auto-correct" stance
+    ensure_owned_private_dir takes for the per-uid dir itself.
+    """
+    base = router_runtime_base()
+    if not base.is_absolute():
+        raise RouterRuntimeBaseRejected(
+            f"NELIX_RUNTIME_BASE={str(base)!r} is a relative path; refusing an ambiguous, "
+            f"cwd-dependent runtime base — set it to an absolute path")
+    resolved = base.resolve()
+    try:
+        st = os.stat(resolved)
+    except OSError as e:
+        raise RouterRuntimeBaseRejected(
+            f"NELIX_RUNTIME_BASE {str(base)!r} (resolved: {str(resolved)!r}) is not usable: "
+            f"{e}") from e
+    if not stat.S_ISDIR(st.st_mode):
+        raise RouterRuntimeBaseRejected(
+            f"NELIX_RUNTIME_BASE {str(base)!r} (resolved: {str(resolved)!r}) is not a "
+            f"directory; refusing to use it")
+    if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and not (st.st_mode & stat.S_ISVTX):
+        raise RouterRuntimeBaseRejected(
+            f"NELIX_RUNTIME_BASE {str(base)!r} (resolved: {str(resolved)!r}) is mode "
+            f"{oct(st.st_mode & 0o7777)}: group/world-writable WITHOUT the sticky bit. A "
+            f"co-resident user could rename or replace our runtime dir out from under us — "
+            f"refusing to use it. Either `chmod +t` it (like the real /tmp, mode 1777), or "
+            f"point NELIX_RUNTIME_BASE at a location only this uid (or root) can write to")
+    return resolved
+
+
 def ensure_router_runtime_dir() -> Path:
     """Create-or-verify the router's full runtime location, shallowest level first: the
     per-uid base directory, then the hash subdir inside it. This is the ONLY sanctioned way
     to prepare the directory router_sock()/router_lock() live in — see
-    ensure_owned_private_dir for why a plain mkdir(parents=True) is not safe here. Returns
-    router_runtime_dir()."""
+    ensure_owned_private_dir for why a plain mkdir(parents=True) is not safe here, and
+    verify_router_runtime_base() for why the BASE itself cannot be trusted unexamined before
+    that. Returns router_runtime_dir().
+
+    Forward note for 3c (the router process): call this BEFORE binding router_sock() or
+    calling `daemon/singleton.py:acquire(router_lock(), ...)` — acquire() performs no
+    ownership/symlink verification of its own — and open/bind both symlink-safely (e.g.
+    O_NOFOLLOW) so a symlink planted after this check is refused rather than followed.
+    """
+    verify_router_runtime_base()
     d = router_runtime_dir()
     for level in (d.parent, d):
         ensure_owned_private_dir(level)
