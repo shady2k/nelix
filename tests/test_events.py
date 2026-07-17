@@ -226,83 +226,74 @@ def test_owner_resolved_before_lock_not_under_it():
     assert not t.is_alive() and q.latest_seq("s1") == 1
 
 
-def test_raising_on_publish_leaves_the_queue_consistent_and_notifies():
-    # Finding #5 + fix pass 2 (R2/R4): an on_publish hook that raises must not leave the OUTER
-    # (raising) event half-indexed, a concurrently-pending decision stays pinned, and a blocked
-    # waiter is notified ON THE EXCEPTION PATH — PROMPTLY, not only after its full timeout (R4).
-    # The hook does a legitimate NESTED publish for the waiter's session before raising: that nested
-    # event survives the outer rollback (R2) and is exactly what the woken waiter returns, so a
-    # regression that dropped the finally: notify_all would return it only at timeout and FAIL (d).
-    import threading, pytest, time as _t
-    q = EventQueue(max_history=100, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o", "s2": "o"}))
-    dec = q.publish("s1", "x", "waiting_for_user", "answer me", "waiting_for_user", decision_id="d1")
+def test_eviction_skips_a_not_yet_indexed_event():
+    # Fix pass 3 (A): during a nested publish inside on_publish, the OUTER event is already in
+    # _events/_by_id but NOT yet in its owner's _owner_hist bucket — its _index_new runs only in
+    # publish()'s finally. The nested publish's eviction scans _events and MUST NEVER select that
+    # un-indexed outer event: doing so crashes _drop's hist.remove with ValueError (and leaves the
+    # ring half-mutated). Everything published before the outer event here is a PINNED decision, so
+    # the ascending scan reaches the un-indexed outer first — the membership guard makes it skip past
+    # to the real (indexed) victim. No exception, count stays exact.
+    q = EventQueue(max_history=0, owner_floor=0, owner_resolver=_fixed_owner({"s": "o"}))
+    pin = q.publish("s", "x", "waiting_for_user", "pin", "waiting_for_user", decision_id="d1")
 
+    def hook(outer):
+        # a nested publish for the SAME owner drives the evictable count over the (0) bound while
+        # `outer` is still un-indexed; the nested _evict_if_needed must not pick `outer`.
+        q.publish("s", "x", "working", "nested", "working")
+
+    # WITHOUT the guard this raises ValueError inside the nested eviction; WITH it, publish returns.
+    e = q.publish("s", "x", "working", "outer", "working", on_publish=hook)
+    assert e.summary == "outer"
+    assert q.pending("s") is pin                                     # pinned decision untouched
+    assert q._evictable_count == sum(len(h) for h in q._owner_hist.values())
+
+
+def test_raising_on_publish_leaves_the_queue_consistent_and_notifies():
+    # Fix pass 3 (B + D): an on_publish hook that raises must (1) leave the event FULLY indexed and
+    # the queue internally consistent (never half-indexed), watermarks monotonic (never rewound), and
+    # (2) notify a blocked waiter ON THE EXCEPTION PATH — PROMPTLY, not only after its full timeout.
+    # A NON-nested raising hook is used deliberately (D): the ONLY notify_all that can wake the waiter
+    # is the outer publish's own finally, so a nested publish's finally cannot mask a dropped
+    # exception-path notify. The waiter is armed before the (raising) event and returns exactly it.
+    import threading, pytest, time as _t
+    q = EventQueue(max_history=100, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o"}))
     got = {}
     started = threading.Event()
 
     def waiter():
         started.set()
         got["t0"] = _t.time()
-        got["evt"] = q.wait_event(after_seq=dec.seq, timeout=5, session_id="s2")
+        got["evt"] = q.wait_event(after_seq=0, timeout=5, session_id="s1")
         got["t1"] = _t.time()
 
     t = threading.Thread(target=waiter, daemon=True); t.start()
     assert started.wait(1)
     _t.sleep(0.1)                                          # let the waiter reach _cv.wait
 
-    captured = {}
-
-    def boom(outer):
-        # reentrant nested publish for the waiter's session, THEN raise (the model the lock supports).
-        captured["nested"] = q.publish("s2", "x", "working", "nested", "working")
-        raise RuntimeError("on_publish blew up AFTER a nested publish")
+    def boom(ev):
+        raise RuntimeError("on_publish blew up (no nesting)")
 
     with pytest.raises(RuntimeError):
-        q.publish("s2", "x", "working", "outer", "working", on_publish=boom)
+        q.publish("s1", "x", "working", "outer", "working", on_publish=boom)
 
-    nested = captured["nested"]
-    # (a) the OUTER (raising) event is fully gone; only the nested s2 event remains for s2.
-    assert all(e.summary != "outer" for e in q._events)
-    assert [e for e in q._events if e.session_id == "s2"] == [nested]
-    assert q._evictable_count == sum(len(h) for h in q._owner_hist.values())
-    # (b) the nested publish's watermark advance SURVIVES the outer rollback (R2) — not clobbered
-    # back to a stale pre-callback scalar.
-    assert q.latest_seq() == nested.seq
-    assert q.latest_seq("s2") == nested.seq
-    # (c) the pending decision is untouched — still pinned + deliverable.
-    assert q.pending("s1") is dec
-    assert q.latest_after(0, "s1") is dec
-    # (d) the blocked waiter was notified on the EXCEPTION path and returned the nested event PROMPTLY
-    # (well under its 5s timeout) — this is what makes the exception-path notify_all observable.
+    # (a) the event is FULLY indexed (not rolled back), count consistent, watermark monotonic.
+    assert [e.summary for e in q._events if e.session_id == "s1"] == ["outer"]
+    assert q._evictable_count == sum(len(h) for h in q._owner_hist.values()) == 1
+    assert q.latest_seq() == 1 and q.latest_seq("s1") == 1
+    assert q.latest_after(0, "s1").summary == "outer"     # deliverable to a caught-up-behind cursor
+    # (b) the blocked waiter was notified on the EXCEPTION path and returned the event PROMPTLY (well
+    # under its 5s timeout). A dropped finally: notify_all would only wake it at timeout -> this FAILS.
     t.join(3)
     assert not t.is_alive()
-    assert got["evt"] is nested
+    assert got["evt"] is not None and got["evt"].summary == "outer"
     assert got["t1"] - got["t0"] < 3
 
 
-def test_raising_on_publish_without_nesting_fully_rolls_back():
-    # Finding #5 (pure case, preserved): a hook that raises WITHOUT nesting leaves NO residue — the
-    # event is gone and the session's watermark returns to its pre-publish value (0 for a first
-    # publish). Recomputing from retained state must not resurrect a phantom or under-count.
-    import pytest
-    q = EventQueue(max_history=100, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o"}))
-    before_count = q._evictable_count
-
-    def boom(ev):
-        raise RuntimeError("no nesting")
-
-    with pytest.raises(RuntimeError):
-        q.publish("s1", "x", "working", "solo", "working", on_publish=boom)
-    assert not any(e.session_id == "s1" for e in q._events)
-    assert q.latest_seq() == 0
-    assert q.latest_seq("s1") == 0
-    assert q._evictable_count == before_count == sum(len(h) for h in q._owner_hist.values())
-
-
-def test_nested_publish_in_on_publish_survives_outer_rollback():
-    # Fix pass 2 (R2): rollback must restore watermarks from the RETAINED state, never from saved
-    # pre-callback scalars. A nested publish inside on_publish that THEN raises legitimately retains
-    # its event; a retained seq-N event must never coexist with latest_seq()==0.
+def test_nested_publish_in_on_publish_stays_indexed_and_advances_watermark():
+    # Fix pass 3 (B, test b): an on_publish that does a NESTED publish then raises — the nested event
+    # stays indexed and BOTH watermarks reflect the nested seq (never rewound below it). The outer
+    # event is ALSO fully retained (B removes the outer-rollback), no ValueError, count consistent.
     import pytest
     q = EventQueue(max_history=100, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o"}))
     captured = {}
@@ -315,43 +306,35 @@ def test_nested_publish_in_on_publish_survives_outer_rollback():
         q.publish("s1", "x", "working", "outer", "working", on_publish=hook)
 
     nested = captured["nested"]
-    # the nested event is retained...
-    assert any(e is nested for e in q._events)
-    assert q._by_id.get(nested.event_id) is nested
-    # ...and BOTH watermarks reflect the nested seq (not a stale/zero pre-callback value).
+    assert q._by_id.get(nested.event_id) is nested                  # nested retained + indexed
+    # BOTH the outer AND the nested are retained (no outer-rollback), count consistent, no crash.
+    assert sorted(e.summary for e in q._events if e.session_id == "s1") == ["nested", "outer"]
+    assert q._evictable_count == sum(len(h) for h in q._owner_hist.values()) == 2
+    # watermarks reflect the NESTED (highest) seq and were never rewound.
     assert q.latest_seq() == nested.seq
     assert q.latest_seq("s1") == nested.seq
-    # the OUTER event is fully gone — exactly one retained s1 event, count consistent.
-    assert all(e.summary != "outer" for e in q._events)
-    assert [e for e in q._events if e.session_id == "s1"] == [nested]
-    assert q._evictable_count == sum(len(h) for h in q._owner_hist.values())
 
 
-def test_forget_session_wakes_a_blocked_waiter():
-    # Fix pass 2 (R3): a waiter blocked in wait_event for a session that is then forgotten must be
-    # woken PROMPTLY. Its state + expiry evidence are removed, so without a wake (and a definitive
-    # verdict) it would sleep the full timeout and only then return None. forget_session notifies,
-    # and the woken waiter — its once-known session now gone — resyncs (CURSOR_EXPIRED) at once.
-    import threading, time
-    q = EventQueue(max_history=100, owner_floor=0, owner_resolver=_fixed_owner({"X": "o"}))
-    q.publish("X", "x", "working", "e", "working")        # X is a KNOWN session with retained state
-    got = {}
-    started = threading.Event()
+def test_raising_publish_does_not_rewind_watermark_below_evicted_high():
+    # Fix pass 3 (B, test c): with max_history=0 every evictable event is evicted immediately. A first
+    # publish is evicted (evicted_high=1); a subsequent RAISING publish must NOT rewind latest_seq
+    # below evicted_high. The reverted rollback recomputed _last_seq from RETAINED events — which,
+    # after an eviction, rewinds it below _evicted_high and makes /status's resync cursor report
+    # CURSOR_EXPIRED forever (and can false-expire a live session).
+    import pytest
+    q = EventQueue(max_history=0, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o"}))
+    q.publish("s1", "x", "working", "e1", "working")                # seq 1, immediately evicted
+    assert q._evicted_high_by_session.get("s1") == 1
 
-    def waiter():
-        started.set()
-        got["t0"] = time.time()
-        got["res"] = q.wait_event(after_seq=q.latest_seq("X"), timeout=5, session_id="X")
-        got["t1"] = time.time()
+    def boom(ev):
+        raise RuntimeError("hook blew up")
 
-    t = threading.Thread(target=waiter, daemon=True); t.start()
-    assert started.wait(1)
-    time.sleep(0.1)                                        # let the waiter reach _cv.wait
-    q.forget_session("X")
-    t.join(2)
-    assert not t.is_alive()                                # returned; did NOT sleep the full 5s
-    assert got["t1"] - got["t0"] < 2                       # promptly, well under the timeout
-    assert got["res"] is CURSOR_EXPIRED                    # events gone -> resync verdict
+    with pytest.raises(RuntimeError):
+        q.publish("s1", "x", "working", "e2", "working", on_publish=boom)   # seq 2
+    # latest_seq stays >= evicted_high (monotonic, never rewound below it).
+    assert q.latest_seq("s1") == 2 >= q._evicted_high_by_session.get("s1")
+    # the resync cursor clears expiry — no permanent CURSOR_EXPIRED / resync hot loop.
+    assert q.latest_after(q.latest_seq("s1"), "s1") is None
 
 
 def test_forget_session_releases_retention_and_bookkeeping():

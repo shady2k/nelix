@@ -659,27 +659,21 @@ class SessionManager:
             if snap is not None and snap.get("terminal_kind") == "done":
                 self._lineages.pop(snap.get("lineage_id"), None)
             existed = self._sessions.pop(session_id, None) is not None
-            retained_terminal = False
             if self._terminal_ttl > 0:
                 # ONE expiry computed here, reused for BOTH stores below: the recent-terminal async
                 # record must share self._terminal's exact retention policy, never a second one.
                 expires_at = self._clock() + self._terminal_ttl
                 if snap is not None:
                     self._terminal[session_id] = (snap, expires_at)
-                    retained_terminal = True
                 if qid is not None:
                     self._terminal_async[session_id] = (
                         {"id": qid, "reason": "executor_finished"}, expires_at)
-            # A session that gets NO retained _terminal entry (survival disabled via ttl<=0, or
-            # terminal_snapshot() yielded None) has NO status() TTL-expiry seam that would ever forget
-            # it — so its event-ring retention (a quiet owner's events are floor-protected and never
-            # evicted) and its three per-session dicts would leak for the daemon's whole life. Forget
-            # it HERE, at the definitive removal point (fix pass 2 / R1). A session that DID get a
-            # _terminal entry is left for the TTL seam: exactly-once, and its final result stays
-            # observable within the TTL (spec §5 final wake is never discarded early). Lock order
-            # manager._lock -> events._cv already exists (status()/latest_seqs), so no new ordering.
-            if existed and not retained_terminal:
-                self._events.forget_session(session_id)
+            # NB: the event ring is NOT forgotten here. forget_session is wired at exactly ONE seam —
+            # the terminal-snapshot TTL-expiry sweep in status() — which waits out the terminal TTL so
+            # spec §5's final wake is never discarded before a waiter can read it. Pruning the
+            # non-default corners that never reach that seam (ttl<=0, a None terminal snapshot, or a
+            # publish racing after slot-free) is DEFERRED to the retirement work (see forget_session's
+            # docstring); the events themselves stay bounded by the normal ring regardless.
         if existed and self._logger is not None:
             self._logger.info("manager", "slot_freed", session_id=session_id)
 
