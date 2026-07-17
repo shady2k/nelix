@@ -35,7 +35,7 @@ from nelix_contracts.ids import (
 )
 from nelix_contracts.records import timestamp
 
-from .db import connect, translates_sqlite
+from .db import ThreadLocalConnections, translates_sqlite
 
 _COLS = ("session_id, owner_id, orchestration_id, idempotency_key, request_fingerprint, "
          "state, generation_id, reason, created_at")
@@ -87,13 +87,22 @@ def _row_to_reservation(row, *, replay: bool) -> Reservation:
 
 class StartLedger:
     def __init__(self, root, *, clock=time.time, mint=new_session_id):
-        self._conn = connect(root)
+        self._conns = ThreadLocalConnections(root)
+        # See Store.__init__: opened NOW, in the constructing thread, so construction
+        # keeps validating/creating the database synchronously exactly as before. Any
+        # OTHER thread sharing this instance gets its own connection lazily on first use.
+        self._conns.get()
         self._clock = clock
         self._mint = mint
 
+    @property
+    def _conn(self):
+        """The CALLING thread's own connection (opened lazily if this is its first use)."""
+        return self._conns.get()
+
     @translates_sqlite
     def close(self):
-        self._conn.close()
+        self._conns.close()
 
     @translates_sqlite
     def reserve(self, *, idempotency_key, owner_id, orchestration_id,

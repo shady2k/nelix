@@ -497,14 +497,17 @@ def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatc
     # sqlite3.Connection instance. Verified: that raises `AttributeError: 'sqlite3.Connection'
     # object attribute 'execute' is read-only` immediately (same root cause already documented
     # above on `test_a_filesystem_that_cannot_do_wal_is_permanent_not_retryable` — a
-    # C-extension type with no instance __dict__) — and unlike that test, patching cannot move
-    # to a Connection subclass via `factory=` here, because `store._conn` is already
-    # constructed by the time this test runs; `sqlite3.Connection.execute = ...` at the class
-    # level also fails (`TypeError: cannot set 'execute' attribute of immutable type
-    # 'sqlite3.Connection'`, verified). The interception moves one level up instead: `Store` is
-    # an ordinary Python object, so `monkeypatch.setattr(store, "_conn", ...)` swaps in a thin
-    # proxy that raises on execute() and delegates everything else to the real connection. The
-    # simulated scenario and assertions are unchanged.
+    # C-extension type with no instance __dict__).
+    #
+    # NOTE (nelix-91y): `store._conn` is now a per-thread PROPERTY (it delegates to
+    # `store._conns.get()`, ThreadLocalConnections' lazy per-thread opener), so
+    # `monkeypatch.setattr(store, "_conn", ...)` no longer works either — a property with no
+    # setter is a DATA descriptor, and assigning to it raises `AttributeError: property
+    # '_conn' of 'Store' object has no setter` (verified). The interception moves one level
+    # further down: `store._conns` is an ordinary Python object and `.get()` an ordinary
+    # bound method, so patching `store._conns.get` swaps in the boom proxy for whichever
+    # thread calls it — here, the only thread involved. The simulated scenario and
+    # assertions are unchanged.
     from nelix_store.store import Store
 
     class _BoomConnection:
@@ -521,7 +524,8 @@ def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatc
 
     store = Store(tmp_path, clock=lambda: 1000.0)
     try:
-        monkeypatch.setattr(store, "_conn", _BoomConnection(store._conn))
+        real_conn = store._conn
+        monkeypatch.setattr(store._conns, "get", lambda: _BoomConnection(real_conn))
         with pytest.raises(NelixError) as ei:
             store.get_session("s-" + "1" * 32, owner_id="hermes:local")
         assert ei.value.code == errors.STORE_UNAVAILABLE
@@ -612,9 +616,19 @@ def test_a_signal_storm_cannot_spin_past_the_advertised_bound(tmp_path, monkeypa
     assert elapsed < 10, f"overran its {0.3}s bound: {elapsed}s"
 
 
-def test_close_does_not_leak_a_raw_sqlite_error(tmp_path):
-    # "no raw sqlite3 exception escapes any public method" was not true: close() is public and
-    # was undecorated, so a wrong-thread close leaked a raw ProgrammingError.
+def test_close_from_a_thread_that_never_touched_the_store_now_succeeds_cleanly(tmp_path):
+    # Before nelix-91y, Store() opened its ONE process-wide connection eagerly, in the
+    # constructing thread, for the instance's whole life — so close() called from any OTHER
+    # thread was a genuine cross-thread misuse: sqlite3 raised ProgrammingError, and
+    # (close() being public and undecorated at the time) it leaked raw, then later
+    # (decorated) came back as INTERNAL_ERROR. Either way, an operation that should be
+    # harmless (closing a store nobody else was using) surfaced as an error.
+    #
+    # Per-thread connections (ThreadLocalConnections) make the whole class of bug
+    # unreachable through the public API: a thread that never touched this Store has no
+    # connection of its own to close, so close() has nothing to do here and simply
+    # succeeds. This is the positive control for the fix, not just "does not leak raw" —
+    # the operation is not merely translated cleanly, it no longer errors at all.
     from nelix_store.store import Store
 
     store = Store(tmp_path, clock=lambda: 1000.0)
@@ -631,8 +645,31 @@ def test_close_does_not_leak_a_raw_sqlite_error(tmp_path):
     t = threading.Thread(target=closer)
     t.start()
     t.join(timeout=10)
-    assert not [b for b in boom if str(b).startswith("RAW")], f"close leaked: {boom}"
-    # "not raw" was all this proved, and "not raw" is satisfied by ANY NelixError — including
-    # the store_corrupt this actually returned (measured), which is a false accusation against
-    # the user's data for what is a wrong-thread call in our own code. Name the party.
-    assert boom == [errors.INTERNAL_ERROR], f"a wrong-thread close named the wrong party: {boom}"
+    assert boom == [], f"closing from a foreign, never-used thread should be a clean no-op: {boom}"
+
+
+def test_close_still_translates_a_genuine_sqlite_error(tmp_path):
+    # The fix above removes the cross-thread FALSE positive; it must not also remove
+    # translation for a TRUE failure closing the calling thread's own connection. Reaches
+    # into `store._conns._local` (the ThreadLocalConnections' per-thread slot) to swap in a
+    # connection whose close() raises — the same kind of internals-poking the test above
+    # this one in the file needed for the same C-extension-immutability reasons.
+    from nelix_store.store import Store
+
+    class _BoomOnClose:
+        def close(self):
+            e = sqlite3.OperationalError("disk I/O error")
+            e.sqlite_errorcode = sqlite3.SQLITE_IOERR
+            raise e
+
+    store = Store(tmp_path, clock=lambda: 1000.0)
+    real_conn = store._conn                        # this thread's real connection, opened
+                                                     # eagerly at construction
+    store._conns._local.conn = _BoomOnClose()       # swap THIS thread's slot only
+    try:
+        with pytest.raises(NelixError) as ei:
+            store.close()
+        assert ei.value.code == errors.STORE_UNAVAILABLE
+    finally:
+        store._conns._local.conn = None
+        real_conn.close()
