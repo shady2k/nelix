@@ -259,9 +259,18 @@ class Store:
             record = self.get_terminal(session_id, owner_id=owner_id)   # owner guard first
             if record.acknowledged_at is not None:
                 return record
+            # SQLite silently COERCES NaN to NULL on write. `float(self._clock())` therefore
+            # let a NaN clock stamp NULL — leaving this CAS's own "AND acknowledged_at IS
+            # NULL" guard still matching, the re-read returning None (VALID, the field is
+            # optional), nothing raising, and the transaction COMMITTING. Measured: ack
+            # reported SUCCESS and acknowledged nothing, silently and forever. +inf failed the
+            # opposite way (stored as-is, rejected by the re-read, rolled back) and reported
+            # OUR clock as store_corrupt. Same rule as every other timestamp, so the same
+            # helper — read here rather than at entry because a REPEATED ack returns above
+            # without needing a clock at all, and must stay idempotent regardless of one.
             self._conn.execute(
                 "UPDATE terminal SET acknowledged_at=? WHERE session_id=? "
-                "AND acknowledged_at IS NULL", (float(self._clock()), session_id))
+                "AND acknowledged_at IS NULL", (timestamp(self._clock(), "clock"), session_id))
             return self.get_terminal(session_id, owner_id=owner_id)
 
     @translates_sqlite

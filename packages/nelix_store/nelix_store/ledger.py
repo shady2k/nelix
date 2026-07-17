@@ -33,6 +33,7 @@ from nelix_contracts.ids import (
     InvalidId, new_session_id, validate_generation_id, validate_orchestration_id,
     validate_owner_id, validate_session_id,
 )
+from nelix_contracts.records import timestamp
 
 from .db import connect, translates_sqlite
 
@@ -110,10 +111,21 @@ class StartLedger:
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                # A reservation has no delete path, so an unreadable created_at is durable
+                # FOREVER — and `float(self._clock())` admitted three different ones: +inf
+                # stored as-is and reserve reported success (Reservation carries no
+                # created_at and _row_to_reservation never validates it, so nothing
+                # downstream could notice); True became 1.0; a non-numeric clock escaped as a
+                # raw ValueError/TypeError, which translates_sqlite does not catch. NaN was
+                # caught only BY ACCIDENT — it coerces to NULL, tripping `created_at REAL NOT
+                # NULL`, whose IntegrityError the handler below then misreads as the
+                # (owner, key) UNIQUE constraint and reports as store_corrupt. Validate the
+                # read itself; do not rely on a column constraint to catch one of four cases.
                 self._conn.execute(
                     f"INSERT INTO starts ({_COLS}) VALUES (?,?,?,?,?,?,?,?,?)",
                     (session_id, owner_id, orchestration_id, idempotency_key,
-                     request_fingerprint, "starting", None, None, float(self._clock())))
+                     request_fingerprint, "starting", None, None,
+                     timestamp(self._clock(), "clock")))
                 return Reservation(session_id=session_id, state="starting",
                                    generation_id=None, reason=None, replay=False)
             except sqlite3.IntegrityError:

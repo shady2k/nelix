@@ -310,6 +310,48 @@ def test_a_key_at_the_limit_is_accepted(ledger):
     assert r.state == "starting"
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), True,
+                                 "not-a-number", None])
+def test_reserve_rejects_a_nonsense_clock(tmp_path, bad):
+    # reserve's created_at was the last unguarded clock read in the package: prune_terminal
+    # validated its own (67c300c), ack_terminal did not, and neither did this. Measured on
+    # 3d25a1b, and NO two values failed the same way — which is the argument for guarding the
+    # READ instead of each symptom:
+    #   nan       -> SQLite coerces NaN to NULL on write, `created_at REAL NOT NULL` fires,
+    #                and the `except sqlite3.IntegrityError` branch below assumes the only
+    #                candidate was the (owner, key) UNIQUE constraint -> STORE_CORRUPT
+    #                "reservation insert failed on an unexpected constraint". Our own clock,
+    #                reported to the caller as durable damage.
+    #   inf/-inf  -> RETURNED SUCCESS with created_at=inf stored durably and permanently.
+    #                Reservation carries no created_at, and _row_to_reservation never
+    #                validates it, so nothing downstream can ever notice.
+    #   True      -> RETURNED SUCCESS, silently stored as 1.0 (bool is an int subclass).
+    #   "..."/None-> raw ValueError/TypeError out through the package boundary:
+    #                translates_sqlite only catches sqlite3.Error.
+    # Reservations have no delete path, so an inf/1.0 created_at is durable forever.
+    lg = StartLedger(tmp_path, clock=lambda: bad)
+    try:
+        with pytest.raises(NelixError) as ei:
+            reserve(lg)
+        assert ei.value.code == errors.INVALID_REQUEST
+    finally:
+        lg.close()
+
+
+def test_a_rejected_clock_leaves_no_reservation_behind(tmp_path):
+    # +inf is the one that reached disk: it stores as-is (unlike NaN, which NOT NULL caught by
+    # accident), so reserve reported success over a permanently unreadable timestamp. A
+    # rejected clock must mint nothing — the caller's retry has to be free to reserve cleanly.
+    lg = StartLedger(tmp_path, clock=lambda: float("inf"))
+    try:
+        with pytest.raises(NelixError):
+            reserve(lg)
+        assert lg._conn.execute("SELECT COUNT(*) FROM starts").fetchone()[0] == 0, \
+            "a rejected clock still minted a durable reservation"
+    finally:
+        lg.close()
+
+
 def test_the_ledger_survives_a_restart(tmp_path):
     lg = StartLedger(tmp_path, clock=lambda: 1000.0)
     first = reserve(lg)

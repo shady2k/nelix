@@ -102,6 +102,24 @@ def _live_session(store, ledger, owner="hermes:local", key="k1", **over):
     return started_session(store, ledger, owner=owner, key=key, state="running", **over)
 
 
+def _acked_setup(tmp_path, clock):
+    """A published, UNacknowledged terminal record on a Store built with `clock`.
+
+    A nonsense clock cannot disturb the setup, which is what makes it a clean probe of the
+    ack: this Store's clock is read only by ack_terminal and prune_terminal. Identity comes
+    from a real start (the ledger keeps its own sane clock) and put_terminal's ended_at is
+    the caller's fact, not a clock read.
+    """
+    lg = StartLedger(tmp_path, clock=lambda: 1000.0)
+    try:
+        store = Store(tmp_path, clock=clock)
+        sid = _live_session(store, lg)
+        store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    finally:
+        lg.close()
+    return store, sid
+
+
 def test_a_terminal_record_cannot_exist_without_its_session(store):
     with pytest.raises(NelixError) as ei:
         store.put_terminal("s-" + "9" * 32, terminal_kind="done", summary="s", ended_at=1.0)
@@ -379,6 +397,53 @@ def test_prune_rejects_a_nonsense_clock(tmp_path, bad):
     try:
         with pytest.raises(NelixError) as ei:
             store.prune_terminal(max_age_seconds=60, max_count=100)
+        assert ei.value.code == errors.INVALID_REQUEST
+    finally:
+        store.close()
+
+
+def test_a_nonsense_clock_cannot_make_ack_a_silent_no_op(tmp_path):
+    # The SHARPEST case, and the mechanism is not the obvious one — measured, not reasoned:
+    # SQLite silently COERCES NaN to NULL on write (nan -> stored NULL; inf and -inf store
+    # as-is). So the CAS `SET acknowledged_at=NaN ... AND acknowledged_at IS NULL` stamps
+    # NULL; its own guard therefore still matches next time; the re-read returns
+    # acknowledged_at=None, which is VALID because the field is optional; nothing raises, so
+    # the transaction COMMITS. Measured end to end on 3d25a1b: ack_terminal RETURNED SUCCESS
+    # with acknowledged_at=None and the row left unacknowledged. Silently, and forever.
+    #
+    # 67c300c guarded prune_terminal's clock read and left this one, so the package rejected a
+    # nonsense clock in one method and lied about the outcome in another.
+    store, sid = _acked_setup(tmp_path, clock=lambda: float("nan"))
+    try:
+        with pytest.raises(NelixError) as ei:
+            store.ack_terminal(sid, owner_id="hermes:local")
+        assert ei.value.code == errors.INVALID_REQUEST
+        row = store._conn.execute(
+            "SELECT acknowledged_at FROM terminal WHERE session_id=?", (sid,)).fetchone()
+        assert row["acknowledged_at"] is None, "a rejected ack must not have written anything"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), True,
+                                 "not-a-number", None])
+def test_ack_rejects_a_nonsense_clock(tmp_path, bad):
+    # Measured on 3d25a1b, and the outcomes DIFFER per value — which is exactly why the guard
+    # belongs on the read rather than on any one symptom:
+    #   nan   -> success, nothing acknowledged (above)
+    #   inf   -> stored as inf, re-read's TerminalRecord rejects it, `with self._conn:` rolls
+    #            back, row left clean: ack raised STORE_CORRUPT — naming OUR construction
+    #            argument as the caller's data rotting
+    #   True  -> silently 1.0, a real acknowledgement at a fictional time (bool is an int
+    #            subclass, which is why timestamp() rejects it explicitly)
+    #   "..."/None -> raw ValueError/TypeError, straight out through the package boundary:
+    #            translates_sqlite only catches sqlite3.Error
+    # One finite clock read closes all four. invalid_request names the right party: the clock
+    # is this Store's own construction argument and no retry of the same call can fix it.
+    store, sid = _acked_setup(tmp_path, clock=lambda: bad)
+    try:
+        with pytest.raises(NelixError) as ei:
+            store.ack_terminal(sid, owner_id="hermes:local")
         assert ei.value.code == errors.INVALID_REQUEST
     finally:
         store.close()
