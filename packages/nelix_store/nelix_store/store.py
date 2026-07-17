@@ -17,7 +17,7 @@ import time
 
 from nelix_contracts.errors import (
     DUPLICATE_START, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, OWNER_MISMATCH, SCHEMA_TOO_NEW,
-    STORE_CORRUPT, UNKNOWN_SESSION, NelixError,
+    STORE_CORRUPT, TERMINAL_EXPIRED, UNKNOWN_SESSION, NelixError,
 )
 from nelix_contracts.records import (
     SCHEMA_VERSION, SessionRecord, TerminalRecord, timestamp,
@@ -40,8 +40,13 @@ _SESSION_SELECT = (
 # `PRAGMA foreign_keys=ON` connection.
 _TERMINAL_SELECT = (
     "SELECT t.session_id, st.owner_id, st.orchestration_id, st.generation_id, "
-    "t.terminal_kind, t.summary, t.ended_at, t.acknowledged_at, t.schema_version "
+    "t.terminal_kind, t.summary, t.ended_at, t.published_at, t.acknowledged_at, "
+    "t.expired_at, t.expire_reason, t.schema_version "
     "FROM terminal t JOIN starts st ON st.session_id = t.session_id")
+
+# A row the OWNER still has to deal with. Dismissal (ack, theirs, at once) and expiry (prune,
+# ours, later) both take a result off the board; neither deletes the receipt underneath it.
+_ON_THE_BOARD = "t.acknowledged_at IS NULL AND t.expired_at IS NULL"
 
 # transition_session's CAS UPDATE has no owner_id column to filter on directly (identity
 # lives in starts, not sessions) — expressed as a subquery so the owner check stays part of
@@ -209,24 +214,39 @@ class Store:
                 (session_id,)).fetchone()
             if start is None:
                 raise NelixError(UNKNOWN_SESSION, f"no such session: {session_id}")
+            # The store's own stamp: retention ages from THIS, never from the caller's
+            # ended_at. Read before the comparison below, not after, because the incoming
+            # record must be judged valid before any stored state is consulted — otherwise a
+            # malformed field on a session that already ended reports IDEMPOTENCY_CONFLICT
+            # ("you sent a different result") for what is really INVALID_REQUEST ("you sent
+            # nonsense"), naming the wrong disagreement. The cost is that a Store built with a
+            # nonsense clock now fails EVERY put_terminal including an otherwise-idempotent
+            # retry — deliberate: such a Store cannot publish anything, and one answer for one
+            # call beats an answer that depends on whether a row happens to exist.
+            published_at = timestamp(self._clock(), "clock")
             # Validate before writing; identity from the join cannot disagree.
             TerminalRecord(session_id=session_id, owner_id=start["owner_id"],
                            orchestration_id=start["orchestration_id"],
                            generation_id=start["generation_id"],
-                           terminal_kind=terminal_kind, summary=summary, ended_at=ended_at)
+                           terminal_kind=terminal_kind, summary=summary, ended_at=ended_at,
+                           published_at=published_at)
             existing = self._conn.execute(
                 "SELECT terminal_kind, summary, ended_at FROM terminal WHERE session_id=?",
                 (session_id,)).fetchone()
             if existing is not None:
                 if (existing["terminal_kind"], existing["summary"], existing["ended_at"]) == (
                         terminal_kind, summary, ended_at):
-                    return                      # same result: idempotent, ack untouched
+                    # Same result: idempotent. published_at is NOT restamped — a generation
+                    # retrying in a loop would otherwise keep its result alive forever and
+                    # defeat the age bound retention just moved to.
+                    return
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  f"{session_id} already ended as {existing['terminal_kind']!r}")
             self._conn.execute(
                 "INSERT INTO terminal (session_id, terminal_kind, summary, ended_at, "
-                "acknowledged_at, schema_version) VALUES (?,?,?,?,?,?)",
-                (session_id, terminal_kind, summary, ended_at, None, SCHEMA_VERSION))
+                "published_at, acknowledged_at, schema_version) VALUES (?,?,?,?,?,?,?)",
+                (session_id, terminal_kind, summary, ended_at, published_at, None,
+                 SCHEMA_VERSION))
 
     @translates_sqlite
     def get_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
@@ -248,6 +268,9 @@ class Store:
         the GC's schedule". Dismissal (the owner's decision, at once) and reclamation (the
         pruner's, later) are different events.
 
+        `AND t.expired_at IS NULL` is the second half, and it is what lets prune stop deleting:
+        an expired result leaves the board without its receipt leaving the database.
+
         The filter is HERE and not in _TERMINAL_SELECT on purpose: get_terminal shares that
         SELECT, a get by id is not the board, and ack_terminal re-reads through get_terminal
         inside its own transaction — hiding acked rows there would break ack's idempotency
@@ -255,7 +278,7 @@ class Store:
         """
         rows = self._conn.execute(
             f"{_TERMINAL_SELECT} WHERE st.owner_id=? AND t.schema_version=? "
-            "AND t.acknowledged_at IS NULL "
+            f"AND {_ON_THE_BOARD} "
             "ORDER BY t.ended_at, t.session_id", (owner_id, SCHEMA_VERSION)).fetchall()
         records, _skipped = _read_rows(rows, TerminalRecord)
         return records
@@ -273,6 +296,17 @@ class Store:
             record = self.get_terminal(session_id, owner_id=owner_id)   # owner guard first
             if record.acknowledged_at is not None:
                 return record
+            # An expired result is durably retired and cannot be dismissed. Naming it is the
+            # point: prune used to DELETE the row, so this answered unknown_session — the same
+            # answer as a session id that was never real, for the opposite situation. A caller
+            # cannot tell "you were too late" from "you are confused" and the two want opposite
+            # responses. The table's `expired_at IS NULL OR acknowledged_at IS NULL` CHECK
+            # backstops this branch: without it the CAS below would try to acknowledge an
+            # expired row and SQLite would refuse the write outright.
+            if record.expired_at is not None:
+                raise NelixError(TERMINAL_EXPIRED,
+                                 f"{session_id} expired ({record.expire_reason}) before it was "
+                                 f"acknowledged")
             # SQLite silently COERCES NaN to NULL on write. `float(self._clock())` therefore
             # let a NaN clock stamp NULL — leaving this CAS's own "AND acknowledged_at IS
             # NULL" guard still matching, the re-read returning None (VALID, the field is
@@ -289,11 +323,26 @@ class Store:
 
     @translates_sqlite
     def prune_terminal(self, *, max_age_seconds: float, max_count: int) -> int:
-        """Drop acknowledged records; bound the rest by age, and by count PER OWNER.
+        """Bound the BOARD by age and by count PER OWNER. Returns the number of results retired.
+
+        This DELETED rows, and that was the defect: the row is the only evidence that a session
+        ever ended, so deleting it made the store forget, and the next matching retry re-published
+        the owner's dismissed result onto their board. It now stamps `expired_at`, which takes the
+        result off the board and leaves the receipt. Nothing here deletes anything: a receipt lives
+        at least as long as its session and start, and reclaiming all three is a session-history GC
+        that does not exist yet.
+
+        It never touches an ACKNOWLEDGED row. Under the old condition — `acknowledged_at IS NOT
+        NULL OR (age)` — max_age gated only unacknowledged rows, so an acked row was eligible on
+        the very next prune at any age: the ack->prune window was zero, which is why an ordinary
+        sub-second retry could land in it. An acked result is already off the board and there is
+        nothing left to reclaim from it.
 
         Per owner is not a detail: a global count bound lets a noisy owner evict a quiet
         owner's unacknowledged result — which breaks both "unacked results survive" and
-        "owner is a correctness namespace". rev 1 did exactly that.
+        "owner is a correctness namespace". rev 1 did exactly that. The count bounds the BOARD,
+        so only board rows are counted — receipts an owner has already dealt with must not evict
+        the live results they have not.
 
         Deliberately operates on ROWS, not deserialised records, so a row from a newer
         schema is still bounded rather than growing forever behind a read this build cannot
@@ -316,15 +365,26 @@ class Store:
         now = timestamp(self._clock(), "clock")
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
-            removed = self._conn.execute(
-                "DELETE FROM terminal WHERE acknowledged_at IS NOT NULL "
-                "OR (? - ended_at) > ?", (now, max_age_seconds)).rowcount
-            removed += self._conn.execute(
-                "DELETE FROM terminal WHERE session_id IN ("
+            # `AS t` so the one _ON_THE_BOARD predicate reads verbatim here, in the count
+            # query's subquery below, and on the board itself: three hand-written copies of
+            # "what is on the board" is three chances for them to drift, and a drift between
+            # the board's filter and the pruner's would either strand rows on the board forever
+            # or retire ones still being shown.
+            expired = self._conn.execute(
+                "UPDATE terminal AS t SET expired_at=?, expire_reason='age' "
+                f"WHERE {_ON_THE_BOARD} AND (? - t.published_at) > ?",
+                (now, now, max_age_seconds)).rowcount
+            # Runs AFTER the age pass, and reads what that pass wrote: rows it just expired are
+            # no longer on the board, so they neither survive the count bound nor get counted
+            # twice into the return value.
+            expired += self._conn.execute(
+                "UPDATE terminal SET expired_at=?, expire_reason='count' "
+                "WHERE session_id IN ("
                 "  SELECT session_id FROM ("
                 "    SELECT t.session_id, ROW_NUMBER() OVER ("
-                "      PARTITION BY st.owner_id ORDER BY t.ended_at DESC, t.session_id DESC"
+                "      PARTITION BY st.owner_id ORDER BY t.published_at DESC, t.session_id DESC"
                 "    ) AS rn FROM terminal t "
-                "    JOIN starts st ON st.session_id = t.session_id"
-                "  ) WHERE rn > ?)", (max_count,)).rowcount
-        return removed
+                "    JOIN starts st ON st.session_id = t.session_id "
+                f"    WHERE {_ON_THE_BOARD}"
+                "  ) WHERE rn > ?)", (now, max_count)).rowcount
+        return expired
