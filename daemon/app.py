@@ -7,7 +7,8 @@ import paths
 from daemon import reaper, singleton
 from daemon.broker_client import BrokerClient, set_broker, get_broker
 from daemon.config import (load_executors, load_concurrency_limit, load_idle_retained_limit,
-                           load_retention, load_log_level, load_kill_grace_seconds)
+                           load_retention, load_log_level, load_kill_grace_seconds,
+                           load_event_ring)
 from daemon.drivers import get_driver
 from daemon.launchers import get_launcher
 from daemon.events import EventQueue
@@ -118,7 +119,8 @@ def main():
     set_broker(BrokerClient())            # spawn the broker BEFORE any threads exist
     grace = load_kill_grace_seconds(cfg_path)
     reaper_ctx = build_reaper_ctx(grace)
-    events = EventQueue()
+    ring = load_event_ring(cfg_path)
+    events = EventQueue(max_history=ring.max_history, owner_floor=ring.owner_floor)
     retention = load_retention(cfg_path)
     manager = SessionManager(
         specs, events,

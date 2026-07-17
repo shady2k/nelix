@@ -112,6 +112,29 @@ def test_rpc_session_scoped_roundtrip():
         srv.shutdown()
 
 
+def test_wait_returns_cursor_expired_when_cursor_fell_off_the_ring():
+    # nelix-9a4.5 deliverable 3: a /wait armed at a cursor whose events were evicted (the ring
+    # dropped them) must answer with an EXPLICIT cursor_expired resync marker, never a silent
+    # event:null — otherwise a wake-driven caller stalls forever and never re-/status's.
+    own("s-00000001")
+    m = FakeManager()
+    # small ring, no floor: a flood on ANOTHER session drops s-00000001's only event.
+    m._events = EventQueue(max_history=5, owner_floor=0)
+    own("s-flood01")
+    m._events.publish("s-00000001", EXECUTOR, "done", "old doorbell", "done_candidate")
+    for _ in range(20):
+        m._events.publish("s-flood01", EXECUTOR, "working", "", "working")
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8804, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:8804"
+    try:
+        _, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id=s-00000001")
+        assert wb["event"] is None
+        assert wb["cursor_expired"] is True
+    finally:
+        srv.shutdown()
+
+
 def test_respond_without_decision_id_returns_409_missing():
     # A respond whose outcome is missing_decision_id surfaces as HTTP 409 with the pending
     # decision meta (incl. its text) so the orchestrator retries with the id — NOT a guessed 200.

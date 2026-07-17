@@ -76,6 +76,15 @@ def main():
                 # Hermes reconciles via nelix_status.
                 print(json.dumps({"kind": "none"}, ensure_ascii=False))
                 return 0
+            if body.get("cursor_expired"):
+                # The cursor fell off the back of the bounded ring: events we never saw were
+                # evicted, so this wait can never deliver them. Ring the doorbell anyway (a resync
+                # wake) so Hermes re-pulls the authoritative state via nelix_status instead of
+                # long-polling a doorbell that will never fire (nelix-9a4.5 deliverable 3).
+                out = {"schema": "nelix.wake.v1", "status_required": True,
+                       "cursor_expired": True, "session_id": args.session_id}
+                print(json.dumps(out, ensure_ascii=False))
+                return 0
             evt = body.get("event")
             if evt is None:
                 continue                     # timeout tick — re-issue

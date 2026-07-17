@@ -252,6 +252,35 @@ def load_kill_grace_seconds(path, default=5.0):
 
 
 @dataclass
+class EventRingConfig:
+    # max_history: bound on EVICTABLE delivery/history events (unresolved decisions are PINNED and
+    # exempt — daemon/events.py). Default 2048: with the default concurrency (5 active + 5 idle
+    # sessions) that is ~200 recent events per session, far more than a session accumulates between
+    # a waiter's doorbell pulls, so normal operation never evicts a still-relevant delivery event —
+    # yet the log can no longer grow without bound over a long-lived daemon.
+    max_history: int = 2048
+    # owner_floor: per-owner recent-history retention floor. A quiet owner keeps at least this many
+    # of its most-recent evictable events even while another owner floods, so a cross-owner flood
+    # cannot evict a quiet owner's recent delivery doorbell. Default 64 (~a turn's worth of
+    # delivery/progress events); owners * floor stays well under max_history at the default limits.
+    owner_floor: int = 64
+
+
+def load_event_ring(path):
+    """Event-ring bounds (daemon/events.py). Malformed TOML/IO or a non-int / bool / below-floor
+    value falls back to the default (mirrors load_retention's _cfg_int) — never crash the load."""
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        data = {}
+    return EventRingConfig(
+        max_history=_cfg_int(data, "event_ring_max", 2048, floor=1),
+        owner_floor=_cfg_int(data, "event_ring_owner_floor", 64, floor=0),
+    )
+
+
+@dataclass
 class RetentionConfig:
     daemon_log_retain: int = 10
     session_retain: int = 20

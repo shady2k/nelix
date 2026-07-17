@@ -48,6 +48,31 @@ def test_terminal_snapshot_pruned_after_ttl():
     assert "s-1" not in mgr.status(owner_id=OWNER).get("recent_terminal", {})
 
 
+def test_terminal_expiry_forgets_session_from_event_ring():
+    # nelix-9a4.5 finding #4 wiring: when a session's terminal snapshot expires (its final result is
+    # no longer observable), the manager releases its event-ring retention + per-session bookkeeping,
+    # so the ring is bounded to live + not-yet-pruned sessions over the daemon's lifetime.
+    t = {"now": 1000.0}
+    mgr = _mgr(ttl=10.0, clock=lambda: t["now"])
+    own("s-gone01"); mgr._sessions["s-gone01"] = _FakeSession("s-gone01")
+    mgr._events.publish("s-gone01", "claude", "working", "", "working")
+    mgr._events.publish("s-gone01", "claude", "done", "final result", "done_candidate")
+    assert mgr._events.latest_seq("s-gone01") > 0
+    mgr._free_slot("s-gone01")
+    # WITHIN ttl: the final result must still be observable, so the ring data is retained.
+    mgr.status(owner_id=OWNER)
+    assert mgr._events.latest_seq("s-gone01") > 0
+    assert any(e.session_id == "s-gone01" for e in mgr._events._events)
+    # PAST ttl: the sweep that prunes the terminal snapshot also forgets the session's ring state.
+    t["now"] = 1011.0
+    mgr.status(owner_id=OWNER)
+    assert mgr._events.latest_seq("s-gone01") == 0
+    assert not any(e.session_id == "s-gone01" for e in mgr._events._events)
+    assert "s-gone01" not in mgr._events._last_seq_by_session
+    assert "s-gone01" not in mgr._events._evicted_high_by_session
+    assert "s-gone01" not in mgr._events._owner_cache
+
+
 def test_multiple_terminal_snapshots_coexist_and_prune_independently():
     t = {"now": 1000.0}
     mgr = _mgr(ttl=10.0, clock=lambda: t["now"])
