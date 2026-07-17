@@ -27,6 +27,12 @@ STORE_UNSUPPORTED = "store_unsupported"
 # the same call can fix a defect in the code making it.
 INTERNAL_ERROR = "internal_error"
 
+# The terminal result existed and the store retired it from the board before the owner
+# acknowledged it. Distinct from unknown_session ON PURPOSE: deleting the row made "you were too
+# late" and "that session id was never real" the same answer, and they call for opposite
+# responses from a caller. Non-retryable — no retry of the same ack un-expires a result.
+TERMINAL_EXPIRED = "terminal_expired"
+
 # retryable=True means: the SAME call, unchanged, may succeed later.
 # It is deliberately False for the cursor conditions — they mean "refetch the board and
 # re-arm", so a verbatim retry would spin.
@@ -48,6 +54,7 @@ _RETRYABLE = {
     STORE_UNAVAILABLE: True,     # busy / lock contention / environment: the same call may work later
     STORE_UNSUPPORTED: False,    # a permanent environment defect: retrying cannot help
     INTERNAL_ERROR: False,       # a defect in this code: the same call cannot start working
+    TERMINAL_EXPIRED: False,     # the result is durably retired: retrying the ack cannot undo it
 }
 
 ALL_CODES = frozenset(_RETRYABLE)

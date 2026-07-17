@@ -1,3 +1,4 @@
+import sqlite3
 import threading
 
 import pytest
@@ -81,6 +82,11 @@ def test_republishing_after_an_ack_neither_conflicts_nor_erases_the_ack(store, l
     store.ack_terminal(sid, owner_id="hermes:local")
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
     assert store.get_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
+    # Keeping the ack is necessary but not sufficient: the row must also stay OFF the board.
+    # The resurrection this all exists to stop needs prune to have run first; this is the same
+    # invariant one step earlier, where the payload is still live and a retry could relist it.
+    assert store.list_terminal("hermes:local") == [], \
+        "a retried put relisted a result the owner had already dismissed"
 
 
 @pytest.mark.parametrize("field,bad", [
@@ -267,20 +273,135 @@ def test_an_acknowledged_result_cannot_be_resurrected_by_a_retried_put(store, le
     sid = _live_session(store, ledger)
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
     store.ack_terminal(sid, owner_id="hermes:local")
-    assert store.prune_terminal(max_age_seconds=86400, max_count=100) == 1
+    store.prune_terminal(max_age_seconds=86400, max_count=100)
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
     assert store.list_terminal("hermes:local") == [], \
         "the owner dismissed this result and a retried put put it back on their board"
+    assert store.get_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0, \
+        "the retry erased the acknowledgement it should have recognised"
 
 
-def test_prune_removes_acknowledged_records(store, ledger):
+def test_pruning_an_acknowledged_result_keeps_its_receipt(store, ledger):
+    # REPLACES test_prune_removes_acknowledged_records, which asserted THE DEFECT: it acked,
+    # pruned, and demanded the row be gone and get_terminal raise UNKNOWN_SESSION. Deleting the
+    # row destroys the only evidence that this session ever ended, and terminal idempotency is
+    # keyed on exactly that evidence — so the next matching put re-publishes the dismissed
+    # result. prune's condition was `acknowledged_at IS NOT NULL OR (age)`, meaning max_age
+    # gated only UNACKNOWLEDGED rows and an acked row was eligible on the very next prune at any
+    # age: the ack->prune window is ZERO, not hours.
+    #
+    # The receipt is now permanent. Reclamation is not prune's to do: a receipt lives at least
+    # as long as its session and its start, and nothing GCs those either.
     sid = started_session(store, ledger, state="running")
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=100.0)
     store.ack_terminal(sid, owner_id="hermes:local")
-    assert store.prune_terminal(max_age_seconds=86400, max_count=100) == 1
+    assert store.prune_terminal(max_age_seconds=86400, max_count=100) == 0, \
+        "prune reclaimed an acknowledged receipt; the next matching put would resurrect it"
+    rec = store.get_terminal(sid, owner_id="hermes:local")
+    assert rec.acknowledged_at == 1000.0
+    assert store.list_terminal("hermes:local") == []      # dismissed, and it stays dismissed
+
+
+def test_an_abandoned_result_expires_into_a_receipt_rather_than_vanishing(store, ledger, clock):
+    # Age-pruning an UNACKNOWLEDGED result used to delete it outright, so afterwards the store
+    # could not tell "this session never ended" from "it ended and you were too late" — both
+    # answered UNKNOWN_SESSION. The payload was the receipt, so losing one lost the other.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    clock.t = 1600.0
+    assert store.prune_terminal(max_age_seconds=500, max_count=100) == 1
+    assert store.list_terminal("hermes:local") == []
+    rec = store.get_terminal(sid, owner_id="hermes:local")
+    assert (rec.expired_at, rec.expire_reason) == (1600.0, "age")
+    assert rec.acknowledged_at is None       # nobody ever dismissed it; it timed out
+
+
+def test_count_pruning_expires_into_receipts(store, ledger, clock):
+    sid_old = None
+    for i in range(3):
+        clock.t = 1000.0 + i
+        sid = started_session(store, ledger, key=f"k{i}", state="running")
+        store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=float(i))
+        if i == 0:
+            sid_old = sid
+    assert store.prune_terminal(max_age_seconds=86400, max_count=1) == 2
+    rec = store.get_terminal(sid_old, owner_id="hermes:local")
+    assert (rec.expired_at, rec.expire_reason) == (1002.0, "count")
+
+
+def test_acknowledging_an_expired_result_says_so_instead_of_denying_it_existed(store, ledger,
+                                                                               clock):
+    # THE matrix row "expired | ack | terminal_expired". Deleting the row made this
+    # UNKNOWN_SESSION — the same answer as a session id that was never real. An owner who acks a
+    # result the pruner retired a moment earlier deserves to be told which of those happened.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    clock.t = 1600.0
+    store.prune_terminal(max_age_seconds=500, max_count=100)
     with pytest.raises(NelixError) as ei:
-        store.get_terminal(sid, owner_id="hermes:local")
-    assert ei.value.code == errors.UNKNOWN_SESSION
+        store.ack_terminal(sid, owner_id="hermes:local")
+    assert ei.value.code == errors.TERMINAL_EXPIRED
+    assert ei.value.retryable is False       # no retry of the same ack un-expires it
+
+
+def test_terminal_expired_is_reported_for_a_prune_that_committed_first(store, ledger, clock):
+    # The matrix's "prune committed first | ack | DETERMINISTIC terminal_expired". The seam test
+    # covers the prune that loses the race; this is the one that wins it, and the point is that
+    # the loser is now a named outcome rather than a vanished row.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    clock.t = 1600.0
+    assert store.prune_terminal(max_age_seconds=500, max_count=100) == 1
+    for _ in range(3):
+        with pytest.raises(NelixError) as ei:
+            store.ack_terminal(sid, owner_id="hermes:local")
+        assert ei.value.code == errors.TERMINAL_EXPIRED
+
+
+def test_republishing_an_expired_result_does_not_resurrect_it(store, ledger, clock):
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    clock.t = 1600.0
+    store.prune_terminal(max_age_seconds=500, max_count=100)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)   # same result
+    assert store.list_terminal("hermes:local") == [], \
+        "a retry put an EXPIRED result back on the board"
+    rec = store.get_terminal(sid, owner_id="hermes:local")
+    assert (rec.expired_at, rec.expire_reason) == (1600.0, "age")
+
+
+def test_republishing_an_expired_result_differently_is_still_a_conflict(store, ledger, clock):
+    # Expiry reclaims the BOARD SLOT, not the outcome. The first valid outcome is immutable for
+    # this session id whether it is live, dismissed or expired — otherwise expiry would quietly
+    # become a way to overwrite history by waiting.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    clock.t = 1600.0
+    store.prune_terminal(max_age_seconds=500, max_count=100)
+    with pytest.raises(NelixError) as ei:
+        store.put_terminal(sid, terminal_kind="error", summary="s", ended_at=5.0)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+
+
+def test_republishing_an_acknowledged_result_differently_is_a_conflict(store, ledger):
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    store.ack_terminal(sid, owner_id="hermes:local")
+    with pytest.raises(NelixError) as ei:
+        store.put_terminal(sid, terminal_kind="error", summary="s", ended_at=5.0)
+    assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
+
+
+def test_a_repeated_ack_after_a_prune_returns_the_original_acknowledgement(store, ledger, clock):
+    # The matrix's "ack-compacted | repeated ack | the ORIGINAL acknowledgement". Under the old
+    # code prune deleted the row, so this raised UNKNOWN_SESSION: ack's idempotency guarantee
+    # ("a repeated ack returns the same timestamp") silently expired whenever the GC ran.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    store.ack_terminal(sid, owner_id="hermes:local")
+    clock.t = 9000.0
+    store.prune_terminal(max_age_seconds=500, max_count=100)
+    assert store.ack_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
 
 
 def test_a_stale_worker_clock_cannot_reap_a_fresh_result(store, ledger, clock):
@@ -438,6 +559,74 @@ def test_a_corrupt_terminal_row_does_not_blind_an_owner(store, ledger):
         " published_at, acknowledged_at, schema_version) VALUES (?,?,?,?,?,?,?)",
         (other_sid, "done", "s", "soon", 1000.0, None, SCHEMA_VERSION))
     assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid]
+
+
+def _raw_terminal(store, sid, **over):
+    """Write a terminal row straight past put_terminal, to probe the CHECK constraints.
+
+    The constraints exist for durable states this package's own writers cannot produce — a
+    future writer, a repair script, a half-applied migration. So the probe has to bypass the
+    writer too, or it would only be testing put_terminal.
+    """
+    row = dict(session_id=sid, terminal_kind="done", summary="s", ended_at=5.0,
+               published_at=1000.0, acknowledged_at=None, expired_at=None, expire_reason=None,
+               schema_version=SCHEMA_VERSION)
+    row.update(over)
+    cols = ", ".join(row)
+    store._conn.execute(f"INSERT INTO terminal ({cols}) VALUES ({', '.join('?' * len(row))})",
+                        tuple(row.values()))
+
+
+@pytest.mark.parametrize("state,why", [
+    (dict(expired_at=1600.0, expire_reason=None), "expired with no reason"),
+    (dict(expired_at=None, expire_reason="age"), "a reason but not expired"),
+    (dict(expired_at=1600.0, expire_reason="whenever"), "an unnameable reason"),
+    (dict(expired_at=1600.0, expire_reason="acknowledged"), "dismissal masquerading as expiry"),
+    (dict(expired_at=1600.0, expire_reason="age", acknowledged_at=1000.0),
+     "expired AND acknowledged"),
+])
+def test_an_impossible_terminal_state_cannot_be_stored(store, ledger, state, why):
+    # Each of these is a durable state that would make the lifecycle unreadable: a row that is
+    # expired for no reason, or dismissed and timed-out at once, cannot be answered coherently
+    # by ack or by the board. Unrepresentable beats untested — a CHECK makes SQLite refuse it at
+    # the write, so no reader has to carry a branch for a state that cannot arrive.
+    sid = _live_session(store, ledger)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        _raw_terminal(store, sid, **state)
+
+
+def test_a_receipt_cannot_be_erased_by_deleting_its_session(store, ledger):
+    # ON DELETE RESTRICT, never CASCADE. The receipt is what makes an acknowledged result
+    # unresurrectable; a cascade from sessions would delete it silently and hand the
+    # resurrection bug straight back through a different door.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        store._conn.execute("DELETE FROM sessions WHERE session_id=?", (sid,))
+    assert store.get_terminal(sid, owner_id="hermes:local").terminal_kind == "done"
+
+
+def test_a_session_cannot_be_erased_by_deleting_its_start(store, ledger):
+    sid = _live_session(store, ledger)
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        store._conn.execute("DELETE FROM starts WHERE session_id=?", (sid,))
+
+
+def test_receipts_do_not_consume_the_owners_board_budget(store, ledger, clock):
+    # The count bound bounds THE BOARD, so it must count board rows. Were receipts counted, an
+    # owner who diligently acks their results would watch those dead receipts evict the live
+    # ones they have not read yet — the bound would punish exactly the behaviour it exists to
+    # support, and the eviction would look like data loss.
+    for i in range(4):
+        clock.t = 1000.0 + i
+        acked = started_session(store, ledger, key=f"done{i}", state="running")
+        store.put_terminal(acked, terminal_kind="done", summary="s", ended_at=float(i))
+        store.ack_terminal(acked, owner_id="hermes:local")
+    clock.t = 2000.0
+    live = _live_session(store, ledger, key="live")
+    store.put_terminal(live, terminal_kind="done", summary="s", ended_at=9.0)
+    assert store.prune_terminal(max_age_seconds=86400, max_count=2) == 0
+    assert [r.session_id for r in store.list_terminal("hermes:local")] == [live]
 
 
 def test_a_prune_cannot_land_between_the_ack_and_its_reread(tmp_path):

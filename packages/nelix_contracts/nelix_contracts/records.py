@@ -130,6 +130,8 @@ class TerminalRecord:
     ended_at: float
     published_at: float
     acknowledged_at: float | None = None
+    expired_at: float | None = None
+    expire_reason: str | None = None
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self):
@@ -143,6 +145,16 @@ class TerminalRecord:
         # having it rather than reusing the caller's ended_at.
         timestamp(self.published_at, "published_at")
         timestamp(self.acknowledged_at, "acknowledged_at", optional=True)
+        timestamp(self.expired_at, "expired_at", optional=True)
+        if self.expire_reason is not None:
+            _text(self.expire_reason, "expire_reason")
+        # The COMBINATIONS (expired without a reason, expired AND acknowledged, a reason outside
+        # age/count) are deliberately NOT re-checked here. They are CHECK constraints on the
+        # terminal table, SQLite enforces those against every writer unconditionally, and the db
+        # version gate refuses any file whose schema predates them — so a record built from a
+        # stored row physically cannot carry one. A copy of the rule here would be a branch no
+        # test could reach: not a guard, just a second place for the rule to rot.
+
 
     def to_dict(self) -> dict:
         return asdict(self)

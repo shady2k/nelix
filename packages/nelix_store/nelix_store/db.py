@@ -64,7 +64,7 @@ CREATE INDEX IF NOT EXISTS starts_by_owner ON starts (owner_id);
 -- Live/runtime fields ONLY. Identity comes from starts by join — it is never stored twice,
 -- so the two can never disagree.
 CREATE TABLE IF NOT EXISTS sessions (
-    session_id     TEXT PRIMARY KEY REFERENCES starts (session_id),
+    session_id     TEXT PRIMARY KEY REFERENCES starts (session_id) ON DELETE RESTRICT,
     state          TEXT NOT NULL,
     executor       TEXT NOT NULL,
     task           TEXT NOT NULL,
@@ -74,7 +74,28 @@ CREATE TABLE IF NOT EXISTS sessions (
     schema_version INTEGER NOT NULL
 );
 
--- Terminal-result fields ONLY.
+-- A PERMANENT RECEIPT, not a payload the pruner may reclaim.
+--
+-- Terminal idempotency has no key column: its effective key is session_id and its remembered
+-- outcome is (terminal_kind, summary, ended_at) IN THIS ROW. Nothing else remembers either the
+-- result or the ack — so while prune DELETED this row, the store forgot that the session had
+-- ended at all, and the next matching retry inserted a fresh UNACKNOWLEDGED row and put the
+-- owner's dismissed result back on their board. The row therefore outlives the board: prune
+-- retires it (expired_at) instead of deleting it, and only ever expires rows nobody acked.
+--
+-- WHY THE SUMMARY IS RETAINED, and not replaced by a digest. Compaction's whole purpose would
+-- be to reclaim the payload while keeping equality evidence. Measured on this schema at 1000
+-- sessions: dropping a 280-byte summary (daemon/config.py's MAX_SUMMARY_LEN, the only bound
+-- this codebase puts on anything called a summary) reclaims 16% of the file — because the
+-- sessions.task beside it is far larger, unbounded, retained forever and GC'd by nothing, so
+-- compaction reclaims the smaller share of a row that is pinned regardless. A digest would buy
+-- that 16% by making SHA-256 over a canonical encoding a permanent durable contract, and by
+-- creating a state that cannot exist today: payload and fingerprint, both stored, disagreeing.
+-- That is the same objection that rules out a second receipts table, and it does not stop
+-- applying because the second representation is a column instead of a table. Equality stays
+-- exact. If a writer ever publishes megabyte summaries the arithmetic flips (at 64KB it is
+-- 98%) — and put_terminal caps nothing today, so the cheap answer then is a cap at the
+-- contract boundary, which bounds task and summary alike, not a digest that bounds one column.
 --
 -- ended_at is the WORKER's reported fact ("when did I finish"), and it is what the board
 -- displays. published_at is the STORE's fact ("when did this become durable here"), and it is
@@ -82,14 +103,33 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- clock decided how long its own result was kept — a stale one reaped it before the owner ever
 -- looked, a future one made it immortal. Retention is this package's policy, so it ages from
 -- this package's clock.
+--
+-- RECEIPT LIFETIME, written down rather than enforced as a horizon we cannot honour: a receipt
+-- lives at least as long as its session and its start. There is no retry horizon and no
+-- session/start GC, so receipts cannot be reclaimed independently of either. A future
+-- session-history GC deletes start + session + receipt as ONE lifecycle operation, once no
+-- replay is legal — which is exactly why both FKs are RESTRICT below.
 CREATE TABLE IF NOT EXISTS terminal (
-    session_id      TEXT PRIMARY KEY REFERENCES sessions (session_id),
+    session_id      TEXT PRIMARY KEY REFERENCES sessions (session_id) ON DELETE RESTRICT,
     terminal_kind   TEXT NOT NULL,
     summary         TEXT NOT NULL,
     ended_at        REAL NOT NULL,
     published_at    REAL NOT NULL,
-    acknowledged_at REAL,
-    schema_version  INTEGER NOT NULL
+    acknowledged_at REAL,          -- the OWNER dismissed it (their decision, at once)
+    expired_at      REAL,          -- the PRUNER retired it (ours, later). Never both.
+    expire_reason   TEXT,
+    schema_version  INTEGER NOT NULL,
+    -- The impossible states, made unrepresentable rather than merely untested. A reader that
+    -- cannot receive these needs no branch for them, and SQLite enforces CHECK against every
+    -- writer, including one that never goes through this package.
+    CHECK ((expired_at IS NULL) = (expire_reason IS NULL)),
+    CHECK (expire_reason IS NULL OR expire_reason IN ('age', 'count')),
+    -- Dismissal and expiry are mutually exclusive, and this is the constraint the lifecycle
+    -- rests on: an acked result is already off the board, so the pruner has no reason to expire
+    -- it, and a result the owner never saw cannot have been dismissed. It is also what backstops
+    -- ack_terminal's terminal_expired branch — without the branch, the CAS would try to
+    -- acknowledge an expired row and SQLite would refuse the write outright.
+    CHECK (expired_at IS NULL OR acknowledged_at IS NULL)
 );
 -- Indexed on published_at, not ended_at: this index exists to serve pruning, and pruning now
 -- orders and bounds by published_at.
