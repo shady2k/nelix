@@ -41,7 +41,6 @@ def test_local_task_reaches_decision_and_creates_file(tmp_path):
 
 
 def test_supervisor_spawns_daemon_and_runs(tmp_path, monkeypatch):
-    import registry
     # operator must point HERMES_HOME at a profile whose nelix.toml has NELIX_EXECUTOR
     transport = supervisor.ensure_running()
     try:

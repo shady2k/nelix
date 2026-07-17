@@ -9,8 +9,10 @@ today — nothing to read, nothing to poll for):
     nelix_status(include_progress) -> RpcClient.status -> GET /status?include_progress=1
         -> manager.status(session_id, include_progress=True) -> merges Session.progress_view()
 
-Three layers are exercised: the manager (the actual merge/gate logic), the HTTP layer (query-param
-threading), and the plugin tool (arg passthrough to RpcClient).
+Two layers are exercised here: the manager (the actual merge/gate logic) and the HTTP layer
+(query-param threading). The third — the plugin tool's arg passthrough to RpcClient — moved to
+the plugin repo (shady2k/hermes-nelix, tests/test_plugin_status_progress.py) with the plugin
+itself; it is the only layer of this stack the core no longer owns.
 """
 import json
 import sys
@@ -22,7 +24,6 @@ from daemon.events import EventQueue                         # noqa: E402
 from daemon.manager import SessionManager                    # noqa: E402
 from daemon.messages import ProgressNote                     # noqa: E402
 from test_async_question import _demo_specs, _make_session   # noqa: E402
-from test_plugin_wake_cursor import _setup                   # noqa: E402
 from test_rpc_server import _req, _serve                     # noqa: E402
 
 
@@ -108,25 +109,3 @@ def test_rpc_status_include_progress_query_threads_through():
         assert b["progress"][-1]["summary"] == "hi" and b["progress_total"] == 1
     finally:
         srv.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Plugin level: nelix_status arg passthrough to RpcClient.status
-# ---------------------------------------------------------------------------
-
-def test_nelix_status_include_progress_arg_passthrough(monkeypatch, tmp_path):
-    seen = {}
-
-    class C:
-        def __init__(self, t): pass
-        def status(self, sid=None, include_progress=False):
-            seen["sid"] = sid
-            seen["include_progress"] = include_progress
-            return {"sessions": {}}
-
-    _, ctx = _setup(monkeypatch, tmp_path, C)
-    ctx.tools["nelix_status"]["handler"]({"include_progress": True})
-    assert seen["include_progress"] is True
-
-    ctx.tools["nelix_status"]["handler"]({})
-    assert seen["include_progress"] is False       # default omitted -> passed through as False

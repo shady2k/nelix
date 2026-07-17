@@ -122,30 +122,13 @@ def test_hermes_wiring_defaults_to_paths_hermes_home(monkeypatch, tmp_path):
     assert _profile(wiring, "(root)")["verdict"] == "wired"
 
 
-# --- manifest_drift: plugin.yaml provides_tools vs ctx.register_tool(...) names ---------
+def test_collect_adds_hermes_wiring_and_keeps_old_keys(monkeypatch, tmp_path):
+    """collect() gains hermes_wiring without dropping existing consumers' keys.
 
-
-def test_manifest_drift_flags_registered_but_undeclared_tool(tmp_path):
-    """(d) A tool registered in __init__.py but absent from provides_tools is reported."""
-    doctor = _load_doctor()
-    pj = tmp_path / "plugin.yaml"
-    pj.write_text("provides_tools: [nelix_start, nelix_status]\n")
-    init = tmp_path / "__init__.py"
-    init.write_text(
-        "def register(ctx):\n"
-        "    ctx.register_tool('nelix_start', 'nelix', {}, None)\n"
-        "    ctx.register_tool('nelix_status', 'nelix', {}, None)\n"
-        "    ctx.register_tool('nelix_screen', 'nelix', {}, None)\n"
-    )
-    drift = doctor.manifest_drift(plugin_yaml=pj, init_path=init)
-    assert "nelix_screen" in drift["registered"]
-    assert "nelix_screen" not in drift["declared"]
-    assert drift["missing_from_manifest"] == ["nelix_screen"]
-    assert drift["extra_in_manifest"] == []
-
-
-def test_collect_adds_new_sections_and_keeps_old_keys(monkeypatch, tmp_path):
-    """collect() gains hermes_wiring + manifest_drift without dropping existing consumers' keys."""
+    It used to report a manifest_drift section too; that check moved to the plugin repo with
+    plugin.yaml and __init__.py [nelix-4el.1]. The assertion that it is GONE is the point —
+    a stale key here would be the core claiming to know a plugin it no longer ships.
+    """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import paths
     importlib.reload(paths)
@@ -155,14 +138,5 @@ def test_collect_adds_new_sections_and_keeps_old_keys(monkeypatch, tmp_path):
     for key in ("daemon", "lock_holder", "sessions", "strays"):
         assert key in out
     assert "profiles" in out["hermes_wiring"]
-    assert "registered" in out["manifest_drift"]
-
-
-def test_real_manifest_declares_every_registered_tool():
-    """Truthfulness: plugin.yaml provides_tools must match the tools __init__.py registers,
-    with no drift in either direction — including nelix_screen."""
-    doctor = _load_doctor()
-    drift = doctor.manifest_drift()
-    assert drift["missing_from_manifest"] == []
-    assert drift["extra_in_manifest"] == []
-    assert "nelix_screen" in drift["declared"]
+    assert "manifest_drift" not in out
+    assert not hasattr(doctor, "manifest_drift")

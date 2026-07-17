@@ -11,11 +11,6 @@ PIP  := $(VENV)/bin/pip
 # daemon (nelix-cb0: os.waitid — 3.13+ — passed on a 3.14 .venv, died on the 3.11 daemon).
 PYTHON ?= python3.11
 
-# Hermes profile whose installed nelix plugin `deploy` / `reinstall-plugin` refresh via
-# `hermes plugins update` (which runs the plugin's update hooks, not a raw git reset). Override
-# for another profile:  make reinstall-plugin PROFILE=work
-PROFILE ?= local
-
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -65,12 +60,15 @@ vt-spike-run: venv  ## Render a captured raw via libghostty-vt: make vt-spike-ru
 	@$(PY) -c "import wasmtime" 2>/dev/null || $(PIP) install 'wasmtime==45.0.0'
 	$(PY) spikes/vt-ghostty/compare.py "$(RAW)"
 
-.PHONY: reinstall-plugin
-reinstall-plugin:  ## Update the installed plugin via `hermes plugins update` (override PROFILE)
-	hermes --profile $(PROFILE) plugins update nelix
-
+# `reinstall-plugin` used to live here and ran `hermes plugins update nelix`. It is gone, not
+# moved: this repo is the core, and the Hermes plugin now deploys from its own repo
+# (shady2k/hermes-nelix). Pushing the core deploys nothing to Hermes [nelix-4el.1].
 .PHONY: deploy
-deploy:  ## Push main, then update the installed plugin to it
+deploy:  ## Push the core to origin/main
 	git push origin main
-	$(MAKE) reinstall-plugin
-	@echo "Deployed. Restart the Hermes '$(PROFILE)' session (/new) so the daemon reloads the new code."
+	@echo ""
+	@echo ">> Core pushed. This does NOT update anything in Hermes."
+	@echo ">> The nelix Hermes plugin is a separate product and deploys from its own repo:"
+	@echo ">>   https://github.com/shady2k/hermes-nelix"
+	@echo ">> (That plugin is currently PARKED and non-functional — it imports daemon.* and must"
+	@echo ">>  learn to locate a core rather than contain one. See its README.)"

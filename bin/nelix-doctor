@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """Read-only nelix operator status: daemon health, singleton-lock holder, live sessions,
 detected strays (recorded children whose owner daemon is gone but child is alive), and the
-Hermes-side wiring — whether each profile actually loads nelix, plus manifest truthfulness."""
-import ast
+Hermes-side wiring — whether each profile actually loads nelix.
+
+No manifest_drift section: that check compared plugin.yaml's provides_tools against the tools
+__init__.py registers, and both files left with the plugin (shady2k/hermes-nelix,
+tests/test_plugin_manifest.py). It lived here only because the core repo root used to BE the
+plugin root. hermes_wiring below still reports whether each profile loads nelix — that is a
+property of the operator's Hermes install, which the core can see; the manifest's truthfulness
+is a property of a repo the core no longer owns. An operator-facing drift check pointed at the
+INSTALLED plugin dir would be a fair thing to add back [nelix-4el.1]."""
 import json
 import sys
 from pathlib import Path
@@ -13,8 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import paths                                   # noqa: E402
 import supervisor                              # noqa: E402
 from daemon import reaper, singleton           # noqa: E402
-
-_PLUGIN_ROOT = Path(__file__).resolve().parents[1]   # the plugin dir = repo root
 
 
 def _scan_strays(inspector):
@@ -81,39 +86,6 @@ def hermes_wiring(home=None):
     return {"home": str(home), "profiles": profiles}
 
 
-def _declared_tools(plugin_yaml):
-    """`provides_tools` names from plugin.yaml (the manifest), or [] if absent/malformed."""
-    try:
-        data = yaml.safe_load(Path(plugin_yaml).read_text())
-    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, yaml.YAMLError):
-        return []
-    tools = data.get("provides_tools") if isinstance(data, dict) else None
-    return [str(t) for t in tools] if isinstance(tools, list) else []
-
-
-def _registered_tools(init_path):
-    """Names passed as the first argument to every ctx.register_tool(...) call in __init__.py —
-    parsed from the AST so it stays truthful without importing the plugin (which needs a ctx)."""
-    tree = ast.parse(Path(init_path).read_text())
-    names = []
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "register_tool" and node.args):
-            first = node.args[0]
-            if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                names.append(first.value)
-    return names
-
-
-def manifest_drift(plugin_yaml=None, init_path=None):
-    """Compare the manifest's declared tools against the ones the code actually registers."""
-    declared = set(_declared_tools(plugin_yaml or _PLUGIN_ROOT / "plugin.yaml"))
-    registered = set(_registered_tools(init_path or _PLUGIN_ROOT / "__init__.py"))
-    return {"declared": sorted(declared), "registered": sorted(registered),
-            "missing_from_manifest": sorted(registered - declared),
-            "extra_in_manifest": sorted(declared - registered)}
-
-
 def collect(inspector=None):
     inspector = inspector or reaper.ProcessInspector()
     transport = supervisor.endpoint()
@@ -135,8 +107,7 @@ def collect(inspector=None):
     return {"daemon": {"alive": transport is not None, "base": base_url},
             "lock_holder": holder, "sessions": sessions,
             "strays": _scan_strays(inspector),
-            "hermes_wiring": hermes_wiring(),
-            "manifest_drift": manifest_drift()}
+            "hermes_wiring": hermes_wiring()}
 
 
 def main():
