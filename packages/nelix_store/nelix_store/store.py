@@ -23,7 +23,7 @@ from nelix_contracts.records import (
     SCHEMA_VERSION, SessionRecord, TerminalRecord, timestamp,
 )
 
-from .db import connect, translates_sqlite
+from .db import ThreadLocalConnections, translates_sqlite
 
 # Identity is JOINED from starts, never stored in these tables (nelix-555). Three
 # independent copies could disagree; one row cannot disagree with itself.
@@ -93,12 +93,23 @@ def _decode_stored(record_type, row):
 
 class Store:
     def __init__(self, root, *, clock=time.time, timeout: float = 30.0):
-        self._conn = connect(root, timeout=timeout)
+        self._conns = ThreadLocalConnections(root, timeout=timeout)
+        # Opened NOW, in the constructing thread: every existing caller relies on
+        # construction itself validating/creating the database synchronously (a bad root,
+        # an unsupported sqlite, a disagreeing schema all raise here, not on first use).
+        # Any OTHER thread that later touches this same instance still gets its own
+        # connection, opened lazily on ITS first use — see ThreadLocalConnections.
+        self._conns.get()
         self._clock = clock
+
+    @property
+    def _conn(self):
+        """The CALLING thread's own connection (opened lazily if this is its first use)."""
+        return self._conns.get()
 
     @translates_sqlite
     def close(self):
-        self._conn.close()
+        self._conns.close()
 
     # ---- sessions -------------------------------------------------------------
     @translates_sqlite

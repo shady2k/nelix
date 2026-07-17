@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -185,6 +186,92 @@ class _OneRow:
 
     def fetchone(self):
         return self._row
+
+
+def test_a_brand_new_db_shared_by_many_threads_bootstraps_exactly_once(tmp_path, monkeypatch):
+    # nelix-91y review finding #2: ThreadLocalConnections used to delegate the WHOLE
+    # per-connection open to connect() unconditionally, so every thread's first use re-ran
+    # the entire DB bootstrap (flock + WAL conversion + version stamp + DDL) even once the
+    # database was already up. The fix is an INSTANCE-level "bootstrapped" guard: the first
+    # connection (from whichever thread gets there first) runs the real bootstrap through
+    # connect(), and every other thread's first open must skip it entirely. Counting calls
+    # to connect() itself is the only way to observe "exactly once" rather than "idempotent
+    # every time", which is the property rev1 already had and is NOT what was asked for.
+    calls = []
+    real_connect = db.connect
+
+    def counting_connect(*a, **kw):
+        calls.append(1)
+        return real_connect(*a, **kw)
+
+    monkeypatch.setattr(db, "connect", counting_connect)
+    conns = db.ThreadLocalConnections(tmp_path)
+
+    n = 8
+    barrier = threading.Barrier(n)
+    results, errs = [], []
+
+    def go():
+        try:
+            barrier.wait(timeout=30)
+            conn = conns.get()
+            # A real schema table, not `SELECT 1`: `SELECT 1` passes against ANY connection,
+            # bootstrapped or not, so it proved nothing about whether the DDL had actually
+            # finished before this thread's open returned — an implementation that flipped
+            # `_bootstrapped`/released the gate BEFORE the DDL completed would still pass it.
+            # `starts` exists only once _SCHEMA has run, so a thread that observes the
+            # database before that raises "no such table" here instead of silently reading 1.
+            results.append(conn.execute("SELECT count(*) FROM starts").fetchone()[0])
+        except BaseException as e:      # noqa: BLE001 - account for everything
+            errs.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=go, daemon=True) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(not t.is_alive() for t in threads), "a thread hung on its first open"
+    assert errs == [], f"concurrent first opens on a brand-new db failed: {errs}"
+    assert results == [0] * n, "not every thread's first open saw a fully-bootstrapped schema"
+    assert len(calls) == 1, f"expected exactly ONE full bootstrap, connect() ran {len(calls)}"
+
+
+def test_a_process_chdir_does_not_change_which_db_file_a_fresh_thread_opens(tmp_path):
+    # nelix-91y review finding #3: ThreadLocalConnections used to store the root UNRESOLVED
+    # and reinterpret it relative to the process's current directory on every thread's first
+    # open. A chdir between two threads' first opens then made ONE shared instance operate on
+    # TWO different database files depending on which thread asked and when.
+    original_cwd = os.getcwd()
+    (tmp_path / "relstore").mkdir()
+    os.chdir(tmp_path)
+    try:
+        conns = db.ThreadLocalConnections("relstore")     # relative to CWD right now
+        first_conn = conns.get()                          # constructing thread opens here
+        first_path = Path(
+            first_conn.execute("PRAGMA database_list").fetchone()["file"]).resolve()
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        os.chdir(elsewhere)
+
+        box = []
+
+        def fresh_thread():
+            conn = conns.get()          # this thread's first open, CWD has since changed
+            box.append(Path(
+                conn.execute("PRAGMA database_list").fetchone()["file"]).resolve())
+
+        t = threading.Thread(target=fresh_thread)
+        t.start()
+        t.join(timeout=10)
+        assert not t.is_alive(), "the fresh thread hung opening its first connection"
+        assert box, "the fresh thread's first open failed to produce a connection"
+        assert box[0] == first_path, (
+            f"a chdir between two threads' first opens changed which db file the SAME "
+            f"instance uses: {box[0]} != {first_path}")
+    finally:
+        os.chdir(original_cwd)
 
 
 def test_a_future_database_schema_raises_store_corrupt_specifically(tmp_path):
@@ -393,6 +480,41 @@ def test_a_filesystem_that_cannot_do_wal_is_permanent_not_retryable(tmp_path, mo
     assert ei.value.code == errors.STORE_UNSUPPORTED
 
 
+def test_connect_established_closes_its_new_connection_on_a_pragma_failure(
+        tmp_path, monkeypatch):
+    # nelix-91y review round 2, finding #4: connect()'s exception path closes the connection
+    # it just opened before re-raising (see connect()'s `if conn is not None: conn.close()`
+    # arms); _connect_established() did not — a PRAGMA failing AFTER the open succeeded left
+    # a live, never-closed sqlite3.Connection behind for every thread whose per-connection
+    # setup died partway through. Same factory-subclass interception as the WAL test above,
+    # aimed at the LAST pragma _connect_established sets so an earlier one has already
+    # succeeded on the leaked connection.
+    db.connect(tmp_path).close()        # bootstrap first: _connect_established assumes it
+
+    real_connect = sqlite3.connect
+    opened = []
+
+    class _BoomOnForeignKeys(sqlite3.Connection):
+        def execute(self, sql, params=()):
+            if "foreign_keys" in sql:
+                raise sqlite3.OperationalError("simulated pragma failure")
+            return super().execute(sql, params)
+
+    def fake_connect(*a, **kw):
+        kw.setdefault("factory", _BoomOnForeignKeys)
+        conn = real_connect(*a, **kw)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+    with pytest.raises(NelixError):
+        db._connect_established(tmp_path, timeout=5.0)
+
+    assert opened, "the connection under test was never opened"
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")   # a closed connection refuses any further use
+
+
 def test_busy_is_unavailable_and_retryable():
     e = sqlite3.OperationalError("database is locked")
     e.sqlite_errorcode = 5           # SQLITE_BUSY
@@ -497,14 +619,17 @@ def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatc
     # sqlite3.Connection instance. Verified: that raises `AttributeError: 'sqlite3.Connection'
     # object attribute 'execute' is read-only` immediately (same root cause already documented
     # above on `test_a_filesystem_that_cannot_do_wal_is_permanent_not_retryable` — a
-    # C-extension type with no instance __dict__) — and unlike that test, patching cannot move
-    # to a Connection subclass via `factory=` here, because `store._conn` is already
-    # constructed by the time this test runs; `sqlite3.Connection.execute = ...` at the class
-    # level also fails (`TypeError: cannot set 'execute' attribute of immutable type
-    # 'sqlite3.Connection'`, verified). The interception moves one level up instead: `Store` is
-    # an ordinary Python object, so `monkeypatch.setattr(store, "_conn", ...)` swaps in a thin
-    # proxy that raises on execute() and delegates everything else to the real connection. The
-    # simulated scenario and assertions are unchanged.
+    # C-extension type with no instance __dict__).
+    #
+    # NOTE (nelix-91y): `store._conn` is now a per-thread PROPERTY (it delegates to
+    # `store._conns.get()`, ThreadLocalConnections' lazy per-thread opener), so
+    # `monkeypatch.setattr(store, "_conn", ...)` no longer works either — a property with no
+    # setter is a DATA descriptor, and assigning to it raises `AttributeError: property
+    # '_conn' of 'Store' object has no setter` (verified). The interception moves one level
+    # further down: `store._conns` is an ordinary Python object and `.get()` an ordinary
+    # bound method, so patching `store._conns.get` swaps in the boom proxy for whichever
+    # thread calls it — here, the only thread involved. The simulated scenario and
+    # assertions are unchanged.
     from nelix_store.store import Store
 
     class _BoomConnection:
@@ -521,7 +646,8 @@ def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatc
 
     store = Store(tmp_path, clock=lambda: 1000.0)
     try:
-        monkeypatch.setattr(store, "_conn", _BoomConnection(store._conn))
+        real_conn = store._conn
+        monkeypatch.setattr(store._conns, "get", lambda: _BoomConnection(real_conn))
         with pytest.raises(NelixError) as ei:
             store.get_session("s-" + "1" * 32, owner_id="hermes:local")
         assert ei.value.code == errors.STORE_UNAVAILABLE
@@ -612,9 +738,19 @@ def test_a_signal_storm_cannot_spin_past_the_advertised_bound(tmp_path, monkeypa
     assert elapsed < 10, f"overran its {0.3}s bound: {elapsed}s"
 
 
-def test_close_does_not_leak_a_raw_sqlite_error(tmp_path):
-    # "no raw sqlite3 exception escapes any public method" was not true: close() is public and
-    # was undecorated, so a wrong-thread close leaked a raw ProgrammingError.
+def test_close_from_a_thread_that_never_touched_the_store_now_succeeds_cleanly(tmp_path):
+    # Before nelix-91y, Store() opened its ONE process-wide connection eagerly, in the
+    # constructing thread, for the instance's whole life — so close() called from any OTHER
+    # thread was a genuine cross-thread misuse: sqlite3 raised ProgrammingError, and
+    # (close() being public and undecorated at the time) it leaked raw, then later
+    # (decorated) came back as INTERNAL_ERROR. Either way, an operation that should be
+    # harmless (closing a store nobody else was using) surfaced as an error.
+    #
+    # Per-thread connections (ThreadLocalConnections) make the whole class of bug
+    # unreachable through the public API: a thread that never touched this Store has no
+    # connection of its own to close, so close() has nothing to do here and simply
+    # succeeds. This is the positive control for the fix, not just "does not leak raw" —
+    # the operation is not merely translated cleanly, it no longer errors at all.
     from nelix_store.store import Store
 
     store = Store(tmp_path, clock=lambda: 1000.0)
@@ -631,8 +767,184 @@ def test_close_does_not_leak_a_raw_sqlite_error(tmp_path):
     t = threading.Thread(target=closer)
     t.start()
     t.join(timeout=10)
-    assert not [b for b in boom if str(b).startswith("RAW")], f"close leaked: {boom}"
-    # "not raw" was all this proved, and "not raw" is satisfied by ANY NelixError — including
-    # the store_corrupt this actually returned (measured), which is a false accusation against
-    # the user's data for what is a wrong-thread call in our own code. Name the party.
-    assert boom == [errors.INTERNAL_ERROR], f"a wrong-thread close named the wrong party: {boom}"
+    assert boom == [], f"closing from a foreign, never-used thread should be a clean no-op: {boom}"
+
+
+def test_close_still_translates_a_genuine_sqlite_error(tmp_path):
+    # The fix above removes the cross-thread FALSE positive; it must not also remove
+    # translation for a TRUE failure closing the calling thread's own connection. Reaches
+    # into `store._conns._local` (the ThreadLocalConnections' per-thread slot) to swap in a
+    # connection whose close() raises — the same kind of internals-poking the test above
+    # this one in the file needed for the same C-extension-immutability reasons.
+    from nelix_store.store import Store
+
+    class _BoomOnClose:
+        def close(self):
+            e = sqlite3.OperationalError("disk I/O error")
+            e.sqlite_errorcode = sqlite3.SQLITE_IOERR
+            raise e
+
+    store = Store(tmp_path, clock=lambda: 1000.0)
+    real_conn = store._conn                        # this thread's real connection, opened
+                                                     # eagerly at construction
+    store._conns._local.conn = _BoomOnClose()       # swap THIS thread's slot only
+    try:
+        with pytest.raises(NelixError) as ei:
+            store.close()
+        assert ei.value.code == errors.STORE_UNAVAILABLE
+    finally:
+        store._conns._local.conn = None
+        real_conn.close()
+
+
+def test_close_then_reuse_from_the_same_thread_raises_instead_of_silently_reopening(tmp_path):
+    # nelix-91y review finding #1: close() only ever dropped the CALLING thread's own
+    # cached connection reference (`self._local.conn = None`). The next call from that SAME
+    # thread found nothing cached and `get()`'s lazy-open path silently reopened a fresh
+    # connection — turning "closed database" into "works again". Before per-thread
+    # connections this was impossible to miss: `store.close(); store.list_sessions(...)`
+    # raised a stable error. That property must survive: closed means closed, not "reopens
+    # on next use".
+    from nelix_store.store import Store
+
+    store = Store(tmp_path, clock=lambda: 1000.0)
+    store.close()
+    with pytest.raises(NelixError) as ei:
+        store.list_sessions("hermes:local")
+    assert ei.value.code == errors.INTERNAL_ERROR
+
+
+def test_close_then_use_from_a_fresh_worker_thread_also_raises(tmp_path):
+    # The other half of finding #1: a POOL WORKER thread that never touched this Store
+    # before its owner called close() must ALSO be refused — not silently granted a brand
+    # new connection to an instance its owner already shut down.
+    from nelix_store.store import Store
+
+    store = Store(tmp_path, clock=lambda: 1000.0)
+    store.close()
+
+    box = []
+
+    def worker():
+        try:
+            store.get_session("s-" + "1" * 32, owner_id="hermes:local")
+        except NelixError as e:
+            box.append(e.code)
+        except BaseException as e:          # noqa: BLE001
+            box.append(f"RAW {type(e).__name__}")
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), "the fresh worker thread hung"
+    assert box == [errors.INTERNAL_ERROR], (
+        f"a fresh worker thread using a closed store should raise a stable closed-instance "
+        f"error, got {box}")
+
+
+def test_close_also_stops_a_worker_thread_that_already_had_its_own_connection_open(tmp_path):
+    # The exact scenario the review's bug report names: main constructs the instance, a pool
+    # worker opens its OWN connection and keeps it, and main.close() at shutdown physically
+    # closes only main's connection (sqlite3 enforces thread affinity on close() just as on
+    # execute() — a foreign thread's connection cannot be closed from here; see
+    # ThreadLocalConnections.close()'s docstring). The worker's own connection object is
+    # therefore still technically open, but the shared _closed flag must still refuse any
+    # FURTHER use through the public API — a worker may not go on treating a store its owner
+    # already closed as live.
+    from nelix_store.store import Store
+
+    store = Store(tmp_path, clock=lambda: 1000.0)
+    opened, may_continue, boom = threading.Event(), threading.Event(), []
+
+    def worker():
+        try:
+            store.get_session("s-" + "1" * 32, owner_id="hermes:local")  # opens ITS OWN conn
+        except NelixError:
+            pass                          # unknown_session is fine; the open is what matters
+        opened.set()
+        assert may_continue.wait(timeout=10), "main never signalled after closing"
+        try:
+            store.get_session("s-" + "1" * 32, owner_id="hermes:local")
+        except NelixError as e:
+            boom.append(e.code)
+        except BaseException as e:          # noqa: BLE001
+            boom.append(f"RAW {type(e).__name__}")
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert opened.wait(timeout=5), "worker never opened its own connection"
+    store.close()
+    may_continue.set()
+    t.join(timeout=10)
+    assert not t.is_alive(), "the worker thread hung"
+    assert boom == [errors.INTERNAL_ERROR], (
+        f"a worker with an already-open connection kept using a closed store: {boom}")
+
+
+def test_a_fresh_open_racing_close_raises_instead_of_opening_after_close_returns(
+        tmp_path, monkeypatch):
+    # nelix-91y review round 2, finding #1: ThreadLocalConnections.get() checked `_closed`
+    # and then, on a cache miss, opened a new connection — but the check and the open were
+    # NOT atomic. A thread could pass the check, get paused there, watch ANOTHER thread's
+    # close() run all the way to completion, and still go on to open and cache a brand-new
+    # connection AFTER close() had already returned — exactly what "a closed instance is
+    # unusable" forbids.
+    #
+    # Reproduced deterministically: _open() is patched to pause right where it is entered
+    # (before it can take its own lock or touch `_closed`), close() is run to completion
+    # during that pause, and only then is the real _open() allowed to proceed. The fix must
+    # have the real _open() observe `_closed` and raise WITHOUT ever calling connect() or
+    # _connect_established() — i.e. without opening anything.
+    conns = db.ThreadLocalConnections(tmp_path)
+    conns.get()          # bootstraps on the main thread; this thread keeps its own connection
+
+    real_open = db.ThreadLocalConnections._open
+    about_to_open, may_open = threading.Event(), threading.Event()
+
+    def paused_open(self):
+        about_to_open.set()
+        assert may_open.wait(timeout=10), "close() never ran during the pause"
+        return real_open(self)
+
+    monkeypatch.setattr(db.ThreadLocalConnections, "_open", paused_open)
+
+    opened = []
+    real_connect, real_established = db.connect, db._connect_established
+
+    def counting_connect(*a, **kw):
+        opened.append("connect")
+        return real_connect(*a, **kw)
+
+    def counting_established(*a, **kw):
+        opened.append("_connect_established")
+        return real_established(*a, **kw)
+
+    monkeypatch.setattr(db, "connect", counting_connect)
+    monkeypatch.setattr(db, "_connect_established", counting_established)
+
+    results = []
+
+    def fresh_thread():
+        try:
+            results.append(("ok", conns.get()))
+        except NelixError as e:
+            results.append(("error", e))
+
+    t = threading.Thread(target=fresh_thread)
+    t.start()
+    try:
+        assert about_to_open.wait(timeout=5), "the fresh thread never reached its first open"
+        conns.close()                 # runs to completion WHILE the fresh thread is paused
+        may_open.set()
+        t.join(timeout=10)
+        assert not t.is_alive(), "the fresh thread hung"
+        assert results, "the fresh thread produced no result at all"
+        kind, payload = results[0]
+        assert kind == "error", (
+            "a fresh thread's first open raced close() and still opened a connection after "
+            "close() had already returned")
+        assert payload.code == errors.INTERNAL_ERROR
+        assert opened == [], f"a new connection was opened during the race: {opened}"
+    finally:
+        may_open.set()
+        t.join(timeout=10)

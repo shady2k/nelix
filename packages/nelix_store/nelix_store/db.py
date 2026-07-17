@@ -16,6 +16,7 @@ import functools
 import math
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -336,6 +337,212 @@ def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
         if conn is not None:
             conn.close()
         raise NelixError(STORE_UNAVAILABLE, f"could not open the database: {e}") from None
+
+
+def _connect_established(root: Path, *, timeout: float) -> sqlite3.Connection:
+    """Open a PER-THREAD connection to a database THIS INSTANCE has already bootstrapped.
+
+    The counterpart to connect(), for every open after the first (nelix-91y review finding
+    #2): connect()'s flock + WAL conversion + version stamp + DDL exist to make an UNKNOWN
+    file safe to use, and re-running that WRITE transaction on every thread's first open —
+    even once the database is already up and already WAL — collided with an unrelated
+    writer's open transaction on the same shared instance, so a brand-new thread's first
+    READ could fail with a retryable store_unavailable without ever reaching the WAL-safe
+    SELECT that would have succeeded. Once ThreadLocalConnections has bootstrapped the
+    database ONCE (see _open), every other thread's connection needs only the per-CONNECTION
+    state sqlite3 resets on every new connection object — no flock, no mode check, no
+    transaction, no DDL.
+    """
+    if sqlite3.sqlite_version_info < MIN_SQLITE:
+        raise NelixError(STORE_UNSUPPORTED,
+                         f"SQLite {'.'.join(map(str, MIN_SQLITE))}+ required "
+                         f"(found {sqlite3.sqlite_version})")
+    conn = None
+    try:
+        conn = sqlite3.connect(root / DB_FILENAME, isolation_level=None, timeout=timeout)
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+    except sqlite3.Error as e:
+        # nelix-91y review round 2, finding #4: unlike connect(), this left the connection
+        # it had just opened live and unclosed if a PRAGMA after the open raised — matched
+        # to connect()'s own `if conn is not None: conn.close()` cleanup so a per-connection
+        # setup failure leaks nothing either way.
+        if conn is not None:
+            conn.close()
+        raise classify_sqlite_error(e) from None
+    except OSError as e:
+        if conn is not None:
+            conn.close()
+        raise NelixError(STORE_UNAVAILABLE, f"could not open the database: {e}") from None
+
+
+class ThreadLocalConnections:
+    """One sqlite3 connection PER THREAD to the same database file — what makes a single
+    Store/StartLedger instance safe to share across concurrent threads (nelix-91y: the
+    router is a threaded HTTP server that shares ONE instance across request-handler
+    threads).
+
+    Each thread that touches the holder gets its own connection, opened lazily the first
+    time THAT thread asks for one — via connect() for the FIRST thread across the whole
+    instance (which bootstraps the database), and via the cheap _connect_established() for
+    every thread after that (nelix-91y review finding #2: the DB-level bootstrap runs AT
+    MOST ONCE per instance, not once per connection — see _open()). `check_same_thread`
+    keeps sqlite3's safe default (True) on every one of them — a connection is only ever
+    touched by the thread that opened it, so the default is exactly what we want, not an
+    obstacle to defeat with `check_same_thread=False`.
+
+    WHY this shape and not the alternatives (the nelix-91y reviewer's call, recorded once
+    here rather than re-litigated per call site):
+      (a, chosen) per-thread connections over WAL. WAL (already forced by connect()) is
+          precisely what lets concurrent readers proceed without blocking a writer — the
+          module docstring's whole reason for choosing WAL only pays off if readers and
+          writers can actually be concurrent. `BEGIN IMMEDIATE` (already used by every
+          writer method in store.py/ledger.py) serializes writers across connections
+          through the database's own file lock, and `busy_timeout` (already set by
+          connect()) waits out that contention before SQLITE_BUSY can surface — which
+          classify_sqlite_error already maps to a retryable STORE_UNAVAILABLE.
+      (b, rejected) ONE `check_same_thread=False` connection behind a process-wide lock.
+          Throws away WAL's concurrency on purpose — every reader would queue behind the
+          lock too — AND a SECOND `BEGIN IMMEDIATE` on the SAME connection while the first
+          is still open fails immediately with "cannot start a transaction within a
+          transaction" (every writer method here opens one), so the lock guarding it would
+          not be an optional optimisation, it would be mandatory just to keep the package
+          correct — a strictly worse bottleneck than the concurrency SQLite already gives
+          every other multi-connection user for free.
+      (c, rejected) a single serialized DB-worker thread. Needless indirection: it
+          re-implements, by hand, exactly the serialization WAL + busy_timeout already do
+          inside SQLite.
+    """
+
+    def __init__(self, root, *, timeout: float = 30.0):
+        # Resolved ONCE, here, against the CWD at construction time (nelix-91y review
+        # finding #3). The old code stored the root as given and let connect() reinterpret
+        # it, via Path(root), on every thread's first open — so a process chdir between two
+        # threads' first opens made one shared instance open TWO different files depending
+        # on which thread asked and when. An absolute, resolved path has nothing left for a
+        # later chdir to change the meaning of.
+        self._root = Path(root).resolve()
+        self._timeout = timeout
+        self._local = threading.local()
+        # Guards TWO things, both entered only on a cache miss in get(): "has this INSTANCE
+        # bootstrapped its database yet" (nelix-91y review finding #2), and — the SAME
+        # lock, not a second one (nelix-91y review round 2, finding #1) — "is a fresh open
+        # atomic with close()". Separate from, and in addition to, connect()'s own
+        # cross-process flock, which still protects the file itself against a DIFFERENT
+        # process's first-open. This one is in-process: the first thread through _open()
+        # runs the real connect() and flips `_bootstrapped`; every other thread's first open
+        # skips straight to the cheap per-connection-only path — but every one of them,
+        # bootstrap or not, takes this SAME lock first, which is what makes the close race
+        # below impossible rather than merely unlikely.
+        self._open_lock = threading.Lock()
+        self._bootstrapped = False
+        # A thread-safe flag, not a plain bool: set from whichever thread calls close(),
+        # observed by every thread's get() from then on — see close()'s docstring for why
+        # this is the whole point of the flag.
+        self._closed = threading.Event()
+
+    def get(self) -> sqlite3.Connection:
+        """Return THIS thread's connection, opening it on the first call made from this
+        thread — and refuse, always, once this instance has been close()d.
+
+        Two different paths check `_closed`, on purpose, at two different strengths:
+
+        FAST path (this thread already has a cached connection): checked here, lockless.
+        That connection may have been opened before close() ran, on a different thread, and
+        never itself explicitly closed — sqlite3's thread affinity means close() cannot
+        reach it; see close()'s docstring — so it must ALSO stop being handed out through
+        this API the moment the instance is closed. An in-flight operation racing an
+        in-progress close() here is accepted: the connection is already open, and this
+        check merely stops FUTURE calls from this thread, not the current one.
+
+        SLOW path (no cached connection yet — a fresh open): NOT checked here. It is
+        checked inside _open(), UNDER THE SAME LOCK close() takes to set `_closed` — see
+        _open()'s docstring for why a lockless check-then-open here was exactly the race
+        nelix-91y review round 2 found: the check and the open were two separate steps, so
+        close() could run to completion in the gap between them, and this thread would
+        still go on to open and cache a brand-new connection afterwards.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            if self._closed.is_set():
+                raise NelixError(INTERNAL_ERROR,
+                                 "this store instance is closed and may not be reused")
+            return conn
+        conn = self._open()
+        self._local.conn = conn
+        return conn
+
+    def _open(self) -> sqlite3.Connection:
+        """Open a NEW connection for the calling thread — refusing instead, atomically,
+        if this instance has already been close()d.
+
+        Held for the WHOLE call, not only around the bootstrap branch (nelix-91y review
+        round 2, finding #1): the closed-check and the actual open — connect()'s full
+        DB-level bootstrap (flock + WAL conversion + version stamp + DDL) for the very
+        first thread, or the cheap _connect_established() for every thread after that,
+        which must run it AT MOST ONCE per instance — both happen under this ONE lock,
+        which close() also takes before it sets `_closed`. That makes the two calls
+        mutually exclusive: whichever gets the lock first runs to completion before the
+        other can even start, so a fresh open can never land AFTER a close() that has
+        already returned — it either finishes first (close() then waits its turn) or never
+        starts at all (it sees `_closed` and raises before touching connect() or
+        _connect_established()).
+        """
+        with self._open_lock:
+            if self._closed.is_set():
+                raise NelixError(INTERNAL_ERROR,
+                                 "this store instance is closed and may not be reused")
+            if not self._bootstrapped:
+                conn = connect(self._root, timeout=self._timeout)
+                self._bootstrapped = True
+                return conn
+            return _connect_established(self._root, timeout=self._timeout)
+
+    def close(self) -> None:
+        """Mark this INSTANCE closed for every thread from now on, and close the CALLING
+        thread's own connection, if it opened one.
+
+        Takes `_open_lock` just to set `_closed` — see _open()'s docstring for why sharing
+        that one lock with every fresh open is what makes the two operations atomic with
+        each other, rather than merely usually non-overlapping.
+
+        A per-thread connection can only be closed BY ITS OWN THREAD: sqlite3 enforces
+        thread affinity on close() exactly as it does on execute() (measured — a
+        foreign-thread `.close()` raises the identical "SQLite objects created in a
+        thread can only be used in that same thread" ProgrammingError a foreign-thread
+        `.execute()` does). There is no way to reach into another thread's connection and
+        close it from here — a worker thread that already opened its own connection keeps
+        it, technically open, until ITS OWN thread closes it or exits. That is accepted,
+        not fixed: the router's process exit reclaims every fd regardless, and SQLite
+        checkpoints WAL back into the main file on a connection's close/exit either way.
+
+        What close() CAN and MUST do instead — the `_closed` flag above — is make every
+        SUBSEQUENT use, from ANY thread, refuse rather than silently succeed. Before it,
+        close() only ever dropped the calling thread's OWN cached reference, so (a) the
+        same thread's next call found nothing cached and quietly opened a fresh connection
+        — "closed database" turned into "works again" — and (b) a pool worker that already
+        had its own connection open kept right on using the instance, unaware its owner had
+        shut it down. Both are exactly what "a closed instance is unusable" must rule out.
+
+        Connections opened by OTHER threads that never re-touch this instance are still
+        released when THEIR thread exits: Python drops the thread-local slot's reference as
+        part of that thread's own teardown, which runs in that thread, not this one, so the
+        connection's ordinary close happens there too (measured: 20 sequential threads that
+        each opened a connection and exited without an explicit close left the process's
+        live-connection count unchanged, once given a garbage-collection pass — reclaiming
+        a `threading.local` slot goes through the cyclic collector, not plain refcounting).
+        The router's worker pool is bounded, so the number of per-thread connections ever
+        live at once is bounded with it.
+        """
+        with self._open_lock:
+            self._closed.set()
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            self._local.conn = None
+            conn.close()
 
 
 def _validate_version(raw) -> None:
