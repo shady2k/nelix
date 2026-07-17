@@ -218,6 +218,132 @@ def test_an_older_database_is_refused_rather_than_silently_used(tmp_path):
     assert ei.value.code == errors.STORE_CORRUPT
 
 
+def _table_names(tmp_path):
+    """Table names read WITHOUT going through db.connect().
+
+    A plain sqlite3.connect() deliberately: connect() is the thing under test, so reading the
+    file with it would let the bug hide the bug. NOTE (f1k-db-contract): the plan's version of
+    this helper subscripted rows by name (`r["name"]`) on a raw connection, which has no
+    row_factory — that raises `TypeError: tuple indices must be integers or slices, not str`
+    before any assertion runs, so the test failed for the wrong reason and proved nothing.
+    """
+    conn = sqlite3.connect(tmp_path / db.DB_FILENAME)
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+def test_refusing_an_old_database_does_not_first_mutate_it(tmp_path, monkeypatch):
+    # connect() ran the WHOLE schema through executescript() before checking the stored
+    # version, so a newer build would create its new tables in an older file and only then
+    # refuse to open it — leaving a mutation behind in a file it just called unusable.
+    db.connect(tmp_path).close()                       # a real v1 database
+    before = _table_names(tmp_path)
+
+    monkeypatch.setattr(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 1)
+    monkeypatch.setattr(db, "_SCHEMA", db._SCHEMA + "\nCREATE TABLE IF NOT EXISTS v2_only (x);")
+    with pytest.raises(NelixError) as ei:
+        db.connect(tmp_path)
+    assert ei.value.code == errors.STORE_CORRUPT
+
+    after = _table_names(tmp_path)
+    assert after == before, f"refusing the file still created {after - before}"
+
+
+def test_an_interrupted_bootstrap_cannot_be_adopted_by_a_newer_build(tmp_path, monkeypatch):
+    # The reorder above refuses a STAMPED file before touching it. This is the door it leaves
+    # open: a bootstrap that DIES PARTWAY THROUGH ITS DDL, after meta exists but before the
+    # stamp is written. A newer build then reads "no stamp" as "a fresh file", applies ITS
+    # schema over the older tables and stamps itself — the same half-applied upgrade the
+    # version gate exists to prevent, arriving through the back door.
+    #
+    # The plan's step said to "apply the schema and stamp it in one transaction". Measured:
+    # executescript() issues an implicit COMMIT first, so the DDL and the stamp physically
+    # CANNOT share a transaction. meta and its stamp are therefore committed atomically FIRST
+    # instead, which buys the same property: an interrupted bootstrap always leaves a file
+    # that says which version it is.
+    #
+    # The death is injected here by a failing statement; in the field it is a crash, a SIGKILL
+    # or a full disk. Either way SQLite is in autocommit, so the statements that already ran
+    # are already committed.
+    monkeypatch.setattr(db, "_SCHEMA", db._SCHEMA + "\nTHIS IS NOT VALID SQL;")
+    with pytest.raises(NelixError):
+        db.connect(tmp_path)
+    monkeypatch.undo()
+    assert "meta" in _table_names(tmp_path), "the injected death did not get as far as meta"
+
+    # A NEWER build now meets that interrupted file. It must refuse it, not adopt it.
+    monkeypatch.setattr(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 1)
+    monkeypatch.setattr(db, "_SCHEMA", db._SCHEMA + "\nCREATE TABLE IF NOT EXISTS v2_only (x);")
+    with pytest.raises(NelixError) as ei:
+        db.connect(tmp_path)
+    assert ei.value.code == errors.STORE_CORRUPT
+    assert "v2_only" not in _table_names(tmp_path), \
+        "a newer build adopted an interrupted older bootstrap and applied its schema over it"
+
+
+def test_a_death_between_creating_meta_and_stamping_it_leaves_nothing_behind(tmp_path,
+                                                                             monkeypatch):
+    # The NARROWEST window, and the one the transaction exists for: meta created, stamp not
+    # yet written. Without a transaction around the pair, the file keeps an unstamped meta —
+    # and an unstamped meta is exactly what a newer build reads as "a fresh file" and adopts.
+    # Committed together, this window has no observable state at all: either the file says
+    # which version it is, or it has no meta.
+    #
+    # Death is injected via a Connection subclass because sqlite3.Connection is a C-extension
+    # type whose execute() cannot be patched on the instance (see the WAL test above for the
+    # same constraint and the same workaround).
+    real_connect = sqlite3.connect
+
+    class _DieOnStamp(sqlite3.Connection):
+        def execute(self, sql, params=()):
+            if "INSERT OR IGNORE INTO meta" in sql:
+                raise sqlite3.OperationalError("disk I/O error")
+            return super().execute(sql, params)
+
+    def fake_connect(*a, **kw):
+        kw.setdefault("factory", _DieOnStamp)
+        return real_connect(*a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+    with pytest.raises(NelixError):
+        db.connect(tmp_path)
+    monkeypatch.undo()
+
+    assert "meta" not in _table_names(tmp_path), \
+        "a death between creating meta and stamping it left an unstamped meta behind — a " \
+        "newer build reads that as a fresh file and applies its schema over it"
+
+    conn = db.connect(tmp_path)       # and the file is still perfectly openable afterwards
+    try:
+        assert conn.execute("SELECT value FROM meta WHERE key='schema_version'"
+                            ).fetchone()["value"] == str(db.SCHEMA_VERSION)
+    finally:
+        conn.close()
+
+
+def test_an_interrupted_bootstrap_is_completed_by_the_same_build(tmp_path, monkeypatch):
+    # The other half, and the reason the interrupted file is not simply declared corrupt: the
+    # SAME build must be able to finish what it started. Stamping first must not turn a
+    # survivable interruption into a permanently unopenable database.
+    monkeypatch.setattr(db, "_SCHEMA", db._SCHEMA + "\nTHIS IS NOT VALID SQL;")
+    with pytest.raises(NelixError):
+        db.connect(tmp_path)
+    monkeypatch.undo()
+
+    conn = db.connect(tmp_path)                       # same build, intact schema: must heal
+    try:
+        names = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"sessions", "terminal", "starts", "meta"} <= names
+        assert conn.execute("SELECT value FROM meta WHERE key='schema_version'"
+                            ).fetchone()["value"] == str(db.SCHEMA_VERSION)
+    finally:
+        conn.close()
+
+
 def test_the_sqlite_feature_floor_is_asserted_at_open(tmp_path):
     # prune's ROW_NUMBER() needs SQLite >= 3.25 (2018). The daemon runs a DIFFERENT
     # interpreter than the test venv — that is the exact shape of nelix-cb0, where a
@@ -275,13 +401,19 @@ def test_busy_is_unavailable_and_retryable():
     assert err.retryable is True
 
 
-def test_a_missing_column_is_corrupt_not_an_infinite_retry():
+def test_a_missing_column_is_our_bug_not_an_infinite_retry():
     # SQLite raises OperationalError for permanent schema defects too. Mapping the CLASS
-    # wholesale to retryable means a broken database is retried forever.
+    # wholesale to retryable means a broken database is retried forever — that is what this
+    # test has always been for, and it still holds.
+    #
+    # What MOVED (nelix-1ul): the party named. This asserted store_corrupt, i.e. "the user's
+    # durable data is damaged". A missing column in a schema THIS PACKAGE creates is our DDL
+    # failing to match our SQL. Non-retryable either way, so the retry contract below is
+    # unchanged; the difference is who gets sent to fix it.
     e = sqlite3.OperationalError("no such column: nope")
     e.sqlite_errorcode = 1           # SQLITE_ERROR
     err = db.classify_sqlite_error(e)
-    assert err.code == errors.STORE_CORRUPT
+    assert err.code == errors.INTERNAL_ERROR
     assert err.retryable is False
 
 
@@ -289,6 +421,71 @@ def test_a_corrupt_file_is_corrupt():
     e = sqlite3.DatabaseError("database disk image is malformed")
     e.sqlite_errorcode = 11          # SQLITE_CORRUPT
     assert db.classify_sqlite_error(e).code == errors.STORE_CORRUPT
+
+
+def test_a_programmer_error_is_not_reported_as_data_corruption(tmp_path):
+    # A wrong-thread call, a closed connection and a bad binding are OUR bugs. Reporting them
+    # as store_corrupt tells the caller their durable state is damaged — non-retryable, so it
+    # escalates to a human for something no human can fix in the data. This is not academic:
+    # it is what HID the broken ack/prune seam (nelix-m88), because the seam's prune died of a
+    # wrong-thread ProgrammingError and the test could not tell that from a real store failure.
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (x)")
+
+    box = []
+
+    def other_thread():
+        try:
+            conn.execute("SELECT 1")
+        except sqlite3.Error as e:
+            box.append(e)
+
+    t = threading.Thread(target=other_thread)
+    t.start()
+    t.join()
+    assert box, "the wrong-thread call did not raise"
+    assert db.classify_sqlite_error(box[0]).code == errors.INTERNAL_ERROR
+
+    closed = sqlite3.connect(":memory:")
+    closed.close()
+    try:
+        closed.execute("SELECT 1")
+    except sqlite3.Error as e:
+        assert db.classify_sqlite_error(e).code == errors.INTERNAL_ERROR
+    else:
+        pytest.fail("a closed connection did not raise")
+
+
+def test_a_bad_binding_is_not_reported_as_data_corruption(tmp_path):
+    # Measured on this interpreter: this one arrives as OperationalError with
+    # sqlite_errorcode=1, NOT as a code-less ProgrammingError. A fix keyed only on
+    # ProgrammingError leaves it misclassified.
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (x)")
+    try:
+        conn.execute("INSERT INTO t VALUES (?, ?)", (1,))
+    except sqlite3.Error as e:
+        assert db.classify_sqlite_error(e).code == errors.INTERNAL_ERROR
+    else:
+        pytest.fail("the bad binding did not raise")
+
+
+def test_internal_error_is_not_retryable():
+    # Retryability is a MACHINE contract: a caller branches on it. No retry of the same call
+    # fixes a wrong-thread bug.
+    e = db.classify_sqlite_error(sqlite3.ProgrammingError("closed"))
+    assert e.code == errors.INTERNAL_ERROR
+    assert e.retryable is False
+
+
+def test_positive_evidence_of_damage_still_names_damage():
+    # The negative control for the INTERNAL_ERROR branch: widening "our bug" must not swallow
+    # the two codes that are actual proof of a damaged file. SQLite reports those positively;
+    # that is the whole basis for no longer inferring damage from silence.
+    for code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        e = sqlite3.DatabaseError("x")
+        e.sqlite_errorcode = code
+        assert db.classify_sqlite_error(e).code == errors.STORE_CORRUPT, code
 
 
 def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatch):
@@ -344,7 +541,10 @@ def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatc
     (sqlite3.SQLITE_AUTH, errors.STORE_UNSUPPORTED),
     (sqlite3.SQLITE_CORRUPT, errors.STORE_CORRUPT),
     (sqlite3.SQLITE_NOTADB, errors.STORE_CORRUPT),
-    (sqlite3.SQLITE_ERROR, errors.STORE_CORRUPT),           # missing column / bad SQL
+    # SQLITE_ERROR (1) is generic: malformed SQL, wrong parameter count, missing column, "no
+    # such table". This package writes its own SQL and bootstraps its own schema, so all four
+    # are OUR defect — it moved off store_corrupt with nelix-1ul.
+    (sqlite3.SQLITE_ERROR, errors.INTERNAL_ERROR),
 ])
 def test_sqlite_result_codes_map_to_the_right_party(code, expected):
     # A full disk classified as non-retryable corruption sends the operator to check their
@@ -423,12 +623,16 @@ def test_close_does_not_leak_a_raw_sqlite_error(tmp_path):
     def closer():
         try:
             store.close()
-        except NelixError:
-            boom.append("nelix")
+        except NelixError as e:
+            boom.append(e.code)
         except BaseException as e:          # noqa: BLE001
             boom.append(f"RAW {type(e).__name__}")
 
     t = threading.Thread(target=closer)
     t.start()
     t.join(timeout=10)
-    assert not [b for b in boom if b.startswith("RAW")], f"close leaked: {boom}"
+    assert not [b for b in boom if str(b).startswith("RAW")], f"close leaked: {boom}"
+    # "not raw" was all this proved, and "not raw" is satisfied by ANY NelixError — including
+    # the store_corrupt this actually returned (measured), which is a false accusation against
+    # the user's data for what is a wrong-thread call in our own code. Name the party.
+    assert boom == [errors.INTERNAL_ERROR], f"a wrong-thread close named the wrong party: {boom}"

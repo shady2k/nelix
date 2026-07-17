@@ -21,6 +21,12 @@ STORE_CORRUPT = "store_corrupt"
 STORE_UNAVAILABLE = "store_unavailable"
 STORE_UNSUPPORTED = "store_unsupported"
 
+# This package's own bug, surfaced through a database call: a wrong-thread use, a closed
+# connection, a malformed statement. NOT the caller's fault and NOT their data rotting, so
+# neither invalid_request nor store_corrupt names the right party. Non-retryable: no retry of
+# the same call can fix a defect in the code making it.
+INTERNAL_ERROR = "internal_error"
+
 # retryable=True means: the SAME call, unchanged, may succeed later.
 # It is deliberately False for the cursor conditions — they mean "refetch the board and
 # re-arm", so a verbatim retry would spin.
@@ -41,6 +47,7 @@ _RETRYABLE = {
     STORE_CORRUPT: False,
     STORE_UNAVAILABLE: True,     # busy / lock contention / environment: the same call may work later
     STORE_UNSUPPORTED: False,    # a permanent environment defect: retrying cannot help
+    INTERNAL_ERROR: False,       # a defect in this code: the same call cannot start working
 }
 
 ALL_CODES = frozenset(_RETRYABLE)
