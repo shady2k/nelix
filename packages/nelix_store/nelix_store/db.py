@@ -20,7 +20,8 @@ import time
 from pathlib import Path
 
 from nelix_contracts.errors import (
-    INVALID_REQUEST, STORE_CORRUPT, STORE_UNAVAILABLE, STORE_UNSUPPORTED, NelixError,
+    INTERNAL_ERROR, INVALID_REQUEST, STORE_CORRUPT, STORE_UNAVAILABLE, STORE_UNSUPPORTED,
+    NelixError,
 )
 
 DB_FILENAME = "nelix.db"
@@ -154,6 +155,20 @@ _UNAVAILABLE_CODES = frozenset({
 _UNSUPPORTED_CODES = frozenset({
     sqlite3.SQLITE_READONLY, sqlite3.SQLITE_PERM, sqlite3.SQLITE_AUTH,
 })
+# The ONLY two codes that are positive evidence of a damaged file. Corruption is something
+# SQLite reports; it is not something we infer from an error we do not recognise.
+#
+# HONESTY, measured: deleting this set changes NO classification today, because the fallback
+# at the bottom of classify_sqlite_error still returns STORE_CORRUPT and these two codes land
+# there anyway. It is a diagnostic (it names damage as damage in the message), not a guard —
+# same call as `commit()` at ledger.py:182-186. It is kept because it is the anchor for the
+# rule above: if the fallback is ever narrowed, corruption must keep its own positive arm
+# rather than silently become an internal error. See the nelix-1ul commit for why the
+# fallback was NOT narrowed here.
+_CORRUPT_CODES = frozenset({
+    sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB,
+})
+_SQLITE_ERROR = 1
 
 
 def classify_sqlite_error(exc) -> NelixError:
@@ -168,9 +183,32 @@ def classify_sqlite_error(exc) -> NelixError:
         return NelixError(STORE_UNAVAILABLE, f"database unavailable: {exc}")
     if base in _UNSUPPORTED_CODES:
         return NelixError(STORE_UNSUPPORTED, f"database not writable here: {exc}")
-    # Everything else — corruption, malformed SQL, a missing column, not-a-database, or an
-    # UNRECOGNISED code — is treated as a durable/structural problem AS A CONSERVATIVE DEFAULT,
-    # not because it is proven damage. Non-retryable by design.
+    if base in _CORRUPT_CODES:
+        return NelixError(STORE_CORRUPT, f"database corrupt: {exc}")
+    # OUR bug, not the caller's data. ProgrammingError/InterfaceError carry no result code at
+    # all (measured: wrong thread and closed connection both give sqlite_errorcode=None).
+    #
+    # SQLITE_ERROR (1) is here too, and deliberately. It is generic — it covers a malformed
+    # statement, a wrong parameter count, a missing column AND "no such table" — but every one
+    # of those is OUR defect in this package's context, because this package bootstraps its
+    # own schema and writes its own SQL: a missing table means our DDL did not run, not that
+    # the user's data rotted. (Measured on this interpreter: all four of those raise code 1;
+    # a wrong parameter count arrives as OperationalError/1, not as a code-less
+    # ProgrammingError, so keying only on the class would leave it misclassified.)
+    #
+    # A code-less or generic error is not evidence of durable damage — treating it as such
+    # reports a code defect as data rot, and sends a human to fix data that is fine.
+    if isinstance(exc, (sqlite3.ProgrammingError, sqlite3.InterfaceError)) or base is None \
+            or base == _SQLITE_ERROR:
+        return NelixError(INTERNAL_ERROR, f"internal database error: {exc}")
+    # An unrecognised code keeps the old conservative default, and this is the ONE place the
+    # rule above is still not honoured: absence of evidence still names corruption here.
+    # Left deliberately, not by oversight. The remaining unrecognised codes are mostly our-bug
+    # shapes too (MISUSE, RANGE, MISMATCH, CONSTRAINT), so this arm is probably wrong the same
+    # way the code-1 arm was — but reclassifying ~14 result codes is a contract change wider
+    # than the defect nelix-1ul describes, and NO test pins any of them (measured: flipping
+    # this to INTERNAL_ERROR breaks 0 tests, which means untested, not correct). It wants its
+    # own bead and its own evidence, not a silent widening.
     return NelixError(STORE_CORRUPT, f"database error: {exc}")
 
 

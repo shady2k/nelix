@@ -275,13 +275,19 @@ def test_busy_is_unavailable_and_retryable():
     assert err.retryable is True
 
 
-def test_a_missing_column_is_corrupt_not_an_infinite_retry():
+def test_a_missing_column_is_our_bug_not_an_infinite_retry():
     # SQLite raises OperationalError for permanent schema defects too. Mapping the CLASS
-    # wholesale to retryable means a broken database is retried forever.
+    # wholesale to retryable means a broken database is retried forever — that is what this
+    # test has always been for, and it still holds.
+    #
+    # What MOVED (nelix-1ul): the party named. This asserted store_corrupt, i.e. "the user's
+    # durable data is damaged". A missing column in a schema THIS PACKAGE creates is our DDL
+    # failing to match our SQL. Non-retryable either way, so the retry contract below is
+    # unchanged; the difference is who gets sent to fix it.
     e = sqlite3.OperationalError("no such column: nope")
     e.sqlite_errorcode = 1           # SQLITE_ERROR
     err = db.classify_sqlite_error(e)
-    assert err.code == errors.STORE_CORRUPT
+    assert err.code == errors.INTERNAL_ERROR
     assert err.retryable is False
 
 
@@ -289,6 +295,71 @@ def test_a_corrupt_file_is_corrupt():
     e = sqlite3.DatabaseError("database disk image is malformed")
     e.sqlite_errorcode = 11          # SQLITE_CORRUPT
     assert db.classify_sqlite_error(e).code == errors.STORE_CORRUPT
+
+
+def test_a_programmer_error_is_not_reported_as_data_corruption(tmp_path):
+    # A wrong-thread call, a closed connection and a bad binding are OUR bugs. Reporting them
+    # as store_corrupt tells the caller their durable state is damaged — non-retryable, so it
+    # escalates to a human for something no human can fix in the data. This is not academic:
+    # it is what HID the broken ack/prune seam (nelix-m88), because the seam's prune died of a
+    # wrong-thread ProgrammingError and the test could not tell that from a real store failure.
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (x)")
+
+    box = []
+
+    def other_thread():
+        try:
+            conn.execute("SELECT 1")
+        except sqlite3.Error as e:
+            box.append(e)
+
+    t = threading.Thread(target=other_thread)
+    t.start()
+    t.join()
+    assert box, "the wrong-thread call did not raise"
+    assert db.classify_sqlite_error(box[0]).code == errors.INTERNAL_ERROR
+
+    closed = sqlite3.connect(":memory:")
+    closed.close()
+    try:
+        closed.execute("SELECT 1")
+    except sqlite3.Error as e:
+        assert db.classify_sqlite_error(e).code == errors.INTERNAL_ERROR
+    else:
+        pytest.fail("a closed connection did not raise")
+
+
+def test_a_bad_binding_is_not_reported_as_data_corruption(tmp_path):
+    # Measured on this interpreter: this one arrives as OperationalError with
+    # sqlite_errorcode=1, NOT as a code-less ProgrammingError. A fix keyed only on
+    # ProgrammingError leaves it misclassified.
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (x)")
+    try:
+        conn.execute("INSERT INTO t VALUES (?, ?)", (1,))
+    except sqlite3.Error as e:
+        assert db.classify_sqlite_error(e).code == errors.INTERNAL_ERROR
+    else:
+        pytest.fail("the bad binding did not raise")
+
+
+def test_internal_error_is_not_retryable():
+    # Retryability is a MACHINE contract: a caller branches on it. No retry of the same call
+    # fixes a wrong-thread bug.
+    e = db.classify_sqlite_error(sqlite3.ProgrammingError("closed"))
+    assert e.code == errors.INTERNAL_ERROR
+    assert e.retryable is False
+
+
+def test_positive_evidence_of_damage_still_names_damage():
+    # The negative control for the INTERNAL_ERROR branch: widening "our bug" must not swallow
+    # the two codes that are actual proof of a damaged file. SQLite reports those positively;
+    # that is the whole basis for no longer inferring damage from silence.
+    for code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        e = sqlite3.DatabaseError("x")
+        e.sqlite_errorcode = code
+        assert db.classify_sqlite_error(e).code == errors.STORE_CORRUPT, code
 
 
 def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatch):
@@ -344,7 +415,10 @@ def test_public_store_methods_do_not_leak_raw_sqlite_errors(tmp_path, monkeypatc
     (sqlite3.SQLITE_AUTH, errors.STORE_UNSUPPORTED),
     (sqlite3.SQLITE_CORRUPT, errors.STORE_CORRUPT),
     (sqlite3.SQLITE_NOTADB, errors.STORE_CORRUPT),
-    (sqlite3.SQLITE_ERROR, errors.STORE_CORRUPT),           # missing column / bad SQL
+    # SQLITE_ERROR (1) is generic: malformed SQL, wrong parameter count, missing column, "no
+    # such table". This package writes its own SQL and bootstraps its own schema, so all four
+    # are OUR defect — it moved off store_corrupt with nelix-1ul.
+    (sqlite3.SQLITE_ERROR, errors.INTERNAL_ERROR),
 ])
 def test_sqlite_result_codes_map_to_the_right_party(code, expected):
     # A full disk classified as non-retryable corruption sends the operator to check their
@@ -423,12 +497,16 @@ def test_close_does_not_leak_a_raw_sqlite_error(tmp_path):
     def closer():
         try:
             store.close()
-        except NelixError:
-            boom.append("nelix")
+        except NelixError as e:
+            boom.append(e.code)
         except BaseException as e:          # noqa: BLE001
             boom.append(f"RAW {type(e).__name__}")
 
     t = threading.Thread(target=closer)
     t.start()
     t.join(timeout=10)
-    assert not [b for b in boom if b.startswith("RAW")], f"close leaked: {boom}"
+    assert not [b for b in boom if str(b).startswith("RAW")], f"close leaked: {boom}"
+    # "not raw" was all this proved, and "not raw" is satisfied by ANY NelixError — including
+    # the store_corrupt this actually returned (measured), which is a false accusation against
+    # the user's data for what is a wrong-thread call in our own code. Name the party.
+    assert boom == [errors.INTERNAL_ERROR], f"a wrong-thread close named the wrong party: {boom}"
