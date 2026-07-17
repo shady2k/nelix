@@ -67,6 +67,12 @@ class Event:
     task_delivery: str = "delivered"
     requires_response: bool = False
     screen_excerpt: str = ""
+    # The event's owner_id, resolved ONCE at publish time (from the durable owner.json, BEFORE the
+    # queue lock) and REMEMBERED here. Every bucket decision (_index_evictable / _pick_victim /
+    # _drop) reads THIS stored value, never re-resolves via the cache — so a later cache flip (None
+    # -> real owner, once owner.json becomes readable) can never move an already-bucketed event to a
+    # different owner's bucket (which would raise ValueError in _drop / drift _evictable_count).
+    owner: str = None
 
 
 class EventQueue:
@@ -132,10 +138,18 @@ class EventQueue:
         return e.kind in RESPONDABLE_KINDS and e.resolved_reason is None
 
     def _owner_of(self, session_id):
+        """Resolve a session's owner_id, memoized one disk read per session. Called ONLY from
+        publish, and ONLY BEFORE self._cv is taken — owner.json is read from disk on a cache miss,
+        and no filesystem I/O may run under the single lock that guards every publish/wait/status.
+        Fail-closed: any resolver error yields None (an ownerless event buckets under a valid None
+        protection bucket), so a resolver exception can never leave a half-published event."""
         cached = self._owner_cache.get(session_id)
         if cached is not None:
             return cached
-        resolved = self._resolve_owner(session_id)
+        try:
+            resolved = self._resolve_owner(session_id)
+        except Exception:
+            resolved = None
         if resolved is not None:
             # a session's owner never changes (daemon/owner.py), so a real owner caches forever.
             # None is NOT cached: a first publish that races ahead of owner.json would otherwise
@@ -144,7 +158,7 @@ class EventQueue:
         return resolved
 
     def _index_evictable(self, e):
-        owner_id = self._owner_of(e.session_id)
+        owner_id = e.owner                         # STORED at publish (never re-resolved) — see #2
         hist = self._owner_hist.setdefault(owner_id, [])
         # keep ascending by seq. A freshly published event is the newest -> appends at the end; an
         # un-pinned (resolved) decision may be OLDER than recent history -> bisect into place.
@@ -182,7 +196,7 @@ class EventQueue:
         for e in self._events:
             if e.event_id in self._pinned:
                 continue                          # pinned decisions are never evicted
-            hist = self._owner_hist.get(self._owner_of(e.session_id))
+            hist = self._owner_hist.get(e.owner)  # STORED owner — the bucket the event actually lives in
             if hist is not None and len(hist) > self._owner_floor:
                 return e
         return None
@@ -190,7 +204,7 @@ class EventQueue:
     def _drop(self, victim):
         self._events.remove(victim)               # victim is near the front -> cheap scan
         del self._by_id[victim.event_id]
-        owner_id = self._owner_of(victim.session_id)
+        owner_id = victim.owner                    # STORED owner: the bucket the victim was indexed under
         hist = self._owner_hist.get(owner_id)
         if hist is not None:
             hist.remove(victim)
@@ -233,25 +247,59 @@ class EventQueue:
                 turn_index=0, range=(0, 0), hint=None, hung=False,
                 task_delivery="delivered", requires_response=False, screen_excerpt="",
                 decision_id=None, on_publish=None):
+        # Resolve the event's owner BEFORE taking self._cv (#3): owner resolution reads owner.json
+        # from disk on a cache miss, and NO filesystem I/O may run under the single lock guarding
+        # every publish/wait/status. Fail-closed to None on any error, so a resolver exception cannot
+        # even reach the locked section — there is never a half-published event. The resolved owner
+        # is stored on the event (#2) and is the ONLY owner ever used for its bucket decisions.
+        resolved_owner = self._owner_of(session_id)
         with self._cv:
+            prev_last_seq = self._last_seq
+            had_sess_seq = session_id in self._last_seq_by_session
+            prev_sess_seq = self._last_seq_by_session.get(session_id)
             e = Event(next(self._seq), f"evt-{uuid.uuid4().hex[:8]}", session_id, executor,
                       kind, summary, state, decision_id=decision_id, turn_index=turn_index,
                       range=range, hint=hint, hung=hung, task_delivery=task_delivery,
-                      requires_response=requires_response, screen_excerpt=screen_excerpt)
-            self._events.append(e)
-            self._by_id[e.event_id] = e
-            self._last_seq = e.seq                                  # seq is strictly increasing
-            self._last_seq_by_session[session_id] = e.seq
-            # on_publish runs HERE — event reserved, not yet visible to waiters — so the session can
-            # install its decision (and possibly mark THIS event superseded) before any woken puller
-            # observes the wake. Classify + evict AFTER it, on the event's FINAL state: a nested
-            # resolve_decision it fires re-enters this (reentrant) lock and only touches already
-            # -indexed events, so the not-yet-indexed `e` is never miscounted or wrongly evicted.
-            if on_publish is not None:
-                on_publish(e)
-            self._index_new(e)
-            self._evict_if_needed()
-            self._cv.notify_all()
+                      requires_response=requires_response, screen_excerpt=screen_excerpt,
+                      owner=resolved_owner)
+            indexed = False
+            try:
+                self._events.append(e)
+                self._by_id[e.event_id] = e
+                self._last_seq = e.seq                              # seq is strictly increasing
+                self._last_seq_by_session[session_id] = e.seq
+                # on_publish runs HERE — event reserved, not yet visible to waiters — so the session
+                # can install its decision (and possibly mark THIS event superseded) before any woken
+                # puller observes the wake. Classify + evict AFTER it, on the event's FINAL state: a
+                # nested resolve_decision it fires re-enters this (reentrant) lock and only touches
+                # already-indexed events, so the not-yet-indexed `e` is never wrongly evicted.
+                if on_publish is not None:
+                    on_publish(e)
+                self._index_new(e)
+                indexed = True
+                self._evict_if_needed()
+            except BaseException:
+                # publish is ATOMIC (#5): if on_publish raised before the event was indexed, fully
+                # roll it back so no un-indexed event is ever left in _events/_by_id — otherwise a
+                # later flood's _pick_victim (which skips only _pinned) could evict a should-be-pinned
+                # decision, or _drop could crash / drift _evictable_count against a phantom event.
+                if not indexed:
+                    self._by_id.pop(e.event_id, None)
+                    try:
+                        self._events.remove(e)
+                    except ValueError:
+                        pass
+                    self._last_seq = prev_last_seq
+                    if had_sess_seq:
+                        self._last_seq_by_session[session_id] = prev_sess_seq
+                    else:
+                        self._last_seq_by_session.pop(session_id, None)
+                raise
+            finally:
+                # A blocked waiter must be notified whether publish committed OR rolled back — the
+                # exception must never leave it hanging on a doorbell that already rang. A wake for a
+                # rolled-back event is harmless (the waiter re-checks its cursor and re-waits).
+                self._cv.notify_all()
             return e
 
     def latest_seq(self, session_id=None):
@@ -267,15 +315,19 @@ class EventQueue:
             return {sid: self._last_seq_by_session.get(sid, 0) for sid in set(session_ids)}
 
     def latest_after(self, after_seq, session_id=None):
-        """The first RETAINED event newer than after_seq (for this session, or any if global), else
-        CURSOR_EXPIRED if the cursor fell off the back of the ring, else None (nothing newer yet)."""
+        """CURSOR_EXPIRED if the cursor fell off the back of the ring (an event of interest with seq
+        > after_seq was evicted), else the first RETAINED event newer than after_seq (for this
+        session, or any if global), else None (nothing newer yet).
+
+        Expiry is checked BEFORE delivery (#1): if the cursor was evicted, the caller MUST resync —
+        silently handing it a still-retained NEWER event would let it believe it never missed the
+        events in between. A caught-up caller (cursor >= the session's evicted-high) never expires,
+        and the /status resync cursor (latest_seq = last-ever-published >= any evicted seq) always
+        clears expiry, so there is no resync hot loop."""
         with self._cv:
-            evt = self._first_after(after_seq, session_id)
-            if evt is not None:
-                return evt
             if self._expired(after_seq, session_id):
                 return CURSOR_EXPIRED
-            return None
+            return self._first_after(after_seq, session_id)
 
     def wait_event(self, after_seq, timeout, session_id):
         # session_id is REQUIRED (no default): a global wait returns on ANY session's event, so a
@@ -290,12 +342,14 @@ class EventQueue:
         deadline = time.time() + timeout
         with self._cv:
             while True:
+                # Expiry is checked BEFORE delivery (#1): a cursor that fell off the back must resync
+                # NOW — never block a doorbell that can never ring, and never silently deliver a newer
+                # retained event that masks the gap. A caught-up cursor never expires (see _expired).
+                if self._expired(after_seq, session_id):
+                    return CURSOR_EXPIRED
                 evt = self._first_after(after_seq, session_id)
                 if evt is not None:
                     return evt
-                if self._expired(after_seq, session_id):
-                    # Cursor fell off the back: resync NOW, do not block a doorbell that never rings.
-                    return CURSOR_EXPIRED
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     return None
@@ -346,3 +400,41 @@ class EventQueue:
                     if best is None or e.seq > best.seq:
                         best = e
             return best
+
+    def forget_session(self, session_id):
+        """Drop a DEFINITIVELY-removed session's retained events AND its per-session bookkeeping, so
+        the ring is bounded to live + not-yet-pruned sessions over the daemon's WHOLE lifetime (#4).
+        Without this the per-session dicts (_last_seq_by_session / _evicted_high_by_session /
+        _owner_cache) and floor-protected owner buckets leak one entry per distinct session EVER
+        published — a long-lived daemon grows without bound.
+
+        MUST be called only once the session's final event / terminal result no longer needs to be
+        observable (the manager wires it at terminal-snapshot expiry, never at slot-free, so spec §5's
+        final wake is never discarded). Idempotent: unknown / already-forgotten sessions are no-ops.
+        Only touches events whose session_id matches, so another session's pinned decision or recent
+        history is never disturbed; _evictable_count stays == sum(len(h) for h in _owner_hist)."""
+        with self._cv:
+            for e in self._events:
+                if e.session_id != session_id:
+                    continue
+                self._by_id.pop(e.event_id, None)
+                if e.event_id in self._pinned:
+                    self._pinned.pop(e.event_id, None)
+                    if e.decision_id is not None:
+                        d = self._by_decision.get(e.decision_id)
+                        if d is not None:
+                            d.pop(e.event_id, None)
+                            if not d:
+                                del self._by_decision[e.decision_id]
+                else:
+                    # evictable: remove from its (STORED-owner) bucket and keep the count exact.
+                    hist = self._owner_hist.get(e.owner)
+                    if hist is not None and e in hist:
+                        hist.remove(e)
+                        self._evictable_count -= 1
+                        if not hist:
+                            del self._owner_hist[e.owner]
+            self._events = [e for e in self._events if e.session_id != session_id]
+            self._owner_cache.pop(session_id, None)
+            self._last_seq_by_session.pop(session_id, None)
+            self._evicted_high_by_session.pop(session_id, None)

@@ -22,10 +22,15 @@ def test_bounded_ring_evicts_oldest_history_under_load():
     assert q.latest_seq("s1") == last.seq == 200
     assert q.latest_seq() == 200
     assert q.latest_seqs(["s1"]) == {"s1": 200}
-    # The oldest events fell off the back: the newest RETAINED event is far past seq 1.
-    oldest_retained = q.latest_after(0, "s1")
-    assert oldest_retained is not None and oldest_retained is not CURSOR_EXPIRED
-    assert oldest_retained.seq > 150            # ~10 retained out of 200 => window is near the top
+    # A cursor that fell off the back of the ring gets the EXPLICIT resync signal — even though
+    # NEWER events are still retained (concurrency-review fix: expiry is checked BEFORE delivery,
+    # so a caller whose cursor was evicted is never silently handed a later event and left to
+    # believe it never missed anything).
+    assert q.latest_after(0, "s1") is CURSOR_EXPIRED
+    # A caller still WITHIN the retained window (cursor >= the session's evicted-high) is delivered
+    # the retained event, never spuriously expired. Arming at last-1 sits above every evicted seq.
+    within = q.latest_after(last.seq - 1, "s1")
+    assert within is not None and within is not CURSOR_EXPIRED and within.seq == last.seq
 
 
 def test_unresolved_decision_is_pinned_through_a_flood_far_past_the_bound():
@@ -53,7 +58,11 @@ def test_resolved_decision_re_enters_the_evictable_budget():
     for i in range(10):
         q.publish("s1", "x", "working", "", "working")
     assert q.pending("s1") is None
-    got = q.latest_after(0, "s1")                         # d is gone; only recent history remains
+    # d fell off the back once it re-entered the evictable budget: arming at the OLD cursor 0 (which
+    # predates d) now correctly resyncs rather than silently skipping to newer history.
+    assert q.latest_after(0, "s1") is CURSOR_EXPIRED
+    # a caller within the retained window still gets recent history, and it is not d.
+    got = q.latest_after(q.latest_seq("s1") - 1, "s1")   # d is gone; only recent history remains
     assert got is not CURSOR_EXPIRED and got.event_id != d.event_id
 
 
@@ -96,9 +105,11 @@ def test_per_owner_floor_protects_a_quiet_owner_from_a_noisy_one():
         q.publish("s-a", "x", "working", "", "working")   # noisy owner A floods
     assert q.pending("s-b") is doorbell                    # pinned decision survives
     assert q.latest_after(doorbell.seq, "s-b") is b_hist   # recent delivery history survives (floor)
-    # A itself is bounded: its OLD history was evicted (only recent retained).
-    first_a = q.latest_after(0, "s-a")
-    assert first_a is not None and first_a is not CURSOR_EXPIRED and first_a.seq > 50
+    # A itself is bounded: its OLD history was evicted, so a cursor from before the eviction resyncs.
+    assert q.latest_after(0, "s-a") is CURSOR_EXPIRED
+    # but a cursor within A's retained window still gets its recent (only-retained) history.
+    recent_a = q.latest_after(q.latest_seq("s-a") - 1, "s-a")
+    assert recent_a is not None and recent_a is not CURSOR_EXPIRED and recent_a.seq > 50
 
 
 def test_default_owner_resolver_buckets_by_disk_owner_record():
@@ -112,6 +123,191 @@ def test_default_owner_resolver_buckets_by_disk_owner_record():
     for i in range(50):
         q.publish("s-busy001", "x", "working", "", "working")
     assert q.latest_after(0, "s-quiet01") is quiet         # protected by its DISK owner's floor
+
+
+# ---------------------------------------------------------------------------
+# nelix-9a4.5 concurrency-review findings (adversarial pass).
+# ---------------------------------------------------------------------------
+
+def test_caught_up_cursor_never_spuriously_expires_across_eviction():
+    # Finding #1 companion: expiry is now checked BEFORE delivery, but a caller that is CAUGHT UP
+    # (cursor >= the session's evicted-high) must NEVER be spuriously expired — only a cursor that
+    # genuinely fell off the back resyncs. Live delivery is unaffected.
+    q = EventQueue(max_history=5, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o"}))
+    for i in range(50):
+        q.publish("s1", "x", "working", "", "working")     # heavy eviction churn
+    resync = q.latest_seq("s1")                             # a fully caught-up cursor
+    assert q.latest_after(resync, "s1") is None             # nothing newer, NOT cursor_expired
+    nxt = q.publish("s1", "x", "working", "next", "working")
+    got = q.latest_after(resync, "s1")                      # the live next event is delivered
+    assert got is nxt and got is not CURSOR_EXPIRED
+    # and arming exactly AT the session's evicted-high (the boundary) delivers, never expires.
+    assert q.latest_after(nxt.seq, "s1") is None            # caught up again -> plain None
+
+
+def test_none_then_real_owner_transition_does_not_corrupt_buckets():
+    # Finding #2: an event published while the owner is unresolved (None) is bucketed under None and
+    # MUST stay there. A later cache flip to a real owner ("A", once owner.json becomes readable)
+    # must not try to remove the None-bucketed event from A's bucket (ValueError in publish -> lost
+    # wakeup) or drift _evictable_count. Force eviction of the None-bucketed event under a flood.
+    calls = {"n": 0}
+
+    def resolver(sid):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else "A"            # first resolve None, then real owner "A"
+
+    q = EventQueue(max_history=3, owner_floor=0, owner_resolver=resolver)
+    first = q.publish("s1", "x", "working", "none-owner", "working")   # owner unresolved -> None
+    assert first.owner is None
+    last = None
+    for i in range(20):
+        last = q.publish("s1", "x", "working", "", "working")          # owner now resolves to "A"
+    assert last.owner == "A"
+    # No exception was raised by the flood's eviction of the None-bucketed 'first', and the
+    # incrementally-maintained count still matches the actual per-owner history.
+    assert q._evictable_count == sum(len(h) for h in q._owner_hist.values())
+    assert first.event_id not in q._by_id                             # 'first' was evicted cleanly
+    assert q.latest_seq("s1") == 21                                    # publish path stayed intact
+
+
+def test_none_bucketed_event_evicts_and_still_wakes_a_waiter():
+    # Finding #2 (wakeup half): the None->owner corruption used to raise inside publish BEFORE
+    # notify_all(), so a blocked waiter was never woken. Verify a flood that evicts the None-bucketed
+    # event still notifies a concurrently blocked waiter.
+    import threading
+    calls = {"n": 0}
+
+    def resolver(sid):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else "A"
+
+    q = EventQueue(max_history=3, owner_floor=0, owner_resolver=resolver)
+    q.publish("s1", "x", "working", "none-owner", "working")          # seq 1, None bucket
+    woke = q.wait_event(after_seq=0, timeout=2, session_id="s1")      # sees seq 1 immediately
+    assert woke is not None and woke.seq == 1
+    got = {}
+    started = threading.Event()
+
+    def waiter():
+        started.set()
+        got["evt"] = q.wait_event(after_seq=1, timeout=2, session_id="s1")
+
+    t = threading.Thread(target=waiter, daemon=True); t.start()
+    assert started.wait(1)
+    import time as _t; _t.sleep(0.05)
+    for i in range(20):                                               # flood evicts the None event
+        q.publish("s1", "x", "working", "", "working")
+    t.join(2)
+    assert not t.is_alive() and got.get("evt") is not None            # waiter was woken, not stuck
+
+
+def test_owner_resolved_before_lock_not_under_it():
+    # Finding #3: owner resolution reads owner.json from disk and MUST happen before self._cv is
+    # taken (no filesystem I/O under the single lock guarding every publish/wait/status). Prove it:
+    # while a resolver is (slowly) resolving, another thread can still acquire the queue.
+    import threading
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_resolver(sid):
+        entered.set()
+        release.wait(2)                                    # block DURING resolution
+        return "o"
+
+    q = EventQueue(max_history=10, owner_floor=0, owner_resolver=slow_resolver)
+    t = threading.Thread(
+        target=lambda: q.publish("s1", "x", "working", "", "working"), daemon=True)
+    t.start()
+    assert entered.wait(2)                                 # resolver is mid-flight
+    # If resolution were under _cv this would deadlock until release; it must return promptly.
+    assert q.latest_seq("s1") == 0                         # nothing published yet (still resolving)
+    release.set()
+    t.join(2)
+    assert not t.is_alive() and q.latest_seq("s1") == 1
+
+
+def test_raising_on_publish_leaves_the_queue_consistent_and_notifies():
+    # Finding #5: an on_publish hook that raises must not leave a half-indexed event. The event is
+    # fully rolled back, a concurrently-pending decision stays pinned + deliverable, _evictable_count
+    # matches the retained evictable events, and a blocked waiter is still notified.
+    import threading, pytest
+    q = EventQueue(max_history=100, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o", "s2": "o"}))
+    dec = q.publish("s1", "x", "waiting_for_user", "answer me", "waiting_for_user", decision_id="d1")
+    before_count = q._evictable_count
+    before_last = q.latest_seq()
+
+    got = {}
+    started = threading.Event()
+
+    def waiter():
+        started.set()
+        got["evt"] = q.wait_event(after_seq=dec.seq, timeout=2, session_id="s2")
+
+    t = threading.Thread(target=waiter, daemon=True); t.start()
+    assert started.wait(1)
+    import time as _t; _t.sleep(0.05)
+
+    def boom(ev):
+        raise RuntimeError("on_publish blew up")
+
+    with pytest.raises(RuntimeError):
+        q.publish("s2", "x", "working", "", "working", on_publish=boom)
+
+    # (a) the raising event is fully gone — no half-indexed residue.
+    assert q._evictable_count == before_count
+    assert q._evictable_count == sum(len(h) for h in q._owner_hist.values())
+    assert all(e.session_id != "s2" for e in q._events)
+    # (b) latest_seq bookkeeping rolled back (this was s2's first event).
+    assert q.latest_seq() == before_last
+    assert q.latest_seq("s2") == 0
+    # (c) the pending decision is untouched — still pinned + deliverable.
+    assert q.pending("s1") is dec
+    assert q.latest_after(0, "s1") is dec
+    # (d) the blocked waiter was still notified (woke on the spurious wake, returned None cleanly).
+    t.join(2)
+    assert not t.is_alive()
+
+
+def test_forget_session_releases_retention_and_bookkeeping():
+    # Finding #4: forget_session drops a definitively-removed session's retained events AND all its
+    # per-session bookkeeping, so a long-lived daemon's ring is bounded to live + not-yet-pruned
+    # sessions rather than leaking one entry per distinct session EVER published.
+    q = EventQueue(max_history=5, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o", "s2": "o"}))
+    for sid in ("s1", "s2"):
+        q.publish(sid, "x", "waiting_for_user", "?", "waiting_for_user", decision_id=f"d-{sid}")
+        for i in range(30):
+            q.publish(sid, "x", "working", "", "working")
+    assert q.latest_seq("s1") > 0 and "s1" in q._last_seq_by_session
+    q.forget_session("s1")
+    # s1 is gone from every structure...
+    assert not any(e.session_id == "s1" for e in q._events)
+    assert all(e.session_id != "s1" for e in q._by_id.values())
+    assert "s1" not in q._last_seq_by_session
+    assert "s1" not in q._evicted_high_by_session
+    assert "s1" not in q._owner_cache
+    assert q.latest_seq("s1") == 0
+    assert q.pending("s1") is None
+    # ...and the count invariant still holds, backed only by s2's retained events.
+    assert q._evictable_count == sum(len(h) for h in q._owner_hist.values())
+    assert q.pending("s2") is not None                     # s2 fully intact
+    # idempotent: forgetting an unknown / already-forgotten session is a harmless no-op.
+    q.forget_session("s1")
+    q.forget_session("never-existed")
+
+
+def test_forget_session_does_not_drop_another_sessions_pinned_or_history():
+    # Finding #4 (targeted): forgetting one session must not disturb another session's pinned
+    # decision or its recent history.
+    q = EventQueue(max_history=50, owner_floor=0, owner_resolver=_fixed_owner({"keep": "o", "drop": "o"}))
+    dec = q.publish("keep", "x", "waiting_for_user", "?", "waiting_for_user", decision_id="d-keep")
+    hist = q.publish("keep", "x", "done", "recent", "done_candidate")
+    q.publish("drop", "x", "waiting_for_user", "?", "waiting_for_user", decision_id="d-drop")
+    q.forget_session("drop")
+    assert q.pending("keep") is dec                        # keep's decision still pinned
+    assert q.latest_after(dec.seq, "keep") is hist         # keep's recent history still deliverable
+    assert q.pending("drop") is None
+    assert "d-drop" not in q._by_decision
+    assert q._evictable_count == sum(len(h) for h in q._owner_hist.values())
 
 
 def test_global_seq_across_sessions():

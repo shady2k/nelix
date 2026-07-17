@@ -821,6 +821,12 @@ class SessionManager:
             per_seq = self._events.latest_seqs(self._sessions.keys())  # one _cv pass under manager._lock
             snapshot = dict(self._sessions)
             now = self._clock()
+            # Sessions whose terminal snapshot has now expired are DEFINITIVELY gone: their final
+            # event / terminal result is no longer observable (a harness away past the TTL has lost
+            # it whether or not we retain the ring). This is the safe teardown seam at which to
+            # release their event-ring retention + per-session bookkeeping (nelix-9a4.5 #4): doing it
+            # at slot-free instead would discard spec §5's final wake before a waiter could read it.
+            expired_terminals = [sid for sid, (snap, exp) in self._terminal.items() if exp <= now]
             self._terminal = {sid: (snap, exp) for sid, (snap, exp) in self._terminal.items()
                               if exp > now}
             # Same expiry sweep, same policy, as self._terminal (Task 6): opportunistic purge here
@@ -829,6 +835,13 @@ class SessionManager:
             self._terminal_async = {sid: (rec, exp) for sid, (rec, exp) in self._terminal_async.items()
                                     if exp > now}
             recent_all = {sid: snap for sid, (snap, exp) in self._terminal.items()}
+            for sid in expired_terminals:
+                # Guard against a same-id relive (restart mints a NEW sid, so this is belt-and-braces):
+                # never forget a session that is live again. The event queue takes its own _cv here —
+                # the manager._lock -> events._cv order already exists (latest_seqs above), so no new
+                # lock ordering and no deadlock.
+                if sid not in self._sessions:
+                    self._events.forget_session(sid)
         # Ownership is decided OUTSIDE the lock (it is disk I/O; holding manager._lock across N
         # reads would stall every session's monitor). Safe: a session's owner never changes, so a
         # verdict cannot go stale — the worst a concurrent start can do is not appear in this
