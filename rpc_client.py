@@ -55,13 +55,25 @@ class RpcClient:
         finally:
             conn.close()
 
-    def start(self, executor, task, cwd, model=None):
-        # model (nelix-9k0): the key is only ADDED when provided, so a default (no-model) call is
-        # byte-for-byte the same request as before this option existed (mirrors status's include_progress).
+    def start(self, executor, task, cwd, model=None, session_id=None):
+        # model (nelix-9k0) and session_id (nelix-3rm) are only ADDED when provided, so a default
+        # call is byte-for-byte the same request as before either option existed (mirrors status's
+        # include_progress). session_id is the ROUTER-assigned id: the router allocates it before
+        # forwarding /start (spec §3), and the daemon's /start accepts it (nelix-9a4.6).
         payload = {"executor": executor, "task": task, "cwd": cwd, "owner_id": self._owner}
         if model is not None:
             payload["model"] = model
+        if session_id is not None:
+            payload["session_id"] = session_id
         _, body = self._call("POST", "/start", payload)
+        return body
+
+    def health(self, timeout=10):
+        """The generation's /health envelope (liveness + build-id `generation_id`). No owner and
+        no session (spec §8/§10): the route carries neither, so the router can probe a generation's
+        identity without impersonating a caller. `owner_id` is still required to CONSTRUCT this
+        client, but is not sent on the wire for /health."""
+        _, body = self._call("GET", "/health", timeout=timeout)
         return body
 
     def status(self, session_id=None, include_progress=False):

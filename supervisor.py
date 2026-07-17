@@ -245,6 +245,29 @@ def endpoint():
     return t if _healthy(t) else None
 
 
+def incarnation():
+    """Identity of the live daemon's PROCESS INCARNATION — `{"pid", "start_fingerprint"}` — or
+    None if no live, fingerprint-matched daemon is recorded. Surfaced from the SAME .active.json
+    state endpoint() already trusts, with the same gate (pid alive AND its recorded start
+    fingerprint still matches), so a recycled pid can never masquerade as the same incarnation.
+
+    The router keys a generation EPOCH on this (nelix-3rm / spec §4: "a fresh generation epoch is
+    minted on EVERY incarnation"): a restart changes the pid (or, on a reused pid, the start
+    fingerprint), so the router observes a new incarnation and mints a new epoch — the daemon's own
+    /health carries no incarnation id yet (that addition is a later slice), so supervisor identity
+    is the key for 3c.1."""
+    st = _read_state()
+    if not st:
+        return None
+    pid = st.get("pid")
+    if not pid or not _pid_alive(pid):
+        return None
+    fp = st.get("start_fingerprint")
+    if reaper.ProcessInspector().start_fingerprint(pid) != fp:
+        return None
+    return {"pid": pid, "start_fingerprint": fp}
+
+
 def _live_lock_holder():
     """The daemon.lock holder's metadata IF it names a live, fingerprint-matched process, else
     None. Fingerprint-matching (process start time) survives PID reuse, so a recycled pid can't
