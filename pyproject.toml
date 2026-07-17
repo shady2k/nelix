@@ -1,0 +1,64 @@
+# setuptools, not hatchling: packages/nelix_contracts and packages/nelix_store already build with
+# setuptools>=68 + setuptools.build_meta. One build system in one repo; nothing here needs anything
+# hatchling does better.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nelix-core"
+version = "0.1.0"
+description = "The nelix core: the PTY daemon, its VT renderer and the executor-facing hook CLIs."
+requires-python = "==3.11.*"
+
+# MEASURED, not inherited from requirements.txt (2026-07-17, AST walk over every import under
+# daemon/): the ONLY third-party module daemon/ imports is wasmtime, in renderer/ghostty.py.
+#   - ptyprocess is NOT imported anywhere under daemon/ — the PTY is stdlib os.openpty +
+#     os.login_tty (daemon/pty_broker.py:109,57). requirements.txt and supervisor.py:71's
+#     _DAEMON_MODULES both call it a daemon import; that is stale. supervisor.py is out of scope
+#     here (nelix-3rm owns it), so its list is left alone — but the INSTALL does not repeat it.
+#   - pyyaml is NOT imported anywhere under daemon/ either; only bin/nelix-doctor imports it, and
+#     nelix-doctor does not ship (see [project.scripts]). It is a tooling dep, not a runtime one.
+# wasmtime is a native wheel; pin it exactly, as requirements-daemon.lock does.
+dependencies = ["wasmtime==45.0.0"]
+
+[project.optional-dependencies]
+# Not installed by the core. `pyyaml` is here because bin/nelix-doctor (a repo tool, not a shipped
+# one) imports it, and `nelix_store`/`nelix_contracts` are test-only today: nothing under daemon/,
+# bin/ or the top-level modules references either package (verified by grep, 2026-07-17).
+dev = ["pytest==8.3.4", "pyyaml==6.0.3"]
+
+# Only the two WORKER-facing CLIs ship. daemon/hook_settings.py hands their absolute paths to every
+# hook-capable executor, so an install without them is a broken core — they are the daemon's own
+# runtime requirement, not a convenience.
+#
+# nelix-doctor / nelix-reap / nelix-wait / nelix-capture / nelix-inventory deliberately do NOT ship.
+# They are operator tools, and shipping them now would mean shipping supervisor.py + rpc_client.py
+# (nelix-doctor, nelix-reap and nelix-wait import them) and dragging pyyaml into every install — to
+# freeze a CLI surface that nelix-3rm is about to replace with the `nelix` CLI. An installed core
+# you cannot inspect is a real cost; paying it for one slice is cheaper than shipping names we plan
+# to break. They keep working from the checkout, which is where an operator has them today.
+[project.scripts]
+nelix-question = "daemon.tools.question:main"
+nelix-note = "daemon.tools.note:main"
+
+[tool.setuptools]
+# paths.py and launcher_resolve.py are TOP-LEVEL modules that daemon/ imports (paths: 9 modules
+# incl. app.py; launcher_resolve: daemon/launchers/__init__.py). Without them the wheel installs
+# and dies at `import daemon.app`. Listed explicitly because auto-discovery on a flat layout would
+# also sweep in tests/, spikes/, supervisor.py and rpc_client.py.
+py-modules = ["paths", "launcher_resolve"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["daemon*"]
+
+[tool.setuptools.package-data]
+# The only non-.py file under daemon/, and ghostty.py:7 loads it relative to its own __file__.
+# Miss it and the install imports fine, then dies the first time it renders.
+"daemon.renderer" = ["shim.wasm"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: builds a wheel and a venv; seconds, not milliseconds (tests/test_real_wheel.py)",
+]
