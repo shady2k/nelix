@@ -220,6 +220,33 @@ def test_concurrent_acks_agree_on_one_timestamp(tmp_path):
     assert len(set(results)) == 1, f"acks disagreed on the timestamp: {sorted(set(results))}"
 
 
+def test_acknowledging_removes_a_result_from_the_board_at_once(store, ledger):
+    # list_terminal filtered on owner and schema_version and NOTHING else — there was no
+    # acknowledged filter at all. So an acked result stayed on the owner's board until the
+    # pruner happened to run, which made "acknowledge" mean "dismiss, eventually, on the GC's
+    # schedule". Logical dismissal (ack) and physical reclamation (prune) are different
+    # events, and only the first is the owner's to decide.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid]
+    store.ack_terminal(sid, owner_id="hermes:local")
+    assert store.list_terminal("hermes:local") == [], \
+        "an acknowledged result was still on the board; only prune removed it"
+
+
+def test_acknowledging_does_not_hide_a_result_from_a_direct_get(store, ledger):
+    # The filter belongs on the BOARD, not on the shared _TERMINAL_SELECT. A get by id is not
+    # the board: ack_terminal re-reads through get_terminal inside its own transaction, and
+    # ack's idempotency (a repeated ack returns the ORIGINAL timestamp) is exactly the ability
+    # to read an acknowledged row back by id. This test passes both before and after the
+    # board filter; its job is to fail on the WRONG fix, and it does.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    store.ack_terminal(sid, owner_id="hermes:local")
+    assert store.get_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
+    assert store.ack_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
+
+
 def test_prune_removes_acknowledged_records(store, ledger):
     sid = started_session(store, ledger, state="running")
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=100.0)
