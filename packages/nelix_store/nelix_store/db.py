@@ -25,7 +25,11 @@ from nelix_contracts.errors import (
 )
 
 DB_FILENAME = "nelix.db"
-SCHEMA_VERSION = 1
+# 2: the terminal lifecycle — published_at (store-owned retention) plus the receipt fields.
+# ONE bump for the whole redesign: intermediate versions buy no compatibility when the package
+# has no writers and no migration machinery, and every extra version is another refusal path to
+# keep honest. Moves TOGETHER with records.SCHEMA_VERSION — see the nelix-165 note there.
+SCHEMA_VERSION = 2
 
 # prune_terminal's ROW_NUMBER() window function needs SQLite >= 3.25 (2018). Asserted at
 # open because the daemon runs a different interpreter than the test venv — a feature that
@@ -71,15 +75,25 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 -- Terminal-result fields ONLY.
+--
+-- ended_at is the WORKER's reported fact ("when did I finish"), and it is what the board
+-- displays. published_at is the STORE's fact ("when did this become durable here"), and it is
+-- the only thing retention may be computed from: prune aged against ended_at, so a worker's own
+-- clock decided how long its own result was kept — a stale one reaped it before the owner ever
+-- looked, a future one made it immortal. Retention is this package's policy, so it ages from
+-- this package's clock.
 CREATE TABLE IF NOT EXISTS terminal (
     session_id      TEXT PRIMARY KEY REFERENCES sessions (session_id),
     terminal_kind   TEXT NOT NULL,
     summary         TEXT NOT NULL,
     ended_at        REAL NOT NULL,
+    published_at    REAL NOT NULL,
     acknowledged_at REAL,
     schema_version  INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS terminal_by_ended ON terminal (ended_at);
+-- Indexed on published_at, not ended_at: this index exists to serve pruning, and pruning now
+-- orders and bounds by published_at.
+CREATE INDEX IF NOT EXISTS terminal_by_published ON terminal (published_at);
 """
 
 LOCK_FILENAME = ".db-init.lock"

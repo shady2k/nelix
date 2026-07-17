@@ -14,7 +14,17 @@ from .ids import (
     validate_session_id,
 )
 
-SCHEMA_VERSION = 1
+# 2: TerminalRecord gained the lifecycle fields (published_at, expired_at, expire_reason).
+#
+# THE nelix-165 TRAP, still armed for whoever moves this next: this constant is SEPARATE from
+# db.SCHEMA_VERSION, and list_sessions/list_terminal filter `schema_version = ?` EXACTLY while
+# get_* does not. So bumping THIS alone makes every existing row vanish from the board while a
+# direct get still reads it — a silently emptied board, not an error. It does not bite here only
+# because both constants moved together and the db version gate refuses an older file outright;
+# that is a coincidence of this change, not a defence, since the two can move independently.
+# Fixing it properly means deciding migration policy (version dispatch in from_dict) and has its
+# own plan — do not paper over it here.
+SCHEMA_VERSION = 2
 
 
 def _check_version(d):
@@ -118,6 +128,7 @@ class TerminalRecord:
     terminal_kind: str
     summary: str
     ended_at: float
+    published_at: float
     acknowledged_at: float | None = None
     schema_version: int = SCHEMA_VERSION
 
@@ -127,6 +138,10 @@ class TerminalRecord:
         _text(self.terminal_kind, "terminal_kind")
         _text(self.summary, "summary")
         timestamp(self.ended_at, "ended_at")
+        # The store's own stamp, so it is REQUIRED: a receipt that cannot say when this package
+        # published it cannot be aged by this package's policy, which is the whole point of
+        # having it rather than reusing the caller's ended_at.
+        timestamp(self.published_at, "published_at")
         timestamp(self.acknowledged_at, "acknowledged_at", optional=True)
 
     def to_dict(self) -> dict:

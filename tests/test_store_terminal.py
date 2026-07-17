@@ -4,6 +4,7 @@ import pytest
 
 from nelix_contracts import errors
 from nelix_contracts.errors import NelixError
+from nelix_contracts.records import SCHEMA_VERSION
 from nelix_store.ledger import StartLedger
 from nelix_store.store import Store
 
@@ -103,18 +104,23 @@ def _live_session(store, ledger, owner="hermes:local", key="k1", **over):
 
 
 def _acked_setup(tmp_path, clock):
-    """A published, UNacknowledged terminal record on a Store built with `clock`.
+    """A published, UNacknowledged terminal record on a Store whose clock is `clock` by the
+    time the ack runs.
 
-    A nonsense clock cannot disturb the setup, which is what makes it a clean probe of the
-    ack: this Store's clock is read only by ack_terminal and prune_terminal. Identity comes
-    from a real start (the ledger keeps its own sane clock) and put_terminal's ended_at is
-    the caller's fact, not a clock read.
+    The clock is SWAPPED IN after publication rather than passed to the constructor. It used to
+    be a constructor argument, on the premise that "a nonsense clock cannot disturb the setup,
+    because this Store's clock is read only by ack_terminal and prune_terminal". published_at
+    ended that: put_terminal reads the clock too, so a nonsense one now rejects the PUT and the
+    test would never reach the ack it exists to probe — it would pass for the wrong reason, on
+    the setup instead of the subject. Swapping after publication keeps the probe isolated to
+    ack's own read, which is what these tests are about.
     """
     lg = StartLedger(tmp_path, clock=lambda: 1000.0)
     try:
-        store = Store(tmp_path, clock=clock)
+        store = Store(tmp_path, clock=lambda: 1000.0)
         sid = _live_session(store, lg)
         store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+        store._clock = clock
     finally:
         lg.close()
     return store, sid
@@ -247,6 +253,26 @@ def test_acknowledging_does_not_hide_a_result_from_a_direct_get(store, ledger):
     assert store.ack_terminal(sid, owner_id="hermes:local").acknowledged_at == 1000.0
 
 
+def test_an_acknowledged_result_cannot_be_resurrected_by_a_retried_put(store, ledger):
+    # THE invariant this whole task exists for. Terminal idempotency has no key column: its
+    # effective key is session_id and its remembered outcome is (terminal_kind, summary,
+    # ended_at) IN THE ROW PRUNE DELETES. Neither starts nor sessions remembers the result or
+    # the ack, so once prune reclaims the row nothing survives to recognise the retry — the
+    # retry inserts a fresh UNACKNOWLEDGED row and the dismissed result is back on the board.
+    #
+    # The window is not narrow. prune's condition is `acknowledged_at IS NOT NULL OR ...`, so
+    # max_age_seconds gates only UNACKNOWLEDGED rows: an acked row is eligible on the very next
+    # prune at any age. The ack->prune window is ZERO, so an ordinary sub-second retry lands in
+    # it, and no "minimum retention" would fix that.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
+    store.ack_terminal(sid, owner_id="hermes:local")
+    assert store.prune_terminal(max_age_seconds=86400, max_count=100) == 1
+    store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=5.0)
+    assert store.list_terminal("hermes:local") == [], \
+        "the owner dismissed this result and a retried put put it back on their board"
+
+
 def test_prune_removes_acknowledged_records(store, ledger):
     sid = started_session(store, ledger, state="running")
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=100.0)
@@ -257,18 +283,81 @@ def test_prune_removes_acknowledged_records(store, ledger):
     assert ei.value.code == errors.UNKNOWN_SESSION
 
 
-def test_prune_reaps_an_abandoned_record_past_max_age(store, ledger):
+def test_a_stale_worker_clock_cannot_reap_a_fresh_result(store, ledger, clock):
+    # ended_at is CALLER-supplied and prune aged against it, so a worker's own clock decided how
+    # long its own result was retained. A worker whose clock is stale (or that reports a
+    # monotonic/uptime value, or 0.0) has its result reaped on the first prune — the owner never
+    # sees it. Retention is a STORE policy.
+    #
+    # max_age MUST fall between the two ages or the test cannot discriminate: the store published
+    # 1s ago, the worker claims it ended 1001s ago. The plan's 86400 is above BOTH (1001 is not
+    # > 86400), which is why the plan's version of this test passes on the unfixed code.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=0.0)
+    clock.t = 1001.0
+    assert store.prune_terminal(max_age_seconds=500, max_count=100) == 0, \
+        "a stale ended_at reaped a result the store published one second ago"
+    assert store.get_terminal(sid, owner_id="hermes:local").ended_at == 0.0, \
+        "ended_at is the worker's reported fact and must survive verbatim"
+
+
+def test_a_future_worker_clock_cannot_make_a_result_immortal(store, ledger, clock):
+    # The other half, and the worse one: a worker with a skewed-FORWARD clock reported an
+    # ended_at in the future, so (now - ended_at) stayed negative and the row outlived every
+    # age bound — unbounded growth chosen by the least trustworthy party in the system.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=1e9)
+    clock.t = 2000.0
+    assert store.prune_terminal(max_age_seconds=500, max_count=100) == 1, \
+        "a future ended_at made the result immortal; the store published it 1000s ago"
+
+
+def test_a_matching_retry_does_not_extend_retention(store, ledger, clock):
+    # NOT a red test for the old defect — it passes on the unfixed code, because today ended_at
+    # simply never changes on a retry, so there is nothing to extend. It guards the NEW column's
+    # semantics: published_at is stamped on FIRST publication only. Were put_terminal to restamp
+    # it on every matching retry, a generation retrying in a loop would keep a result alive
+    # forever and defeat the age bound it just moved to.
+    sid = _live_session(store, ledger)
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    clock.t = 5000.0
+    store.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
+    assert store.prune_terminal(max_age_seconds=100, max_count=100) == 1, \
+        "a retry refreshed published_at, so a result could be kept alive forever by retrying"
+
+
+def test_prune_reaps_an_abandoned_record_past_max_age(store, ledger, clock):
+    # MEANING CHANGED, not just the column. "Past max_age" used to mean "the WORKER says it
+    # ended long ago", which this test got for free from ended_at=0.0 against a clock at 1000 —
+    # the store had published the row an instant earlier. It now means "the STORE published it
+    # long ago", so the test must let the store's own time actually pass. That is the defect
+    # this column exists for, seen from the test's side: the old assertion could be satisfied by
+    # a worker lying about its clock, without a second of real retention elapsing.
     sid = started_session(store, ledger, state="running")
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=0.0)
+    clock.t = 1600.0                    # published at 1000: 600s of real retention
     assert store.prune_terminal(max_age_seconds=500, max_count=100) == 1
 
 
-def test_prune_bounds_by_count_dropping_oldest_first(store, ledger):
+def test_prune_bounds_by_count_dropping_oldest_first(store, ledger, clock):
+    # MEANING CHANGED: "oldest" is now "published earliest" (the store's fact), not "the worker
+    # says it ended earliest".
+    #
+    # ended_at DESCENDS as published_at ASCENDS, deliberately. The obvious update to this test
+    # — advance the clock per publication and leave ended_at ascending too — leaves both columns
+    # in the SAME order, so ordering by either keeps the same rows and the test cannot see which
+    # column the query used. MEASURED: written that way, reverting the ORDER BY to ended_at kept
+    # this test green (0/1). Only disagreeing orders probe the guard.
+    published = []
     for i in range(5):
+        clock.t = 1000.0 + i
         sid = started_session(store, ledger, key=f"k{i}", state="running")
-        store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=float(i))
+        store.put_terminal(sid, terminal_kind="done", summary="all green",
+                           ended_at=float(100 - i))
+        published.append(sid)
     assert store.prune_terminal(max_age_seconds=86400, max_count=2) == 3
-    assert sorted(r.ended_at for r in store.list_terminal("hermes:local")) == [3.0, 4.0]
+    assert sorted(r.session_id for r in store.list_terminal("hermes:local")) == \
+        sorted(published[3:]), "count-pruning kept the rows the WORKERS called newest"
 
 
 def test_a_noisy_owner_cannot_evict_a_quiet_owners_unacked_result(store, ledger):
@@ -326,8 +415,8 @@ def test_one_future_schema_row_does_not_brick_an_owners_terminal_board(store, le
     other_sid = started_session(store, ledger, key="k2", state="running")
     store._conn.execute(
         "INSERT INTO terminal (session_id, terminal_kind, summary, ended_at,"
-        " acknowledged_at, schema_version) VALUES (?,?,?,?,?,?)",
-        (other_sid, "done", "s", 200.0, None, 99))
+        " published_at, acknowledged_at, schema_version) VALUES (?,?,?,?,?,?,?)",
+        (other_sid, "done", "s", 200.0, 1000.0, None, SCHEMA_VERSION + 1))
     assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid]
     with pytest.raises(NelixError) as ei:
         store.get_terminal(other_sid, owner_id="hermes:local")
@@ -335,13 +424,19 @@ def test_one_future_schema_row_does_not_brick_an_owners_terminal_board(store, le
 
 
 def test_a_corrupt_terminal_row_does_not_blind_an_owner(store, ledger):
+    # schema_version is SCHEMA_VERSION, never the literal 1 it used to be. This test proves that
+    # _read_rows SKIPS a row it cannot decode (here: ended_at="soon", legal affinity, illegal
+    # value) — but list_terminal also filters `t.schema_version=?` in SQL, so the moment the
+    # constant moved past 1 the hardcoded row was excluded by the VERSION filter and never
+    # reached the decoder at all. The test would have stayed green while proving nothing. Pinned
+    # to the constant so it keeps testing the skip rather than the filter.
     sid = started_session(store, ledger, key="k1", state="running")
     store.put_terminal(sid, terminal_kind="done", summary="all green", ended_at=100.0)
     other_sid = started_session(store, ledger, key="k2", state="running")
     store._conn.execute(
         "INSERT INTO terminal (session_id, terminal_kind, summary, ended_at,"
-        " acknowledged_at, schema_version) VALUES (?,?,?,?,?,?)",
-        (other_sid, "done", "s", "soon", None, 1))
+        " published_at, acknowledged_at, schema_version) VALUES (?,?,?,?,?,?,?)",
+        (other_sid, "done", "s", "soon", 1000.0, None, SCHEMA_VERSION))
     assert [r.session_id for r in store.list_terminal("hermes:local")] == [sid]
 
 

@@ -40,7 +40,8 @@ _SESSION_SELECT = (
 # `PRAGMA foreign_keys=ON` connection.
 _TERMINAL_SELECT = (
     "SELECT t.session_id, st.owner_id, st.orchestration_id, st.generation_id, "
-    "t.terminal_kind, t.summary, t.ended_at, t.acknowledged_at, t.schema_version "
+    "t.terminal_kind, t.summary, t.ended_at, t.published_at, t.acknowledged_at, "
+    "t.schema_version "
     "FROM terminal t JOIN starts st ON st.session_id = t.session_id")
 
 # transition_session's CAS UPDATE has no owner_id column to filter on directly (identity
@@ -209,24 +210,39 @@ class Store:
                 (session_id,)).fetchone()
             if start is None:
                 raise NelixError(UNKNOWN_SESSION, f"no such session: {session_id}")
+            # The store's own stamp: retention ages from THIS, never from the caller's
+            # ended_at. Read before the comparison below, not after, because the incoming
+            # record must be judged valid before any stored state is consulted — otherwise a
+            # malformed field on a session that already ended reports IDEMPOTENCY_CONFLICT
+            # ("you sent a different result") for what is really INVALID_REQUEST ("you sent
+            # nonsense"), naming the wrong disagreement. The cost is that a Store built with a
+            # nonsense clock now fails EVERY put_terminal including an otherwise-idempotent
+            # retry — deliberate: such a Store cannot publish anything, and one answer for one
+            # call beats an answer that depends on whether a row happens to exist.
+            published_at = timestamp(self._clock(), "clock")
             # Validate before writing; identity from the join cannot disagree.
             TerminalRecord(session_id=session_id, owner_id=start["owner_id"],
                            orchestration_id=start["orchestration_id"],
                            generation_id=start["generation_id"],
-                           terminal_kind=terminal_kind, summary=summary, ended_at=ended_at)
+                           terminal_kind=terminal_kind, summary=summary, ended_at=ended_at,
+                           published_at=published_at)
             existing = self._conn.execute(
                 "SELECT terminal_kind, summary, ended_at FROM terminal WHERE session_id=?",
                 (session_id,)).fetchone()
             if existing is not None:
                 if (existing["terminal_kind"], existing["summary"], existing["ended_at"]) == (
                         terminal_kind, summary, ended_at):
-                    return                      # same result: idempotent, ack untouched
+                    # Same result: idempotent. published_at is NOT restamped — a generation
+                    # retrying in a loop would otherwise keep its result alive forever and
+                    # defeat the age bound retention just moved to.
+                    return
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  f"{session_id} already ended as {existing['terminal_kind']!r}")
             self._conn.execute(
                 "INSERT INTO terminal (session_id, terminal_kind, summary, ended_at, "
-                "acknowledged_at, schema_version) VALUES (?,?,?,?,?,?)",
-                (session_id, terminal_kind, summary, ended_at, None, SCHEMA_VERSION))
+                "published_at, acknowledged_at, schema_version) VALUES (?,?,?,?,?,?,?)",
+                (session_id, terminal_kind, summary, ended_at, published_at, None,
+                 SCHEMA_VERSION))
 
     @translates_sqlite
     def get_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
@@ -318,12 +334,12 @@ class Store:
             self._conn.execute("BEGIN IMMEDIATE")
             removed = self._conn.execute(
                 "DELETE FROM terminal WHERE acknowledged_at IS NOT NULL "
-                "OR (? - ended_at) > ?", (now, max_age_seconds)).rowcount
+                "OR (? - published_at) > ?", (now, max_age_seconds)).rowcount
             removed += self._conn.execute(
                 "DELETE FROM terminal WHERE session_id IN ("
                 "  SELECT session_id FROM ("
                 "    SELECT t.session_id, ROW_NUMBER() OVER ("
-                "      PARTITION BY st.owner_id ORDER BY t.ended_at DESC, t.session_id DESC"
+                "      PARTITION BY st.owner_id ORDER BY t.published_at DESC, t.session_id DESC"
                 "    ) AS rn FROM terminal t "
                 "    JOIN starts st ON st.session_id = t.session_id"
                 "  ) WHERE rn > ?)", (max_count,)).rowcount
