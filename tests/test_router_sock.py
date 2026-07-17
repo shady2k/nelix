@@ -12,6 +12,8 @@ import shutil
 import socket
 import stat
 import threading
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -127,6 +129,86 @@ def test_router_runtime_dir_uses_the_resolved_base(monkeypatch, tmp_path):
     assert alias not in paths.router_runtime_dir().parts
 
 
+# --- single resolution: verify and construct must agree on ONE answer -------------------
+# [review: double-resolution TOCTOU — verify resolves the base, construction re-resolves it]
+#
+# Before the fix, ensure_router_runtime_dir() called verify_router_runtime_base() (which
+# resolves the base once to CHECK it) and then separately called router_runtime_dir() (which
+# resolves the SAME configured base again to BUILD the path). A base that is a symlink can
+# answer safely the first time and point somewhere else the second — the window between the
+# two independent resolve() calls. The fix must resolve the base exactly ONCE per top-level
+# call and reuse that single value for both the check and the construction.
+
+def test_ensure_router_runtime_dir_resolves_the_base_exactly_once(monkeypatch, tmp_path):
+    """Prove single resolution deterministically rather than relying on a real race: make
+    Path.resolve() answer DIFFERENTLY on the second call than the first for the configured
+    base (standing in for a symlink repointed between verify-time and construct-time). If
+    ensure_router_runtime_dir() still resolves twice, the directory it builds lands under the
+    SECOND answer; if it resolves once (the fix), the directory lands under the FIRST — the
+    only answer verify_router_runtime_base() ever saw and checked."""
+    target_a = tmp_path / "target-a"; target_a.mkdir(mode=0o700)
+    target_b = tmp_path / "target-b"; target_b.mkdir(mode=0o700)
+    base_symlink = tmp_path / "swappable-base"
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base_symlink))
+    importlib.reload(paths)
+
+    real_resolve = Path.resolve
+    calls = []
+
+    def fake_resolve(self, *a, **kw):
+        if self == base_symlink:
+            calls.append(1)
+            return target_a if len(calls) == 1 else target_b
+        return real_resolve(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+    d = paths.ensure_router_runtime_dir()
+
+    assert target_a in d.parents, (
+        f"expected the dir under the FIRST (verified) resolution {target_a}, got {d}")
+    assert target_b not in d.parents, (
+        f"dir was built under a SECOND, independent resolution {target_b} — "
+        f"verify and construct disagree (TOCTOU)")
+
+
+def test_resolved_router_paths_matches_the_pure_accessors_in_the_normal_case(monkeypatch, tmp_path):
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(tmp_path))
+    importlib.reload(paths)
+    d, sock, lock = paths.resolved_router_paths()
+    assert d == paths.router_runtime_dir()
+    assert sock == paths.router_sock()
+    assert lock == paths.router_lock()
+    assert sock == d / "router.sock"
+    assert lock == d / "router.lock"
+
+
+def test_resolved_router_paths_resolves_the_base_exactly_once(monkeypatch, tmp_path):
+    """The single-resolution helper itself must only resolve once — it is the building block
+    ensure_router_runtime_dir() is supposed to use instead of mixing independent re-resolutions."""
+    target_a = tmp_path / "target-a"; target_a.mkdir(mode=0o700)
+    target_b = tmp_path / "target-b"; target_b.mkdir(mode=0o700)
+    base_symlink = tmp_path / "swappable-base"
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base_symlink))
+    importlib.reload(paths)
+
+    real_resolve = Path.resolve
+    calls = []
+
+    def fake_resolve(self, *a, **kw):
+        if self == base_symlink:
+            calls.append(1)
+            return target_a if len(calls) == 1 else target_b
+        return real_resolve(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+    d, sock, lock = paths.resolved_router_paths()
+    assert target_a in d.parents
+    assert target_b not in d.parents
+    assert sock.parent == d and lock.parent == d
+
+
 # --- NELIX_RUNTIME_BASE must itself be verified safe [review: hijack via unsafe base] ---
 
 def test_ensure_router_runtime_dir_rejects_a_relative_runtime_base(monkeypatch):
@@ -184,6 +266,72 @@ def test_ensure_router_runtime_dir_still_works_with_the_default_tmp_base(monkeyp
         assert d == paths.router_runtime_dir()
     finally:
         shutil.rmtree(d, ignore_errors=True)   # leave the shared per-uid parent alone
+
+
+# --- base OWNERSHIP: the sticky bit stops other users, not the base's own owner --------
+# [review: an attacker-OWNED sticky (or nominally-private) base still hijacks]
+#
+# verify_router_runtime_base()'s mode check alone is not enough: sticky only denies rename/
+# delete rights to everyone EXCEPT the node's owner (and root). A base owned by some other,
+# non-root uid passes the old mode-only check whether or not it is world-writable — its
+# owner can rename our already-verified per-uid dir out from under us regardless. A test
+# process cannot chown a directory to a foreign uid, so these simulate "owned by someone
+# else" the same way test_ensure_owned_private_dir_rejects_foreign_owner_rather_than_adopting
+# does: make the CODE's own os.getuid() answer differently, so the real (test-owned)
+# directory reads as foreign from the code's point of view.
+
+def test_ensure_router_runtime_dir_rejects_a_sticky_base_owned_by_another_uid(monkeypatch, tmp_path):
+    """1777 (sticky, world-writable) is exactly how the real /tmp is configured, and the old
+    check accepts any sticky base regardless of who owns it. An attacker who owns the base
+    can still rename/replace our verified per-uid dir — sticky only stops OTHER users."""
+    base = tmp_path / "attacker-sticky-base"; base.mkdir(mode=0o777)
+    os.chmod(base, 0o1777)
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 12345)
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base))
+    importlib.reload(paths)
+    with pytest.raises(paths.RouterRuntimeBaseRejected, match="owner"):
+        paths.ensure_router_runtime_dir()
+
+
+def test_ensure_router_runtime_dir_rejects_a_private_base_owned_by_another_uid(monkeypatch, tmp_path):
+    """The more dangerous gap: a 0700 base is not group/world-writable, so it never even
+    reached the sticky-bit branch — the old code trusted ANY "private-looking" base with
+    zero ownership check. An attacker-owned "private" base is exactly as attacker-controlled
+    as an attacker-owned world-writable one."""
+    base = tmp_path / "attacker-private-base"; base.mkdir(mode=0o700)
+    os.chmod(base, 0o700)
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 12345)
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base))
+    importlib.reload(paths)
+    with pytest.raises(paths.RouterRuntimeBaseRejected, match="owner"):
+        paths.ensure_router_runtime_dir()
+
+
+def test_ensure_router_runtime_dir_accepts_a_root_owned_sticky_base_even_when_not_ours(monkeypatch, tmp_path):
+    """Root-owned is always safe no matter which uid we run as — root can already do
+    anything to our files, so a root-owned sticky base (the real /tmp's actual ownership)
+    must be accepted by the carve-out for uid 0, not merely by the "we own it" branch. A test
+    process can't chown to root, so fake it at the os.stat layer: only the base's OWNERSHIP
+    is faked (st_uid=0), while os.getuid() keeps answering this process's real uid — so the
+    only way this can pass is the root carve-out, never the "it's ours" one."""
+    base = tmp_path / "root-sticky-base"; base.mkdir(mode=0o777)
+    os.chmod(base, 0o1777)
+    resolved_base = base.resolve()   # computed BEFORE patching os.stat, to avoid recursion
+    real_stat = os.stat
+
+    def fake_stat(path, *a, **kw):
+        st = real_stat(path, *a, **kw)
+        if Path(path) == resolved_base:
+            return types.SimpleNamespace(st_mode=st.st_mode, st_uid=0)
+        return st
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base))
+    importlib.reload(paths)
+    d = paths.ensure_router_runtime_dir()
+    assert d == paths.router_runtime_dir()
 
 
 # --- create-or-verify security helper ---------------------------------------------------
@@ -301,6 +449,66 @@ def test_ensure_owned_private_dir_mkdir_reaches_0700_even_under_a_hostile_umask(
     assert modes_seen_before_chmod == [0o700], (
         "mkdir(2) itself must already land on 0700 under a hostile ambient umask; seeing "
         "anything else means the internal umask override isn't wrapping the mkdir call")
+
+
+def test_ensure_owned_private_dir_umask_window_is_not_interleaved_across_threads(monkeypatch, tmp_path):
+    """os.umask is process-global, not per-thread: two concurrent same-process creators each
+    doing umask(0o077) ... mkdir ... umask(restore) can interleave without a lock, leaving
+    the ambient umask at 0o077 (or some other wrong value) for the DURATION of one thread's
+    window while it is actually a different thread's turn — or leaving it permanently wrong
+    if a restore lands between the other thread's open and its own restore. Force a real
+    attempt at overlap: make the mkdir syscall itself pause inside the critical section so a
+    concurrently-running rival has every opportunity to slip its own umask(0o077) call in
+    before the first thread restores. With the lock in force this must never happen: every
+    thread's OPEN (umask(0o077)) must be immediately followed, in the GLOBAL call sequence,
+    by that SAME thread's own RESTORE — never by the other thread's open."""
+    real_mkdir = os.mkdir
+
+    def slow_mkdir(path, mode):
+        time.sleep(0.05)   # widen the window a missing lock would let a rival exploit
+        return real_mkdir(path, mode)
+
+    monkeypatch.setattr(os, "mkdir", slow_mkdir)
+
+    events = []   # (thread_ident, requested_mask) in the order os.umask was actually called
+    real_umask = os.umask
+
+    def spying_umask(mask):
+        old = real_umask(mask)
+        events.append((threading.get_ident(), mask))
+        return old
+
+    monkeypatch.setattr(os, "umask", spying_umask)
+
+    targets = [tmp_path / "race-a", tmp_path / "race-b"]
+    results = []
+
+    def go(p):
+        try:
+            results.append(paths.ensure_owned_private_dir(p))
+        except Exception as e:                     # noqa: BLE001 - captured for the assertion below
+            results.append(e)
+
+    threads = [threading.Thread(target=go, args=(p,)) for p in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(isinstance(r, Path) for r in results), results
+    assert len(events) == 4, events   # 2 threads x (open, restore)
+
+    opens = [i for i, (_, mask) in enumerate(events) if mask == 0o077]
+    assert len(opens) == 2, events
+    for i in opens:
+        # the very next event in the GLOBAL sequence must be THIS thread's own restore —
+        # never the other thread's open sneaking in first.
+        assert i + 1 < len(events), events
+        this_thread = events[i][0]
+        next_thread, next_mask = events[i + 1]
+        assert next_thread == this_thread and next_mask != 0o077, (
+            f"thread {this_thread}'s umask(0o077) window was interleaved with another "
+            f"thread's call before its own restore: {events}")
 
 
 # --- the coverage hole: an actual bind at the production router_sock() path ------------
