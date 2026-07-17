@@ -129,6 +129,11 @@ class EventQueue:
         self._evicted_high = 0                    # highest seq EVER evicted (global)
         self._evicted_high_by_session = {}        # session_id -> highest seq evicted for it
 
+        # bumped by forget_session (never leaks — a single global int). A waiter captures it at
+        # entry; a change while it blocks means SOME session was forgotten, and if the waiter's own
+        # once-known session is the one that vanished it must resync now, not sleep out its timeout.
+        self._forget_gen = 0
+
     # ---- internals (all called with self._cv held) ----
 
     @staticmethod
@@ -254,9 +259,6 @@ class EventQueue:
         # is stored on the event (#2) and is the ONLY owner ever used for its bucket decisions.
         resolved_owner = self._owner_of(session_id)
         with self._cv:
-            prev_last_seq = self._last_seq
-            had_sess_seq = session_id in self._last_seq_by_session
-            prev_sess_seq = self._last_seq_by_session.get(session_id)
             e = Event(next(self._seq), f"evt-{uuid.uuid4().hex[:8]}", session_id, executor,
                       kind, summary, state, decision_id=decision_id, turn_index=turn_index,
                       range=range, hint=hint, hung=hung, task_delivery=task_delivery,
@@ -279,19 +281,30 @@ class EventQueue:
                 indexed = True
                 self._evict_if_needed()
             except BaseException:
-                # publish is ATOMIC (#5): if on_publish raised before the event was indexed, fully
-                # roll it back so no un-indexed event is ever left in _events/_by_id — otherwise a
-                # later flood's _pick_victim (which skips only _pinned) could evict a should-be-pinned
-                # decision, or _drop could crash / drift _evictable_count against a phantom event.
+                # publish is ATOMIC (#5): if on_publish raised before the event was indexed, roll
+                # back ONLY the outer event `e` so no un-indexed event is ever left in _events/_by_id
+                # — otherwise a later flood's _pick_victim (which skips only _pinned) could evict a
+                # should-be-pinned decision, or _drop could crash / drift _evictable_count against a
+                # phantom event.
+                #
+                # Watermarks are RECOMPUTED from the retained state, NOT restored from saved
+                # pre-callback scalars (fix pass 2 / R2): on_publish may itself have published (the
+                # reentrant model the lock supports) BEFORE raising, and that nested event is
+                # legitimately retained — restoring the old scalars would clobber its advance, leaving
+                # a retained seq-N event coexisting with latest_seq()==0. So the global watermark
+                # becomes the newest retained event and this session's becomes the newest retained
+                # event OF THIS session (drop the key if none of its events survive).
                 if not indexed:
                     self._by_id.pop(e.event_id, None)
                     try:
                         self._events.remove(e)
                     except ValueError:
                         pass
-                    self._last_seq = prev_last_seq
-                    if had_sess_seq:
-                        self._last_seq_by_session[session_id] = prev_sess_seq
+                    self._last_seq = self._events[-1].seq if self._events else 0
+                    sess_max = max((r.seq for r in self._events
+                                    if r.session_id == session_id), default=0)
+                    if sess_max > 0:
+                        self._last_seq_by_session[session_id] = sess_max
                     else:
                         self._last_seq_by_session.pop(session_id, None)
                 raise
@@ -341,7 +354,18 @@ class EventQueue:
                              "another session's event to this waiter")
         deadline = time.time() + timeout
         with self._cv:
+            start_gen = self._forget_gen
+            known_at_entry = session_id in self._last_seq_by_session
             while True:
+                # A forget of THIS session while we wait drops its retained events like an eviction
+                # (fix pass 2 / R3): it was KNOWN at entry and now has no tracked state at all, so its
+                # events are gone and a doorbell for it can never ring — resync NOW rather than sleep
+                # out the timeout. Gated on a gen change so a NON-forget publish never trips it, and on
+                # known_at_entry so a waiter armed on a not-yet-started session is never spuriously
+                # expired by SOME OTHER session's forget.
+                if (self._forget_gen != start_gen and known_at_entry
+                        and session_id not in self._last_seq_by_session):
+                    return CURSOR_EXPIRED
                 # Expiry is checked BEFORE delivery (#1): a cursor that fell off the back must resync
                 # NOW — never block a doorbell that can never ring, and never silently deliver a newer
                 # retained event that masks the gap. A caught-up cursor never expires (see _expired).
@@ -438,3 +462,9 @@ class EventQueue:
             self._owner_cache.pop(session_id, None)
             self._last_seq_by_session.pop(session_id, None)
             self._evicted_high_by_session.pop(session_id, None)
+            # Wake any waiter blocked on this (now vanished) session so it re-evaluates and resyncs
+            # instead of sleeping out its full timeout on a doorbell that can never ring (fix pass 2
+            # / R3). The gen bump is what lets the woken waiter distinguish "my session was forgotten"
+            # (all its state, incl. expiry evidence, was just removed) from an ordinary spurious wake.
+            self._forget_gen += 1
+            self._cv.notify_all()

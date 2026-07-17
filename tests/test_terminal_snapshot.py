@@ -19,6 +19,13 @@ class _FakeSession:
                 "restarted_from": None, "restart_count": 0, "terminal": True}
 
 
+class _NoSnapSession(_FakeSession):
+    """A session whose terminal_snapshot() yields None (an error / no-snapshot corner) — so no
+    _terminal entry is ever retained for it even when the TTL is positive."""
+    def terminal_snapshot(self):
+        return None
+
+
 def _mgr(ttl=300.0, clock=None):
     specs = {"claude": ExecutorSpec(command="c", args=[], env={}, driver="claude")}
     return SessionManager(specs, EventQueue(), concurrency_limit=5,
@@ -71,6 +78,65 @@ def test_terminal_expiry_forgets_session_from_event_ring():
     assert "s-gone01" not in mgr._events._last_seq_by_session
     assert "s-gone01" not in mgr._events._evicted_high_by_session
     assert "s-gone01" not in mgr._events._owner_cache
+
+
+def test_removal_with_ttl_disabled_forgets_event_ring():
+    # Fix pass 2 (R1): with terminal survival DISABLED (ttl<=0) a removed session never enters
+    # _terminal, so the status() TTL-expiry seam can NEVER forget it. Without a removal-time forget
+    # its events (floor-protected, so never evicted) and all three per-session dicts leak for the
+    # daemon's whole life. forget must happen at the definitive removal point (_free_slot).
+    mgr = _mgr(ttl=-5)
+    own("s-nt"); mgr._sessions["s-nt"] = _FakeSession("s-nt")
+    for _ in range(3):
+        mgr._events.publish("s-nt", "claude", "working", "", "working")
+    assert mgr._events.latest_seq("s-nt") > 0
+    mgr._free_slot("s-nt")
+    assert "s-nt" not in mgr._terminal                      # never retained (survival disabled)
+    assert not any(e.session_id == "s-nt" for e in mgr._events._events)
+    assert mgr._events.latest_seq("s-nt") == 0
+    assert "s-nt" not in mgr._events._last_seq_by_session
+    assert "s-nt" not in mgr._events._evicted_high_by_session
+    assert "s-nt" not in mgr._events._owner_cache
+    assert (mgr._events._evictable_count ==
+            sum(len(h) for h in mgr._events._owner_hist.values()))
+
+
+def test_removal_with_none_terminal_snapshot_forgets_event_ring():
+    # Fix pass 2 (R1): terminal_snapshot() returned None (an error / no-snapshot path) — so even with
+    # ttl>0 no _terminal entry is retained, and again no TTL seam will ever forget it. forget at the
+    # removal point keeps the ring bounded in this corner too.
+    mgr = _mgr(ttl=300.0)
+    own("s-ns"); mgr._sessions["s-ns"] = _NoSnapSession("s-ns")
+    for _ in range(3):
+        mgr._events.publish("s-ns", "claude", "working", "", "working")
+    assert mgr._events.latest_seq("s-ns") > 0
+    mgr._free_slot("s-ns")
+    assert "s-ns" not in mgr._terminal                      # None snapshot -> not retained
+    assert not any(e.session_id == "s-ns" for e in mgr._events._events)
+    assert mgr._events.latest_seq("s-ns") == 0
+    assert "s-ns" not in mgr._events._last_seq_by_session
+    assert "s-ns" not in mgr._events._evicted_high_by_session
+    assert "s-ns" not in mgr._events._owner_cache
+
+
+def test_removal_with_retained_terminal_defers_forget_to_ttl_seam():
+    # Fix pass 2 (R1), the other half: a session that DID get a _terminal entry must NOT be forgotten
+    # early — its final result stays observable within the TTL (spec §5 final wake). It is forgotten
+    # EXACTLY ONCE, at the TTL-expiry seam, never doubly at removal.
+    t = {"now": 1000.0}
+    mgr = _mgr(ttl=10.0, clock=lambda: t["now"])
+    own("s-rt"); mgr._sessions["s-rt"] = _FakeSession("s-rt")
+    mgr._events.publish("s-rt", "claude", "done", "final", "done_candidate")
+    mgr._free_slot("s-rt")
+    # retained within TTL: NOT forgotten at removal.
+    assert "s-rt" in mgr._terminal
+    assert any(e.session_id == "s-rt" for e in mgr._events._events)
+    assert mgr._events.latest_seq("s-rt") > 0
+    # forgotten only at TTL expiry.
+    t["now"] = 1011.0
+    mgr.status(owner_id=OWNER)
+    assert not any(e.session_id == "s-rt" for e in mgr._events._events)
+    assert "s-rt" not in mgr._events._last_seq_by_session
 
 
 def test_multiple_terminal_snapshots_coexist_and_prune_independently():
