@@ -1,4 +1,117 @@
-from daemon.events import EventQueue, RESPONDABLE_KINDS
+from daemon.events import EventQueue, RESPONDABLE_KINDS, CURSOR_EXPIRED
+
+
+def _fixed_owner(mapping):
+    """An owner_resolver that reads a fixed session_id->owner_id map (no disk). None for
+    sessions not in the map (fail-closed, exactly like a missing owner.json)."""
+    return lambda sid: mapping.get(sid)
+
+
+# ---------------------------------------------------------------------------
+# nelix-9a4.5: the event ring is bounded SEMANTIC state, not unbounded history.
+# ---------------------------------------------------------------------------
+
+def test_bounded_ring_evicts_oldest_history_under_load():
+    # A flood of delivery/history events past the bound evicts the OLDEST first; the ring never
+    # grows without limit. latest_seq still reports the last seq EVER published for the session
+    # (cursor stays monotonic across eviction — never rewinds to a retained-only max).
+    q = EventQueue(max_history=10, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o"}))
+    last = None
+    for i in range(200):
+        last = q.publish("s1", "x", "working", f"e{i}", "working")
+    assert q.latest_seq("s1") == last.seq == 200
+    assert q.latest_seq() == 200
+    assert q.latest_seqs(["s1"]) == {"s1": 200}
+    # The oldest events fell off the back: the newest RETAINED event is far past seq 1.
+    oldest_retained = q.latest_after(0, "s1")
+    assert oldest_retained is not None and oldest_retained is not CURSOR_EXPIRED
+    assert oldest_retained.seq > 150            # ~10 retained out of 200 => window is near the top
+
+
+def test_unresolved_decision_is_pinned_through_a_flood_far_past_the_bound():
+    # THE core invariant: an unresolved decision event is exempt from the eviction budget and can
+    # NEVER be dropped while unresolved — even under a flood that dwarfs the bound.
+    q = EventQueue(max_history=5, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o", "s2": "o"}))
+    dec = q.publish("s1", "x", "waiting_for_user", "answer me", "waiting_for_user", decision_id="d1")
+    for i in range(1000):
+        q.publish("s2", "x", "working", "", "working")
+    # still pending, still discoverable, still DELIVERABLE to a waiter armed before it.
+    assert q.pending("s1") is dec
+    assert q.latest_after(0, "s1") is dec
+    # resolving it lets it re-enter the normal (evictable) history budget.
+    assert q.resolve_decision("d1", "answered") == dec.seq
+    assert q.pending("s1") is None
+
+
+def test_resolved_decision_re_enters_the_evictable_budget():
+    q = EventQueue(max_history=2, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o"}))
+    d = q.publish("s1", "x", "waiting_for_user", "?", "waiting_for_user", decision_id="d1")
+    for i in range(10):
+        q.publish("s1", "x", "working", "", "working")
+    assert q.pending("s1") is d                          # pinned: survived the first flood
+    q.resolve_decision("d1", "answered")                 # now evictable
+    for i in range(10):
+        q.publish("s1", "x", "working", "", "working")
+    assert q.pending("s1") is None
+    got = q.latest_after(0, "s1")                         # d is gone; only recent history remains
+    assert got is not CURSOR_EXPIRED and got.event_id != d.event_id
+
+
+def test_cursor_expired_signal_when_cursor_fell_off_the_back():
+    # The silent-stall fix: a waiter armed at a cursor whose events were evicted (nothing newer
+    # retained for its session) gets an EXPLICIT cursor_expired signal, never a silent None.
+    q = EventQueue(max_history=5, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o", "s2": "o"}))
+    q.publish("s1", "x", "done", "old doorbell", "done_candidate")     # seq 1, s1's only event
+    for i in range(20):
+        q.publish("s2", "x", "working", "", "working")                 # flood evicts s1's seq 1
+    # s1 has no retained events, and its cursor (0) is before an evicted seq -> resync signal.
+    assert q.latest_after(0, "s1") is CURSOR_EXPIRED
+    # wait_event returns it IMMEDIATELY (no blocking for the timeout).
+    import time as _t
+    t0 = _t.time()
+    assert q.wait_event(after_seq=0, timeout=5, session_id="s1") is CURSOR_EXPIRED
+    assert _t.time() - t0 < 1.0                                        # did not block the 5s
+
+
+def test_resync_cursor_clears_expiry_no_hot_loop():
+    # After cursor_expired, a caller re-/status's and re-arms at latest_seq(session). That cursor
+    # must NOT re-trip cursor_expired (which would be an unthrottled resync hot loop).
+    q = EventQueue(max_history=3, owner_floor=0, owner_resolver=_fixed_owner({"s1": "o"}))
+    for i in range(20):
+        q.publish("s1", "x", "working", "", "working")
+    resync = q.latest_seq("s1")                            # what /status would hand back
+    got = q.wait_event(after_seq=resync, timeout=0.1, session_id="s1")
+    assert got is None                                     # nothing new, and NOT cursor_expired
+
+
+def test_per_owner_floor_protects_a_quiet_owner_from_a_noisy_one():
+    # A busy owner flooding events must not evict a quiet owner's unresolved doorbell OR its recent
+    # delivery history. The doorbell is pinned (invariant 2); the floor additionally keeps the
+    # quiet owner's recent DELIVERY history off the eviction budget under cross-owner pressure.
+    owners = {"s-b": "B", "s-a": "A"}
+    q = EventQueue(max_history=4, owner_floor=2, owner_resolver=_fixed_owner(owners))
+    doorbell = q.publish("s-b", "x", "waiting_for_user", "?", "waiting_for_user", decision_id="db")
+    b_hist = q.publish("s-b", "x", "done", "quiet delivery", "done_candidate")
+    for i in range(100):
+        q.publish("s-a", "x", "working", "", "working")   # noisy owner A floods
+    assert q.pending("s-b") is doorbell                    # pinned decision survives
+    assert q.latest_after(doorbell.seq, "s-b") is b_hist   # recent delivery history survives (floor)
+    # A itself is bounded: its OLD history was evicted (only recent retained).
+    first_a = q.latest_after(0, "s-a")
+    assert first_a is not None and first_a is not CURSOR_EXPIRED and first_a.seq > 50
+
+
+def test_default_owner_resolver_buckets_by_disk_owner_record():
+    # The default resolver reads the durable owner.json (daemon/owner.py), so cross-owner eviction
+    # protection works off the SAME oracle every other route uses. Real disk, no injected fake.
+    from conftest import own
+    own("s-quiet01", "B")
+    own("s-busy001", "A")
+    q = EventQueue(max_history=3, owner_floor=1)           # default (real) resolver
+    quiet = q.publish("s-quiet01", "x", "done", "b", "done_candidate")
+    for i in range(50):
+        q.publish("s-busy001", "x", "working", "", "working")
+    assert q.latest_after(0, "s-quiet01") is quiet         # protected by its DISK owner's floor
 
 
 def test_global_seq_across_sessions():

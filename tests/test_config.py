@@ -117,6 +117,24 @@ def test_delivery_confirm_seconds_loads_with_default(tmp_path):
     assert specs["b"].delivery_confirm_seconds == 3.5       # overridden
 
 
+def test_load_event_ring_defaults_when_missing(tmp_path):
+    from daemon.config import load_event_ring
+    r = load_event_ring(str(tmp_path / "absent.toml"))
+    assert (r.max_history, r.owner_floor) == (2048, 64)
+
+
+def test_load_event_ring_reads_and_validates(tmp_path):
+    from daemon.config import load_event_ring
+    cfg = tmp_path / "n.toml"
+    cfg.write_text("event_ring_max = 100\nevent_ring_owner_floor = 8\n")
+    r = load_event_ring(str(cfg))
+    assert (r.max_history, r.owner_floor) == (100, 8)
+    # non-int / bool / below-floor fall back to defaults (never crash the load).
+    cfg.write_text("event_ring_max = 0\nevent_ring_owner_floor = true\n")
+    r = load_event_ring(str(cfg))
+    assert (r.max_history, r.owner_floor) == (2048, 64)   # max floor is 1; bool rejected
+
+
 def test_load_retention_defaults_when_missing(tmp_path):
     from daemon.config import load_retention
     r = load_retention(str(tmp_path / "absent.toml"))
