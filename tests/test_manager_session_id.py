@@ -76,6 +76,13 @@ def test_start_honors_a_router_assigned_wide_uuid4_shaped_id():
     "no-prefix12345678",      # missing the s- prefix
     "s-" + "a" * 65,          # over the accepted length
     "s-ABCDEF12",             # uppercase hex rejected (charset is lowercase-only)
+    "s-deadbeef\n",           # trailing newline: `re.match(r"...$")` would accept this (`$` matches
+                              # just before a final "\n") -- the id becomes a `sessions/<sid>/`
+                              # directory name AND is exported as NELIX_SESSION / interpolated into
+                              # hook curl URLs, so a smuggled newline breaks curl silently (review
+                              # finding #1). `.fullmatch()` (no `$`/`^`) has no such gap.
+    "s-deadbeef ",            # trailing space
+    "s-dead\nbeef",           # embedded newline
 ])
 def test_start_rejects_bad_shaped_session_id(bad):
     m, captured = _mgr()
@@ -92,7 +99,7 @@ def test_start_rejects_a_live_session_id_collision():
         m.start(EXECUTOR, "t2", "/tmp", owner_id=OWNER, session_id="s-11112222")
 
 
-def test_start_rejects_an_on_disk_session_id_collision(tmp_path):
+def test_start_rejects_an_on_disk_session_id_collision():
     # A session that already exited leaves its directory on disk; a router-supplied id naming
     # that directory must not be silently reused/clobbered (spec §3), even though it is no
     # longer LIVE in the registry.

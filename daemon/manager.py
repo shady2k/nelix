@@ -28,15 +28,13 @@ _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the C
 # router will mint (a full UUID4 rendered as 32 hex chars, e.g. `s-` + 32 hex) without committing
 # to one exact width — a ULID-as-hex rendering or a UUID's dashless hex both fit. Uppercase hex is
 # deliberately rejected: one canonical casing, so two spellings of one id never look like two ids.
-_SESSION_ID_RE = re.compile(r"^s-[0-9a-f]{8,64}$")
-
-# The caller-facing operations /capabilities (spec §8) reports on. These five never vary with a
-# session's driver/launcher facts TODAY (respond/stop/restart/dialog/screen all go through the
-# manager/session machinery uniformly, regardless of which driver or launcher backs a session) —
-# only `message` does, via `hook_capable` (see `_session_capabilities` below). Listed here, not
-# inferred, so the set is a single visible source of truth rather than implicit in the code that
-# builds the response.
-_STATIC_CALLER_OPERATIONS = ("respond", "stop", "restart", "dialog", "screen")
+#
+# No `$`/`^` anchors: `.fullmatch()` (used by `validate_session_id_shape` below) already pins both
+# ends, and unlike `$`, `fullmatch()` does NOT let a trailing "\n" sneak through — `re.match(r"...$")`
+# accepts "s-deadbeef\n" because `$` matches immediately before a final newline (review finding, this
+# id becomes a directory name AND is exported as `NELIX_SESSION`/interpolated into hook curl URLs, so
+# a smuggled newline breaks curl and silently drops the session's hooks + message channel).
+_SESSION_ID_RE = re.compile(r"s-[0-9a-f]{8,64}")
 
 
 class ModelRejected(ValueError):
@@ -73,10 +71,21 @@ class SessionIdInUse(ValueError):
         self.session_id = session_id
 
 
-def _validate_session_id_shape(session_id):
-    """Shape-check a router-supplied `session_id`. Raises SessionIdRejected. See `_SESSION_ID_RE`
-    for the accepted alphabet/width and why it is safe as a directory-name component verbatim."""
-    if not isinstance(session_id, str) or _SESSION_ID_RE.match(session_id) is None:
+def validate_session_id_shape(session_id):
+    """Shape-check a caller-supplied `session_id`. Raises SessionIdRejected. See `_SESSION_ID_RE`
+    for the accepted alphabet/width and why it is safe as a directory-name component verbatim.
+
+    NOT underscore-prefixed: this is THE one shared daemon-local validator, reused verbatim by
+    `daemon/rpc_server.py` for every route that takes a caller-supplied session_id used as a path
+    component (spec review nelix-9a4.6 finding #3) — /start (via `_spawn` below), /status,
+    /dialog, /screen, /restart, /hook/<sid>, /message/<sid>. One regex, one place the accepted
+    shape can be read, rather than a copy per route that could quietly drift apart.
+
+    `.fullmatch()`, not `.match()` against an anchored pattern: `re.match(r"...$")` would accept
+    "s-deadbeef\\n" because `$` matches just before a trailing newline. `fullmatch()` has no such
+    gap — the whole string must match, full stop.
+    """
+    if not isinstance(session_id, str) or _SESSION_ID_RE.fullmatch(session_id) is None:
         raise SessionIdRejected(f"invalid session_id: {session_id!r}")
 
 
@@ -193,30 +202,27 @@ def _session_capabilities(session_id, sess):
     `screen()` already reads `sess._cols`/`sess._rows` off — reaching into a live Session from the
     manager is an established pattern here, not a new one).
 
-    `message` is the one caller-facing operation gated on `hook_capable`: the nelix-question/
-    nelix-note tools (the ONLY way an executor calls POST /message) are injected into argv only
-    for a hook-capable driver's session (daemon/launchers/local.py `_driver_hook_capable`) — a
-    hookless session has no working message channel. Every other operation
-    (`_STATIC_CALLER_OPERATIONS`) goes through the manager/session machinery uniformly regardless
-    of driver/launcher, so it is unconditionally supported today.
-
-    `unsupported_by_generation` names the code a caller of `message` on THIS session would need
-    to know about (nelix-9a4.6 deliverable D): the ONE reachable+tested use of that code, by
-    design — see the module docstring discussion in the task brief for why a real cross-generation
-    gate would be dead code with a single generation.
+    Review correction (nelix-9a4.6 fix pass): this used to also emit a per-operation
+    `operations: {op: {"supported": ...}}` map, including a `message` entry coded
+    `unsupported_by_generation` whenever `hook_capable` was False. Both reviewers flagged that as
+    FABRICATED: spec §8's `unsupported_by_generation` names a CROSS-GENERATION incompatibility
+    (an operation an OLDER session cannot serve, checked against THIS generation's capability) —
+    it has nothing to do with `hook_capable`, a per-DRIVER fact that varies within one generation.
+    Worse, `/message` (daemon/rpc_server.py `_dispatch_message`) does not actually gate on
+    `hook_capable` at all, so the removed map advertised a failure code the operation could never
+    return. The real §8 "OR per-session capabilities" mechanism, delivered now, is just the FACTS
+    below (session-scoped, truthful, nothing fabricated); a genuine `unsupported_by_generation`
+    response is DEFERRED to Plan 4 (nelix-3rm's successor, multi-generation lifecycle), where more
+    than one generation coexisting makes the cross-generation case real and worth gating on.
     """
     hook_capable = bool(getattr(sess._driver, "hook_capable", False))
     caps = sess._launcher.capabilities
-    operations = {op: {"supported": True} for op in _STATIC_CALLER_OPERATIONS}
-    operations["message"] = ({"supported": True} if hook_capable else
-                             {"supported": False, "code": "unsupported_by_generation"})
     return {
         "session_id": session_id,
         "executor": sess.executor,
         "hook_capable": hook_capable,
         "isolation_class": caps.isolation_class,
         "can_attach": caps.can_attach,
-        "operations": operations,
     }
 
 
@@ -411,8 +417,17 @@ class SessionManager:
             # default) -> self-mint below, byte-identical to pre-feature. restart() never passes one
             # (it has no session_id parameter of its own), so the self-mint path there is unaffected.
             if session_id is not None:
-                _validate_session_id_shape(session_id)
+                try:
+                    validate_session_id_shape(session_id)
+                except SessionIdRejected:
+                    if self._logger is not None:
+                        self._logger.warning("manager", "session_start_rejected",
+                                             reason="invalid_session_id", executor=executor_name)
+                    raise
                 if self._session_id_exists(session_id):
+                    if self._logger is not None:
+                        self._logger.warning("manager", "session_start_rejected",
+                                             reason="session_id_in_use", executor=executor_name)
                     raise SessionIdInUse(session_id)
             # Per-session model override (nelix-9k0): validate + fold BEFORE the lock/cap checks so a
             # bad-shape or unsupported-driver model returns 400, never a 409 "daemon full". Omitted
@@ -443,6 +458,9 @@ class SessionManager:
                         f"(close a completed session with nelix_stop before starting more)")
                 if session_id is not None:
                     if session_id in self._sessions:   # closes the TOCTOU window vs. the pre-lock check
+                        if self._logger is not None:
+                            self._logger.warning("manager", "session_start_rejected",
+                                                 reason="session_id_in_use", executor=executor_name)
                         raise SessionIdInUse(session_id)
                     sid = session_id
                 else:
@@ -847,6 +865,12 @@ class SessionManager:
         capabilities. Deliberately minimal (see the brief): a global response cannot answer a
         per-session question (that is the whole §8 point), so it stays a convenience, not the
         primary surface.
+
+        Review correction: the per-session FACTS returned by `_session_capabilities` (executor,
+        hook_capable, isolation_class, can_attach) ARE this generation's delivered "OR per-session
+        capabilities" half of §8 — with only one generation running, a stable
+        `unsupported_by_generation` RESPONSE CODE would have nothing real to be cross-generation
+        about, so it is deferred to Plan 4 (multi-generation lifecycle), not fabricated here.
         """
         if session_id is not None:
             sess = self._owned(session_id, owner_id)
