@@ -418,7 +418,8 @@ def test_capabilities_still_serves_its_owner(two_harnesses):
     base, mgr, made, sx, sy = two_harnesses
     st, b = _req("GET", base + f"/capabilities?owner_id={X}&sid={sx}")
     assert st == 200 and b["session_id"] == sx
-    assert b["operations"]["respond"]["supported"] is True
+    assert b["hook_capable"] is True   # a real fact (FakeSession's _StubDriver), not an operation code
+    assert "operations" not in b
 
 
 def test_capabilities_requires_an_owner(two_harnesses):
