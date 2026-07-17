@@ -9,7 +9,9 @@ half was fixed by the plugin extraction (4d83167): Hermes is one harness among s
 core that keeps its sessions inside one harness's home is the same category of wrong from the
 other side. The root is now the core's own, and no harness's home appears in this file.
 """
+import hashlib
 import os
+import stat
 from pathlib import Path
 
 # The default state root. NOT XDG: macOS normally has no XDG_RUNTIME_DIR, so an XDG default
@@ -78,6 +80,60 @@ def sun_path_overflow(path) -> str | None:
     return (f"AF_UNIX socket path {str(path)!r} is {n} bytes; this platform allows at most "
             f"{SUN_PATH_MAX - 1}. If it sits under $NELIX_HOME, point NELIX_HOME at a shorter "
             f"path; if it came from $NELIX_RPC_SOCK, shorten that.")
+
+
+# --- router runtime location [nelix-3rm.1] ---------------------------------------------
+# The router's PUBLIC socket + its one-per-NELIX_HOME lock cannot live under nelix_root():
+# $NELIX_HOME is operator-settable (see sun_path_overflow above), so a socket placed under it
+# inherits whatever depth the operator chose — a temp dir or a worktree easily overflows
+# sun_path. The router needs a location whose LENGTH never depends on $NELIX_HOME, so it is
+# keyed by a fixed-width HASH of the canonical root instead of the root's own text.
+
+# Deliberately NOT $TMPDIR: macOS sets $TMPDIR to a long per-user path
+# (/var/folders/xx/.../T/), which can consume most of the sun_path budget before the per-uid/
+# hash suffix is even added. "/tmp" is the shortest base every relevant platform provides;
+# NELIX_RUNTIME_BASE exists so containers/tests can redirect it, not so production changes it.
+DEFAULT_ROUTER_RUNTIME_BASE = "/tmp"
+
+# sha256 hex digits used to key the runtime dir off nelix_root(). 12 hex chars = 48 bits of
+# entropy — negligible collision risk across the handful of $NELIX_HOMEs one uid ever runs,
+# while keeping the total socket path comfortably inside sun_path. (Same width, same
+# rationale, as runtime.py's _BUILD_ID_HASH_LEN.)
+ROUTER_HASH_LEN = 12
+
+
+def router_runtime_base() -> Path:
+    """The short base the router's per-uid runtime namespace hangs off. `NELIX_RUNTIME_BASE`
+    overrides it (documented above); default is the literal "/tmp", NOT resolved through any
+    symlink (macOS's /tmp -> /private/tmp is still short, but resolving buys nothing and only
+    spends bytes we deliberately kept spare)."""
+    val = os.environ.get("NELIX_RUNTIME_BASE", "").strip() or DEFAULT_ROUTER_RUNTIME_BASE
+    return Path(val)
+
+
+def router_runtime_dir() -> Path:
+    """Short, per-uid, hash-keyed runtime directory for the router's public socket + lock.
+
+    `<base>/nelix-<uid>/<hash>`: per-uid so two users never share a node; the hash is over
+    `str(nelix_root())`, which is already canonicalised (see nelix_root's docstring), so
+    distinct $NELIX_HOMEs get distinct locations and any alias of the SAME home (symlink,
+    `~` vs absolute, a trailing `..`) always resolves to the SAME one.
+    """
+    key = hashlib.sha256(str(nelix_root()).encode()).hexdigest()[:ROUTER_HASH_LEN]
+    return router_runtime_base() / f"nelix-{os.getuid()}" / key
+
+
+def router_sock() -> Path:
+    """AF_UNIX socket node for the router's PUBLIC transport. A pure accessor like rpc_sock():
+    it does not check sun_path (see sun_path_overflow — the bind site checks that) and does
+    not create anything (see ensure_router_runtime_dir for that)."""
+    return router_runtime_dir() / "router.sock"
+
+
+def router_lock() -> Path:
+    """The router's one-per-NELIX_HOME advisory lock (daemon/singleton.py acquires it), living
+    beside router_sock() in the same verified runtime dir."""
+    return router_runtime_dir() / "router.lock"
 
 
 def sessions_root() -> Path:
@@ -217,3 +273,78 @@ def private_opener(path, flags):
     """Use as `open(..., opener=private_opener)` so a freshly created file is 0600 with no
     chmod race. Existing files keep their mode, but they live in a 0700 dir so stay private."""
     return os.open(path, flags, 0o600)
+
+
+class RouterRuntimeDirRejected(ValueError):
+    """Raised by ensure_owned_private_dir() when an existing node fails the not-a-symlink /
+    owner / mode check. There is no recovery path other than the operator clearing the node
+    themselves — see the function's docstring for why this must never auto-correct."""
+
+
+def ensure_owned_private_dir(path) -> Path:
+    """Create ONE directory level as a private (0700), uid-owned, real (non-symlink)
+    directory — or verify that an existing one already is all three. This is the ssh-agent /
+    tmux socket-dir pattern, needed because the router's runtime dir hangs off a
+    WORLD-WRITABLE parent (`/tmp` by default): a plain `mkdir` there is a pre-creation /
+    symlink attack surface (an attacker who wins the race to create the node first controls
+    it before we ever touch it), and ensure_private_dir doesn't help — it only tightens mode
+    on a directory it already trusts, and never checks ownership or rejects a symlink.
+
+    - If `path` does not exist: create it with mode 0700 AND chmod it 0700 explicitly
+      afterward. The explicit chmod is not redundant: mkdir's mode argument is masked by
+      umask, so under a pathological umask that strips owner bits, mkdir alone would not
+      reach 0700. Passing 0700 to mkdir itself still matters — it is what keeps the directory
+      at 0700 for the single syscall that creates it, with no window where a concurrent
+      verifier (a race-safe caller — see below) could observe a looser mode.
+    - If `path` exists: verify via `os.lstat` — NOT `stat`, which follows a symlink and would
+      report the TARGET's attributes instead of the node's own — that it is a real directory
+      (not a symlink, not a file), owned by `os.getuid()`, and exactly mode 0700. Any mismatch
+      RAISES RouterRuntimeDirRejected; nothing here ever chmods, chowns, or deletes an
+      existing node to make it match. Adopting a node we don't already own/control is exactly
+      the attack this defends against, and silently deleting something under /tmp that some
+      other process created is its own hazard — surfacing the conflict is the only safe move.
+    - Race-safe: `mkdir` is atomic, so a concurrent creator racing us is not a bug — its
+      `FileExistsError` falls through to the same verify path a pre-existing node would take.
+
+    Callers preparing a multi-level path (see ensure_router_runtime_dir) must call this once
+    per level, SHALLOWEST FIRST, so each level is verified before the next is created inside
+    it — calling it only on the deepest path would let an attacker plant a bad intermediate
+    directory unnoticed.
+    """
+    path = Path(path)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    else:
+        os.chmod(path, 0o700)
+        return path
+
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise RouterRuntimeDirRejected(
+            f"{path} is a symlink, not a private directory; refusing to reuse or replace it")
+    if not stat.S_ISDIR(st.st_mode):
+        raise RouterRuntimeDirRejected(
+            f"{path} exists and is not a directory; refusing to reuse it")
+    if st.st_uid != os.getuid():
+        raise RouterRuntimeDirRejected(
+            f"{path} exists but is owned by uid {st.st_uid}, not this process's uid "
+            f"{os.getuid()} (owner mismatch); refusing to adopt a node we do not own")
+    if st.st_mode & 0o777 != 0o700:
+        raise RouterRuntimeDirRejected(
+            f"{path} exists with mode {oct(st.st_mode & 0o777)}, not 0700; refusing to "
+            f"adopt it — fix its mode (or remove it, if it is not nelix's) and retry")
+    return path
+
+
+def ensure_router_runtime_dir() -> Path:
+    """Create-or-verify the router's full runtime location, shallowest level first: the
+    per-uid base directory, then the hash subdir inside it. This is the ONLY sanctioned way
+    to prepare the directory router_sock()/router_lock() live in — see
+    ensure_owned_private_dir for why a plain mkdir(parents=True) is not safe here. Returns
+    router_runtime_dir()."""
+    d = router_runtime_dir()
+    for level in (d.parent, d):
+        ensure_owned_private_dir(level)
+    return d
