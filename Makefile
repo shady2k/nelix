@@ -1,6 +1,7 @@
 # Nelix — common dev commands. Run `make` (or `make help`) for the list.
-# Python project: a virtualenv plus requirements.txt. (The out-of-process daemon installs its own
-# hash-pinned deps from requirements-daemon.lock at runtime; this venv is for tests + tooling.)
+# Python project: a virtualenv plus requirements.txt. (This venv is for tests + tooling. A shipped
+# daemon does not use it: it runs from an immutable runtime under ~/.nelix/runtimes/<build-id>,
+# frozen at install time from requirements-runtime.lock — see runtime.py.)
 
 VENV ?= .venv
 PY   := $(VENV)/bin/python

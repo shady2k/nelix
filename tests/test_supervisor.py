@@ -303,137 +303,6 @@ def test_ensure_running_reaps_stale_orphan_and_respawns(monkeypatch, tmp_path):
             orphan.kill()
 
 
-def test_ensure_deps_installs_from_hash_lock_when_missing(monkeypatch):
-    importlib.reload(supervisor)
-    calls = []
-    # missing before install, present after (calls non-empty post-run)
-    monkeypatch.setattr(supervisor, "_deps_present", lambda: bool(calls))
-    monkeypatch.setattr(supervisor, "_lazy_installs_allowed", lambda: True)
-    monkeypatch.setattr(supervisor, "_venv_pip_install",
-                        lambda req: (calls.append(req) or (True, "")))
-    supervisor._ensure_deps()
-    assert calls == [supervisor._DAEMON_LOCK]      # installs from the hash-pinned lock, not bare specs
-
-
-def test_deps_present_requires_exact_version(monkeypatch):
-    importlib.reload(supervisor)
-    versions = {"wasmtime": "45.0.0", "ptyprocess": "0.7.0"}
-    monkeypatch.setattr(supervisor.importlib.metadata, "version", lambda n: versions[n])
-    assert supervisor._deps_present() is True
-    versions["wasmtime"] = "44.0.0"                # a wrong version present must NOT count as ok
-    assert supervisor._deps_present() is False
-
-
-def test_deps_present_false_when_distribution_missing(monkeypatch):
-    importlib.reload(supervisor)
-
-    def boom(name):
-        raise supervisor.importlib.metadata.PackageNotFoundError(name)
-    monkeypatch.setattr(supervisor.importlib.metadata, "version", boom)
-    assert supervisor._deps_present() is False
-
-
-def test_deps_present_false_when_module_files_gone(monkeypatch):
-    # exact metadata present but the module is not importable (corrupted install) -> reinstall
-    importlib.reload(supervisor)
-    monkeypatch.setattr(supervisor.importlib.metadata, "version",
-                        lambda n: {"wasmtime": "45.0.0", "ptyprocess": "0.7.0"}[n])
-    monkeypatch.setattr(supervisor.importlib.util, "find_spec", lambda m: None)
-    assert supervisor._deps_present() is False
-
-
-def test_ensure_deps_raises_when_lazy_installs_disabled(monkeypatch):
-    importlib.reload(supervisor)
-    monkeypatch.setattr(supervisor, "_deps_present", lambda: False)
-    monkeypatch.setattr(supervisor, "_lazy_installs_allowed", lambda: False)
-    import pytest as _pt
-    with _pt.raises(RuntimeError):
-        supervisor._ensure_deps()
-
-
-def test_ensure_deps_raises_when_install_fails(monkeypatch):
-    importlib.reload(supervisor)
-    monkeypatch.setattr(supervisor, "_deps_present", lambda: False)  # never becomes present
-    monkeypatch.setattr(supervisor, "_lazy_installs_allowed", lambda: True)
-    monkeypatch.setattr(supervisor, "_venv_pip_install", lambda specs: (False, "boom"))
-    import pytest as _pt
-    with _pt.raises(RuntimeError):
-        supervisor._ensure_deps()
-
-
-def _record_run(record, rc_for):
-    def fake(cmd, **k):
-        record.append(cmd)
-        class R:
-            returncode = rc_for(cmd)
-            stdout = ""
-            stderr = ""
-        return R()
-    return fake
-
-
-def test_venv_pip_install_prefers_uv_with_require_hashes(monkeypatch):
-    importlib.reload(supervisor)
-    monkeypatch.setattr(supervisor.shutil, "which",
-                        lambda b: "/usr/bin/uv" if b == "uv" else None)
-    record = []
-    monkeypatch.setattr(supervisor.subprocess, "run", _record_run(record, lambda cmd: 0))
-    ok, _out = supervisor._venv_pip_install("/lock")
-    assert ok is True
-    assert record[0][0] == "/usr/bin/uv" and record[0][1:3] == ["pip", "install"]
-    assert "--require-hashes" in record[0] and record[0][-2:] == ["-r", "/lock"]
-    assert len(record) == 1  # uv succeeded -> no pip fallback
-
-
-def test_venv_pip_install_falls_through_to_pip_when_uv_fails(monkeypatch):
-    importlib.reload(supervisor)
-    monkeypatch.setattr(supervisor.shutil, "which",
-                        lambda b: "/usr/bin/uv" if b == "uv" else None)
-    record = []
-    # uv present but exits non-zero -> must fall through to the pip tier
-    monkeypatch.setattr(supervisor.subprocess, "run",
-                        _record_run(record, lambda cmd: 1 if cmd[0] == "/usr/bin/uv" else 0))
-    ok, _out = supervisor._venv_pip_install("/lock")
-    assert ok is True
-    assert record[0][0] == "/usr/bin/uv"  # uv tried first
-    assert any(c[:3] == [sys.executable, "-m", "pip"] and "--require-hashes" in c for c in record)
-
-
-def test_venv_pip_install_falls_back_to_pip_when_no_uv(monkeypatch):
-    importlib.reload(supervisor)
-    monkeypatch.setattr(supervisor.shutil, "which", lambda b: None)
-    record = []
-    monkeypatch.setattr(supervisor.subprocess, "run", _record_run(record, lambda cmd: 0))
-    ok, _out = supervisor._venv_pip_install("/lock")
-    assert ok is True
-    assert [sys.executable, "-m", "pip", "--version"] in record
-    assert any(c[:3] == [sys.executable, "-m", "pip"] and "--require-hashes" in c for c in record)
-
-
-def test_venv_pip_install_bootstraps_ensurepip_when_pip_missing(monkeypatch):
-    importlib.reload(supervisor)
-    monkeypatch.setattr(supervisor.shutil, "which", lambda b: None)
-    record = []
-    monkeypatch.setattr(supervisor.subprocess, "run",
-                        _record_run(record, lambda cmd: 1 if "--version" in cmd else 0))
-    ok, _out = supervisor._venv_pip_install("/lock")
-    assert ok is True
-    assert any("ensurepip" in c for c in record)
-
-
-def test_disable_uv_env_forces_pip_tier(monkeypatch):
-    importlib.reload(supervisor)
-    monkeypatch.setenv("NELIX_DISABLE_UV", "1")
-    monkeypatch.setattr(supervisor.shutil, "which",
-                        lambda b: "/usr/bin/uv" if b == "uv" else None)
-    record = []
-    monkeypatch.setattr(supervisor.subprocess, "run", _record_run(record, lambda cmd: 0))
-    ok, _out = supervisor._venv_pip_install("/lock")
-    assert ok is True
-    assert all(c[0] != "/usr/bin/uv" for c in record)   # uv skipped despite being on PATH
-    assert any(c[:3] == [sys.executable, "-m", "pip"] for c in record)
-
-
 def test_daemon_log_is_per_spawn_named_under_logs_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(supervisor)
@@ -508,7 +377,6 @@ def test_ensure_running_reuses_race_winner(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import importlib, supervisor
     importlib.reload(supervisor)
-    monkeypatch.setattr(supervisor, "_ensure_deps", lambda: None)
     monkeypatch.setattr(supervisor, "_open_daemon_log", lambda root: tmp_path / "d.log")
 
     # endpoint: first call (top of ensure_running) None; later (after our spawn "loses") -> winner
@@ -604,7 +472,6 @@ def test_daemon_env_pins_the_resolved_nelix_home_and_drops_hermes_home(monkeypat
         captured.update(kw.get("env") or {})
         return _Proc()
 
-    monkeypatch.setattr(supervisor, "_ensure_deps", lambda: None)
     monkeypatch.setattr(supervisor.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(supervisor, "_healthy", lambda t: True)
     monkeypatch.setattr(supervisor, "_owns_lock", lambda pid: True)
