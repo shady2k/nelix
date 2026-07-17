@@ -19,8 +19,8 @@ class FakeManager:
     def __init__(self): self._events = EventQueue(); self.calls = []
     def start(self, e, t, c, *, owner_id, model=None, session_id=None):
         self.calls.append(("start", e, t, c))
-        return StartOutcome(session_id="s1", base_seq=0,
-                            snapshot={"session_id": "s1", "control_state": "busy",
+        return StartOutcome(session_id="s-00000001", base_seq=0,
+                            snapshot={"session_id": "s-00000001", "control_state": "busy",
                                       "task_delivery": "pending", "pending": False})
     def respond(self, s, a, *, owner_id, decision_id=None):
         self.calls.append(("respond", s, a, decision_id))
@@ -61,12 +61,12 @@ def test_rpc_client_roundtrip():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         c = RpcClient(Transport.tcp("127.0.0.1", 8781, "t"), OWNER)
-        assert c.start(EXECUTOR, "go", "/repo")["session_id"] == "s1"
+        assert c.start(EXECUTOR, "go", "/repo")["session_id"] == "s-00000001"
         assert ("start", EXECUTOR, "go", "/repo") in m.calls
-        ok, body = c.respond("s1", "yes")
-        assert ok is True and ("respond", "s1", "yes", None) in m.calls
+        ok, body = c.respond("s-00000001", "yes")
+        assert ok is True and ("respond", "s-00000001", "yes", None) in m.calls
         assert body["decision_id"] == "dec-x"
-        assert c.stop("s1")["status"] == "stopped"
+        assert c.stop("s-00000001")["status"] == "stopped"
     finally:
         srv.shutdown()
 

@@ -16,8 +16,8 @@ class FakeManager:
         self.respond_status = "resumed"; self.started_model = "__unset__"
     def start(self, executor, task, cwd, *, owner_id, model=None, session_id=None):
         self.started = (executor, task, cwd); self.started_model = model
-        return StartOutcome(session_id="s1", base_seq=0,
-                            snapshot={"session_id": "s1", "control_state": "busy",
+        return StartOutcome(session_id="s-00000001", base_seq=0,
+                            snapshot={"session_id": "s-00000001", "control_state": "busy",
                                       "task_delivery": "pending", "pending": False})
     def respond(self, session_id, answer, *, owner_id, decision_id=None):
         self.responded.append((session_id, answer, decision_id)); s = self.respond_status
@@ -81,7 +81,7 @@ def _req(method, url, token="t", body=None, headers=None):
 
 
 def test_rpc_session_scoped_roundtrip():
-    own("s1")   # /wait only arms on a session the caller owns
+    own("s-00000001")   # /wait only arms on a session the caller owns
     m = FakeManager()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8766, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -89,25 +89,25 @@ def test_rpc_session_scoped_roundtrip():
     try:
         st, b = _req("POST", base + "/start",
                      body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "owner_id": OWNER})
-        assert st == 200 and b["operation"] == "start" and b["session_id"] == "s1"
+        assert st == 200 and b["operation"] == "start" and b["session_id"] == "s-00000001"
         assert b["next_after_seq"] == 0          # daemon-owned start cursor (high-water before start)
         assert m.started == (EXECUTOR, "hi", "/repo")
-        m._events.publish("s1", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
-        _, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id=s1")
-        assert wb["event"]["session_id"] == "s1"
+        m._events.publish("s-00000001", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
+        _, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id=s-00000001")
+        assert wb["event"]["session_id"] == "s-00000001"
         st, rb = _req("POST", base + "/respond",
-                      body={"session_id": "s1", "answer": "yes", "decision_id": "dec-1", "owner_id": OWNER})  # names the decision
-        assert st == 200 and m.responded[-1] == ("s1", "yes", "dec-1")
+                      body={"session_id": "s-00000001", "answer": "yes", "decision_id": "dec-1", "owner_id": OWNER})  # names the decision
+        assert st == 200 and m.responded[-1] == ("s-00000001", "yes", "dec-1")
         assert rb["operation"] == "respond" and rb["status"] == "resumed"
         assert rb["next_after_seq"] == 7 and rb["next_action"] == "end_turn"
         m.respond_status = "stale"
         st, sb = _req("POST", base + "/respond",
-                      body={"session_id": "s1", "answer": "yes", "decision_id": "dec-stale", "owner_id": OWNER})
+                      body={"session_id": "s-00000001", "answer": "yes", "decision_id": "dec-stale", "owner_id": OWNER})
         assert st == 409 and sb["status"] == "stale"
         assert sb["pending"]["decision_id"] == "dec-1"               # current decision for reconcile
         assert sb["next_action"] == "fix_call"
-        st, _ = _req("POST", base + "/stop", body={"session_id": "s1", "owner_id": OWNER})
-        assert st == 200 and m.stopped == ["s1"]
+        st, _ = _req("POST", base + "/stop", body={"session_id": "s-00000001", "owner_id": OWNER})
+        assert st == 200 and m.stopped == ["s-00000001"]
     finally:
         srv.shutdown()
 
@@ -122,12 +122,12 @@ def test_respond_without_decision_id_returns_409_missing():
     base = "http://127.0.0.1:8788"
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s1", "answer": "yes", "owner_id": OWNER})       # no decision_id
+                     body={"session_id": "s-00000001", "answer": "yes", "owner_id": OWNER})       # no decision_id
         assert st == 409 and b["operation"] == "respond"
         assert b["status"] == "missing_decision_id" and b["error"] == "missing_decision_id"
         assert b["pending"]["decision_id"] == "dec-1" and b["pending"]["text"] == "y/n?"
         assert b["next_action"] == "fix_call"
-        assert m.responded[-1] == ("s1", "yes", None)
+        assert m.responded[-1] == ("s-00000001", "yes", None)
     finally:
         srv.shutdown()
 
@@ -136,7 +136,7 @@ def test_respond_missing_answer_is_400():
     srv = make_server(FakeManager(), Transport.tcp("127.0.0.1", 8786, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("POST", "http://127.0.0.1:8786/respond", body={"session_id": "s1", "owner_id": OWNER})
+        st, b = _req("POST", "http://127.0.0.1:8786/respond", body={"session_id": "s-00000001", "owner_id": OWNER})
         assert st == 400 and "missing field" in b.get("error", "") and "answer" in b["error"]
     finally:
         srv.shutdown()
@@ -152,7 +152,7 @@ class _WedgedManager:
     def __init__(self): self._events = EventQueue()
     def respond(self, session_id, answer, *, owner_id, decision_id=None):
         return RespondOutcome("write_timeout",
-                              snapshot={"session_id": "s-w", "control_state": "busy", "pending": False})
+                              snapshot={"session_id": "s-0000dead", "control_state": "busy", "pending": False})
 
 
 def test_respond_write_timeout_is_503():
@@ -162,7 +162,7 @@ def test_respond_write_timeout_is_503():
     buf = io.StringIO()
     srv, base = _serve(_WedgedManager(), buf)
     try:
-        st, b = _req("POST", base + "/respond", body={"session_id": "s-w", "answer": "1", "owner_id": OWNER})
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-0000dead", "answer": "1", "owner_id": OWNER})
         assert st == 503 and b["status"] == "write_timeout" and b["next_action"] == "recover"
     finally:
         srv.shutdown()
@@ -173,7 +173,7 @@ class _UnconfirmedManager:
     def __init__(self): self._events = EventQueue()
     def respond(self, session_id, answer, *, owner_id, decision_id=None):
         return RespondOutcome("respond_failed", decision_id="dec-1", answered_decision_id="dec-1",
-                              snapshot={"session_id": "s-u", "control_state": "busy", "pending": False})
+                              snapshot={"session_id": "s-0000beef", "control_state": "busy", "pending": False})
 
 
 def test_respond_unconfirmed_submit_is_503_recover():
@@ -184,7 +184,7 @@ def test_respond_unconfirmed_submit_is_503_recover():
     buf = io.StringIO()
     srv, base = _serve(_UnconfirmedManager(), buf)
     try:
-        st, b = _req("POST", base + "/respond", body={"session_id": "s-u", "answer": "do the thing", "owner_id": OWNER})
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-0000beef", "answer": "do the thing", "owner_id": OWNER})
         assert st == 503 and b["status"] == "respond_failed" and b["next_action"] == "recover"
         assert b["error"] == "submit_unconfirmed"
         assert b["snapshot"]["pending"] is False
@@ -210,7 +210,7 @@ def test_respond_at_capacity_is_503_honest_backpressure():
     buf = io.StringIO()
     srv, base = _serve(_AtCapacityManager(), buf)
     try:
-        st, b = _req("POST", base + "/respond", body={"session_id": "s-cap", "answer": "continue", "owner_id": OWNER})
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-0000cafe", "answer": "continue", "owner_id": OWNER})
         assert st == 503
         assert b["operation"] == "respond" and b["status"] == "at_capacity"
         assert b["status"] != "no_pending" and b.get("error") != "no_pending_decision"
@@ -242,7 +242,7 @@ def test_respond_not_delivered_executor_finished_is_200_refresh_status():
     srv, base = _serve(_NotDeliveredManager(reason="executor_finished"), buf)
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1", "owner_id": OWNER})
+                     body={"session_id": "s-00000001", "answer": "use a", "decision_id": "q_1", "owner_id": OWNER})
         assert st == 200
         assert b["operation"] == "respond" and b["status"] == "not_delivered"
         assert b["reason"] == "executor_finished"
@@ -254,11 +254,11 @@ def test_respond_not_delivered_executor_finished_is_200_refresh_status():
 def test_respond_not_delivered_in_session_closing_carries_snapshot_no_reason():
     # Task 4 in-Session closing/terminal path predates the `reason` field (always None there) but
     # DOES carry a snapshot — both must reach the caller so Hermes can tell the two sub-cases apart.
-    snap = {"session_id": "s1", "control_state": "terminal", "terminal_kind": "crashed"}
+    snap = {"session_id": "s-00000001", "control_state": "terminal", "terminal_kind": "crashed"}
     srv, base = _serve(_NotDeliveredManager(reason=None, snapshot=snap), __import__("io").StringIO())
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1", "owner_id": OWNER})
+                     body={"session_id": "s-00000001", "answer": "use a", "decision_id": "q_1", "owner_id": OWNER})
         assert st == 200 and b["status"] == "not_delivered"
         assert b["reason"] is None
         assert b["snapshot"]["terminal_kind"] == "crashed"
@@ -287,7 +287,7 @@ def test_respond_queued_async_answer_is_200_not_false_no_pending():
     srv, base = _serve(_QueuedManager(), __import__("io").StringIO())
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s1", "answer": "use a", "decision_id": "q_1", "owner_id": OWNER})
+                     body={"session_id": "s-00000001", "answer": "use a", "decision_id": "q_1", "owner_id": OWNER})
         assert st == 200
         assert b["operation"] == "respond" and b["status"] == "queued"
         assert b["status"] != "no_pending" and b.get("error") != "no_pending_decision"
@@ -305,7 +305,7 @@ def test_start_envelope_shape():
         st, b = _req("POST", "http://127.0.0.1:8790/start",
                      body={"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "owner_id": OWNER})
         assert st == 200 and b["operation"] == "start" and b["status"] == "started"
-        assert b["session_id"] == "s1" and b["next_after_seq"] == 0
+        assert b["session_id"] == "s-00000001" and b["next_after_seq"] == 0
         assert b["snapshot"]["control_state"] == "busy" and b["next_action"] == "end_turn"
     finally:
         srv.shutdown()
@@ -316,7 +316,7 @@ def test_respond_write_timeout_is_503_recover():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8801, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("POST", "http://127.0.0.1:8801/respond", body={"session_id": "s1", "answer": "x", "owner_id": OWNER})
+        st, b = _req("POST", "http://127.0.0.1:8801/respond", body={"session_id": "s-00000001", "answer": "x", "owner_id": OWNER})
         assert st == 503 and b["status"] == "write_timeout" and b["next_action"] == "recover"
         assert b["snapshot"]["pending"] is False
     finally:
@@ -328,9 +328,9 @@ def test_respond_unknown_session_is_404_refresh_status():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8803, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("POST", "http://127.0.0.1:8803/respond", body={"session_id": "s1", "answer": "x", "owner_id": OWNER})
+        st, b = _req("POST", "http://127.0.0.1:8803/respond", body={"session_id": "s-00000001", "answer": "x", "owner_id": OWNER})
         assert st == 404 and b["operation"] == "respond" and b["status"] == "unknown_session"
-        assert b["next_action"] == "refresh_status" and b["session_id"] == "s1"
+        assert b["next_action"] == "refresh_status" and b["session_id"] == "s-00000001"
     finally:
         srv.shutdown()
 
@@ -340,7 +340,7 @@ def test_stop_confirmed_terminal_is_report():
     srv = make_server(m, Transport.tcp("127.0.0.1", 8792, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        st, b = _req("POST", "http://127.0.0.1:8792/stop", body={"session_id": "s1", "owner_id": OWNER})
+        st, b = _req("POST", "http://127.0.0.1:8792/stop", body={"session_id": "s-00000001", "owner_id": OWNER})
         assert st == 200 and b["operation"] == "stop" and b["status"] == "stopped"
         assert b["next_action"] == "report" and b["snapshot"]["terminal_kind"] == "stopped"
     finally:
@@ -361,7 +361,7 @@ def test_rpc_stop_requested_is_refresh_status():
     """/stop returning stop_requested must yield HTTP 200 with next_action='refresh_status'."""
     srv, base = _serve(_StopRequestedManager(), __import__("io").StringIO())
     try:
-        st, b = _req("POST", base + "/stop", body={"session_id": "s1", "owner_id": OWNER})
+        st, b = _req("POST", base + "/stop", body={"session_id": "s-00000001", "owner_id": OWNER})
         assert st == 200 and b["operation"] == "stop"
         assert b["status"] == "stop_requested"
         assert b["next_action"] == "refresh_status"
@@ -378,13 +378,13 @@ def test_respond_no_pending_is_409_and_logs_session_id():
     srv, base = _serve(_NoPendingManager(), buf)
     try:
         st, b = _req("POST", base + "/respond",
-                     body={"session_id": "s-xyz", "answer": "1", "decision_id": "dec-9", "owner_id": OWNER})
+                     body={"session_id": "s-0000abcd", "answer": "1", "decision_id": "dec-9", "owner_id": OWNER})
         assert st == 409 and b["error"] == "no_pending_decision"
     finally:
         srv.shutdown()
     rec = [json.loads(l) for l in buf.getvalue().splitlines()
            if json.loads(l)["event"] == "respond_no_pending"][0]
-    assert rec["session_id"] == "s-xyz"                  # NOT null
+    assert rec["session_id"] == "s-0000abcd"                  # NOT null
     assert rec["provided_decision_id"] == "dec-9" and rec["status"] == 409
 
 
@@ -585,7 +585,7 @@ def test_status_exposes_modal_options_and_prompt_kind():
 def test_respond_invalid_option_is_409_with_options():
     srv, base = _serve(_ModalManager(), __import__("io").StringIO())
     try:
-        st, b = _req("POST", base + "/respond", body={"session_id": "s1", "answer": "9", "owner_id": OWNER})
+        st, b = _req("POST", base + "/respond", body={"session_id": "s-00000001", "answer": "9", "owner_id": OWNER})
         assert st == 409 and b["error"] == "invalid_option"
         assert b["pending"]["options"][0]["id"] == "1"
     finally:

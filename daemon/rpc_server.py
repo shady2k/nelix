@@ -215,6 +215,10 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                     # session's result into another's orchestrator when the daemon is shared. Refuse
                     # it structurally: session_id is mandatory (mirrors the /dialog guard below).
                     self._send(400, {"error": "missing session_id"}); return
+                # Shape-check BEFORE owner.owns_session ever resolves `sessions_root() / sid`
+                # (nelix-9a4.6 review, follow-up finding: /wait was missed by the original pass).
+                if not self._require_valid_sid(sid):
+                    return
                 # Events are NOT owner-tagged (the queue is a global ordered log), so the filter has
                 # to be here: establish ownership of `sid` BEFORE arming, and never arm otherwise.
                 # This is the "arms a waiter for every session it sees" half of the bug — a waiter
@@ -482,14 +486,20 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             elif p.path == "/respond":
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
-                    outcome = manager.respond(body["session_id"], body["answer"],
-                                              owner_id=owner_id,
+                    sid = body["session_id"]
+                    answer = body["answer"]
+                except KeyError as e:
+                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
+                # Shape-check BEFORE manager.respond ever resolves `sessions_root() / sid` via
+                # owner.owns_session (nelix-9a4.6 review follow-up: /respond was missed by the
+                # original pass).
+                if not self._require_valid_sid(sid):
+                    return
+                try:
+                    outcome = manager.respond(sid, answer, owner_id=owner_id,
                                               decision_id=body.get("decision_id"))
                 except PtyInputRejected as e:
                     self._send(400, {"error": str(e)}); return
-                except KeyError as e:
-                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
-                sid = body.get("session_id")
                 provided = body.get("decision_id")
                 if outcome.status == "resumed":
                     self._send(200, {"operation": "respond", "status": "resumed", "session_id": sid,
@@ -582,16 +592,25 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             elif p.path == "/stop":
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
-                    outcome = manager.stop(body["session_id"], owner_id=owner_id)
+                    sid = body["session_id"]
+                except KeyError as e:
+                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
+                # Shape-check BEFORE manager.stop ever resolves `sessions_root() / sid` via
+                # owner.owns_session (nelix-9a4.6 review follow-up: /stop was missed by the
+                # original pass).
+                if not self._require_valid_sid(sid):
+                    return
+                try:
+                    outcome = manager.stop(sid, owner_id=owner_id)
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
                 if outcome.status == "unknown_session":
                     self._send(404, {"operation": "stop", "status": "unknown_session",
-                                     "session_id": body["session_id"], "error": "unknown session",
+                                     "session_id": sid, "error": "unknown session",
                                      "next_action": "refresh_status"})
                 else:
                     self._send(200, {"operation": "stop", "status": outcome.status,
-                                     "session_id": body["session_id"], "snapshot": outcome.snapshot,
+                                     "session_id": sid, "snapshot": outcome.snapshot,
                                      "next_action": "report" if outcome.status == "stopped" else "refresh_status"})
             elif p.path == "/restart":
                 # The owner is used ONLY to authorise the restart of the OLD session. The NEW

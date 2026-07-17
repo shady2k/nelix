@@ -77,9 +77,10 @@ def validate_session_id_shape(session_id):
 
     NOT underscore-prefixed: this is THE one shared daemon-local validator, reused verbatim by
     `daemon/rpc_server.py` for every route that takes a caller-supplied session_id used as a path
-    component (spec review nelix-9a4.6 finding #3) — /start (via `_spawn` below), /status,
-    /dialog, /screen, /restart, /hook/<sid>, /message/<sid>. One regex, one place the accepted
-    shape can be read, rather than a copy per route that could quietly drift apart.
+    component (spec review nelix-9a4.6 finding #3, plus a follow-up review pass that caught /wait,
+    /respond and /stop) — /start (via `_spawn` below), /status, /dialog, /screen, /restart,
+    /hook/<sid>, /message/<sid>, /wait, /respond, /stop. One regex, one place the accepted shape
+    can be read, rather than a copy per route that could quietly drift apart.
 
     `.fullmatch()`, not `.match()` against an anchored pattern: `re.match(r"...$")` would accept
     "s-deadbeef\\n" because `$` matches just before a trailing newline. `fullmatch()` has no such

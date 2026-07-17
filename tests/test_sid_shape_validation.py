@@ -16,6 +16,7 @@ refused BEFORE the filesystem/owner layer is ever touched", which only a real ow
 can falsify.
 """
 import threading
+from urllib.parse import quote
 
 import pytest
 
@@ -25,6 +26,7 @@ from daemon.events import EventQueue
 from daemon.launchers.base import ExecutorCapabilities
 from daemon.manager import SessionManager
 from daemon.rpc_server import make_server
+from daemon.session import RespondOutcome
 from daemon.transport import Transport
 from test_rpc_server import _req
 
@@ -75,6 +77,13 @@ class FakeSession:
     def stop(self):
         pass
 
+    def respond(self, answer, decision_id=None):
+        # /respond's non-idle, no-pending-async fall-through (manager.respond) lands here for this
+        # double -- enough to prove the shape check let a VALID sid reach the manager at all,
+        # which is the only thing this file cares about for /respond.
+        return RespondOutcome("resumed", seq=1, decision_id=decision_id,
+                              answered_decision_id=decision_id, snapshot=self.snapshot())
+
 
 @pytest.fixture
 def daemon():
@@ -112,7 +121,8 @@ def _start(base, tmp_path, session_id=None):
     lambda base, sid: _req("GET", base + f"/dialog?owner_id={OWNER}&session_id={sid}"),
     lambda base, sid: _req("GET", base + f"/screen?owner_id={OWNER}&session_id={sid}"),
     lambda base, sid: _req("GET", base + f"/capabilities?owner_id={OWNER}&sid={sid}"),
-], ids=["status", "dialog", "screen", "capabilities"])
+    lambda base, sid: _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id={sid}"),
+], ids=["status", "dialog", "screen", "capabilities", "wait"])
 def test_traversal_sid_is_400_and_never_reaches_the_owner_check(daemon, monkeypatch, make_req):
     base, mgr, made = daemon
 
@@ -125,6 +135,41 @@ def test_traversal_sid_is_400_and_never_reaches_the_owner_check(daemon, monkeypa
     assert b["error"]["code"] == "invalid_session_id"
     assert b["error"]["retryable"] is False
     assert "message" in b["error"]
+
+
+# ---- follow-up review pass: /wait, /respond, /stop were missed by the sweep above -----------
+
+BAD_SHAPES = [TRAVERSAL, "s-BADUPPER", "s-deadbeef\n"]
+
+
+@pytest.mark.parametrize("make_req", [
+    lambda base, sid: _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&"
+                                          f"session_id={quote(sid, safe='')}"),
+    lambda base, sid: _req("POST", base + "/respond",
+                           body={"session_id": sid, "owner_id": OWNER, "answer": "yes"}),
+    lambda base, sid: _req("POST", base + "/stop", body={"session_id": sid, "owner_id": OWNER}),
+], ids=["wait", "respond", "stop"])
+@pytest.mark.parametrize("bad_sid", BAD_SHAPES, ids=["traversal", "upper", "trailing_newline"])
+def test_wait_respond_stop_bad_shape_sid_is_400_and_never_reaches_the_owner_check(
+        daemon, monkeypatch, make_req, bad_sid):
+    """A re-review found /wait (sid from the query string), /respond and /stop (sid from the JSON
+    body) still funneled a caller-supplied sid straight into owner.owns_session ->
+    paths.sessions_root() / sid, unvalidated -- the same class of gap the original pass (finding
+    #3, see test_traversal_sid_is_400_and_never_reaches_the_owner_check above) fixed for /status,
+    /dialog, /screen, /restart, /hook, /message and /capabilities, just on three routes that sweep
+    missed. Covers the traversal Codex demonstrated, an uppercase id (outside the accepted
+    alphabet), and a trailing newline (the exact `.fullmatch()` vs `.match(r"...$")` gap
+    `validate_session_id_shape`'s docstring calls out)."""
+    base, mgr, made = daemon
+
+    def boom(*a, **k):
+        raise AssertionError("owner.owns_session must never be called for a bad-shape sid")
+    monkeypatch.setattr(owner, "owns_session", boom)
+
+    st, b = make_req(base, bad_sid)
+    assert st == 400, (st, b)
+    assert b["error"]["code"] == "invalid_session_id"
+    assert b["error"]["retryable"] is False
 
 
 def test_dialog_traversal_sid_performs_no_out_of_root_read(daemon, monkeypatch):
@@ -205,6 +250,18 @@ def test_self_minted_id_still_passes_every_validated_route(daemon, tmp_path):
     st, b = _req("POST", base + "/message/" + sid, body={"kind": "note", "summary": "x"},
                  headers={"X-Nelix-Hook-Secret": made[sid].hook_secret})
     assert st != 400
+    # /wait: publish an event first so the (real) 25s long-poll returns immediately instead of
+    # blocking -- mirrors test_rpc_server.py's test_rpc_session_scoped_roundtrip.
+    mgr._events.publish(sid, EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
+    st, b = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id={sid}")
+    assert st == 200, (st, b)
+    assert b["event"]["session_id"] == sid
+    st, b = _req("POST", base + "/respond",
+                 body={"session_id": sid, "owner_id": OWNER, "answer": "yes"})
+    assert st == 200, (st, b)              # FakeSession.respond -> RespondOutcome("resumed")
+    # /stop LAST: it ends the session, so nothing above may run after it.
+    st, b = _req("POST", base + "/stop", body={"session_id": sid, "owner_id": OWNER})
+    assert st == 200, (st, b)
 
 
 def test_router_assigned_wide_id_still_passes_every_validated_route(daemon, tmp_path):
@@ -217,5 +274,15 @@ def test_router_assigned_wide_id_still_passes_every_validated_route(daemon, tmp_
     assert _req("GET", base + f"/capabilities?owner_id={OWNER}&sid={sid}")[0] == 200
     st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id={sid}")
     assert st != 400, (st, b)
+    mgr._events.publish(sid, EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
+    st, b = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id={sid}")
+    assert st == 200, (st, b)
+    assert b["event"]["session_id"] == sid
+    st, b = _req("POST", base + "/respond",
+                 body={"session_id": sid, "owner_id": OWNER, "answer": "yes"})
+    assert st == 200, (st, b)
     st, b = _req("POST", base + "/restart", body={"session_id": sid, "owner_id": OWNER, "force": True})
+    assert st != 400, (st, b)
+    # /stop LAST, on whatever this session id now names post-restart: never 400 for shape.
+    st, b = _req("POST", base + "/stop", body={"session_id": sid, "owner_id": OWNER})
     assert st != 400, (st, b)
