@@ -19,7 +19,9 @@ requires-python = "==3.11.*"
 #     here (nelix-3rm owns it), so its list is left alone — but the INSTALL does not repeat it.
 #   - pyyaml is NOT imported anywhere under daemon/ either; only bin/nelix-doctor imports it, and
 #     nelix-doctor does not ship (see [project.scripts]). It is a tooling dep, not a runtime one.
-# wasmtime is a native wheel; pin it exactly, as requirements-daemon.lock does.
+# wasmtime is a native wheel; pin it exactly. requirements-runtime.lock is COMPILED from this list
+# and adds the hashes every installed generation is frozen from (tests/test_runtime_lock.py fails if
+# the two disagree), so this line is the single place the runtime closure is declared.
 dependencies = ["wasmtime==45.0.0"]
 
 [project.optional-dependencies]

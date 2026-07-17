@@ -12,28 +12,34 @@ different standing in this repo. Read that before changing anything here:
     bin/nelix-reap call supervisor.endpoint() to observe/reap a daemon they did not start.
     This is why supervisor.py stayed when the plugin left.
 
-  * SPAWN + THE DEPS HACK — ensure_running, _daemon_argv, _ensure_deps, _venv_pip_install.
-    Nothing in bin/ calls these; only tests do. Their one production caller was the plugin's
-    __init__.py:77 (supervisor.ensure_running()), which left for shady2k/hermes-nelix. So the
-    spawn half is currently a Python API with no CLI and no production caller. It is NOT dead
-    code: it is the raw material for `nelix daemon ensure` (nelix-3rm / Plan 3), the core entry
-    point a harness is meant to call instead of reimplementing lifecycle — which is exactly the
-    thing whose absence keeps the extracted plugin parked. The deps hack dies with the
-    immutable versioned runtime (nelix-9a4 / Plan 2).
+  * SPAWN — ensure_running, _daemon_argv. Nothing in bin/ calls these; only tests do. Their one
+    production caller was the plugin's __init__.py:77 (supervisor.ensure_running()), which left
+    for shady2k/hermes-nelix. So the spawn half is currently a Python API with no CLI and no
+    production caller. It is NOT dead code: it is the raw material for `nelix daemon ensure`
+    (nelix-3rm / Plan 3), the core entry point a harness is meant to call instead of
+    reimplementing lifecycle — which is exactly the thing whose absence keeps the extracted
+    plugin parked.
+
+  * THE DEPS HACK — _ensure_deps, _venv_pip_install, _deps_present, _lazy_installs_allowed,
+    _resolve_uv. GONE as of nelix-9a4.2; this note is here so it is not reinvented. It existed to
+    make wasmtime importable in whatever interpreter was about to run daemon.app, back when the
+    code arrived by living in a checkout that Hermes' venv could import but had never installed.
+    That interpreter no longer exists. The core is a package: `import daemon.app` only resolves
+    where nelix-core was installed, and installing it brings wasmtime with it (pyproject
+    dependencies) — "has the code" and "has the deps" became the same act [nelix-9a4.1]. A
+    generation gets both frozen into an immutable runtime by runtime.install(); a checkout gets
+    both from `-e .`. There is no third case left for the hack to cover, and its `hermes_cli`
+    import made a core module ask a harness for permission to install its own dependencies.
 
 Naming debt, deliberately left alone in the extraction pass: PLUGIN_ROOT below is now the CORE
-root. Its VALUE is right (it is where daemon/ and requirements-daemon.lock live, which is what
-the spawn needs — verified: the daemon spawns, answers RPC and tears down from this repo with
-no plugin present); only its NAME still says "plugin". Renaming it to CORE_ROOT is a pure
-rename and the natural first step of the locator work [nelix-4el.1].
+root. Its VALUE is right (it is the checkout, which is what the spawn needs when no runtime is
+installed — verified: the daemon spawns, answers RPC and tears down from this repo with no plugin
+present); only its NAME still says "plugin". Renaming it to CORE_ROOT is a pure rename and the
+natural first step of the locator work [nelix-4el.1].
 """
-import importlib
-import importlib.metadata
-import importlib.util
 import json
 import logging
 import os
-import shutil
 import signal
 import socket
 import subprocess
@@ -58,121 +64,6 @@ PLUGIN_ROOT = Path(__file__).parent          # the CORE root now — see the mod
 _HEALTH_TIMEOUT = 10.0
 _log = logging.getLogger("nelix.supervisor")
 
-# Install the daemon's deps into whichever interpreter is about to run daemon.app (our
-# sys.executable), venv-scoped, because that interpreter does not ship them.
-#
-# The old reason written here was "the Hermes runtime venv ... no plugin.yaml field installs
-# deps (pip_dependencies is a no-op)". That was a fact about the harness this file used to live
-# inside; in the core it is no longer true — sys.executable here is the operator's venv (make
-# test, bin/nelix-*), not Hermes'. The MECHANISM still means something ("the interpreter that
-# will run the daemon must have wasmtime/ptyprocess"), so it is kept as-is; only the
-# justification changed. It dies with nelix-9a4 (Plan 2, immutable versioned runtimes).
-_DAEMON_DEPS = ("wasmtime==45.0.0", "ptyprocess==0.7.0")   # top-level imports; versions checked
-_DAEMON_MODULES = ("wasmtime", "ptyprocess")              # import names (== dist names here)
-_DAEMON_LOCK = PLUGIN_ROOT / "requirements-daemon.lock"   # hash-pinned full closure for install
-
-
-def _deps_present() -> bool:
-    """True only if each imported daemon dep is installed AT ITS PINNED VERSION *and* its module
-    is on the path. Version-only would let a corrupted install (metadata present, module files
-    gone) skip the hash-locked install; importability-only would let a wrong version bypass it —
-    require both. (A broken transitive dep, e.g. wcwidth, surfaces loudly as a daemon-start
-    failure caught by the health check, not as silent corruption — so it is not checked here.)"""
-    for spec in _DAEMON_DEPS:
-        name, _, want = spec.partition("==")
-        try:
-            if importlib.metadata.version(name) != want:
-                return False
-        except importlib.metadata.PackageNotFoundError:
-            return False
-    return all(importlib.util.find_spec(m) is not None for m in _DAEMON_MODULES)
-
-
-def _lazy_installs_allowed() -> bool:
-    if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1":
-        return False
-    try:
-        from hermes_cli.config import load_config
-        return bool((load_config().get("security") or {}).get("allow_lazy_installs", True))
-    except Exception:
-        return True
-
-
-def _resolve_uv():
-    """Resolve uv for the fast install tier, honoring NELIX_DISABLE_UV=1 (force the pip tier).
-    Logs the resolved ABSOLUTE path so a PATH-shadowed uv is visible in the daemon log."""
-    if os.environ.get("NELIX_DISABLE_UV") == "1":
-        return None
-    uv = shutil.which("uv")
-    if uv:
-        _log.info("nelix daemon dep install: uv resolved to %s", uv)
-    return uv
-
-
-def _venv_pip_install(req_file):
-    """Install the hash-pinned daemon deps from *req_file* (a --require-hashes requirements lock)
-    into the active venv (sys.executable) via a uv -> pip -> ensurepip ladder, mirroring Hermes'
-    lazy installer (tools/lazy_deps.py) so it also works in a uv-managed venv that ships no pip.
-    Hash pinning makes a compromised/redirected index unable to substitute a tampered artifact.
-    Returns (ok, output)."""
-    venv_root = Path(sys.executable).parent.parent
-    env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
-    install = ["install", "--require-hashes", "-r", str(req_file)]
-    # Tier 1: uv (fast; does not need pip inside the venv).
-    uv = _resolve_uv()
-    if uv:
-        try:
-            r = subprocess.run([uv, "pip", *install], env=env,
-                               capture_output=True, text=True,
-                               stdin=subprocess.DEVNULL, timeout=300)
-            if r.returncode == 0:
-                return True, (r.stdout or "") + (r.stderr or "")
-        except (OSError, subprocess.SubprocessError):
-            pass  # fall through to pip
-    # Tier 2: python -m pip (bootstrap via ensurepip if pip is absent).
-    pip = [sys.executable, "-m", "pip"]
-    need_bootstrap = False
-    try:
-        probe = subprocess.run(pip + ["--version"], capture_output=True, text=True,
-                               stdin=subprocess.DEVNULL, timeout=30)
-        need_bootstrap = probe.returncode != 0
-    except (OSError, subprocess.SubprocessError):
-        need_bootstrap = True
-    if need_bootstrap:
-        try:
-            subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
-        except (OSError, subprocess.SubprocessError) as e:
-            return False, f"pip unavailable and ensurepip bootstrap failed: {e}"
-    try:
-        r = subprocess.run(pip + install, capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL, timeout=300)
-        return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
-    except (OSError, subprocess.SubprocessError) as e:
-        return False, f"pip install failed: {e}"
-
-
-def _ensure_deps() -> None:
-    """Make wasmtime/ptyprocess importable in the Hermes runtime venv (sys.executable).
-
-    Honors the same security gate as Hermes' lazy installer. Raises RuntimeError
-    with a manual-pip hint if installs are disabled or fail."""
-    if _deps_present():
-        return
-    manual = f"{sys.executable} -m pip install --require-hashes -r {_DAEMON_LOCK}"
-    if not _lazy_installs_allowed():
-        raise RuntimeError(
-            "nelix daemon needs " + " ".join(_DAEMON_DEPS)
-            + " but lazy installs are disabled (security.allow_lazy_installs=false). "
-            + f"Install manually: {manual}")
-    ok, output = _venv_pip_install(_DAEMON_LOCK)
-    importlib.invalidate_caches()
-    if not ok or not _deps_present():
-        raise RuntimeError(
-            "nelix daemon dependency install failed; install manually: "
-            + manual + "\n" + (output or "")[-1000:].strip())
-
-
 def _root() -> Path:
     return paths.nelix_root()
 
@@ -188,7 +79,60 @@ def state_file() -> Path:
 
 
 def _daemon_argv():
-    return [sys.executable, "-m", "daemon.app"]
+    """The daemon's launch argv — and the point at which a generation is PINNED FOR ITS WHOLE LIFE.
+
+    The interpreter chosen here becomes the daemon's `sys.executable`, and the daemon re-spawns its
+    PTY broker with exactly that (`daemon/broker_client.py:31`). Aim it at an immutable runtime and
+    every later respawn re-enters the SAME frozen code, even if a newer runtime has been installed
+    and `current` has moved on since — which is what "old sessions keep running old code" actually
+    reduces to. Aim it at a mutable checkout and it means nothing.
+
+    No runtime installed = the checkout, where sys.executable is the venv that has the core on it
+    (`-e .`). That is the dev loop, not a fallback: `runtime.active()` raises rather than land here
+    if a runtime was named and is missing.
+    """
+    try:
+        from .runtime import active_python
+    except ImportError:           # loaded as a top-level module (tests), not as a package
+        from runtime import active_python
+    return [str(active_python() or sys.executable), "-m", "daemon.app"]
+
+
+def _apply_code_source(env: dict) -> dict:
+    """Set where the daemon child gets `daemon.*` from — and, under a runtime, where it MUST NOT.
+
+    A runtime is only immutable if it is also the SOLE source of its code. This used to put
+    PLUGIN_ROOT (the checkout) on the child's PYTHONPATH unconditionally, which is how a checkout
+    makes `import daemon.app` work at all — but PYTHONPATH PRECEDES site-packages, so doing it to a
+    runtime-launched daemon would hand generation N-1 the working tree's code and quietly undo
+    everything the version-addressed directory bought: pinned in name only.
+
+    A runtime therefore has PYTHONPATH SCRUBBED, not merely left un-injected — an inherited
+    PYTHONPATH leaks a repo in just as well as one we add — plus user site-packages, which is
+    another writable directory that outranks nothing but is still not part of the frozen closure.
+    A checkout keeps the injection, because there the checkout IS the install.
+    """
+    if _active_build() is None:
+        env["PYTHONPATH"] = str(PLUGIN_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        return env
+    for leak in ("PYTHONPATH", "PYTHONHOME"):
+        env.pop(leak, None)
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
+def _daemon_cwd() -> str:
+    """cwd for the daemon child. The checkout runs IN the checkout (its cwd is a code source too,
+    via sys.path[0]); a runtime must not, for the same reason it does not get PYTHONPATH."""
+    return str(PLUGIN_ROOT) if _active_build() is None else str(paths.nelix_root())
+
+
+def _active_build():
+    try:
+        from .runtime import active
+    except ImportError:           # loaded as a top-level module (tests), not as a package
+        from runtime import active
+    return active()
 
 
 def _free_port() -> int:
@@ -461,8 +405,6 @@ def ensure_running() -> Transport:
     if adopted:
         return adopted
 
-    _ensure_deps()  # daemon imports wasmtime/ptyprocess; install them venv-scoped if absent
-
     transport = _choose_transport()
     root = _root()
     paths.ensure_private_dir(root)
@@ -475,11 +417,10 @@ def ensure_running() -> Transport:
     # under daemon/ reads it (measured — zero hits), and materialising a harness's home for the
     # daemon and every executor it launches is precisely the coupling this slice removes. If a
     # Hermes harness has it set, it still reaches the child through os.environ below.
-    env = {**os.environ,
-           "NELIX_RPC_TRANSPORT": transport.kind,
-           "NELIX_CONFIG": str(paths.config_path()),
-           "NELIX_HOME": str(paths.nelix_root()),
-           "PYTHONPATH": str(PLUGIN_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    env = _apply_code_source({**os.environ,
+                              "NELIX_RPC_TRANSPORT": transport.kind,
+                              "NELIX_CONFIG": str(paths.config_path()),
+                              "NELIX_HOME": str(paths.nelix_root())})
     if transport.kind == "unix":
         env["NELIX_RPC_SOCK"] = transport.path
     else:
@@ -488,7 +429,7 @@ def ensure_running() -> Transport:
         env["NELIX_RPC_TOKEN"] = transport.token
     try:
         proc = subprocess.Popen(
-            _daemon_argv(), cwd=str(PLUGIN_ROOT), env=env,
+            _daemon_argv(), cwd=_daemon_cwd(), env=env,
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True, close_fds=True)
     finally:

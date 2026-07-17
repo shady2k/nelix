@@ -84,6 +84,67 @@ def sessions_root() -> Path:
     return nelix_root() / "sessions"
 
 
+def runtimes_root() -> Path:
+    """Where installed runtimes live, one immutable directory per build id [nelix-9a4.2]."""
+    return nelix_root() / "runtimes"
+
+
+def runtime_dir(build_id: str) -> Path:
+    """A single generation's runtime: VERSION-ADDRESSED, and never written again once its
+    manifest exists. This is what makes "old sessions keep running old code" true rather than
+    aspirational: daemon/broker_client.py respawns a dead broker with
+    `[sys.executable, "-m", "daemon.pty_broker"]`, so if an upgrade replaced the files under a
+    live generation, that respawn would import the NEW code into an OLD session. It cannot,
+    because an upgrade never touches this directory — it creates a different one."""
+    return runtimes_root() / build_id
+
+
+def runtime_python(build_id: str) -> Path:
+    """The interpreter a generation runs. Everything the daemon spawns via sys.executable —
+    the PTY broker above all — inherits it, so pinning THIS pins the whole generation."""
+    return runtime_dir(build_id) / "venv" / "bin" / "python"
+
+
+def runtime_interpreter_home(build_id: str) -> Path:
+    """The generation's OWN copy of the base interpreter (binary + stdlib), which `venv/` is
+    built from and points `pyvenv.cfg: home` at.
+
+    It is copied in rather than shared because a venv retains NOTHING by itself — measured
+    2026-07-17, and this is the nelix-cb0 door reopening: `uv venv --python 3.11` symlinks
+    `venv/bin/python` at `~/.local/share/uv/python/cpython-3.11-macos-aarch64-none`, an
+    UNVERSIONED alias that is itself a symlink to the current patch, and `sys.base_prefix`
+    (hence the whole stdlib) resolves through it. So `uv python install 3.11.16` would silently
+    re-point every "immutable" runtime at a different interpreter, and `uv python uninstall`
+    would break them all — while the runtime directory stayed byte-for-byte identical.
+    `python -m venv --copies` does NOT fix it: it copies the 17MB binary and leaves `home` (and
+    therefore `os.py`) in the shared store."""
+    return runtime_dir(build_id) / "python"
+
+
+def runtime_manifest(build_id: str) -> Path:
+    """The install's COMMIT MARKER, written last and atomically: a runtime directory without it
+    is a partial install and is never used.
+
+    The tree cannot be staged elsewhere and renamed into place — the trick `_write_state` uses
+    for files. Measured 2026-07-17: a venv records ABSOLUTE paths (`pyvenv.cfg: home`, and a
+    `bin/python` symlink into the interpreter home), so a staged venv is dead on arrival after
+    the rename — `bin/python` dangles. The build therefore happens AT the final path and commits
+    with this one small file."""
+    return runtime_dir(build_id) / "manifest.json"
+
+
+def runtime_current() -> Path:
+    """Mutable pointer to the generation new daemons start from. The pointer moves; the runtime
+    it named does not — an upgrade repoints this symlink, and anything already running holds its
+    own runtime path and never notices."""
+    return runtimes_root() / "current"
+
+
+def runtime_install_lock() -> Path:
+    """Serializes concurrent installers building into runtimes_root()."""
+    return runtimes_root() / ".install.lock"
+
+
 def session_meta(session_dir) -> Path:
     """Per-session metadata sidecar (cols/rows/executor/driver). Single source of the filename so
     the daemon (writer) and the nelix-capture tool (reader) agree."""

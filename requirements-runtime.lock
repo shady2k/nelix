@@ -1,0 +1,32 @@
+# The RUNTIME's third-party closure, hash-pinned — frozen into every generation by
+# runtime.install() (`uv pip install --require-hashes`). Hash pinning is what stops a
+# compromised or redirected index substituting a tampered artifact into a generation.
+#
+# COMPILED FROM pyproject.toml, never hand-edited, and that is the point: this file used to be
+# requirements-daemon.lock, compiled from a hand-kept requirements-daemon.in, and the two drifted
+# — the .in pinned ptyprocess as a daemon dep when nothing under daemon/ has ever imported it
+# (the PTY is stdlib os.openpty + os.login_tty; measured by AST walk 2026-07-17 [nelix-9a4.1]).
+# A lock compiled from the package's own [project.dependencies] cannot drift from them, the same
+# reason requirements.txt says `-e .` instead of restating them.
+# tests/test_runtime_lock.py fails if this file and pyproject.toml disagree.
+#
+# The core wheel itself is NOT here: it is built, not resolved, so runtime.install() hashes the
+# wheel it was handed and folds that hash into the build id.
+#
+# Regenerate after changing pyproject.toml's dependencies:
+#   uv pip compile pyproject.toml --generate-hashes --no-header --python-version 3.11 \
+#     -o requirements-runtime.lock
+wasmtime==45.0.0 \
+    --hash=sha256:1736a70a48f713aaf1a878514d29cc6f554213b5431e04447813a3b9b4320381 \
+    --hash=sha256:2ad4bf7ca286ceea35c1e420d10b368d7f83faf9a5ffde87b4ee334a9b7f55f3 \
+    --hash=sha256:31d10f25c330cebcfb364e9a357123deeec96c41725ff2bba91b705587f38a93 \
+    --hash=sha256:3579b0ec6d001750d66ec7089aaeee2c048f88328c82743e15f099af01b0cf84 \
+    --hash=sha256:35e713f907264e470f3bc9b592b81b8ed0f8f5651725d9f07a5d52beb0642e38 \
+    --hash=sha256:4e843795b53e66c71313f2254731467372e5e1549227cf14accb9e2d57701c10 \
+    --hash=sha256:5d1416ec6da8cd87c29e2e9eb074358c91839c2fff971fe428c8921eaae68e73 \
+    --hash=sha256:6251ee5074a8b8bfaa98e6e99cb5d49d6d0f2320b3265d5aa6c2ee5df5fb4519 \
+    --hash=sha256:a0b6ca14b4628a5d1ffa91ccf2c0f2c58fa171f126ec085d564b09d5795395dd \
+    --hash=sha256:a499f6ab0eebb70dca83d6a4904b743cd122f322af3abe86af08ad753533d946 \
+    --hash=sha256:ae9726590e6d90c6305b8b507c93468b145204d4390aa9a2e29e26babcae110e \
+    --hash=sha256:bef65282b7de744106a91da43e4d06ba19d2d587bc54abb83b3e757f0c4fc030
+    # via nelix-core (pyproject.toml)
