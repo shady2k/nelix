@@ -14,7 +14,7 @@ class FakeManager:
     def __init__(self):
         self._events = EventQueue(); self.started = None; self.responded = []; self.stopped = []
         self.respond_status = "resumed"; self.started_model = "__unset__"
-    def start(self, executor, task, cwd, *, owner_id, model=None):
+    def start(self, executor, task, cwd, *, owner_id, model=None, session_id=None):
         self.started = (executor, task, cwd); self.started_model = model
         return StartOutcome(session_id="s1", base_seq=0,
                             snapshot={"session_id": "s1", "control_state": "busy",
@@ -423,7 +423,7 @@ def test_rpc_requires_token():
 class FakeManagerRaisesValueError:
     def __init__(self):
         self._events = EventQueue()
-    def start(self, executor, task, cwd, *, owner_id, model=None):
+    def start(self, executor, task, cwd, *, owner_id, model=None, session_id=None):
         raise ValueError(f"launcher 'auto' is not implemented (post-MVP); use 'local'")
     def respond(self, *a): return None
     def status(self, session_id=None, *, owner_id, include_progress=False): return {}
@@ -460,7 +460,7 @@ def test_rpc_start_without_model_passes_none():
 
 class FakeManagerRejectsModel:
     def __init__(self): self._events = EventQueue()
-    def start(self, executor, task, cwd, *, owner_id, model=None):
+    def start(self, executor, task, cwd, *, owner_id, model=None, session_id=None):
         from daemon.manager import ModelRejected
         raise ModelRejected("driver does not support a model override")
     def respond(self, *a): return None
@@ -485,7 +485,7 @@ def test_rpc_start_model_rejected_returns_400():
 
 class FakeManagerModelUnavailable:
     def __init__(self): self._events = EventQueue()
-    def start(self, executor, task, cwd, *, owner_id, model=None):
+    def start(self, executor, task, cwd, *, owner_id, model=None, session_id=None):
         from daemon.manager import ModelUnavailable
         raise ModelUnavailable([{"id": "glm-5.2", "display_name": "GLM-5.2"}])
     def respond(self, *a): return None

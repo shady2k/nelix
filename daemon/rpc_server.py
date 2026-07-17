@@ -13,10 +13,12 @@ from daemon import owner
 from daemon.config import MSG_MAX_BODY, DEFAULT_DIALOG_PAGE_CHARS
 from daemon.dialog import DialogReader
 from daemon.env_resolver import EnvResolveError
+from daemon.errors import error_envelope
 from daemon.events import EXTERNAL_OUTPUT_POLICY
+from daemon.generation import generation_id
 from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
-from daemon.manager import ModelRejected, ModelUnavailable
+from daemon.manager import ModelRejected, ModelUnavailable, SessionIdInUse, SessionIdRejected
 from daemon.messages import parse_message_body
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.transport import peer_is_self
@@ -166,7 +168,13 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                              seq=manager._events.latest_seq(sid))
 
         def _dispatch_get(self, p):
-            if p.path == "/wait":
+            if p.path == "/health":
+                # spec §8/§10: a liveness/identity probe. Deliberately NO owner_id and NO session
+                # id — every other caller-facing route needs one or both; this one must not, or a
+                # health check would need to already know a caller identity to ask "are you up".
+                self._send(200, {"status": "ok", "rpc_protocol": RPC_PROTOCOL_VERSION,
+                                 "generation_id": generation_id()})
+            elif p.path == "/wait":
                 qs = parse_qs(p.query)
                 after = self._int(qs.get("after_seq", ["0"])[0], 0)
                 sid = qs.get("session_id", [None])[0]
@@ -367,7 +375,8 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
                     outcome = manager.start(body["executor"], body["task"], body["cwd"],
-                                            owner_id=owner_id, model=body.get("model"))
+                                            owner_id=owner_id, model=body.get("model"),
+                                            session_id=body.get("session_id"))
                 except owner.OwnerWriteFailed as e:
                     # The owner record could not be persisted, so no session was started (spec §7:
                     # start FAILS if the owner cannot be written). 500, not 4xx: the request was
@@ -379,6 +388,10 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                     self._send(500, {"error": str(e)}); return
                 except ModelUnavailable as e:        # nelix-kwr: model not offered by the backend
                     self._send(400, {"error": str(e), "available_models": e.available_models}); return
+                except SessionIdInUse as e:           # spec §3: never silently reuse/clobber
+                    self._send(409, error_envelope("session_id_in_use", str(e), retryable=False)); return
+                except SessionIdRejected as e:        # bad-shape router-supplied session_id
+                    self._send(400, error_envelope("invalid_session_id", str(e), retryable=False)); return
                 except (ModelRejected, owner.OwnerRejected) as e:   # ValueError subclasses: BEFORE the 409
                     self._send(400, {"error": str(e)}); return   # bad-shape/unsupported model = client input error
                 except PtyInputRejected as e:        # subclass of ValueError: catch BEFORE it

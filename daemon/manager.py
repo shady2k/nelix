@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -11,11 +12,23 @@ from daemon import owner
 from daemon.drivers import get_driver
 from daemon.env_resolver import EnvResolveError, resolve_env_cmds
 from daemon.events import EXTERNAL_OUTPUT_POLICY
+from daemon.launchers import get_launcher
 from daemon.model_cache import ModelCache
 from daemon.model_discovery import discover, auth_of, DiscoveryError
 from daemon.session import RespondOutcome, Session
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
+
+# spec §3: "The generation's start endpoint accepts a router-assigned id." And: "Widen the id.
+# `uuid.uuid4().hex[:8]` is 32 random bits — needlessly collision-prone ... Use a full UUID/ULID."
+# A caller-supplied id becomes a `sessions/<sid>/` directory name VERBATIM, so this is a security
+# boundary, not a nicety: `s-` plus a lowercase-hex-only charset makes path traversal / separators
+# moot by construction (no character in the accepted alphabet means anything to a path parser).
+# The range 8..64 accepts BOTH today's legacy self-mint (`s-` + 8 hex) and the wide id the future
+# router will mint (a full UUID4 rendered as 32 hex chars, e.g. `s-` + 32 hex) without committing
+# to one exact width — a ULID-as-hex rendering or a UUID's dashless hex both fit. Uppercase hex is
+# deliberately rejected: one canonical casing, so two spellings of one id never look like two ids.
+_SESSION_ID_RE = re.compile(r"^s-[0-9a-f]{8,64}$")
 
 
 class ModelRejected(ValueError):
@@ -31,6 +44,32 @@ class ModelUnavailable(ValueError):
     def __init__(self, available_models):
         super().__init__("requested model is not offered by this executor")
         self.available_models = available_models          # [{"id","display_name"}], sorted, capped
+
+
+class SessionIdRejected(ValueError):
+    """A router-supplied `session_id` on /start (spec §3) with bad shape: empty, path separators/
+    traversal, or anything outside `_SESSION_ID_RE`. A ValueError subclass (like ModelRejected) so
+    /start maps it to 400 (client input error) ahead of the generic ValueError->409 branch."""
+
+
+class SessionIdInUse(ValueError):
+    """A router-supplied `session_id` (spec §3) that already names a session — live in the
+    registry, or a directory persisted on disk from a session that ran before. NEVER silently
+    reused or clobbered: the id becomes a `sessions/<sid>/` directory name, and reusing one would
+    mix an old (or another live) session's on-disk state into this start. A ValueError subclass
+    so it reaches /start's exception chain, but rpc_server maps it to the stable error envelope
+    (code `session_id_in_use`) rather than the generic bare-string 409."""
+
+    def __init__(self, session_id):
+        super().__init__(f"session_id already in use: {session_id!r}")
+        self.session_id = session_id
+
+
+def _validate_session_id_shape(session_id):
+    """Shape-check a router-supplied `session_id`. Raises SessionIdRejected. See `_SESSION_ID_RE`
+    for the accepted alphabet/width and why it is safe as a directory-name component verbatim."""
+    if not isinstance(session_id, str) or _SESSION_ID_RE.match(session_id) is None:
+        raise SessionIdRejected(f"invalid session_id: {session_id!r}")
 
 
 def _validate_model_shape(model):
@@ -178,6 +217,9 @@ class SessionManager:
         # model override reads driver.model_flag). Never call get_driver() directly — that would
         # bypass an injected factory (tests / custom drivers).
         self._driver_factory = driver_factory or get_driver
+        # Same seam, for the generation-level /capabilities baseline (nelix-9a4.6 deliverable C):
+        # a configured executor's STATIC launcher capabilities, read without spawning anything.
+        self._launcher_factory = launcher_factory or get_launcher
         # nelix-kwr: pre-flight model-membership cache, one per daemon (fresh random salt each
         # start). Protocol-agnostic; _check_model_available reads the driver's own models_protocol
         # and passes it through to .models(), so the cache never assumes which strategy runs.
@@ -210,9 +252,20 @@ class SessionManager:
     def _owned_sids(self, session_ids, owner_id):
         return {sid for sid in session_ids if owner.owns_session(sid, owner_id)}
 
-    def start(self, executor_name, task, cwd, *, owner_id, model=None):
+    def start(self, executor_name, task, cwd, *, owner_id, model=None, session_id=None):
         return self._spawn(executor_name, task, cwd, lineage_id=None, restarted_from=None,
-                           owner_id=owner_id, model=model)
+                           owner_id=owner_id, model=model, session_id=session_id)
+
+    def _session_id_exists(self, sid):
+        """True if `sid` already names a session — live in the registry, or a directory
+        persisted on disk from a session that ran before (even one long exited; gc_sessions may
+        since have pruned it, in which case the id is free again). Checked before honoring a
+        router-supplied id (spec §3): the id becomes a `sessions/<sid>/` directory name verbatim,
+        so silently reusing one would mix another session's on-disk state into this start."""
+        with self._lock:
+            if sid in self._sessions:
+                return True
+        return (paths.sessions_root() / sid).exists()
 
     def _apply_model_override(self, spec, executor_name, model):
         """Validate + fold a per-session `model` into a fresh per-session ExecutorSpec (last-wins).
@@ -286,7 +339,7 @@ class SessionManager:
             self._logger.error("manager", event, session_id=session_id, exc_info=True)
 
     def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, owner_id,
-               reserve=False, model=None):
+               reserve=False, model=None, session_id=None):
         # reserve=True: a slot reservation was made for us by restart() (old session popped +
         # self._reserved bumped under the lock). We OWN that reservation and must release it exactly
         # once: consume it ATOMICALLY with inserting the new session (so len(_sessions)+_reserved
@@ -311,6 +364,15 @@ class SessionManager:
                     self._logger.warning("manager", "session_start_rejected",
                                          reason="bad_cwd", executor=executor_name)
                 raise ValueError(f"cwd does not exist or is not a directory: {cwd!r}")
+            # Router-assigned session id (spec §3, nelix-9a4.6 deliverable A): validated + collision-
+            # checked BEFORE the lock/cap checks, same reasoning as owner/model above — a bad-shape or
+            # colliding id is the caller's input error, never a 409 "daemon full". Omitted (None, the
+            # default) -> self-mint below, byte-identical to pre-feature. restart() never passes one
+            # (it has no session_id parameter of its own), so the self-mint path there is unaffected.
+            if session_id is not None:
+                _validate_session_id_shape(session_id)
+                if self._session_id_exists(session_id):
+                    raise SessionIdInUse(session_id)
             # Per-session model override (nelix-9k0): validate + fold BEFORE the lock/cap checks so a
             # bad-shape or unsupported-driver model returns 400, never a 409 "daemon full". Omitted
             # model -> spec is untouched (byte-identical to pre-feature). The validated value is stored
@@ -338,7 +400,12 @@ class SessionManager:
                     raise RuntimeError(
                         f"idle_retained_limit={self._idle_limit} reached "
                         f"(close a completed session with nelix_stop before starting more)")
-                sid = f"s-{uuid.uuid4().hex[:8]}"
+                if session_id is not None:
+                    if session_id in self._sessions:   # closes the TOCTOU window vs. the pre-lock check
+                        raise SessionIdInUse(session_id)
+                    sid = session_id
+                else:
+                    sid = f"s-{uuid.uuid4().hex[:8]}"
                 base_seq = self._events.latest_seq()  # waiter arms past anything already emitted
                 sess = self._make(sid, executor_name, spec)
                 sess.on_terminal = self._free_slot
