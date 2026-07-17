@@ -411,56 +411,118 @@ def ensure_owned_private_dir(path) -> Path:
 
 
 class RouterRuntimeBaseRejected(ValueError):
-    """Raised by ensure_router_runtime_dir() when NELIX_RUNTIME_BASE itself cannot safely
-    host the router's per-uid runtime tree — see verify_router_runtime_base() for the checks.
-    Unlike RouterRuntimeDirRejected (an existing node under a good base failing its own check),
-    this is about the base's own location or permissions being unsafe before anything is even
+    """Raised by ensure_router_runtime_dir() when NELIX_RUNTIME_BASE itself — or one of its
+    ANCESTOR directories — cannot safely host the router's per-uid runtime tree — see
+    verify_router_runtime_base() for the checks. Unlike RouterRuntimeDirRejected (an existing
+    node under a good base failing its own check), this is about the base's location or
+    permissions (or one of the directories above it) being unsafe before anything is even
     created under it."""
 
 
+def _verify_component_trust(path: Path, label: str) -> None:
+    """One component of verify_router_runtime_base()'s ancestry walk — the resolved base
+    itself, or one of its ancestors up to "/" — checked against the single trust rule that
+    walk enforces at every level: a real directory, owned by root or by this process's own
+    uid, and if it is group- or world-writable, carrying the sticky bit.
+
+    Folded out of verify_router_runtime_base() so the base's own check and every ancestor's
+    check are ONE piece of logic, not two copies that could drift apart. `label` is a
+    caller-supplied description of `path` (naming it as the base or as "ancestor of ...") so
+    the raised message always identifies exactly which component in the chain failed.
+
+    A failed `os.stat` — the component does not exist, or is not reachable — is a REJECTION,
+    not a skip: an ancestor we cannot even stat is not one we can vouch for, and silently
+    treating "unknown" as "trusted" is exactly the fail-open mistake this whole check exists
+    to avoid.
+    """
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        raise RouterRuntimeBaseRejected(f"{label} {str(path)!r} is not usable: {e}") from e
+    if not stat.S_ISDIR(st.st_mode):
+        raise RouterRuntimeBaseRejected(
+            f"{label} {str(path)!r} is not a directory; refusing to use it")
+    if st.st_uid not in (0, os.getuid()):
+        raise RouterRuntimeBaseRejected(
+            f"{label} {str(path)!r} is owned by uid {st.st_uid}, neither root nor this "
+            f"process's own uid {os.getuid()} — its owner could rename or replace our "
+            f"runtime dir (or the base itself, if this is an ancestor of it) out from under "
+            f"us regardless of mode (the sticky bit stops other users, never the node's own "
+            f"owner); refusing to use it. Point NELIX_RUNTIME_BASE at a location whose full "
+            f"ancestry is owned by root or by this uid")
+    if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and not (st.st_mode & stat.S_ISVTX):
+        raise RouterRuntimeBaseRejected(
+            f"{label} {str(path)!r} is mode {oct(st.st_mode & 0o7777)}: group/world-writable "
+            f"WITHOUT the sticky bit. A co-resident user could rename or replace it (and "
+            f"anything built under it, including our already-verified runtime dir) out from "
+            f"under us — refusing to use it. Either `chmod +t` it (like the real /tmp, mode "
+            f"1777), or point NELIX_RUNTIME_BASE at a location whose full ancestry only this "
+            f"uid (or root) can write to")
+
+
 def verify_router_runtime_base() -> Path:
-    """Verify NELIX_RUNTIME_BASE (or the "/tmp" default) is safe to build the router's per-uid
-    runtime tree under, and return its RESOLVED path. A security-sensitive caller must build
-    under THIS SAME resolved value, never the raw configured one and never a SECOND, fresh
-    resolution — see resolved_router_paths(), which calls this function and reuses its return
-    value rather than resolving the base again.
+    """Verify NELIX_RUNTIME_BASE (or the "/tmp" default) — and every directory ABOVE it, up to
+    "/" — is safe to build the router's per-uid runtime tree under, and return the base's
+    RESOLVED path. A security-sensitive caller must build under THIS SAME resolved value,
+    never the raw configured one and never a SECOND, fresh resolution — see
+    resolved_router_paths(), which calls this function and reuses its return value rather than
+    resolving the base again.
 
     ensure_owned_private_dir() verifies the per-uid dir and its hash child, but neither of
-    those checks reaches the BASE itself. Left unchecked, a relative NELIX_RUNTIME_BASE
-    resolves ambiguously against the process's cwd, and a non-default base that is
-    group/world-writable WITHOUT the sticky bit lets a co-resident attacker rename/replace an
-    already-verified per-uid dir out from under us — deleting or renaming a node only needs
-    write permission on its PARENT, which the sticky bit is exactly what denies to everyone but
-    the file's owner (and root). The result of skipping this check would not be a mere
-    pre-creation race like the base's own docstring above describes: it would be the router's
-    socket binding, or its lock opening, inside attacker-controlled territory.
+    those checks reaches the BASE itself, and checking the base alone is not enough either: a
+    base that is itself victim-owned and mode-safe can still be pulled out from under us if
+    some ANCESTOR of it is attacker-controlled. Renaming or replacing a directory only needs
+    write permission on its PARENT — so an attacker who owns (or can write to, sans sticky bit)
+    any directory ABOVE the base can swap the base out after we have already verified it, and
+    our subsequent pathname-based mkdir lands under the replacement instead. Leaf-only checks
+    do not see this: they stat the base's own node and stop, never looking at what holds it.
 
     - A RELATIVE base is rejected outright: it names no fixed location, so "safe" cannot even
       be evaluated.
     - The base is then RESOLVED (`Path.resolve()`) before any check — the default "/tmp" is
       itself a symlink to "/private/tmp" on macOS, and the resolved target, not the symlink
       spelling, is what the filesystem actually enforces permissions on.
-    - The resolved base must exist and be a directory, and if it is group- or world-writable
-      (`st_mode & (S_IWGRP | S_IWOTH)`), it MUST also carry the sticky bit (`S_ISVTX`) — exactly
-      how the real `/tmp` is configured (mode 1777). A root-owned or otherwise private
-      (not group/world-writable) base needs no sticky bit: nobody but its owner can rename
-      inside it regardless.
-    - The resolved base must be OWNED BY root (uid 0) or by this process's own uid
-      (`st_uid in (0, os.getuid())`) — checked IN ADDITION to the mode/sticky rule above, not
-      instead of it. The sticky bit only denies rename/delete rights to everyone EXCEPT the
-      node's OWNER (and root): it stops a co-resident stranger, but does nothing at all
-      against the base's own owner. An attacker-owned `1777` base therefore clears the
-      mode/sticky check yet its owner can still rename our already-verified per-uid dir out
-      from under us — and an attacker-owned base that merely LOOKS private (not
-      group/world-writable, so the sticky branch above never even triggers) is exactly as
+    - Every component from the resolved base up to "/" — the base itself, then each of
+      `resolved.parents` — is checked with the SAME rule (see _verify_component_trust): it
+      must exist and be a real directory; it must be OWNED BY root (uid 0) or by this
+      process's own uid (`st_uid in (0, os.getuid())`); and if it is group- or world-writable
+      (`st_mode & (S_IWGRP | S_IWOTH)`), it MUST also carry the sticky bit (`S_ISVTX`) —
+      exactly how the real `/tmp` is configured (mode 1777). A root-owned or otherwise
+      private (not group/world-writable) directory needs no sticky bit: nobody but its owner
+      can rename inside it regardless.
+    - The ownership rule is checked IN ADDITION to the mode/sticky rule, not instead of it, at
+      every level: the sticky bit only denies rename/delete rights to everyone EXCEPT the
+      node's OWNER (and root) — it stops a co-resident stranger, but does nothing at all
+      against the node's own owner. An attacker-owned `1777` directory therefore clears the
+      mode/sticky check yet its owner can still rename our already-verified tree out from
+      under us — and an attacker-owned directory that merely LOOKS private (not
+      group/world-writable, so the sticky branch never even triggers) is exactly as
       attacker-controlled, just via a different-looking mode. Root is exempted because root
       can already do anything to our files regardless of this check; our own uid is exempted
-      because a base we own cannot be used against us by definition.
+      because a directory we own cannot be used against us by definition.
+    - Any component failing either rule raises RouterRuntimeBaseRejected NAMING that
+      component, not just the base — including a component `os.stat` cannot even reach
+      (failing closed rather than treating an unreadable ancestor as trusted).
 
-    Any failure raises RouterRuntimeBaseRejected; nothing here creates, chmods, or otherwise
-    touches the base — an operator-supplied location that fails this check must be fixed (or
-    replaced) by the operator, the same "surface the conflict, never auto-correct" stance
-    ensure_owned_private_dir takes for the per-uid dir itself.
+    IMPORTANT — what this check is, and is not: this is a pathname-based FAIL-FAST pre-check.
+    It closes misconfiguration (a relative or missing base) and the common attacker cases (a
+    hostile or hostile-ancestor base) loudly and early, before any syscall touches the
+    filesystem. But pathname checks are inherently racy against an attacker who controls ANY
+    directory in the path: nothing stops that directory's owner from replacing a component
+    the instant after this function returns and before the caller's next syscall runs — this
+    walk narrows the window and the set of attackers who can win the race, it does not close
+    it. The ATOMIC security boundary is the ROUTER PROCESS itself (slice 3c): it MUST
+    establish and hold the runtime-dir hierarchy via FD-RELATIVE traversal — `os.open(...,
+    O_DIRECTORY | O_NOFOLLOW)` from a trusted anchor, then `mkdir`/`stat`/`bind`/lock-open
+    relative to the held directory FDs (e.g. via `dir_fd=`) — never by re-resolving pathnames
+    once it has started building. That fd-relative construction is the residual this function
+    explicitly leaves to 3c; this function's job ends at "loudly refuse the cases a pathname
+    check CAN see."
+
+    Nothing here creates, chmods, or otherwise touches the base or any ancestor; an
+    operator-supplied location that fails this check must be fixed (or replaced) by the
+    operator, the same "surface the conflict, never auto-correct" stance ensure_owned_private_dir
+    takes for the per-uid dir itself.
     """
     base = router_runtime_base()
     if not base.is_absolute():
@@ -468,30 +530,12 @@ def verify_router_runtime_base() -> Path:
             f"NELIX_RUNTIME_BASE={str(base)!r} is a relative path; refusing an ambiguous, "
             f"cwd-dependent runtime base — set it to an absolute path")
     resolved = base.resolve()
-    try:
-        st = os.stat(resolved)
-    except OSError as e:
-        raise RouterRuntimeBaseRejected(
-            f"NELIX_RUNTIME_BASE {str(base)!r} (resolved: {str(resolved)!r}) is not usable: "
-            f"{e}") from e
-    if not stat.S_ISDIR(st.st_mode):
-        raise RouterRuntimeBaseRejected(
-            f"NELIX_RUNTIME_BASE {str(base)!r} (resolved: {str(resolved)!r}) is not a "
-            f"directory; refusing to use it")
-    if st.st_uid not in (0, os.getuid()):
-        raise RouterRuntimeBaseRejected(
-            f"NELIX_RUNTIME_BASE {str(base)!r} (resolved: {str(resolved)!r}) is owned by uid "
-            f"{st.st_uid}, neither root nor this process's own uid {os.getuid()} — its owner "
-            f"could rename or replace our runtime dir out from under us regardless of mode "
-            f"(the sticky bit stops other users, never the node's own owner); refusing to "
-            f"use it. Point NELIX_RUNTIME_BASE at a location owned by root or by this uid")
-    if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and not (st.st_mode & stat.S_ISVTX):
-        raise RouterRuntimeBaseRejected(
-            f"NELIX_RUNTIME_BASE {str(base)!r} (resolved: {str(resolved)!r}) is mode "
-            f"{oct(st.st_mode & 0o7777)}: group/world-writable WITHOUT the sticky bit. A "
-            f"co-resident user could rename or replace our runtime dir out from under us — "
-            f"refusing to use it. Either `chmod +t` it (like the real /tmp, mode 1777), or "
-            f"point NELIX_RUNTIME_BASE at a location only this uid (or root) can write to")
+    _verify_component_trust(
+        resolved, f"NELIX_RUNTIME_BASE {str(base)!r} (resolved: {str(resolved)!r})")
+    for ancestor in resolved.parents:
+        _verify_component_trust(
+            ancestor,
+            f"NELIX_RUNTIME_BASE {str(base)!r} (resolved: {str(resolved)!r}) ancestor")
     return resolved
 
 
@@ -524,6 +568,11 @@ def resolved_router_paths() -> tuple[Path, Path, Path]:
     symlink-safely (O_NOFOLLOW) at the actual syscall — resolving once here defends against
     the base being swapped BETWEEN verify and construct, not against a symlink planted at the
     leaf node itself after this call returns.
+
+    Same residual as verify_router_runtime_base() (see its docstring for the full statement):
+    this function's checks are pathname-based fail-fast pre-checks, not the atomic security
+    boundary. That boundary is the router process (3c), which must hold the hierarchy via
+    fd-relative traversal from a trusted anchor rather than re-resolving pathnames.
     """
     resolved_base = verify_router_runtime_base()
     d = _router_runtime_dir_from(resolved_base)

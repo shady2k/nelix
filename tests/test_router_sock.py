@@ -170,6 +170,10 @@ def test_ensure_router_runtime_dir_resolves_the_base_exactly_once(monkeypatch, t
     assert target_b not in d.parents, (
         f"dir was built under a SECOND, independent resolution {target_b} — "
         f"verify and construct disagree (TOCTOU)")
+    assert len(calls) == 1, (
+        f"base_symlink was resolved {len(calls)} times, not once — an extra resolution "
+        f"escapes the single-resolution guarantee even if this particular assertion above "
+        f"still happened to pass")
 
 
 def test_resolved_router_paths_matches_the_pure_accessors_in_the_normal_case(monkeypatch, tmp_path):
@@ -207,6 +211,10 @@ def test_resolved_router_paths_resolves_the_base_exactly_once(monkeypatch, tmp_p
     assert target_a in d.parents
     assert target_b not in d.parents
     assert sock.parent == d and lock.parent == d
+    assert len(calls) == 1, (
+        f"base_symlink was resolved {len(calls)} times, not once — an extra resolution "
+        f"escapes the single-resolution guarantee even if this particular assertion above "
+        f"still happened to pass")
 
 
 # --- NELIX_RUNTIME_BASE must itself be verified safe [review: hijack via unsafe base] ---
@@ -332,6 +340,79 @@ def test_ensure_router_runtime_dir_accepts_a_root_owned_sticky_base_even_when_no
     importlib.reload(paths)
     d = paths.ensure_router_runtime_dir()
     assert d == paths.router_runtime_dir()
+
+
+# --- ANCESTRY: an attacker-owned ancestor can replace an otherwise-fine base ------------
+# [review: ancestry TOCTOU — verify_router_runtime_base() checked only the base's own stat]
+#
+# A base that is itself victim-owned, 0700, and passes every check above can still be pulled
+# out from under us if some ANCESTOR of it is attacker-owned and writable: the attacker can
+# rename/replace the base after our stat (they only need write on the base's PARENT to do
+# that), and our subsequent pathname-based mkdir lands under the replacement. Leaf-only
+# checks — even the correct owner/sticky rule applied only to the base itself — do not see
+# this; the walk must cover every component from the resolved base up to "/".
+
+def test_ensure_router_runtime_dir_rejects_a_base_whose_ancestor_is_owned_by_another_uid(
+    monkeypatch, tmp_path
+):
+    """attacker-parent/base: the base itself is victim-owned 0700 (passes its own check), but
+    the PARENT directory is attacker-owned — the attacker can rename `base` out from under us
+    after verification. Simulated by spoofing os.stat's st_uid for just the parent path (a
+    test process cannot really chown to a foreign uid); the base's real stat is untouched, so
+    this proves the ancestor's ownership is what trips the rejection, not the base's own."""
+    attacker_parent = tmp_path / "attacker-parent"
+    attacker_parent.mkdir(mode=0o755)
+    base = attacker_parent / "base"
+    base.mkdir(mode=0o700)
+    resolved_parent = attacker_parent.resolve()
+    real_stat = os.stat
+
+    def fake_stat(path, *a, **kw):
+        st = real_stat(path, *a, **kw)
+        if Path(path) == resolved_parent:
+            return types.SimpleNamespace(st_mode=st.st_mode, st_uid=st.st_uid + 12345)
+        return st
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base))
+    importlib.reload(paths)
+
+    with pytest.raises(paths.RouterRuntimeBaseRejected) as excinfo:
+        paths.ensure_router_runtime_dir()
+    assert str(resolved_parent) in str(excinfo.value), (
+        "rejection must name the offending ancestor, not just say something failed")
+    assert "owner" in str(excinfo.value)
+
+
+def test_ensure_router_runtime_dir_rejects_a_base_under_a_non_sticky_writable_ancestor(
+    monkeypatch, tmp_path
+):
+    """The other half of the ancestry hazard: an ancestor that is merely group/world-writable
+    without the sticky bit lets ANY co-resident (not just its owner) rename/replace the base
+    out from under us, exactly like the base-level check above but one level up the tree."""
+    writable_parent = tmp_path / "writable-parent"
+    writable_parent.mkdir(mode=0o777)
+    os.chmod(writable_parent, 0o777)   # world-writable, no sticky bit
+    base = writable_parent / "base"
+    base.mkdir(mode=0o700)
+    monkeypatch.setenv("NELIX_RUNTIME_BASE", str(base))
+    importlib.reload(paths)
+
+    with pytest.raises(paths.RouterRuntimeBaseRejected) as excinfo:
+        paths.ensure_router_runtime_dir()
+    assert str(writable_parent.resolve()) in str(excinfo.value)
+    assert "sticky" in str(excinfo.value)
+
+
+def test_verify_router_runtime_base_accepts_the_real_tmp_ancestry_chain(monkeypatch):
+    """The ancestry walk must not reject the real default base: '/' is root-owned 0755,
+    '/private' (macOS) is root-owned 0755, and '/private/tmp' (what '/tmp' resolves to) is
+    root-owned sticky 1777 — every component passes the same per-component trust rule the
+    walk applies to the base itself."""
+    monkeypatch.delenv("NELIX_RUNTIME_BASE", raising=False)
+    importlib.reload(paths)
+    resolved = paths.verify_router_runtime_base()   # must not raise
+    assert resolved.is_absolute()
 
 
 # --- create-or-verify security helper ---------------------------------------------------
