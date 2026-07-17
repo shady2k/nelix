@@ -1,0 +1,283 @@
+"""nelix-3rm slice 3c.1 Part E: the START path (spec §3) — the whole point of the router.
+
+The router allocates the session id BEFORE forwarding /start, records the chosen generation, forwards
+with the assigned id, and records the result idempotently. A retried /start with the SAME
+idempotency_key must NEVER spawn a second worker: a same-request retry replays the original outcome;
+a same-key-DIFFERENT-request is an idempotency_conflict; a lost/failed forward is recorded and its
+stable error is replayed.
+
+The generation backend here is a small IN-PROCESS HTTP stub implementing the daemon's GET /health +
+POST /start (accepting a router-assigned session_id) — the router's start path + idempotency are
+unit-tested WITHOUT a real daemon. A real-daemon integration test lives in
+test_router_start_realdaemon.py."""
+import http.server
+import json
+import re
+import threading
+
+import pytest
+
+import paths
+from daemon.transport import Transport
+from nelix_store.ledger import StartLedger
+from router.registry import GenerationRegistry
+from router.start import StartPath
+
+from conftest import EXECUTOR, OWNER
+
+_SID_RE = re.compile(r"^s-[0-9a-f]{32}$")
+
+
+class _Backend:
+    """In-process HTTP stub of a generation: GET /health + POST /start."""
+
+    def __init__(self, *, mode="ok", build_id="b-1"):
+        self.mode = mode
+        self.build_id = build_id
+        self.starts = []                      # every /start body the backend received
+        backend = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/health":
+                    self._send(200, {"status": "ok", "rpc_protocol": 1,
+                                     "generation_id": backend.build_id})
+                else:
+                    self._send(404, {"error": "not found"})
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(n) or b"{}")
+                if self.path != "/start":
+                    self._send(404, {"error": "not found"}); return
+                backend.starts.append(body)
+                if backend.mode == "error":
+                    self._send(409, {"error": "generation is full"}); return
+                sid = body.get("session_id")
+                self._send(200, {"operation": "start", "status": "started", "session_id": sid,
+                                 "snapshot": {"session_id": sid, "control_state": "busy"},
+                                 "next_after_seq": 0, "next_action": "end_turn"})
+
+        self._srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self._srv.server_address[1]
+        threading.Thread(target=self._srv.serve_forever, daemon=True).start()
+
+    @property
+    def transport(self):
+        return Transport.tcp("127.0.0.1", self.port, "t")
+
+    def close(self):
+        self._srv.shutdown()
+
+
+class _Supervisor:
+    """A minimal supervisor stand-in whose endpoint() points at a given transport."""
+
+    def __init__(self, transport, inc=None):
+        self._t = transport
+        self.inc = inc or {"pid": 1, "start_fingerprint": "fp"}
+
+    def endpoint(self):
+        return self._t
+
+    def ensure_running(self):
+        return self._t
+
+    def incarnation(self):
+        return self.inc
+
+
+def _start_path(backend):
+    ledger = StartLedger(paths.nelix_root())
+    reg = GenerationRegistry(supervisor=_Supervisor(backend.transport),
+                             health_probe=lambda t: backend.build_id)
+    return StartPath(ledger, reg), ledger
+
+
+def _body(**over):
+    b = {"executor": EXECUTOR, "task": "do the thing", "cwd": "/repo", "owner_id": OWNER,
+         "idempotency_key": "k-1"}
+    b.update(over)
+    return b
+
+
+def test_fresh_start_reserves_assigns_forwards_and_commits():
+    backend = _Backend()
+    sp, ledger = _start_path(backend)
+    try:
+        status, resp = sp.handle(_body())
+        assert status == 200
+        assert resp["status"] == "started"
+        sid = resp["session_id"]
+        assert _SID_RE.match(sid)                         # router-minted wide id
+        # The backend received EXACTLY the router-assigned id.
+        assert len(backend.starts) == 1
+        assert backend.starts[0]["session_id"] == sid
+        # The ledger row committed to the generation epoch the response reports.
+        row = ledger.lookup("k-1", owner_id=OWNER)
+        assert row.state == "started"
+        assert row.generation_id == resp["generation_id"]
+        assert re.match(r"^g-[0-9a-f]{32}$", resp["generation_id"])
+    finally:
+        backend.close()
+
+
+def test_retried_same_request_replays_and_does_not_forward_twice():
+    backend = _Backend()
+    sp, ledger = _start_path(backend)
+    try:
+        s1, r1 = sp.handle(_body())
+        s2, r2 = sp.handle(_body())                       # identical retry, same idempotency_key
+        assert s1 == 200 and s2 == 200
+        assert r2["session_id"] == r1["session_id"]       # SAME session, not a new one
+        assert r2.get("replay") is True
+        assert len(backend.starts) == 1                   # NO second forward -> NO second worker
+    finally:
+        backend.close()
+
+
+def test_same_key_different_request_is_an_idempotency_conflict():
+    backend = _Backend()
+    sp, _ = _start_path(backend)
+    try:
+        sp.handle(_body(task="task A"))
+        status, resp = sp.handle(_body(task="task B"))    # same key, different task
+        assert status == 409
+        assert resp["error"]["code"] == "idempotency_conflict"
+        assert resp["error"]["retryable"] is False
+        assert len(backend.starts) == 1                   # the conflicting retry never forwarded
+    finally:
+        backend.close()
+
+
+def test_generation_failure_fails_the_reservation_and_returns_a_stable_error():
+    backend = _Backend(mode="error")
+    sp, ledger = _start_path(backend)
+    try:
+        status, resp = sp.handle(_body())
+        assert status == 503
+        assert resp["error"]["code"] == "generation_unavailable"
+        assert "error" in resp and "code" in resp["error"]     # a stable envelope, not a bare 500
+        row = ledger.lookup("k-1", owner_id=OWNER)
+        assert row.state == "failed"                            # durably recorded
+        assert len(backend.starts) == 1
+    finally:
+        backend.close()
+
+
+def test_retry_after_failure_replays_the_recorded_failure():
+    backend = _Backend(mode="error")
+    sp, _ = _start_path(backend)
+    try:
+        sp.handle(_body())
+        status, resp = sp.handle(_body())                 # same key: replays the recorded failure
+        assert status == 503
+        assert resp["error"]["code"] == "generation_unavailable"
+        assert len(backend.starts) == 1                   # NOT forwarded again
+    finally:
+        backend.close()
+
+
+def test_generation_unavailable_when_no_backend_can_be_made():
+    # A registry that cannot provide a generation at all -> GENERATION_UNAVAILABLE, and the
+    # reservation is failed so a same-key retry replays the failure (never a fresh worker).
+    class _DeadSupervisor:
+        def endpoint(self): return None
+        def ensure_running(self): raise RuntimeError("daemon did not become healthy")
+        def incarnation(self): return None
+    ledger = StartLedger(paths.nelix_root())
+    sp = StartPath(ledger, GenerationRegistry(supervisor=_DeadSupervisor(),
+                                              health_probe=lambda t: None))
+    status, resp = sp.handle(_body())
+    assert status == 503
+    assert resp["error"]["code"] == "generation_unavailable"
+    assert resp["error"]["retryable"] is True
+    assert ledger.lookup("k-1", owner_id=OWNER).state == "failed"
+
+
+def test_forward_to_a_dead_transport_is_generation_unavailable():
+    class _Sup:
+        def endpoint(self): return Transport.tcp("127.0.0.1", 9, "t")   # discard port: refused
+        def ensure_running(self): return self.endpoint()
+        def incarnation(self): return {"pid": 1, "start_fingerprint": "fp"}
+    ledger = StartLedger(paths.nelix_root())
+    sp = StartPath(ledger, GenerationRegistry(supervisor=_Sup(), health_probe=lambda t: None))
+    status, resp = sp.handle(_body())
+    assert status == 503
+    assert resp["error"]["code"] == "generation_unavailable"
+    assert ledger.lookup("k-1", owner_id=OWNER).state == "failed"
+
+
+def test_missing_idempotency_key_is_rejected():
+    backend = _Backend()
+    sp, _ = _start_path(backend)
+    try:
+        b = _body(); del b["idempotency_key"]
+        status, resp = sp.handle(b)
+        assert status == 400
+        assert resp["error"]["code"] == "invalid_request"
+        assert len(backend.starts) == 0
+    finally:
+        backend.close()
+
+
+def test_invalid_owner_id_is_rejected():
+    backend = _Backend()
+    sp, _ = _start_path(backend)
+    try:
+        status, resp = sp.handle(_body(owner_id="bad owner id!!"))
+        assert status == 400
+        assert resp["error"]["code"] == "invalid_request"
+    finally:
+        backend.close()
+
+
+def test_no_orchestration_id_still_replays_on_retry():
+    # A caller that supplies only an idempotency_key (no orchestration_id) must still get an
+    # idempotent retry — the router derives a STABLE orchestration_id from (owner, key), so a retry
+    # reproduces it and replays rather than conflicting on a freshly-minted one.
+    backend = _Backend()
+    sp, _ = _start_path(backend)
+    try:
+        s1, r1 = sp.handle(_body())
+        s2, r2 = sp.handle(_body())
+        assert s1 == 200 and s2 == 200
+        assert r2["session_id"] == r1["session_id"]
+        assert r2.get("replay") is True
+        assert len(backend.starts) == 1
+    finally:
+        backend.close()
+
+
+def test_concurrent_duplicate_starts_forward_once():
+    backend = _Backend()
+    sp, _ = _start_path(backend)
+    try:
+        results = []
+        barrier = threading.Barrier(8)
+
+        def _go():
+            barrier.wait()
+            results.append(sp.handle(_body()))
+
+        threads = [threading.Thread(target=_go) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        sids = {r[1].get("session_id") for r in results}
+        assert len(sids) == 1                             # one session across all duplicates
+        assert len(backend.starts) == 1                   # exactly ONE worker spawned
+    finally:
+        backend.close()
