@@ -301,29 +301,20 @@ def test_a_corrupt_terminal_row_does_not_blind_an_owner(store, ledger):
 
 
 def test_a_prune_cannot_land_between_the_ack_and_its_reread(tmp_path):
-    # !! THIS TEST DOES NOT WORK YET — DO NOT TRUST IT AS A GUARD. Bead: see below. !!
-    # Measured 0/5: removing ack_terminal's outer transaction does NOT fail it. The commit
-    # that added it (3368b0e) claims "a seam that actually catches"; that claim is FALSE and
-    # this comment is the correction.
+    # ack_terminal is one transaction: read -> CAS -> re-read. Without it, a prune landing
+    # between the CAS and the re-read makes an ack that DURABLY SUCCEEDED report
+    # unknown_session — a non-retryable error for an operation that worked.
     #
-    # THE INTENT (which is sound): spy on the public get_terminal and, on its SECOND call —
-    # after the CAS, before the re-read — run a prune on another connection. With the
-    # transaction, prune hits ack's write lock and cannot interleave; without it, the CAS has
-    # auto-committed, the row is prunable, and the re-read raises. That is exactly the defect
-    # the transaction exists for.
-    #
-    # WHY IT FAILS, diagnosed: the pruner Store is built on this thread but its prune runs on
-    # a SPAWNED one, and db.connect() never sets check_same_thread=False — so the call raises
-    # a raw sqlite3.ProgrammingError (misclassified as STORE_CORRUPT, since ProgrammingError
-    # carries no sqlite_errorcode and falls to the conservative default) and prune never
-    # reaches SQLite's locking at all. It races nothing, in either the shipped or the mutated
-    # code.
-    #
-    # THE FIX, and it is smaller than the bug: drop the thread entirely. The spy already runs
-    # on this thread inside ack_terminal, so call prune SYNCHRONOUSLY from it using a pruner
-    # Store built on this thread. No thread affinity to violate; the pruner's BEGIN IMMEDIATE
-    # meets ack's write lock and, at busy_timeout=0, returns store_unavailable at once. The
-    # thread was never needed — it only hid the bug.
+    # THE SEAM, and both halves are load-bearing:
+    #  * SYNCHRONOUS, on this thread. The pruner Store is built here, and db.connect() does not
+    #    set check_same_thread=False, so pruning from a spawned thread raises before reaching
+    #    ANY SQLite locking — it would race nothing. (Nor can the Store be built inside the
+    #    thread: connect() runs executescript(_SCHEMA), which needs a write lock the acker
+    #    holds, so it would fail at connect rather than at prune.)
+    #  * BEFORE the re-read, not after. The prune must land while ack is between its CAS and
+    #    its re-read. The previous spy did `record = real_get(...)` and only THEN counted and
+    #    pruned, so on the second call the re-read had already returned and the prune raced
+    #    nothing. Measured: with both bugs present, deleting BEGIN IMMEDIATE caught 0/5.
     from nelix_store.ledger import StartLedger
     from nelix_store.store import Store
 
@@ -333,25 +324,27 @@ def test_a_prune_cannot_land_between_the_ack_and_its_reread(tmp_path):
         sid = _live_session(acker, lg)
         acker.put_terminal(sid, terminal_kind="done", summary="s", ended_at=5.0)
 
-        # busy_timeout=0: the pruner must FAIL FAST when ack holds the write lock, rather than
-        # wait for it — otherwise "blocked" and "succeeded" look the same to the test.
+        # busy_timeout=0: the pruner must FAIL FAST when ack holds the write lock rather than
+        # wait for it — otherwise "blocked" and "succeeded" look identical to the test.
         pruner = Store(tmp_path, clock=lambda: 1000.0, timeout=0.0)
         calls, pruned = [], []
         real_get = acker.get_terminal
 
         def spy(session_id, *, owner_id):
-            record = real_get(session_id, owner_id=owner_id)
             calls.append(session_id)
-            if len(calls) == 2:                     # between the CAS and the re-read
-                t = threading.Thread(
-                    target=lambda: pruned.append(_try_prune(pruner)), daemon=True)
-                t.start()
-                t.join(timeout=0.5)
-            return record
+            if len(calls) == 2:                  # between the CAS and the re-read
+                pruned.append(_try_prune(pruner))
+            return real_get(session_id, owner_id=owner_id)
 
         acker.get_terminal = spy
         record = acker.ack_terminal(sid, owner_id="hermes:local")   # must NOT raise
         assert record.acknowledged_at == 1000.0
+        # The ack surviving is necessary but NOT sufficient: a prune that died of an unrelated
+        # error would leave the ack intact too and look identical. Assert the prune was
+        # BLOCKED BY THE WRITE LOCK — that is the thing the transaction actually does. This
+        # assertion is what would have caught the wrong-thread bug that hid this seam for
+        # seven revisions: it returned store_corrupt, not store_unavailable.
+        assert pruned == [errors.STORE_UNAVAILABLE], f"the prune did not race the ack: {pruned}"
         pruner.close()
     finally:
         lg.close()
