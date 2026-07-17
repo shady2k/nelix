@@ -238,7 +238,7 @@ class _RestartCapSession:
 
 
 def _restart_mgr(tmp_path, monkeypatch, spec=None, limit=2):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     _RestartCapSession.instances = []
     specs = {EXECUTOR: spec or make_spec(command="claude", args=["--foo"], driver="claude",
                                          max_restarts=3)}

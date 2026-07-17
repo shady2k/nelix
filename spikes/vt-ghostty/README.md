@@ -54,7 +54,7 @@ make vt-spike-run RAW=<path-to-session-raw>   # renders RAW via libghostty-vt an
 ```
 
 `RAW` is a captured session byte stream, e.g.
-`~/.hermes/profiles/<profile>/workspace/nelix/sessions/<id>/raw`.
+`$NELIX_HOME/sessions/<id>/raw` (default `~/.nelix/sessions/<id>/raw`).
 
 For the full per-row view: `.venv/bin/python spikes/vt-ghostty/compare.py <RAW> --show`.
 

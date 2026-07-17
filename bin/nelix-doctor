@@ -11,6 +11,7 @@ property of the operator's Hermes install, which the core can see; the manifest'
 is a property of a repo the core no longer owns. An operator-facing drift check pointed at the
 INSTALLED plugin dir would be a fair thing to add back [nelix-4el.1]."""
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -56,11 +57,26 @@ def _enabled_plugins(config_path):
     return [str(x) for x in enabled] if isinstance(enabled, list) else []
 
 
+def hermes_home() -> Path:
+    """Where Hermes keeps its profiles. Lives HERE, not in paths.py, and that is the point of
+    nelix-9a4.7: paths.py is the CORE's layout and must not know a harness's name. This function
+    is the last thing in the core that does, and it survives only because hermes_wiring below is
+    explicitly a probe of the operator's Hermes install — a question the core answers ABOUT
+    another program, not a place the core stores anything."""
+    val = os.environ.get("HERMES_HOME", "").strip()
+    if val:
+        return Path(val)
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.path.expanduser("~/.hermes"))
+
+
 def _inspect_profile(name, profile_dir, config_path):
     """Wiring verdict for a single Hermes profile: is nelix enabled, installed, configured?"""
     enabled = "nelix" in _enabled_plugins(config_path)
     installed = (Path(profile_dir) / "plugins" / "nelix").is_dir()
-    toml_present = (Path(profile_dir) / "workspace" / "nelix" / "nelix.toml").is_file()
     if enabled and installed:
         verdict, reason = "wired", None
     elif not enabled:
@@ -69,13 +85,21 @@ def _inspect_profile(name, profile_dir, config_path):
         verdict, reason = "not_wired", "plugin dir missing"
     return {"name": name, "config": str(config_path), "dir": str(profile_dir),
             "nelix_enabled": enabled, "plugin_installed": installed,
-            "nelix_toml_present": toml_present, "verdict": verdict, "reason": reason}
+            "verdict": verdict, "reason": reason}
 
 
 def hermes_wiring(home=None):
     """Per-profile answer to 'does the profile the user launched actually load nelix?'. Inspects
-    the root/default profile (<home>/config.yaml) plus every <home>/profiles/<name>/config.yaml."""
-    home = Path(home) if home is not None else paths.hermes_home()
+    the root/default profile (<home>/config.yaml) plus every <home>/profiles/<name>/config.yaml.
+
+    No `nelix_toml_present` per profile any more. It used to report
+    <profile>/workspace/nelix/nelix.toml — the core's config back when the core's state lived
+    inside Hermes' tree. The config is a property of $NELIX_HOME now, not of a Hermes profile,
+    so a per-profile answer would be false for every profile forever. It is reported once, as
+    `nelix_home` in collect(). (This line is why 'grep for the path STRINGS, not just the
+    functions' matters: nothing here imported or called nelix_root — it hand-built the same
+    path out of literals, invisible to a search for the accessor.)"""
+    home = Path(home) if home is not None else hermes_home()
     profiles = [_inspect_profile("(root)", home, home / "config.yaml")]
     try:
         named = sorted(p for p in (home / "profiles").iterdir() if (p / "config.yaml").is_file())
@@ -105,6 +129,9 @@ def collect(inspector=None):
     else:
         base_url = None
     return {"daemon": {"alive": transport is not None, "base": base_url},
+            "nelix_home": {"root": str(paths.nelix_root()),
+                           "config": str(paths.config_path()),
+                           "config_present": paths.config_path().is_file()},
             "lock_holder": holder, "sessions": sessions,
             "strays": _scan_strays(inspector),
             "hermes_wiring": hermes_wiring()}

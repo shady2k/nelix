@@ -587,7 +587,7 @@ def test_respond_invalid_option_is_409_with_options():
 
 
 def test_dialog_serves_flat_page_with_offset(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))   # isolate from real on-disk sessions
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerWithDialog()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8771, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -606,7 +606,7 @@ def test_dialog_serves_flat_page_with_offset(monkeypatch, tmp_path):
 
 def test_dialog_page_carries_at_end_mid_and_at_end(monkeypatch, tmp_path):
     import io
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
     try:
         # Mid-transcript: next_offset (56) < total_len (100)
@@ -624,7 +624,7 @@ def test_dialog_page_carries_at_end_mid_and_at_end(monkeypatch, tmp_path):
 
 def test_dialog_unknown_session_carries_hint(monkeypatch, tmp_path):
     import io
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     srv, base = _serve(FakeManagerWithDialog(), io.StringIO())
     try:
         st, b = _req("GET", base + "/dialog?session_id=nope")
@@ -658,7 +658,7 @@ class _CapturingManager:
 def test_dialog_omitted_limit_uses_daemon_default(monkeypatch, tmp_path):
     import io
     from daemon.config import DEFAULT_DIALOG_PAGE_CHARS
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     _CapturingDialog.last_limit = "unset"
     srv, base = _serve(_CapturingManager(), io.StringIO())
     try:
@@ -679,7 +679,7 @@ def test_dialog_at_end_on_exact_final_page_real_reader(monkeypatch, tmp_path):
     import io
     from daemon.dialog import Dialog
     import paths
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     sess_dir = paths.sessions_root() / "s1"
     d = Dialog(sess_dir, tail_lines=10, spool_max_bytes=4096)
     d.add_agent_line("hello world")          # flat text becomes "‹agent›\nhello world"
@@ -939,7 +939,7 @@ def test_status_read_is_logged(tmp_path):
 
 
 def test_dialog_served_from_disk_when_session_not_live(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import importlib, json, threading, urllib.request, paths
     importlib.reload(paths)
     from daemon.dialog import Dialog
@@ -1004,3 +1004,20 @@ def test_unix_foreign_uid_is_rejected(monkeypatch, unix_sock, fake_manager):
     finally:
         server.shutdown(); server.server_close()
     assert "unauthorized_peer" in buf.getvalue()
+
+
+def test_unix_bind_refuses_an_over_long_socket_path_naming_the_cause(fake_manager, tmp_path):
+    """An over-long AF_UNIX node must fail with a message that names the path, the byte count and
+    the setting to change — not a bare OSError('AF_UNIX path too long') from inside bind().
+
+    The check has to happen BEFORE the server is constructed: server_bind() unlinks any existing
+    node before binding, so a late failure destroys a live daemon's socket on the way down.
+    macOS allows 103 bytes; pytest's own tmp_path is already ~125, which is exactly how an
+    operator-set NELIX_HOME reaches this state.
+    """
+    over = str(tmp_path / ("d" * 120) / "rpc.sock")
+    assert len(over.encode()) > 103
+    with pytest.raises(ValueError) as e:
+        make_server(fake_manager, Transport.unix(over))
+    msg = str(e.value)
+    assert "cannot bind" in msg and "NELIX_HOME" in msg and str(len(over.encode())) in msg

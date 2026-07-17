@@ -18,9 +18,9 @@ uses, so a captured frame is exactly what `observe()` sees — no live process n
 
 ```sh
 # inspect a session's frames (dims come from meta.json):
-bin/nelix-capture ~/.hermes/.../sessions/<id> --all            # gallery of distinct frames
-bin/nelix-capture ~/.hermes/.../sessions/<id> --at-marker Cultivating   # a specific spinner frame
-bin/nelix-capture ~/.hermes/.../sessions/<id> --final          # the last screen (idle / menu / done)
+bin/nelix-capture ~/.nelix/sessions/<id> --all            # gallery of distinct frames
+bin/nelix-capture ~/.nelix/sessions/<id> --at-marker Cultivating   # a specific spinner frame
+bin/nelix-capture ~/.nelix/sessions/<id> --final          # the last screen (idle / menu / done)
 
 # a bare raw file works too (pass the dims it was captured at):
 bin/nelix-capture path/to/raw --cols 120 --rows 40 --final

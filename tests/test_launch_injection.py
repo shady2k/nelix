@@ -3,9 +3,8 @@ import os
 
 import daemon.launchers.local as local
 import paths
+from daemon import hook_settings
 from conftest import make_spec
-
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class FakeBroker:
@@ -150,13 +149,29 @@ def test_no_injection_without_session_and_secret(monkeypatch):
 def test_injects_executor_message_instructions_for_claude(monkeypatch):
     # The executor must be TOLD (via --append-system-prompt) that nelix-question/nelix-note exist,
     # by absolute path, without disturbing the existing --settings hook fold.
+    #
+    # Asserts the path the code RESOLVES, not a hardcoded <repo>/bin. This test hardcoded
+    # <repo>/bin and was RED on main from 9b1a14e (nelix-9a4.1) until here: that slice rewrote
+    # hook_settings._tool_path to prefer the INSTALLED console script (sysconfig scripts dir),
+    # which requirements.txt's `-e .` creates — so the old assertion only held in a venv where
+    # the core was NOT installed. Its pass/fail was a function of venv state rather than of the
+    # code, which is why a green suite hid it (MEASURED: move the two console scripts out of
+    # .venv/bin and it passes; put them back and it fails).
+    #
+    # The contract worth asserting is the one _tool_path was rewritten to enforce: the path nelix
+    # hands a worker must actually EXIST and be runnable. Naming <site-packages>/bin/nelix-question
+    # — a path that never exists — is the silent failure that rewrite was for. _tool_path's own
+    # resolution order is covered hermetically in tests/test_hook_settings.py.
     spec = make_spec(command="claude", args=["--foo"], driver="claude")
     cap = _run(monkeypatch, spec, session_id="s-1", hook_secret="sek")
     argv = cap["argv"]
     assert argv.count("--append-system-prompt") == 1
     text = argv[argv.index("--append-system-prompt") + 1]
-    assert os.path.join(_REPO_ROOT, "bin", "nelix-question") in text
-    assert os.path.join(_REPO_ROOT, "bin", "nelix-note") in text
+    for name in ("nelix-question", "nelix-note"):
+        tool = hook_settings._tool_path(name)
+        assert tool in text, f"instructions never name {name}"
+        assert os.path.isabs(tool), f"{name} named by a relative path: {tool}"
+        assert os.access(tool, os.X_OK), f"{name} named at a path that is not runnable: {tool}"
     assert "--settings" in argv                                # hook fold untouched
     json.loads(argv[argv.index("--settings") + 1])             # still valid JSON
 

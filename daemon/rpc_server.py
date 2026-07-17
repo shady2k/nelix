@@ -499,6 +499,12 @@ class UnixHTTPServer(ThreadingHTTPServer):
 
 
 def _make_unix_server(path, handler):
+    # Check BEFORE constructing the server: server_bind() unlinks any existing node before it
+    # binds, so letting an over-long path reach it destroys the node and then dies with a bare
+    # OSError("AF_UNIX path too long") that names nothing actionable.
+    problem = paths.sun_path_overflow(path)
+    if problem:
+        raise ValueError(f"nelix daemon cannot bind its RPC socket: {problem}")
     server = UnixHTTPServer(path, handler, bind_and_activate=False)
     server.server_bind()
     os.chmod(path, 0o600)                 # node readable/writable by owner only; no listen yet

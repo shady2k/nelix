@@ -1,26 +1,43 @@
-"""Single source of truth for nelix's on-disk layout under HERMES_HOME.
+"""Single source of truth for nelix's on-disk layout under NELIX_HOME.
 
-Every nelix path is defined HERE and nowhere else. Import-safe: stdlib only plus
-a lazy hermes_constants probe, no project imports — so both the in-process plugin
-(registry/supervisor/__init__) and the out-of-process daemon resolve identical paths.
+Every nelix path is defined HERE and nowhere else. Import-safe: stdlib only, no project
+imports — so every harness and the out-of-process daemon resolve identical paths.
+
+This file used to open "under HERMES_HOME" and root the layout at
+`hermes_home()/workspace/nelix`. That was the state-side half of a mistake whose code-side
+half was fixed by the plugin extraction (4d83167): Hermes is one harness among several, and a
+core that keeps its sessions inside one harness's home is the same category of wrong from the
+other side. The root is now the core's own, and no harness's home appears in this file.
 """
 import os
 from pathlib import Path
 
+# The default state root. NOT XDG: macOS normally has no XDG_RUNTIME_DIR, so an XDG default
+# would resolve to a different place on the two platforms we care about — or to nothing.
+DEFAULT_NELIX_HOME = "~/.nelix"
 
-def hermes_home() -> Path:
-    val = os.environ.get("HERMES_HOME", "").strip()
-    if val:
-        return Path(val)
-    try:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home())
-    except Exception:
-        return Path(os.path.expanduser("~/.hermes"))
+# macOS `sockaddr_un.sun_path` is 104 bytes INCLUDING the NUL terminator (Linux allows 108).
+# We check against the SMALLER: a socket path that binds on Linux but not on macOS is a
+# portability trap that only shows up on the other machine. Measured on darwin 24.6.0:
+# bind() succeeds at 103 bytes and raises OSError("AF_UNIX path too long") at 104.
+SUN_PATH_MAX = 104
 
 
 def nelix_root() -> Path:
-    return hermes_home() / "workspace" / "nelix"
+    """The core's private state root: `$NELIX_HOME`, else `~/.nelix`. This IS $NELIX_HOME —
+    there is no deeper nesting; `runtimes/`, `sessions/` and the rest hang directly off it.
+
+    CANONICAL, and canonicalised HERE so it cannot be forgotten downstream: `~/.nelix`,
+    `/Users/x/.nelix` and any symlink alias all name ONE root. That matters because root
+    identity is daemon identity — `daemon.lock` and `rpc.sock` live under this path, so two
+    spellings of one directory must not read as two daemons. Note the filesystem already
+    canonicalises for the LOCK (aliases reach one inode, and flock is per-inode), so this is
+    belt-and-braces today; it becomes load-bearing the moment anything keys off the root's
+    NAME rather than its inode — which is exactly what the router's per-uid runtime location
+    is specified to do [nelix-3rm].
+    """
+    val = os.environ.get("NELIX_HOME", "").strip() or DEFAULT_NELIX_HOME
+    return Path(val).expanduser().resolve()
 
 
 def config_path() -> Path:
@@ -33,8 +50,34 @@ def state_file() -> Path:
 
 def rpc_sock() -> Path:
     """AF_UNIX socket node for the local RPC transport. Lives in the 0700 nelix_root (so the node
-    inherits a private dir); the node itself is created 0600 by the daemon at bind time."""
+    inherits a private dir); the node itself is created 0600 by the daemon at bind time.
+
+    A pure accessor: it does NOT check sun_path. See sun_path_overflow() for why not, and for
+    who does.
+    """
     return nelix_root() / "rpc.sock"
+
+
+def sun_path_overflow(path) -> str | None:
+    """Why `path` cannot be an AF_UNIX node on this platform, or None if it fits.
+
+    Returns a reason instead of raising, and lives here rather than inside rpc_sock(), because
+    rpc_sock() is a path accessor and an accessor that throws breaks every caller that only
+    wants the string. That is measured, not hypothetical: pytest's own tmp_path on macOS is
+    ~125 bytes, so a checking rpc_sock() red-lights tests that never bind a thing. The BIND
+    site raises — that is where the limit is actually enforced, and it is the only place that
+    knows a bind is about to happen.
+
+    Worth guarding at all because $NELIX_HOME is operator-settable now: an unguarded bind fails
+    with a bare OSError("AF_UNIX path too long") naming neither the path, the limit, nor the
+    setting that caused it — and it fails AFTER server_bind() has already unlinked the node.
+    """
+    n = len(str(path).encode())
+    if n < SUN_PATH_MAX:           # <, not <=: the limit counts the NUL terminator
+        return None
+    return (f"AF_UNIX socket path {str(path)!r} is {n} bytes; this platform allows at most "
+            f"{SUN_PATH_MAX - 1}. If it sits under $NELIX_HOME, point NELIX_HOME at a shorter "
+            f"path; if it came from $NELIX_RPC_SOCK, shorten that.")
 
 
 def sessions_root() -> Path:
@@ -54,7 +97,7 @@ def child_record(session_dir) -> Path:
 
 
 def daemon_lock() -> Path:
-    """Advisory single-daemon lock for this nelix_root (one daemon per profile)."""
+    """Advisory single-daemon lock for this nelix_root (one daemon per NELIX_HOME)."""
     return nelix_root() / "daemon.lock"
 
 
@@ -79,8 +122,14 @@ def ensure_private_dir(path) -> Path:
     0700, so no nelix-owned directory is group/world-readable — transcripts and the token
     state file can hold secrets. Idempotent, and corrects a directory created earlier under
     a looser umask. (mkdir(parents=True) makes intermediate dirs with the umask, so each
-    level is chmod-ed explicitly; ancestors ABOVE nelix_root, e.g. a shared HERMES_HOME, are
-    left untouched.)"""
+    level is chmod-ed explicitly.)
+
+    The walk now tightens nelix_root ITSELF and stops there. Under the old layout the root was
+    a subdirectory we created (`<hermes_home>/workspace/nelix`) and the loop deliberately left
+    its ancestors — a shared HERMES_HOME — alone. The root IS $NELIX_HOME now, so the dir we
+    chmod 0700 is the one the operator named for us. Ancestors above it are still never
+    touched: point NELIX_HOME at a directory that is nelix's, not at $HOME.
+    """
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     root = nelix_root()

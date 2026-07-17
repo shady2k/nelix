@@ -32,7 +32,7 @@ def _spec():
 
 
 def _session(tmp_path, monkeypatch, sid="s-aaaa0001"):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     spec = _spec()
     # Minimal driver double: only command_prefixes is needed before the monitor runs.
     class _Drv:
@@ -99,7 +99,7 @@ def test_properties_expose_executor_task_cwd(tmp_path, monkeypatch):
 def test_meta_persists_no_env_or_env_cmd_secret(tmp_path, monkeypatch):
     # nelix-c5o §5: _write_meta must NEVER serialize env — neither the static [env] nor the env_cmd
     # command (which can carry a secret path). On restart the command is RE-RUN, never read from disk.
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     spec = ExecutorSpec(command="claude", args=[], env={"STATIC_SECRET": "s3cr3t-static-value"},
                         driver="claude", env_cmd={"TOK": "print-the-secret-token"})
 

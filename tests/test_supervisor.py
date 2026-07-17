@@ -45,7 +45,7 @@ _FAKE = textwrap.dedent("""
 
 
 def _use_fake_daemon(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     monkeypatch.setenv("NELIX_RPC_TRANSPORT", "tcp")
     fake = tmp_path / "fake_daemon.py"
     fake.write_text(_FAKE)
@@ -90,7 +90,7 @@ def test_teardown_kills_and_clears(monkeypatch, tmp_path):
 def test_stale_state_triggers_respawn(monkeypatch, tmp_path):
     _use_fake_daemon(monkeypatch, tmp_path)
     state = paths.state_file()
-    state.parent.mkdir(parents=True)
+    state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(json.dumps({"pid": 999999, "transport": "tcp",
                                  "host": "127.0.0.1", "port": 1, "token": "dead"}))
     transport = supervisor.ensure_running()  # dead pid -> respawn
@@ -99,7 +99,7 @@ def test_stale_state_triggers_respawn(monkeypatch, tmp_path):
 
 
 def test_healthy_requires_matching_protocol(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(supervisor)
     t = Transport.tcp("127.0.0.1", 1, "tok")
     monkeypatch.setattr(supervisor, "_status_body",
@@ -114,7 +114,7 @@ def test_healthy_requires_matching_protocol(monkeypatch, tmp_path):
 
 
 def test_endpoint_rejects_stale_protocol_daemon(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     paths.ensure_private_dir(paths.nelix_root())
     supervisor._write_state(os.getpid(), Transport.unix(str(paths.rpc_sock())))
@@ -139,7 +139,7 @@ def test_reconcile_noop_when_no_holder(monkeypatch):
 
 
 def test_reconcile_adopts_compatible_unix_holder(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     paths.ensure_private_dir(paths.nelix_root())
     monkeypatch.setattr(supervisor, "_live_lock_holder",
@@ -151,7 +151,7 @@ def test_reconcile_adopts_compatible_unix_holder(monkeypatch, tmp_path):
 
 
 def test_reconcile_reaps_incompatible_unix_holder(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     monkeypatch.setattr(supervisor, "_live_lock_holder",
                         lambda: {"pid": 4242, "transport": "unix"})
@@ -165,7 +165,7 @@ def test_reconcile_reaps_incompatible_unix_holder(monkeypatch, tmp_path):
 def test_reconcile_reaps_stale_tcp_holder(monkeypatch, tmp_path):
     # a tcp holder isn't probe-able (no token in lock meta). If it never publishes a usable
     # endpoint within the grace, it's a stale orphan -> reap.
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     monkeypatch.setattr(supervisor, "_live_lock_holder",
                         lambda: {"pid": 4242, "transport": "tcp", "port": 5})
@@ -179,7 +179,7 @@ def test_reconcile_reaps_stale_tcp_holder(monkeypatch, tmp_path):
 def test_reconcile_never_reaps_tcp_winner_that_publishes(monkeypatch, tmp_path):
     # the concurrency hazard Codex flagged: a fresh winner holds the lock but its state write trails
     # by a beat. It publishes within the grace -> we adopt it, never reap a live winner.
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     monkeypatch.setattr(supervisor, "_live_lock_holder",
                         lambda: {"pid": 4242, "transport": "tcp", "port": 5})
@@ -192,7 +192,7 @@ def test_reconcile_never_reaps_tcp_winner_that_publishes(monkeypatch, tmp_path):
 
 
 def test_holder_transport_uses_recorded_unix_path(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     # a manually started daemon serving a non-default node: adopt the path it ACTUALLY bound
     assert supervisor._holder_transport({"transport": "unix", "path": "/tmp/custom.sock"}) \
@@ -204,7 +204,7 @@ def test_holder_transport_uses_recorded_unix_path(monkeypatch, tmp_path):
 
 
 def test_endpoint_rejects_reused_state_pid(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     paths.ensure_private_dir(paths.nelix_root())
     supervisor._write_state(os.getpid(), Transport.unix(str(paths.rpc_sock())))
@@ -224,7 +224,7 @@ def test_reap_daemon_tolerates_holder_already_gone(monkeypatch):
 
 
 def test_teardown_ctrl_c_skips_graceful_for_remaining_pids(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(supervisor)
     monkeypatch.setattr(supervisor, "_read_state", lambda: {"pid": 100})
     monkeypatch.setattr(supervisor, "_pid_alive", lambda pid: True)
@@ -241,7 +241,7 @@ def test_teardown_ctrl_c_skips_graceful_for_remaining_pids(monkeypatch, tmp_path
 
 
 def test_teardown_reaps_orphan_lock_holder_not_in_state(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(supervisor)
     monkeypatch.setattr(supervisor, "_read_state", lambda: {"pid": 100})   # recorded daemon...
     monkeypatch.setattr(supervisor, "_pid_alive", lambda pid: pid == 200)  # ...is dead; 200 alive
@@ -258,7 +258,7 @@ def test_teardown_reaps_orphan_lock_holder_not_in_state(monkeypatch, tmp_path):
 def test_ensure_running_reaps_stale_orphan_and_respawns(monkeypatch, tmp_path):
     """The real incident: .active.json names a DEAD pid while a live daemon on STALE code holds the
     lock+socket. ensure_running must reap the orphan and bring up a fresh, compatible daemon."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     monkeypatch.setenv("NELIX_RPC_TRANSPORT", "tcp")
     fake = tmp_path / "fake_daemon.py"; fake.write_text(_FAKE)
     importlib.reload(supervisor)
@@ -268,7 +268,7 @@ def test_ensure_running_reaps_stale_orphan_and_respawns(monkeypatch, tmp_path):
 
     # 1) a live ORPHAN daemon on an OLD protocol, holding the singleton lock
     port = supervisor._free_port()
-    env = {**os.environ, "HERMES_HOME": str(tmp_path), "NELIX_RPC_TRANSPORT": "tcp",
+    env = {**os.environ, "NELIX_HOME": str(tmp_path), "NELIX_RPC_TRANSPORT": "tcp",
            "NELIX_RPC_TOKEN": "orphan", "NELIX_RPC_PORT": str(port), "NELIX_FAKE_PROTOCOL": "0",
            "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     orphan = subprocess.Popen([sys.executable, str(fake)], env=env,
@@ -435,9 +435,9 @@ def test_disable_uv_env_forces_pip_tier(monkeypatch):
 
 
 def test_daemon_log_is_per_spawn_named_under_logs_dir(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(supervisor)
-    root = supervisor._root(); root.mkdir(parents=True)
+    root = supervisor._root(); root.mkdir(parents=True, exist_ok=True)
     p = supervisor._open_daemon_log(root)
     logs = paths.logs_dir()
     assert p.parent == logs                                   # logs now live under logs/, not root
@@ -449,9 +449,9 @@ def test_daemon_log_is_per_spawn_named_under_logs_dir(monkeypatch, tmp_path):
 
 
 def test_open_daemon_log_migrates_legacy_root_logs(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(supervisor)
-    root = supervisor._root(); root.mkdir(parents=True)
+    root = supervisor._root(); root.mkdir(parents=True, exist_ok=True)
     old = root / "daemon-20250101-000000-111.log"; old.write_text("old")   # legacy root layout
     (root / "daemon-latest.log").symlink_to(old.name)
     p = supervisor._open_daemon_log(root)
@@ -463,9 +463,9 @@ def test_open_daemon_log_migrates_legacy_root_logs(monkeypatch, tmp_path):
 
 
 def test_prune_keeps_newest_retain_and_spares_symlink(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(supervisor)
-    root = supervisor._root(); root.mkdir(parents=True)
+    root = supervisor._root(); root.mkdir(parents=True, exist_ok=True)
     made = []
     for i in range(5):
         f = root / f"daemon-2026010{i}-000000-{1000+i}.log"
@@ -488,9 +488,9 @@ def test_teardown_logs_to_nelix_logger(monkeypatch, tmp_path, caplog):
 
 
 def test_prune_spares_current_file_and_keeps_total_retain(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(supervisor)
-    root = supervisor._root(); root.mkdir(parents=True)
+    root = supervisor._root(); root.mkdir(parents=True, exist_ok=True)
     # 3 old files (one FUTURE-dated so it sorts newest) + a "current" file with an OLDER mtime.
     # current must survive regardless of mtime, and the total must be exactly retain=2.
     for i, mt in enumerate((100, 5000, 200)):           # index 1 is future-dated
@@ -505,7 +505,7 @@ def test_prune_spares_current_file_and_keeps_total_retain(monkeypatch, tmp_path)
 
 
 def test_ensure_running_reuses_race_winner(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import importlib, supervisor
     importlib.reload(supervisor)
     monkeypatch.setattr(supervisor, "_ensure_deps", lambda: None)
@@ -529,7 +529,7 @@ def test_ensure_running_reuses_race_winner(monkeypatch, tmp_path):
 
 
 def test_endpoint_returns_unix_transport_from_state(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import importlib, supervisor, paths
     importlib.reload(paths); importlib.reload(supervisor)
     paths.ensure_private_dir(paths.nelix_root())
@@ -543,7 +543,7 @@ def test_endpoint_returns_unix_transport_from_state(monkeypatch, tmp_path):
 
 def test_write_state_is_0600_and_carries_transport(monkeypatch, tmp_path):
     import importlib, supervisor, paths, os, stat, json
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     paths.ensure_private_dir(paths.nelix_root())
     supervisor._write_state(4242, Transport.tcp("127.0.0.1", 55555, "tok"))
@@ -557,7 +557,7 @@ def test_write_state_is_0600_and_carries_transport(monkeypatch, tmp_path):
 def test_teardown_survives_ctrl_c_and_force_kills(monkeypatch, tmp_path):
     # Hermes' quit handler raises KeyboardInterrupt during teardown's graceful wait.
     # teardown must NOT propagate it, and must escalate to SIGKILL (force exit).
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(supervisor)
     monkeypatch.setattr(supervisor, "_read_state",
                         lambda: {"pid": 4242, "port": 1, "token": "t"})
@@ -577,3 +577,39 @@ def test_teardown_survives_ctrl_c_and_force_kills(monkeypatch, tmp_path):
     supervisor.teardown("ctrl-c test")                    # must not raise
     assert supervisor.signal.SIGTERM in signals           # graceful attempt first
     assert supervisor.signal.SIGKILL in signals           # then force-killed
+
+
+def test_daemon_env_pins_the_resolved_nelix_home_and_drops_hermes_home(monkeypatch, tmp_path):
+    """The spawn env must pin NELIX_HOME to the RESOLVED root, so the daemon cannot land on a
+    different root than the supervisor that spawned it (a symlink relocated between spawn and
+    start would otherwise split them silently). And it must NOT materialise HERMES_HOME: nothing
+    under daemon/ reads it, and injecting a harness's home into the daemon and every executor it
+    launches is the coupling nelix-9a4.7 removes. A HERMES_HOME the operator really has set still
+    reaches the child through os.environ — this asserts we do not INVENT one.
+    """
+    real = tmp_path / "real"; real.mkdir()
+    alias = tmp_path / "alias"; alias.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("NELIX_HOME", str(alias))          # spelled via the alias...
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    importlib.reload(paths); importlib.reload(supervisor)
+
+    captured = {}
+
+    class _Proc:
+        pid = 4242
+        def poll(self): return None
+        def terminate(self): pass
+
+    def _fake_popen(argv, **kw):
+        captured.update(kw.get("env") or {})
+        return _Proc()
+
+    monkeypatch.setattr(supervisor, "_ensure_deps", lambda: None)
+    monkeypatch.setattr(supervisor.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(supervisor, "_healthy", lambda t: True)
+    monkeypatch.setattr(supervisor, "_owns_lock", lambda pid: True)
+    monkeypatch.setattr(supervisor, "_write_state", lambda pid, t: None)
+    supervisor.ensure_running()
+
+    assert captured["NELIX_HOME"] == str(real), "...but the daemon is pinned to the RESOLVED root"
+    assert "HERMES_HOME" not in captured

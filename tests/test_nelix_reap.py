@@ -18,7 +18,7 @@ def _load_reap():
 
 
 def test_reap_orphans_refuses_under_live_daemon(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import paths; importlib.reload(paths)
     reap = _load_reap()
     monkeypatch.setattr(reap.supervisor, "endpoint", lambda: Transport.tcp("127.0.0.1", 9999, "t"))   # live
@@ -27,7 +27,7 @@ def test_reap_orphans_refuses_under_live_daemon(monkeypatch, tmp_path):
 
 
 def test_reap_orphans_kills_when_daemon_dead(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import paths; importlib.reload(paths)
     from daemon import reaper
     sd = paths.sessions_root() / "s-orphan9"; sd.mkdir(parents=True)

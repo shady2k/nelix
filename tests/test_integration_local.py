@@ -41,7 +41,7 @@ def test_local_task_reaches_decision_and_creates_file(tmp_path):
 
 
 def test_supervisor_spawns_daemon_and_runs(tmp_path, monkeypatch):
-    # operator must point HERMES_HOME at a profile whose nelix.toml has NELIX_EXECUTOR
+    # operator must point NELIX_HOME at a root whose nelix.toml has NELIX_EXECUTOR
     transport = supervisor.ensure_running()
     try:
         sid = RpcClient(transport).start(os.environ["NELIX_EXECUTOR"],
