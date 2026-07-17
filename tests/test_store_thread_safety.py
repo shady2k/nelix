@@ -11,6 +11,7 @@ connection, sqlite3 raised `ProgrammingError: SQLite objects created in a thread
 used in that same thread` — mapped to INTERNAL_ERROR, a 5xx for what is purely this package's
 own connection-plumbing bug, not the caller's.
 """
+import gc
 import sqlite3
 import threading
 
@@ -143,6 +144,165 @@ def test_write_contention_on_a_shared_store_is_a_retryable_store_unavailable(tmp
     finally:
         release.set()
         t.join(timeout=10)
+        store.close()
+
+
+def test_a_fresh_threads_first_read_succeeds_while_another_thread_holds_a_write(tmp_path):
+    # nelix-91y review finding #2 (the main functional defect): every thread's FIRST open
+    # used to re-run the ENTIRE db bootstrap (flock + BEGIN IMMEDIATE + version stamp + DDL)
+    # even once the database was already initialized and already WAL. So a brand-new
+    # thread's first call to a READ-ONLY method first attempted this bootstrap WRITE, which
+    # collided with an UNRELATED writer's already-open transaction on the SAME shared
+    # instance — the WAL-safe SELECT was never reached. timeout=0 makes that collision
+    # immediate and certain instead of probabilistic: with busy_timeout=0, any lock
+    # contention at all raises SQLITE_BUSY right away.
+    #
+    # Distinguishes itself from test_write_contention_on_a_shared_store_is_a_retryable_
+    # store_unavailable above: that test proves write-vs-write contention correctly
+    # surfaces as store_unavailable. This one proves a fresh thread's READ must NOT collide
+    # with a concurrent write AT ALL, because get_session/list_sessions never take a write
+    # lock themselves — the only thing that could still collide is bootstrap machinery that
+    # has no business running once the database is already up.
+    store = Store(tmp_path, clock=lambda: 1000.0, timeout=0)   # bootstraps here, main thread
+    ledger = StartLedger(tmp_path, clock=lambda: 1000.0)
+    r = ledger.reserve(idempotency_key="k1", owner_id=OWNER, orchestration_id=OID,
+                       request_fingerprint=FP)
+    ledger.assign_generation(r.session_id, GID)
+    store.create_session(r.session_id, state="running", executor="coder", task="t",
+                         cwd="/repo", model=None, created_at=100.0)
+    ledger.close()
+
+    lock_held, release = threading.Event(), threading.Event()
+
+    def holder():
+        # This thread's OWN first connection (the instance is already bootstrapped by the
+        # main thread above), then an ordinary application write transaction — nothing to
+        # do with bootstrap.
+        conn = store._conn
+        conn.execute("BEGIN IMMEDIATE")
+        lock_held.set()
+        release.wait(timeout=10)
+        conn.execute("ROLLBACK")
+
+    t = threading.Thread(target=holder, daemon=True)
+    t.start()
+    try:
+        assert lock_held.wait(timeout=5), "holder thread never acquired the write lock"
+
+        results = []
+
+        def reader():
+            # A FRESH thread: this is its first-ever call to the shared store, made while
+            # the holder thread's write transaction is open.
+            try:
+                results.append(("ok", store.get_session(r.session_id, owner_id=OWNER)))
+            except NelixError as e:
+                results.append(("error", e))
+
+        rt = threading.Thread(target=reader, daemon=True)
+        rt.start()
+        rt.join(timeout=10)
+        assert not rt.is_alive(), "the fresh reader thread hung"
+        assert results, "the fresh reader thread produced no result at all"
+        kind, payload = results[0]
+        assert kind == "ok", (
+            f"a fresh thread's first read failed while another thread held a write: "
+            f"{payload.code if isinstance(payload, NelixError) else payload}")
+        assert payload.session_id == r.session_id
+    finally:
+        release.set()
+        t.join(timeout=10)
+        store.close()
+
+
+def test_a_long_lived_worker_pool_shares_one_store_across_many_requests_per_worker(tmp_path):
+    # The router's actual shape, closer than any other test in this file: a FIXED pool of
+    # worker threads, each alive for the process's lifetime and handling MANY requests over
+    # time — not the one-shot-per-thread pattern every test above uses. This is the scenario
+    # ThreadLocalConnections' lazy-open-once-then-cache-forever path exists to serve: each
+    # worker opens its connection ONCE and reuses it across every one of its rounds.
+    ledger = StartLedger(tmp_path, clock=lambda: 1000.0)
+    store = Store(tmp_path, clock=lambda: 1000.0)
+
+    n_workers, rounds = 4, 25
+    errs, lock = [], threading.Lock()
+
+    def worker(worker_id):
+        try:
+            for round_ in range(rounds):
+                r = ledger.reserve(idempotency_key=f"w{worker_id}-r{round_}", owner_id=OWNER,
+                                   orchestration_id=OID, request_fingerprint=FP)
+                ledger.assign_generation(r.session_id, GID)
+                store.create_session(r.session_id, state="running", executor="coder",
+                                     task="t", cwd="/repo", model=None, created_at=100.0)
+                got = store.get_session(r.session_id, owner_id=OWNER)
+                assert got.session_id == r.session_id
+        except BaseException as e:          # noqa: BLE001 - account for everything
+            with lock:
+                errs.append(f"worker {worker_id}, round {round_}: {type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+              for i in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    try:
+        assert all(not t.is_alive() for t in threads), "a worker hung"
+        assert errs == [], f"long-lived worker pool failed: {errs}"
+        listed = store.list_sessions(OWNER)
+        assert len(listed) == n_workers * rounds, \
+            "not every worker's every round made it onto the board"
+    finally:
+        ledger.close()
+        store.close()
+
+
+def test_many_short_lived_threads_touching_a_shared_store_leave_no_connection_growth(tmp_path):
+    # ThreadLocalConnections opens one connection per thread and relies on each thread's OWN
+    # teardown to reclaim it (db.py's close() docstring: "measured — 20 sequential threads
+    # that each opened a connection and exited without an explicit close left the process's
+    # open-fd count unchanged"). That claim had no assertion pinning it anywhere in the suite
+    # — a real assertion on live connection count, not a bare pass.
+    #
+    # Counts LIVE sqlite3.Connection OBJECTS, not raw OS fds: measured, this process's raw
+    # `/dev/fd` count is NOT a clean signal here — it also reflects libsqlite3/WAL's own
+    # shared-memory bookkeeping on this platform, which does not shrink 1:1 with Python
+    # object lifetime even once every `sqlite3.Connection` wrapper is provably gone. Counting
+    # the wrapper objects directly is what actually pins THIS package's contract: a
+    # short-lived thread's connection must not accumulate in the shared instance.
+    #
+    # The explicit gc.collect() is required, not decorative: `threading.local`'s per-thread
+    # slot is reclaimed through CPython's cyclic collector, not plain refcounting — a dying
+    # thread's `_local.conn` reference does not drop the connection's refcount to zero the
+    # moment `Thread.join()` returns (verified: without a collection pass, 50 such threads
+    # measurably leave their sqlite3.Connection objects alive here). That is not a leak: a
+    # real long-running process's normal periodic gen0 collections reclaim it regardless,
+    # same as any other reference cycle. Forcing the collection here is what turns
+    # "eventually, whenever GC next runs" into a deterministic assertion of the property the
+    # docstring claims — no PERMANENT growth, not "reclaimed before the very next line".
+    store = Store(tmp_path, clock=lambda: 1000.0)
+
+    def live_connections():
+        gc.collect()
+        return sum(1 for o in gc.get_objects() if isinstance(o, sqlite3.Connection))
+
+    try:
+        before = live_connections()
+        for _ in range(50):
+            def touch():
+                store._conn.execute("SELECT 1").fetchone()
+
+            t = threading.Thread(target=touch)
+            t.start()
+            t.join(timeout=10)
+            assert not t.is_alive(), "a short-lived thread hung"
+        after = live_connections()
+        assert after <= before, (
+            f"live sqlite3.Connection objects grew from {before} to {after} across 50 "
+            f"short-lived threads that each opened and dropped their own connection")
+    finally:
         store.close()
 
 
