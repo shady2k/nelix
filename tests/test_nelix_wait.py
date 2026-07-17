@@ -282,7 +282,7 @@ def test_nelix_wait_discovers_unix_endpoint_and_prints_doorbell(tmp_path, unix_s
     class FakeManager:
         def __init__(self):
             self._events = EventQueue()
-        def start(self, *a): return "s1", 0
+        def start(self, *a): return "s-00000001", 0
         def respond(self, *a, **k): ...
         def status(self, sid=None, *, owner_id, include_progress=False): return {"sessions": {}}
         def stop(self, *a): return True
@@ -296,18 +296,18 @@ def test_nelix_wait_discovers_unix_endpoint_and_prints_doorbell(tmp_path, unix_s
     # /wait only arms on a session the caller OWNS, and it asks the durable record — so this fake
     # session needs the record a real start would have written. Without it the route correctly
     # refuses to arm and the waiter polls forever.
-    own("s1")
+    own("s-00000001")
 
     # Push a real event into the queue BEFORE running the waiter (it will poll once)
     mgr._events.publish(
-        "s1", EXECUTOR, "waiting_for_user", "approve?", "waiting_for_user",
+        "s-00000001", EXECUTOR, "waiting_for_user", "approve?", "waiting_for_user",
         requires_response=True, hung=False)
 
     # Write the unix-transport state file
     sf = _write_state(tmp_path, {"transport": "unix", "path": unix_sock})
 
     try:
-        out = _run_wait(sf, ["--after", "0", "--session-id", "s1", "--owner-id", OWNER])
+        out = _run_wait(sf, ["--after", "0", "--session-id", "s-00000001", "--owner-id", OWNER])
     finally:
         srv.shutdown()
 
@@ -315,7 +315,7 @@ def test_nelix_wait_discovers_unix_endpoint_and_prints_doorbell(tmp_path, unix_s
     assert rec["schema"] == "nelix.wake.v1"
     assert rec["status_required"] is True
     assert rec["kind"] == "waiting_for_user"
-    assert rec["session_id"] == "s1"
+    assert rec["session_id"] == "s-00000001"
     assert rec["requires_response"] is True
     # Doorbell fields only — no executor chrome
     assert "summary" not in rec and "screen_excerpt" not in rec and "event_id" not in rec

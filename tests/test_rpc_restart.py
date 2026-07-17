@@ -30,11 +30,11 @@ def test_restart_route_returns_new_session():
                                          snapshot={"session_id": "s-new", "control_state": "busy"}))
     srv, base = _serve(mgr, 8771)
     try:
-        st, b = _req("POST", base + "/restart", body={"session_id": "s-old", "owner_id": OWNER})
+        st, b = _req("POST", base + "/restart", body={"session_id": "s-01234567", "owner_id": OWNER})
         assert st == 200 and b["operation"] == "restart" and b["status"] == "restarted"
         assert b["session_id"] == "s-new" and b["lineage_id"] == "s-old"
-        assert b["restarted_from"] == "s-old" and b["next_action"] == "end_turn"
-        assert mgr.calls == [("s-old", False)]
+        assert b["restarted_from"] == "s-01234567" and b["next_action"] == "end_turn"
+        assert mgr.calls == [("s-01234567", False)]
     finally:
         srv.shutdown()
 
@@ -43,7 +43,7 @@ def test_restart_route_budget_exhausted_is_409():
     mgr = _RestartManager(RestartOutcome("restart_budget_exhausted", restart_count=3, max_restarts=3))
     srv, base = _serve(mgr, 8772)
     try:
-        st, b = _req("POST", base + "/restart", body={"session_id": "s-old", "owner_id": OWNER})
+        st, b = _req("POST", base + "/restart", body={"session_id": "s-01234567", "owner_id": OWNER})
         assert st == 409 and b["error"] == "restart_budget_exhausted" and b["max_restarts"] == 3
     finally:
         srv.shutdown()
@@ -53,7 +53,7 @@ def test_restart_route_unknown_is_404():
     mgr = _RestartManager(RestartOutcome("unknown_session"))
     srv, base = _serve(mgr, 8773)
     try:
-        st, b = _req("POST", base + "/restart", body={"session_id": "s-nope", "owner_id": OWNER})
+        st, b = _req("POST", base + "/restart", body={"session_id": "s-0000dead", "owner_id": OWNER})
         assert st == 404
     finally:
         srv.shutdown()
@@ -65,8 +65,8 @@ def test_restart_route_force_passed_through():
                                          snapshot={"session_id": "s-new", "control_state": "busy"}))
     srv, base = _serve(mgr, 8774)
     try:
-        _req("POST", base + "/restart", body={"session_id": "s-old", "force": True, "owner_id": OWNER})
-        assert mgr.calls == [("s-old", True)]
+        _req("POST", base + "/restart", body={"session_id": "s-01234567", "force": True, "owner_id": OWNER})
+        assert mgr.calls == [("s-01234567", True)]
     finally:
         srv.shutdown()
 
@@ -89,7 +89,7 @@ def test_restart_route_start_failed_is_409():
     mgr = _RestartManager(RestartOutcome("start_failed"))
     srv, base = _serve(mgr, 8777)
     try:
-        st, b = _req("POST", base + "/restart", body={"session_id": "s-old", "owner_id": OWNER})
+        st, b = _req("POST", base + "/restart", body={"session_id": "s-01234567", "owner_id": OWNER})
         assert st == 409 and b["error"] == "start_failed"
     finally:
         srv.shutdown()
@@ -103,7 +103,7 @@ def test_restart_route_includes_next_after_seq():
                                          snapshot={"session_id": "s-new", "control_state": "busy"}))
     srv, base = _serve(mgr, 8778)
     try:
-        st, b = _req("POST", base + "/restart", body={"session_id": "s-old", "owner_id": OWNER})
+        st, b = _req("POST", base + "/restart", body={"session_id": "s-01234567", "owner_id": OWNER})
         assert st == 200 and b["next_after_seq"] == 42
     finally:
         srv.shutdown()
@@ -117,9 +117,9 @@ def test_rpc_client_restart_round_trip():
     srv = make_server(mgr, Transport.tcp("127.0.0.1", 8775, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        ok, body = RpcClient(Transport.tcp("127.0.0.1", 8775, "t"), OWNER).restart("s-old")
+        ok, body = RpcClient(Transport.tcp("127.0.0.1", 8775, "t"), OWNER).restart("s-01234567")
         assert ok is True and body["status"] == "restarted" and body["restart_count"] == 2
-        ok2, body2 = RpcClient(Transport.tcp("127.0.0.1", 8775, "t"), OWNER).restart("s-old")  # same fake outcome
+        ok2, body2 = RpcClient(Transport.tcp("127.0.0.1", 8775, "t"), OWNER).restart("s-01234567")  # same fake outcome
         assert ok2 is True
     finally:
         srv.shutdown()

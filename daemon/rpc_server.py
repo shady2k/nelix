@@ -13,10 +13,14 @@ from daemon import owner
 from daemon.config import MSG_MAX_BODY, DEFAULT_DIALOG_PAGE_CHARS
 from daemon.dialog import DialogReader
 from daemon.env_resolver import EnvResolveError
+from daemon.errors import error_envelope
 from daemon.events import EXTERNAL_OUTPUT_POLICY
+from daemon.generation import generation_id
 from daemon.hooks import HookEvent
 from daemon.hygiene import PtyInputRejected
-from daemon.manager import ModelRejected, ModelUnavailable
+from daemon.manager import (
+    ModelRejected, ModelUnavailable, SessionIdInUse, SessionIdRejected, validate_session_id_shape,
+)
 from daemon.messages import parse_message_body
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.transport import peer_is_self
@@ -25,6 +29,17 @@ _MAX_BODY = 4 * 1024 * 1024   # 4 MiB body cap (post-auth memory hygiene; genero
 _HOOK_MAX_BODY = 256 * 1024   # tight cap for hook payloads: they are small lifecycle events
 _HOOK_RATE_CAPACITY = 60      # per-session token-bucket burst (generous for a busy turn's tool events)
 _HOOK_RATE_REFILL = 30.0      # tokens/sec sustained; a genuine flood/forge attempt is dropped
+
+
+def _query_sid(query, key="session_id"):
+    """Extract `key` from a raw query string, treating a `key=` with an EMPTY value as PRESENT
+    ("") rather than absent (None). `parse_qs`'s default (`keep_blank_values=False`) drops a blank
+    value entirely, conflating "the caller omitted this" with "the caller sent an explicit empty
+    string" -- which matters wherever an omitted sid is legitimate (the global /status and
+    /capabilities forms) but an explicit empty one is not (nelix-9a4.6 review finding #4: an empty
+    `sid` on /capabilities used to silently fall through to the global baseline instead of 400ing).
+    """
+    return parse_qs(query, keep_blank_values=True).get(key, [None])[0]
 
 
 class _HookRateLimiter:
@@ -143,6 +158,24 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             except owner.OwnerRejected as e:
                 raise _BadRequest(400, str(e))
 
+        def _require_valid_sid(self, sid):
+            """Shape-check a caller-supplied session id BEFORE it is used as a `sessions/<sid>/`
+            path component ANYWHERE downstream -- the owner lookup, the transcript read, the meta
+            read (nelix-9a4.6 review finding #3: /start alone had this check; every other route
+            taking a caller-supplied sid read straight past it). Sends the stable 400 envelope and
+            returns False on a bad shape; returns True and sends nothing on a good one.
+
+            Callers with an OPTIONAL sid (the global /status and /capabilities forms) must check
+            `is None` themselves first -- an omitted sid is not this method's business, only a
+            PRESENT bad-shape one is.
+            """
+            try:
+                validate_session_id_shape(sid)
+                return True
+            except SessionIdRejected as e:
+                self._send(400, error_envelope("invalid_session_id", str(e), retryable=False))
+                return False
+
         def do_GET(self):
             if not self._auth():
                 return
@@ -166,7 +199,13 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                              seq=manager._events.latest_seq(sid))
 
         def _dispatch_get(self, p):
-            if p.path == "/wait":
+            if p.path == "/health":
+                # spec §8/§10: a liveness/identity probe. Deliberately NO owner_id and NO session
+                # id — every other caller-facing route needs one or both; this one must not, or a
+                # health check would need to already know a caller identity to ask "are you up".
+                self._send(200, {"status": "ok", "rpc_protocol": RPC_PROTOCOL_VERSION,
+                                 "generation_id": generation_id()})
+            elif p.path == "/wait":
                 qs = parse_qs(p.query)
                 after = self._int(qs.get("after_seq", ["0"])[0], 0)
                 sid = qs.get("session_id", [None])[0]
@@ -176,6 +215,10 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                     # session's result into another's orchestrator when the daemon is shared. Refuse
                     # it structurally: session_id is mandatory (mirrors the /dialog guard below).
                     self._send(400, {"error": "missing session_id"}); return
+                # Shape-check BEFORE owner.owns_session ever resolves `sessions_root() / sid`
+                # (nelix-9a4.6 review, follow-up finding: /wait was missed by the original pass).
+                if not self._require_valid_sid(sid):
+                    return
                 # Events are NOT owner-tagged (the queue is a global ordered log), so the filter has
                 # to be here: establish ownership of `sid` BEFORE arming, and never arm otherwise.
                 # This is the "arms a waiter for every session it sees" half of the bug — a waiter
@@ -198,6 +241,8 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
                 owner_id = self._owner(qs.get("owner_id", [None])[0])
+                if sid is not None and not self._require_valid_sid(sid):
+                    return
                 # Task 8: explicit on-demand progress detail, off by default (anti-poll: an
                 # active-working snapshot stays progress-free unless the caller asks for it).
                 include_progress = qs.get("include_progress", ["0"])[0].lower() in ("1", "true")
@@ -214,6 +259,12 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 self._log_read("dialog", sid)
                 if not sid:
                     self._send(400, {"error": "missing session_id"}); return
+                # Shape-check BEFORE the owner-gate below or the disk read past it (nelix-9a4.6
+                # review finding #3): a bad-shape sid (traversal, separators, control chars) must
+                # never reach `paths.sessions_root() / sid`, regardless of what owner-gating would
+                # have done with it.
+                if not self._require_valid_sid(sid):
+                    return
                 # THE route the session id alone must never open: everything below reads the
                 # transcript straight off DISK, so it never passes through the manager and would
                 # otherwise hand any caller the full dialog of any session whose id it holds. The
@@ -257,12 +308,35 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 qs = parse_qs(p.query)
                 sid = qs.get("session_id", [None])[0]
                 owner_id = self._owner(qs.get("owner_id", [None])[0])
+                if sid is not None and not self._require_valid_sid(sid):
+                    return
                 self._log_read("screen", sid)
                 raw = qs.get("raw", ["0"])[0].lower() in ("1", "true")
                 force = qs.get("force", ["0"])[0].lower() in ("1", "true")
                 # manager.screen owner-gates via _owned. Note `force` bypasses the anti-poll
                 # withhold, NOT the owner gate: they are checked in that order inside screen().
                 self._send(200, manager.screen(sid, owner_id=owner_id, raw=raw, force=force))
+            elif p.path == "/capabilities":
+                # spec §8: per-session capabilities. NOTE the query key is `sid` (not
+                # `session_id` like every other route) — verbatim per the brief. owner_id is
+                # required regardless of whether `sid` is present, exactly like /status (the same
+                # `_owner` helper, the same missing-owner 400 shape; no new auth path).
+                #
+                # `_query_sid` (not a plain qs.get): a PRESENT but empty `sid=` must 400, not be
+                # silently treated as "omitted -> global baseline" (nelix-9a4.6 review finding #4)
+                # -- parse_qs()'s default drops a blank value, conflating the two.
+                qs = parse_qs(p.query)
+                sid = _query_sid(p.query, "sid")
+                owner_id = self._owner(qs.get("owner_id", [None])[0])
+                if sid is not None and not self._require_valid_sid(sid):
+                    return
+                result = manager.capabilities(sid, owner_id=owner_id)
+                if sid is not None and result is None:
+                    self._send(404, error_envelope(
+                        "unknown_session",
+                        "unknown session, or not this owner's", retryable=False))
+                    return
+                self._send(200, {**result, "rpc_protocol": RPC_PROTOCOL_VERSION})
             else:
                 self._send(404, {"error": "not found"})
 
@@ -285,6 +359,12 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             # the per-session secret (X-Nelix-Hook-Secret), IN ADDITION to the transport's
             # peercred/token in _auth. Tight body cap; hands a typed HookEvent to Session.on_hook.
             sid = p.path[len("/hook/"):]
+            # Shape-check the path-embedded sid first (nelix-9a4.6 review finding #3): every
+            # caller-supplied session id used as a path component gets the SAME check, /hook
+            # included, even though this route's own lookup (manager.get, a dict read) is not
+            # itself filesystem-reachable via sid today.
+            if not self._require_valid_sid(sid):
+                return
             body = self._read_json(max_body=_HOOK_MAX_BODY)      # 413 (too large) / 400 (malformed)
             sess = manager.get(sid)
             secret = getattr(sess, "hook_secret", None) if sess is not None else None
@@ -318,6 +398,9 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             # (msg_limiter) so message spam can never starve hook delivery. Never touches the PTY
             # (single-writer PTY invariant): only manager state methods are called here.
             sid = p.path[len("/message/"):]
+            # Shape-check first, same reasoning as _dispatch_hook above (nelix-9a4.6 review finding #3).
+            if not self._require_valid_sid(sid):
+                return
             body = self._read_json(max_body=MSG_MAX_BODY)   # 413 (too large) / 400 (malformed)
             sess = manager.get(sid)
             secret = getattr(sess, "hook_secret", None) if sess is not None else None
@@ -367,7 +450,8 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
                     outcome = manager.start(body["executor"], body["task"], body["cwd"],
-                                            owner_id=owner_id, model=body.get("model"))
+                                            owner_id=owner_id, model=body.get("model"),
+                                            session_id=body.get("session_id"))
                 except owner.OwnerWriteFailed as e:
                     # The owner record could not be persisted, so no session was started (spec §7:
                     # start FAILS if the owner cannot be written). 500, not 4xx: the request was
@@ -379,6 +463,10 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                     self._send(500, {"error": str(e)}); return
                 except ModelUnavailable as e:        # nelix-kwr: model not offered by the backend
                     self._send(400, {"error": str(e), "available_models": e.available_models}); return
+                except SessionIdInUse as e:           # spec §3: never silently reuse/clobber
+                    self._send(409, error_envelope("session_id_in_use", str(e), retryable=False)); return
+                except SessionIdRejected as e:        # bad-shape router-supplied session_id
+                    self._send(400, error_envelope("invalid_session_id", str(e), retryable=False)); return
                 except (ModelRejected, owner.OwnerRejected) as e:   # ValueError subclasses: BEFORE the 409
                     self._send(400, {"error": str(e)}); return   # bad-shape/unsupported model = client input error
                 except PtyInputRejected as e:        # subclass of ValueError: catch BEFORE it
@@ -398,14 +486,20 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             elif p.path == "/respond":
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
-                    outcome = manager.respond(body["session_id"], body["answer"],
-                                              owner_id=owner_id,
+                    sid = body["session_id"]
+                    answer = body["answer"]
+                except KeyError as e:
+                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
+                # Shape-check BEFORE manager.respond ever resolves `sessions_root() / sid` via
+                # owner.owns_session (nelix-9a4.6 review follow-up: /respond was missed by the
+                # original pass).
+                if not self._require_valid_sid(sid):
+                    return
+                try:
+                    outcome = manager.respond(sid, answer, owner_id=owner_id,
                                               decision_id=body.get("decision_id"))
                 except PtyInputRejected as e:
                     self._send(400, {"error": str(e)}); return
-                except KeyError as e:
-                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
-                sid = body.get("session_id")
                 provided = body.get("decision_id")
                 if outcome.status == "resumed":
                     self._send(200, {"operation": "respond", "status": "resumed", "session_id": sid,
@@ -498,23 +592,41 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             elif p.path == "/stop":
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
-                    outcome = manager.stop(body["session_id"], owner_id=owner_id)
+                    sid = body["session_id"]
+                except KeyError as e:
+                    self._send(400, {"error": f"missing field: {e.args[0]}"}); return
+                # Shape-check BEFORE manager.stop ever resolves `sessions_root() / sid` via
+                # owner.owns_session (nelix-9a4.6 review follow-up: /stop was missed by the
+                # original pass).
+                if not self._require_valid_sid(sid):
+                    return
+                try:
+                    outcome = manager.stop(sid, owner_id=owner_id)
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return
                 if outcome.status == "unknown_session":
                     self._send(404, {"operation": "stop", "status": "unknown_session",
-                                     "session_id": body["session_id"], "error": "unknown session",
+                                     "session_id": sid, "error": "unknown session",
                                      "next_action": "refresh_status"})
                 else:
                     self._send(200, {"operation": "stop", "status": outcome.status,
-                                     "session_id": body["session_id"], "snapshot": outcome.snapshot,
+                                     "session_id": sid, "snapshot": outcome.snapshot,
                                      "next_action": "report" if outcome.status == "stopped" else "refresh_status"})
             elif p.path == "/restart":
                 # The owner is used ONLY to authorise the restart of the OLD session. The NEW
                 # session's owner is read back off disk by the manager, never taken from this body.
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
-                    outcome = manager.restart(body["session_id"], owner_id=owner_id,
+                    restart_sid = body["session_id"]
+                except (KeyError, TypeError):
+                    self._send(400, {"error": "missing field: 'session_id'"}); return
+                # Shape-check BEFORE the manager ever resolves it (nelix-9a4.6 review finding #3):
+                # a bad-shape sid here reaches `paths.sessions_root() / sid` on the crashed-session
+                # disk-meta fallback path (`_restart_source`), and may spawn from what it finds.
+                if not self._require_valid_sid(restart_sid):
+                    return
+                try:
+                    outcome = manager.restart(restart_sid, owner_id=owner_id,
                                               force=bool(body.get("force", False)))
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return

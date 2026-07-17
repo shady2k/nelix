@@ -40,8 +40,8 @@ class FakeManager:
     `record_async_question`, `append_progress_note` (see tests/test_message_route.py)."""
 
     def __init__(self):
-        self._sessions = {"s1": FakeSession()}
-        self._live = {"s1"}
+        self._sessions = {"s-11111111": FakeSession()}
+        self._live = {"s-11111111"}
         self._qseq = {}
         self._pending = {}
         self._progress_seq = {}
@@ -94,7 +94,7 @@ def server(unix_sock):
     srv.server_close()
 
 
-def _env(sock, secret=SECRET, session="s1", extra=None):
+def _env(sock, secret=SECRET, session="s-11111111", extra=None):
     e = {"PATH": "/usr/bin:/bin", "NELIX_HOOK_SOCK": sock,
          "NELIX_HOOK_SECRET": secret, "NELIX_SESSION": session}
     if extra:

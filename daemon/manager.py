@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -11,11 +12,29 @@ from daemon import owner
 from daemon.drivers import get_driver
 from daemon.env_resolver import EnvResolveError, resolve_env_cmds
 from daemon.events import EXTERNAL_OUTPUT_POLICY
+from daemon.launchers import get_launcher
 from daemon.model_cache import ModelCache
 from daemon.model_discovery import discover, auth_of, DiscoveryError
 from daemon.session import RespondOutcome, Session
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
+
+# spec §3: "The generation's start endpoint accepts a router-assigned id." And: "Widen the id.
+# `uuid.uuid4().hex[:8]` is 32 random bits — needlessly collision-prone ... Use a full UUID/ULID."
+# A caller-supplied id becomes a `sessions/<sid>/` directory name VERBATIM, so this is a security
+# boundary, not a nicety: `s-` plus a lowercase-hex-only charset makes path traversal / separators
+# moot by construction (no character in the accepted alphabet means anything to a path parser).
+# The range 8..64 accepts BOTH today's legacy self-mint (`s-` + 8 hex) and the wide id the future
+# router will mint (a full UUID4 rendered as 32 hex chars, e.g. `s-` + 32 hex) without committing
+# to one exact width — a ULID-as-hex rendering or a UUID's dashless hex both fit. Uppercase hex is
+# deliberately rejected: one canonical casing, so two spellings of one id never look like two ids.
+#
+# No `$`/`^` anchors: `.fullmatch()` (used by `validate_session_id_shape` below) already pins both
+# ends, and unlike `$`, `fullmatch()` does NOT let a trailing "\n" sneak through — `re.match(r"...$")`
+# accepts "s-deadbeef\n" because `$` matches immediately before a final newline (review finding, this
+# id becomes a directory name AND is exported as `NELIX_SESSION`/interpolated into hook curl URLs, so
+# a smuggled newline breaks curl and silently drops the session's hooks + message channel).
+_SESSION_ID_RE = re.compile(r"s-[0-9a-f]{8,64}")
 
 
 class ModelRejected(ValueError):
@@ -31,6 +50,44 @@ class ModelUnavailable(ValueError):
     def __init__(self, available_models):
         super().__init__("requested model is not offered by this executor")
         self.available_models = available_models          # [{"id","display_name"}], sorted, capped
+
+
+class SessionIdRejected(ValueError):
+    """A router-supplied `session_id` on /start (spec §3) with bad shape: empty, path separators/
+    traversal, or anything outside `_SESSION_ID_RE`. A ValueError subclass (like ModelRejected) so
+    /start maps it to 400 (client input error) ahead of the generic ValueError->409 branch."""
+
+
+class SessionIdInUse(ValueError):
+    """A router-supplied `session_id` (spec §3) that already names a session — live in the
+    registry, or a directory persisted on disk from a session that ran before. NEVER silently
+    reused or clobbered: the id becomes a `sessions/<sid>/` directory name, and reusing one would
+    mix an old (or another live) session's on-disk state into this start. A ValueError subclass
+    so it reaches /start's exception chain, but rpc_server maps it to the stable error envelope
+    (code `session_id_in_use`) rather than the generic bare-string 409."""
+
+    def __init__(self, session_id):
+        super().__init__(f"session_id already in use: {session_id!r}")
+        self.session_id = session_id
+
+
+def validate_session_id_shape(session_id):
+    """Shape-check a caller-supplied `session_id`. Raises SessionIdRejected. See `_SESSION_ID_RE`
+    for the accepted alphabet/width and why it is safe as a directory-name component verbatim.
+
+    NOT underscore-prefixed: this is THE one shared daemon-local validator, reused verbatim by
+    `daemon/rpc_server.py` for every route that takes a caller-supplied session_id used as a path
+    component (spec review nelix-9a4.6 finding #3, plus a follow-up review pass that caught /wait,
+    /respond and /stop) — /start (via `_spawn` below), /status, /dialog, /screen, /restart,
+    /hook/<sid>, /message/<sid>, /wait, /respond, /stop. One regex, one place the accepted shape
+    can be read, rather than a copy per route that could quietly drift apart.
+
+    `.fullmatch()`, not `.match()` against an anchored pattern: `re.match(r"...$")` would accept
+    "s-deadbeef\\n" because `$` matches just before a trailing newline. `fullmatch()` has no such
+    gap — the whole string must match, full stop.
+    """
+    if not isinstance(session_id, str) or _SESSION_ID_RE.fullmatch(session_id) is None:
+        raise SessionIdRejected(f"invalid session_id: {session_id!r}")
 
 
 def _validate_model_shape(model):
@@ -140,6 +197,36 @@ def gc_sessions(keep_ids, retain, max_age_days, now=None, logger=None):
             _rmtree(d, logger)
 
 
+def _session_capabilities(session_id, sess):
+    """The per-session /capabilities payload (spec §8) for a LIVE session, built from real facts:
+    `sess._driver.hook_capable` and `sess._launcher.capabilities` (the same private attributes
+    `screen()` already reads `sess._cols`/`sess._rows` off — reaching into a live Session from the
+    manager is an established pattern here, not a new one).
+
+    Review correction (nelix-9a4.6 fix pass): this used to also emit a per-operation
+    `operations: {op: {"supported": ...}}` map, including a `message` entry coded
+    `unsupported_by_generation` whenever `hook_capable` was False. Both reviewers flagged that as
+    FABRICATED: spec §8's `unsupported_by_generation` names a CROSS-GENERATION incompatibility
+    (an operation an OLDER session cannot serve, checked against THIS generation's capability) —
+    it has nothing to do with `hook_capable`, a per-DRIVER fact that varies within one generation.
+    Worse, `/message` (daemon/rpc_server.py `_dispatch_message`) does not actually gate on
+    `hook_capable` at all, so the removed map advertised a failure code the operation could never
+    return. The real §8 "OR per-session capabilities" mechanism, delivered now, is just the FACTS
+    below (session-scoped, truthful, nothing fabricated); a genuine `unsupported_by_generation`
+    response is DEFERRED to Plan 4 (nelix-3rm's successor, multi-generation lifecycle), where more
+    than one generation coexisting makes the cross-generation case real and worth gating on.
+    """
+    hook_capable = bool(getattr(sess._driver, "hook_capable", False))
+    caps = sess._launcher.capabilities
+    return {
+        "session_id": session_id,
+        "executor": sess.executor,
+        "hook_capable": hook_capable,
+        "isolation_class": caps.isolation_class,
+        "can_attach": caps.can_attach,
+    }
+
+
 def _default_session_factory(sid, executor, spec, events, launcher_factory,
                              driver_factory, logger):
     return Session(sid, executor, driver_factory(spec.driver),
@@ -178,6 +265,9 @@ class SessionManager:
         # model override reads driver.model_flag). Never call get_driver() directly — that would
         # bypass an injected factory (tests / custom drivers).
         self._driver_factory = driver_factory or get_driver
+        # Same seam, for the generation-level /capabilities baseline (nelix-9a4.6 deliverable C):
+        # a configured executor's STATIC launcher capabilities, read without spawning anything.
+        self._launcher_factory = launcher_factory or get_launcher
         # nelix-kwr: pre-flight model-membership cache, one per daemon (fresh random salt each
         # start). Protocol-agnostic; _check_model_available reads the driver's own models_protocol
         # and passes it through to .models(), so the cache never assumes which strategy runs.
@@ -210,9 +300,20 @@ class SessionManager:
     def _owned_sids(self, session_ids, owner_id):
         return {sid for sid in session_ids if owner.owns_session(sid, owner_id)}
 
-    def start(self, executor_name, task, cwd, *, owner_id, model=None):
+    def start(self, executor_name, task, cwd, *, owner_id, model=None, session_id=None):
         return self._spawn(executor_name, task, cwd, lineage_id=None, restarted_from=None,
-                           owner_id=owner_id, model=model)
+                           owner_id=owner_id, model=model, session_id=session_id)
+
+    def _session_id_exists(self, sid):
+        """True if `sid` already names a session — live in the registry, or a directory
+        persisted on disk from a session that ran before (even one long exited; gc_sessions may
+        since have pruned it, in which case the id is free again). Checked before honoring a
+        router-supplied id (spec §3): the id becomes a `sessions/<sid>/` directory name verbatim,
+        so silently reusing one would mix another session's on-disk state into this start."""
+        with self._lock:
+            if sid in self._sessions:
+                return True
+        return (paths.sessions_root() / sid).exists()
 
     def _apply_model_override(self, spec, executor_name, model):
         """Validate + fold a per-session `model` into a fresh per-session ExecutorSpec (last-wins).
@@ -286,7 +387,7 @@ class SessionManager:
             self._logger.error("manager", event, session_id=session_id, exc_info=True)
 
     def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, owner_id,
-               reserve=False, model=None):
+               reserve=False, model=None, session_id=None):
         # reserve=True: a slot reservation was made for us by restart() (old session popped +
         # self._reserved bumped under the lock). We OWN that reservation and must release it exactly
         # once: consume it ATOMICALLY with inserting the new session (so len(_sessions)+_reserved
@@ -311,6 +412,24 @@ class SessionManager:
                     self._logger.warning("manager", "session_start_rejected",
                                          reason="bad_cwd", executor=executor_name)
                 raise ValueError(f"cwd does not exist or is not a directory: {cwd!r}")
+            # Router-assigned session id (spec §3, nelix-9a4.6 deliverable A): validated + collision-
+            # checked BEFORE the lock/cap checks, same reasoning as owner/model above — a bad-shape or
+            # colliding id is the caller's input error, never a 409 "daemon full". Omitted (None, the
+            # default) -> self-mint below, byte-identical to pre-feature. restart() never passes one
+            # (it has no session_id parameter of its own), so the self-mint path there is unaffected.
+            if session_id is not None:
+                try:
+                    validate_session_id_shape(session_id)
+                except SessionIdRejected:
+                    if self._logger is not None:
+                        self._logger.warning("manager", "session_start_rejected",
+                                             reason="invalid_session_id", executor=executor_name)
+                    raise
+                if self._session_id_exists(session_id):
+                    if self._logger is not None:
+                        self._logger.warning("manager", "session_start_rejected",
+                                             reason="session_id_in_use", executor=executor_name)
+                    raise SessionIdInUse(session_id)
             # Per-session model override (nelix-9k0): validate + fold BEFORE the lock/cap checks so a
             # bad-shape or unsupported-driver model returns 400, never a 409 "daemon full". Omitted
             # model -> spec is untouched (byte-identical to pre-feature). The validated value is stored
@@ -338,7 +457,15 @@ class SessionManager:
                     raise RuntimeError(
                         f"idle_retained_limit={self._idle_limit} reached "
                         f"(close a completed session with nelix_stop before starting more)")
-                sid = f"s-{uuid.uuid4().hex[:8]}"
+                if session_id is not None:
+                    if session_id in self._sessions:   # closes the TOCTOU window vs. the pre-lock check
+                        if self._logger is not None:
+                            self._logger.warning("manager", "session_start_rejected",
+                                                 reason="session_id_in_use", executor=executor_name)
+                        raise SessionIdInUse(session_id)
+                    sid = session_id
+                else:
+                    sid = f"s-{uuid.uuid4().hex[:8]}"
                 base_seq = self._events.latest_seq()  # waiter arms past anything already emitted
                 sess = self._make(sid, executor_name, spec)
                 sess.on_terminal = self._free_slot
@@ -721,6 +848,51 @@ class SessionManager:
                 "limit": self._limit,
                 "cursor": cursor,
                 "recent_terminal": recent}
+
+    def capabilities(self, session_id=None, *, owner_id):
+        """spec §8 "Internal overlap contract": "An operation unavailable on an older session
+        needs a stable `unsupported_by_generation` response OR per-session capabilities. A single
+        global capabilities response from N is insufficient for operations targeting N-1."
+
+        `session_id` given: the PER-SESSION form (the primary deliverable) — owner-gated exactly
+        like `status()` (`_owned`, i.e. `owner.owns_session`), so a non-owner or unknown id gets
+        the same `None` sentinel `status()`'s per-session branch would treat as "unknown session"
+        (rpc_server maps that to the stable error envelope, code `unknown_session`). Sourced from
+        REAL per-session facts: the executor name, the driver's `hook_capable`, and the launcher's
+        `ExecutorCapabilities` — never from a second generation, because there is only one.
+
+        `session_id` omitted: the generation-level BASELINE — protocol version (stamped by
+        rpc_server, same as /status) and the generation's configured executors with their static
+        capabilities. Deliberately minimal (see the brief): a global response cannot answer a
+        per-session question (that is the whole §8 point), so it stays a convenience, not the
+        primary surface.
+
+        Review correction: the per-session FACTS returned by `_session_capabilities` (executor,
+        hook_capable, isolation_class, can_attach) ARE this generation's delivered "OR per-session
+        capabilities" half of §8 — with only one generation running, a stable
+        `unsupported_by_generation` RESPONSE CODE would have nothing real to be cross-generation
+        about, so it is deferred to Plan 4 (multi-generation lifecycle), not fabricated here.
+        """
+        if session_id is not None:
+            sess = self._owned(session_id, owner_id)
+            if sess is None:
+                return None
+            return _session_capabilities(session_id, sess)
+        return self._generation_capabilities()
+
+    def _generation_capabilities(self):
+        executors = {}
+        for name, spec in self._specs.items():
+            driver = self._driver_factory(spec.driver)
+            caps = self._launcher_factory(spec.launcher).capabilities
+            executors[name] = {
+                "driver": spec.driver,
+                "launcher": spec.launcher,
+                "hook_capable": bool(getattr(driver, "hook_capable", False)),
+                "isolation_class": caps.isolation_class,
+                "can_attach": caps.can_attach,
+            }
+        return {"executors": executors}
 
     def stop(self, session_id, *, owner_id, reason="user_stop"):
         """The CALLER-facing stop. Owner-gated: killing another harness's session is destructive

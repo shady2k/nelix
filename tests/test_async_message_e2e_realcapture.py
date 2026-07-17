@@ -56,7 +56,8 @@ QUESTION = ROOT / "bin" / "nelix-question"
 NOTE = ROOT / "bin" / "nelix-note"
 _FRAME = (Path(__file__).parent / "golden" / "claude" / "idle_prompt" / "bare-prompt.txt").read_text()
 
-_SID = "s1"
+_SID = "s-11111111"   # must be shape-valid (nelix-9a4.6 finding #3: /message, /hook, /wait etc.
+                      # now shape-check every caller-supplied session id at the RPC layer)
 
 
 class Spec:

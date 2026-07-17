@@ -6,12 +6,17 @@ REAL make_server over REAL HTTP, with real owner records on a real disk. Only th
 
 The bar is EVERY caller-facing route, not the happy path:
     /status (board + single)   /wait   /dialog   /screen   /start   /respond   /stop   /restart
+    /capabilities (per-session form)
 A route missing from this file is a route with no proof, so `test_every_caller_facing_route_is_covered`
 fails if one is added without one.
 
 The two exempt routes (/hook, /message) are proved STILL EXEMPT here too — a per-session secret is
 a stronger check than an owner id, and "fail closed everywhere" must not quietly break the
 executor's own plane on the way past.
+
+/health is a THIRD, DIFFERENT kind of exemption (nelix-9a4.6): it carries no session and no
+per-caller state to leak, so there is nothing for an owner id to gate — proved here too, so that
+distinction is not just asserted in a comment.
 """
 import json
 import re
@@ -25,11 +30,20 @@ import paths
 from conftest import EXECUTOR, make_spec
 from daemon import owner
 from daemon.events import EventQueue
+from daemon.launchers.base import ExecutorCapabilities
 from daemon.manager import SessionManager
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
 from daemon.transport import Transport
 from test_rpc_server import _req
+
+
+class _StubDriver:
+    hook_capable = True
+
+
+class _StubLauncher:
+    capabilities = ExecutorCapabilities(isolation_class="host", can_attach=False)
 
 X = "harness-x"          # e.g. Hermes, on a phone
 Y = "harness-y"          # e.g. Claude Code, local — same daemon, same uid
@@ -53,6 +67,8 @@ class FakeSession:
         self.hook_secret = f"secret-{sid}"
         self.on_terminal = None
         self.dialog = None
+        self._driver = _StubDriver()          # /capabilities reads hook_capable off this
+        self._launcher = _StubLauncher()       # /capabilities reads .capabilities off this
 
     def start(self, task, cwd):
         self.task, self.cwd = task, cwd
@@ -386,6 +402,32 @@ def test_screen_requires_an_owner(two_harnesses):
     assert st == 400 and b["error"] == "missing owner_id"
 
 
+# ============================================================ /capabilities — per-session (nelix-9a4.6)
+
+def test_capabilities_of_another_owners_session_is_unknown(two_harnesses):
+    # NOTE the query key is `sid`, not `session_id` (verbatim per the brief — the one route where
+    # the two differ).
+    base, mgr, made, sx, sy = two_harnesses
+    st, b = _req("GET", base + f"/capabilities?owner_id={Y}&sid={sx}")
+    assert st == 404
+    assert b["error"]["code"] == "unknown_session"
+    assert "X SECRET TASK" not in json.dumps(b)
+
+
+def test_capabilities_still_serves_its_owner(two_harnesses):
+    base, mgr, made, sx, sy = two_harnesses
+    st, b = _req("GET", base + f"/capabilities?owner_id={X}&sid={sx}")
+    assert st == 200 and b["session_id"] == sx
+    assert b["hook_capable"] is True   # a real fact (FakeSession's _StubDriver), not an operation code
+    assert "operations" not in b
+
+
+def test_capabilities_requires_an_owner(two_harnesses):
+    base, mgr, made, sx, sy = two_harnesses
+    st, b = _req("GET", base + f"/capabilities?sid={sx}")
+    assert st == 400 and b["error"] == "missing owner_id"
+
+
 # ============================================================ /respond — the irreversible one
 
 def test_respond_cannot_answer_another_harnesss_decision(two_harnesses):
@@ -587,6 +629,17 @@ def test_message_route_is_not_owner_gated(two_harnesses):
     assert st != 400 or b.get("error") != "missing owner_id", "/message grew an owner_id requirement"
 
 
+def test_health_route_needs_no_owner_at_all(two_harnesses):
+    # A THIRD kind of exemption (nelix-9a4.6), distinct from /hook and /message's per-session
+    # secret: /health carries no session and no per-caller state, so there is nothing an owner id
+    # could gate. Proved against the SAME running daemon the other harnesses' sessions live on, so
+    # this is not a different daemon's behavior.
+    base, mgr, made, sx, sy = two_harnesses
+    st, b = _req("GET", base + "/health")
+    assert st == 200 and b["status"] == "ok"
+    assert "X SECRET TASK" not in json.dumps(b) and "Y SECRET TASK" not in json.dumps(b)
+
+
 def test_message_route_still_rejects_a_wrong_secret(two_harnesses):
     base, mgr, made, sx, sy = two_harnesses
     st, _ = _req("POST", base + f"/message/{sx}", body={"kind": "note", "text": "x"},
@@ -608,9 +661,11 @@ def test_every_caller_facing_route_is_covered():
     routes = set(re.findall(r'p\.path == "(/[a-z]+)"', src))
     routes |= {m.rstrip("/") for m in re.findall(r'p\.path\.startswith\("(/[a-z]+/)"\)', src)}
     caller_facing = {"/wait", "/status", "/dialog", "/screen",
-                     "/start", "/respond", "/stop", "/restart"}
-    exempt = {"/hook", "/message"}
-    assert routes == caller_facing | exempt, (
-        f"the route table changed: {routes ^ (caller_facing | exempt)}. A new caller-facing route "
-        f"must be owner-gated and proved in this file; a new executor-facing route must justify "
-        f"its exemption (a per-session secret, not an owner id).")
+                     "/start", "/respond", "/stop", "/restart", "/capabilities"}
+    exempt = {"/hook", "/message"}                # per-session secret, stronger than an owner id
+    no_owner_state = {"/health"}                  # no session, no per-caller state to gate at all
+    assert routes == caller_facing | exempt | no_owner_state, (
+        f"the route table changed: {routes ^ (caller_facing | exempt | no_owner_state)}. A new "
+        f"caller-facing route must be owner-gated and proved in this file; a new executor-facing "
+        f"route must justify its exemption (a per-session secret, not an owner id); a route with "
+        f"no session/per-caller state at all (like /health) justifies needing no owner id.")

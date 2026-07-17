@@ -94,7 +94,7 @@ def test_rpc_status_default_omits_include_progress():
     m = _ProgressAwareManager()
     srv, base = _serve(m, __import__("io").StringIO())
     try:
-        st, b = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1")
+        st, b = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s-00000001")
         assert st == 200 and m.seen[-1] is False
         assert "progress" not in b
     finally:
@@ -105,7 +105,7 @@ def test_rpc_status_include_progress_query_threads_through():
     m = _ProgressAwareManager()
     srv, base = _serve(m, __import__("io").StringIO())
     try:
-        st, b = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s1&include_progress=1")
+        st, b = _req("GET", base + f"/status?owner_id={OWNER}&session_id=s-00000001&include_progress=1")
         assert st == 200 and m.seen[-1] is True
         assert b["progress"][-1]["summary"] == "hi" and b["progress_total"] == 1
     finally:
