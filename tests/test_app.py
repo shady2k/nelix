@@ -6,6 +6,7 @@ from daemon.app import warn_invalid_log_level
 from daemon import app                       # noqa: E402
 from daemon.transport import Transport       # noqa: E402
 from daemon.config import LogLevelConfig
+import paths                                 # noqa: E402
 
 
 def test_invalid_log_level_warns_once():
@@ -31,7 +32,7 @@ def test_install_stack_dump_handler_enables_faulthandler():
 
 
 def test_acquire_singleton_second_call_conflicts(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import importlib, io, json, paths
     importlib.reload(paths)
     from daemon import app, singleton
@@ -48,7 +49,7 @@ def test_acquire_singleton_second_call_conflicts(monkeypatch, tmp_path):
 
 
 def test_build_reaper_ctx_has_identity(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     from daemon import app
     import os
     ctx = app.build_reaper_ctx(grace=3.0)
@@ -85,7 +86,7 @@ def test_load_specs_parse_error_returns_empty_and_logs(tmp_path):
 
 
 def test_transport_from_env_defaults_to_unix(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     monkeypatch.delenv("NELIX_RPC_TRANSPORT", raising=False)
     import importlib, paths
     importlib.reload(paths)
@@ -99,3 +100,19 @@ def test_transport_from_env_tcp(monkeypatch):
     monkeypatch.setenv("NELIX_RPC_PORT", "51000")
     monkeypatch.setenv("NELIX_RPC_TOKEN", "abc")
     assert app.transport_from_env() == Transport.tcp("127.0.0.1", 51000, "abc")
+
+
+def test_explicit_rpc_sock_does_not_derive_the_nelix_home_node(monkeypatch, tmp_path):
+    """An explicit NELIX_RPC_SOCK must WIN without the $NELIX_HOME node being derived at all.
+
+    `dict.get(k, default)` evaluates its default eagerly, so the old spelling built the derived
+    path even when it was about to be thrown away. Harmless while rpc_sock() was total — a trap
+    the moment anything about the derived path can fail. Proven by making the derivation blow up:
+    if it is still evaluated, this test raises instead of passing.
+    """
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    monkeypatch.delenv("NELIX_RPC_TRANSPORT", raising=False)
+    monkeypatch.setenv("NELIX_RPC_SOCK", "/tmp/nx-explicit.sock")
+    boom = lambda: (_ for _ in ()).throw(AssertionError("derived the NELIX_HOME node anyway"))
+    monkeypatch.setattr(paths, "rpc_sock", boom)
+    assert app.transport_from_env() == Transport.unix("/tmp/nx-explicit.sock")

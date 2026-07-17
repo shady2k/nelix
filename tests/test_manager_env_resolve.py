@@ -27,7 +27,7 @@ def _records(buf):
 
 
 def _mgr(monkeypatch, tmp_path, spec, buf):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     return SessionManager({EXECUTOR: spec}, EventQueue(),
                           launcher_factory=lambda name: LocalLauncher(),
                           driver_factory=get_driver, concurrency_limit=3,

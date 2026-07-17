@@ -31,7 +31,10 @@ def transport_from_env():
         return Transport.tcp(os.environ.get("NELIX_RPC_HOST", "127.0.0.1"),
                              int(os.environ["NELIX_RPC_PORT"]),
                              os.environ["NELIX_RPC_TOKEN"])
-    return Transport.unix(os.environ.get("NELIX_RPC_SOCK", str(paths.rpc_sock())))
+    # `or`, not dict.get(k, default): get() evaluates its default EAGERLY, so the derived node
+    # would be built even when NELIX_RPC_SOCK names the socket explicitly. Harmless while
+    # rpc_sock() was total; a trap the moment anything about the derived path can fail.
+    return Transport.unix(os.environ.get("NELIX_RPC_SOCK") or str(paths.rpc_sock()))
 
 
 def acquire_singleton(logger, transport=None):
@@ -111,7 +114,7 @@ def main():
     transport = transport_from_env()
     _LOCK_FD = acquire_singleton(logger, transport=transport)
     if _LOCK_FD is None:
-        raise SystemExit(3)               # another daemon owns this nelix_root
+        raise SystemExit(3)               # another daemon owns this NELIX_HOME
     set_broker(BrokerClient())            # spawn the broker BEFORE any threads exist
     grace = load_kill_grace_seconds(cfg_path)
     reaper_ctx = build_reaper_ctx(grace)

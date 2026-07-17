@@ -19,7 +19,7 @@ from daemon.drivers import get_driver
 
 
 def _serve(monkeypatch, tmp_path, spec, port):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     buf = io.StringIO()
     mgr = SessionManager({EXECUTOR: spec}, EventQueue(),
                          launcher_factory=lambda name: LocalLauncher(),

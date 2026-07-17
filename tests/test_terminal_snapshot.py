@@ -102,7 +102,7 @@ def test_session_terminal_kind_set_by_fail_delivery(tmp_path, monkeypatch):
     from daemon.session import Session
     from daemon.config import ExecutorSpec
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
 
     class _Handle:
         def is_alive(self): return True
@@ -142,7 +142,7 @@ def test_delivery_failed_then_child_exits_preserves_terminal_kind(tmp_path, monk
     from daemon.events import EventQueue
     from daemon.dialog import Dialog
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
 
     class _Handle:
         def is_alive(self): return True
@@ -194,7 +194,7 @@ def test_operator_stop_publishes_single_stopped_event_no_double(tmp_path, monkey
     from daemon.events import EventQueue
     from daemon.dialog import Dialog
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
 
     class _Handle:
         def is_alive(self): return False
@@ -239,7 +239,7 @@ def test_live_snapshot_omits_terminal_kind_while_working(tmp_path, monkeypatch):
         submit_key = "\r"
         def __init__(self): self._settle = 0
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     spec = ExecutorSpec(command="c", args=[], env={}, driver="claude")
     sess = Session("s-w01", "claude", _Drv(), object(), spec, EventQueue())
     sess._dialog = Dialog(tmp_path / "s-w01", tail_lines=200, spool_max_bytes=0)

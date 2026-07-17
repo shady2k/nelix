@@ -1,7 +1,8 @@
 """bin/nelix-inventory must regenerate tests/golden/INVENTORY.md deterministically from TRACKED
 inputs only (nelix-puf). Before this fix the generator also scanned a live, per-machine sessions
-dir (~/.hermes/.../sessions), so its output varied by machine and the committed manifest could not
-be reproduced. These tests pin the two properties that make it reproducible:
+dir (then ~/.hermes/.../sessions; $NELIX_HOME/sessions since nelix-9a4.7), so its output varied by
+machine and the committed manifest could not be reproduced. These tests pin the two properties
+that make it reproducible:
 
   1. the generator reads NO live/per-machine source — only the committed captures under
      tests/golden/claude/_regression/ (both `*.raw` and timed `*.capture`), and
@@ -32,25 +33,41 @@ def gen():
     return module
 
 
+LIVE_SESSION_TOKENS = (
+    ".nelix",          # the live root today ($NELIX_HOME's default)
+    "NELIX_HOME",      # ...however it is spelled
+    "sessions_root",   # ...or reached through paths.py
+    ".hermes",         # the live root before nelix-9a4.7; a regression could still name it
+    "SESSIONS_DIR",
+)
+
+
 def test_generator_source_has_no_live_sessions_path():
-    """The reproducibility guarantee: the active code references neither the live sessions dir nor a
-    SESSIONS_DIR constant — so the manifest cannot depend on per-machine state."""
+    """The reproducibility guarantee: the active code names NO live/per-machine source — so the
+    manifest cannot depend on machine state.
+
+    This guard was `".hermes" not in src` and nothing else. nelix-9a4.7 moved the live root to
+    $NELIX_HOME (~/.nelix), which would have quietly retired it: a regression that re-introduced
+    a live scan would reach for paths.sessions_root() or ~/.nelix and the check could never fire
+    again — a guard whose deletion changes nothing, which is a diagnostic, not a guard. It names
+    the tokens a live scan would actually use now, and keeps the old one because naming it is
+    still wrong.
+    """
     src = GENERATOR.read_text()
-    assert ".hermes" not in src
-    assert "SESSIONS_DIR" not in src
+    for token in LIVE_SESSION_TOKENS:
+        assert token not in src, f"generator names a live/per-machine source: {token!r}"
 
 
 def test_committed_sources_are_all_tracked(gen):
-    """Every scanned source lives under the committed _regression/ dir — never under $HOME/.hermes —
-    and both raw dumps and timed captures are ingested."""
+    """Every scanned source lives under the committed _regression/ dir — never under the live
+    root ($NELIX_HOME) — and both raw dumps and timed captures are ingested."""
     sources = gen._committed_sources()
     names = {sid for sid, _p, _c, _r in sources}
     # the prefix (I4a/I5) and the timed modal capture (I6a) are both present and tracked
     assert "s-039a61b4" in names
     assert "s-beb967e9" in names
     for _sid, path, _c, _r in sources:
-        assert path.parent == REGRESSION_DIR, path
-        assert ".hermes" not in str(path)
+        assert path.parent == REGRESSION_DIR, path      # subsumes any live root, named or not
         assert path.suffix in (".raw", ".capture")
 
 

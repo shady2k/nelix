@@ -90,7 +90,7 @@ class FakeManagerDialog:
 
 
 def test_rpc_client_dialog(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))   # isolate from real on-disk sessions
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))   # isolate from real on-disk sessions
     m = FakeManagerDialog()
     srv = make_server(m, Transport.tcp("127.0.0.1", 8782, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()

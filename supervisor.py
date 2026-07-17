@@ -1,6 +1,6 @@
 """Lifecycle of the ephemeral orchestration daemon.
 
-Detached child, single state file under $HERMES_HOME/workspace/nelix/, SIGTERM->SIGKILL
+Detached child, single state file under $NELIX_HOME (default ~/.nelix), SIGTERM->SIGKILL
 teardown. (Modelled on plugins/google_meet/process_manager.py, back when this file lived
 inside a Hermes plugin.)
 
@@ -468,10 +468,17 @@ def ensure_running() -> Transport:
     paths.ensure_private_dir(root)
     log_path = _open_daemon_log(root)
     log = open(log_path, "ab")
+    # NELIX_HOME is passed as the RESOLVED, CANONICAL root rather than left to the child's own
+    # default, so the daemon cannot land on a different root than the supervisor that spawned it
+    # (a relocated symlink between spawn and start would otherwise split them). Same reason
+    # NELIX_CONFIG is passed resolved. HERMES_HOME is deliberately NOT set here any more: nothing
+    # under daemon/ reads it (measured — zero hits), and materialising a harness's home for the
+    # daemon and every executor it launches is precisely the coupling this slice removes. If a
+    # Hermes harness has it set, it still reaches the child through os.environ below.
     env = {**os.environ,
            "NELIX_RPC_TRANSPORT": transport.kind,
            "NELIX_CONFIG": str(paths.config_path()),
-           "HERMES_HOME": str(paths.hermes_home()),
+           "NELIX_HOME": str(paths.nelix_root()),
            "PYTHONPATH": str(PLUGIN_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")}
     if transport.kind == "unix":
         env["NELIX_RPC_SOCK"] = transport.path

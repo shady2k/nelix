@@ -29,7 +29,7 @@ class _FakeSession:
 
 
 def _mgr(tmp_path, monkeypatch, limit=2, max_restarts=3):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     _FakeSession.instances = []
     spec = ExecutorSpec(command="c", args=[], env={}, driver="claude", max_restarts=max_restarts)
     return SessionManager({"claude": spec}, EventQueue(), concurrency_limit=limit,

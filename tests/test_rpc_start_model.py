@@ -49,7 +49,7 @@ class _CapturingLauncher:
 
 
 def _serve(monkeypatch, tmp_path, *, spec=None, driver_factory=None, port=8801):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     captured = []
     buf = io.StringIO()
     mgr = SessionManager({EXECUTOR: spec or make_spec(command="claude", args=["--foo"],

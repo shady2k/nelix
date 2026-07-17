@@ -269,8 +269,8 @@ def respond_driving_loop(sess, answer, decision_id, *, settle=0.03, timeout=8.0)
     return box["out"]
 
 
-def test_sessions_dir_resolves_under_hermes_home(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def test_sessions_dir_resolves_under_nelix_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     sess = Session("s1", "demo", ClaudeDriver(), None, Spec(), EventQueue())
     assert sess._sessions_dir == paths.sessions_root()
 
@@ -883,7 +883,7 @@ def test_snapshot_decision_carries_decision_id_and_policy(tmp_path):
 
 
 def test_start_passes_cwd_to_launcher(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     seen = {}
 
     class FakeLauncher:
@@ -1100,7 +1100,7 @@ def test_session_start_writes_meta_json(monkeypatch, tmp_path):
     import json
     import stat
     import paths
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     sess, _, _ = make_session(tmp_path, frames=["Welcome\n❯ \n⏵⏵ ask mode (shift+tab to cycle)\n"])
     sess.start("do work", str(tmp_path))
     meta_path = paths.sessions_root() / "s1" / "meta.json"
@@ -1580,7 +1580,7 @@ def test_delivery_does_not_wedge_when_executor_ignores_stdin(tmp_path, monkeypat
     never drains stdin. Delivering a task larger than the PTY buffer must NOT block the
     monitor thread forever in os.write — it must resolve (delivery_failed + finalize)
     within a bounded time. FAILS on the pre-fix blocking-write code (monitor wedges)."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     from daemon.pty_session import PtySession
     from daemon.broker_client import BrokerClient
 
@@ -1657,7 +1657,7 @@ def test_delivery_drains_output_so_large_task_reaches_executor(tmp_path, monkeyp
     which is only possible if the monitor DRAINS the child's output while writing — otherwise
     both sides deadlock and the bounded write fails with write_unconfirmed. FAILS on the
     pre-fix write() that waits only for writability and never reads during the write."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     from daemon.pty_session import PtySession
     from daemon.broker_client import BrokerClient
 
@@ -1689,7 +1689,7 @@ def test_delivery_drains_output_so_large_task_reaches_executor(tmp_path, monkeyp
 
 
 def test_start_writes_child_record(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import importlib, paths
     importlib.reload(paths)
     from daemon import reaper
@@ -1721,7 +1721,7 @@ def test_start_writes_child_record(tmp_path, monkeypatch):
 
 
 def test_finish_frees_slot_and_forgets_record_on_clean_exit(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import importlib, paths
     importlib.reload(paths)
     from daemon import reaper
@@ -1746,7 +1746,7 @@ def test_finish_frees_slot_and_forgets_record_on_clean_exit(tmp_path, monkeypatc
 
 
 def test_finish_kills_group_when_monitor_dies_with_child_alive(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import importlib, paths, signal
     importlib.reload(paths)
     from daemon import reaper
@@ -1788,7 +1788,7 @@ def test_respond_after_terminal_is_rejected_without_writing(tmp_path):
 
 
 def test_start_asserts_group_leader_when_reaping(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import importlib, paths, pytest
     importlib.reload(paths)
     from daemon import reaper

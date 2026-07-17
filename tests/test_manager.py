@@ -182,7 +182,7 @@ def _seed_session(root, name, age_days=0.0, now=None):
 
 
 def test_gc_count_prunes_oldest_keeps_active(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import paths
     from daemon.manager import gc_sessions
     root = paths.sessions_root()
@@ -200,7 +200,7 @@ def test_gc_count_prunes_oldest_keeps_active(monkeypatch, tmp_path):
 
 
 def test_gc_age_prunes_old(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import paths
     from daemon.manager import gc_sessions
     root = paths.sessions_root()
@@ -213,7 +213,7 @@ def test_gc_age_prunes_old(monkeypatch, tmp_path):
 
 
 def test_gc_rmtree_failure_is_skipped(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import paths
     from daemon import manager
     root = paths.sessions_root()
@@ -228,7 +228,7 @@ def test_gc_rmtree_failure_is_skipped(monkeypatch, tmp_path):
 def test_session_created_and_stopped_logged(tmp_path, monkeypatch):
     import io, json
     from daemon.obs import Logger
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     buf = io.StringIO()
     mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), concurrency_limit=1,
                          logger=Logger(level="debug", stream=buf),
@@ -242,7 +242,7 @@ def test_session_created_and_stopped_logged(tmp_path, monkeypatch):
 def test_unknown_executor_logs_rejected(tmp_path, monkeypatch):
     import io
     from daemon.obs import Logger
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     buf = io.StringIO()
     mgr = SessionManager({}, EventQueue(), logger=Logger(level="debug", stream=buf))
     try:
@@ -279,7 +279,7 @@ def test_manager_sets_on_terminal_and_reaper_ctx():
 def test_stop_all_uses_shutdown_reason(tmp_path, monkeypatch):
     import io, json
     from daemon.obs import Logger
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     buf = io.StringIO()
     mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), concurrency_limit=1,
                          logger=Logger(level="debug", stream=buf),
