@@ -32,12 +32,16 @@ SCHEMA_VERSION = 1
 # exists in CI and not in production is the nelix-cb0 failure mode.
 MIN_SQLITE = (3, 25, 0)
 
-_SCHEMA = """
+# meta is NOT in _SCHEMA: it is created and stamped together, in one transaction, before the
+# rest of the DDL runs. See _stamp_before_the_ddl. It lives here, alone, so the two can never
+# drift apart.
+_META_DDL = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
+)"""
 
+_SCHEMA = """
 -- The ONE authoritative row for a session's identity. Everything else references it.
 CREATE TABLE IF NOT EXISTS starts (
     session_id          TEXT PRIMARY KEY,
@@ -258,6 +262,11 @@ def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
                         f"on a host-local filesystem")
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute("PRAGMA foreign_keys=ON")
+            # BEFORE any DDL: a file whose stamp disagrees with this build must be refused
+            # without being touched. The DDL below is not read-only — it is what makes this
+            # ordering load-bearing rather than cosmetic.
+            _refuse_a_disagreeing_database(conn)
+            _stamp_before_the_ddl(conn)
             conn.executescript(_SCHEMA)
             _check_or_stamp_version(conn)
         return conn
@@ -275,23 +284,17 @@ def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
         raise NelixError(STORE_UNAVAILABLE, f"could not open the database: {e}") from None
 
 
-def _check_or_stamp_version(conn):
-    """Stamp-or-verify in ONE atomic step.
+def _validate_version(raw) -> None:
+    """Judge a stamp that is already in hand. Raises, or returns having agreed.
 
-    rev 2 did SELECT-then-INSERT with no transaction, so eight concurrent first-opens raced:
-    6/320 hit `UNIQUE constraint failed: meta.key`, 3/320 hit `database is locked`. That is
-    the very check-then-write class this store moved to SQLite to abolish — reintroduced one
-    layer underneath the code that abolished it. INSERT OR IGNORE makes the database the
-    arbiter, exactly like reservations' UNIQUE constraint.
+    Shared by the pre-DDL refusal and the post-DDL stamp-or-verify so the two can never drift
+    into disagreeing about what a legal version is.
     """
-    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
-                 (str(SCHEMA_VERSION),))
-    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     try:
-        found = int(row["value"])
+        found = int(raw)
     except (TypeError, ValueError):
         raise NelixError(STORE_CORRUPT,
-                         f"database version stamp is unreadable: {row['value']!r}") from None
+                         f"database version stamp is unreadable: {raw!r}") from None
     if found > SCHEMA_VERSION:
         # An OLDER generation must not open a NEWER generation's database and misread it.
         raise NelixError(STORE_CORRUPT,
@@ -304,3 +307,83 @@ def _check_or_stamp_version(conn):
         raise NelixError(STORE_CORRUPT,
                          f"database schema {found} predates this build ({SCHEMA_VERSION}) "
                          f"and no migration exists; refusing to open it")
+
+
+def _refuse_a_disagreeing_database(conn):
+    """Refuse an existing database whose stamp disagrees with this build — BEFORE any DDL.
+
+    connect() used to run the whole schema through executescript() and only THEN check the
+    stamp, so a newer build opening an older file created its new tables and only afterwards
+    declared the file unusable. It left a mutation behind in a file it had just refused, which
+    is the one thing a refusal must not do: the operator's rollback to the older build then
+    met a file carrying half of the newer schema. The version gate exists precisely because
+    CREATE TABLE IF NOT EXISTS cannot alter an existing table; running it first defeated it.
+
+    Reads nothing but the catalogue and one row, and writes nothing at all — a refusal here is
+    guaranteed clean because there is nothing yet to roll back.
+    """
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+                    ).fetchone() is None:
+        return          # a fresh file: no stamp can disagree, and the DDL is what creates it
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if row is None:
+        # meta exists but was never stamped: a bootstrap that died between its DDL and its
+        # stamp. Not a disagreement — there is nothing to disagree with — so let the DDL and
+        # the stamp below complete it. They are both idempotent.
+        return
+    _validate_version(row["value"])
+
+
+def _stamp_before_the_ddl(conn):
+    """Create meta and write the stamp in ONE transaction, BEFORE the rest of the DDL.
+
+    The plan for this change said to "apply the schema and stamp it in one transaction".
+    Measured: `executescript()` issues an implicit COMMIT before it runs, so the DDL and the
+    stamp physically cannot share a transaction — the literal instruction is impossible. This
+    buys the property it was after, from the other end.
+
+    WHY IT MATTERS that the stamp goes FIRST, not last. A bootstrap can die partway through
+    its DDL (a crash, a SIGKILL, a full disk), and SQLite is in autocommit here, so whatever
+    already ran is already durable. With the stamp written LAST, such a file has meta but no
+    stamp — and a NEWER build reads "no stamp" as "a fresh file", applies its own schema over
+    the older tables and stamps itself. That is precisely the half-applied upgrade the version
+    gate exists to prevent, walking in through the door the reordering above left open
+    (measured: a v2 build adopted an interrupted v1 file and stamped it v2).
+
+    Stamped first, an interrupted bootstrap always leaves a file that SAYS which version it
+    is: the same build finishes it (every statement here and in _SCHEMA is idempotent), and a
+    newer build refuses it — cleanly, above, before touching it.
+
+    This is deliberately NOT a reason to reject an unstamped meta as corrupt: an interrupted
+    first bootstrap must stay completable, not become permanently unopenable.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_META_DDL)
+        conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+                     (str(SCHEMA_VERSION),))
+    except BaseException:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+def _check_or_stamp_version(conn):
+    """Stamp-or-verify in ONE atomic step.
+
+    rev 2 did SELECT-then-INSERT with no transaction, so eight concurrent first-opens raced:
+    6/320 hit `UNIQUE constraint failed: meta.key`, 3/320 hit `database is locked`. That is
+    the very check-then-write class this store moved to SQLite to abolish — reintroduced one
+    layer underneath the code that abolished it. INSERT OR IGNORE makes the database the
+    arbiter, exactly like reservations' UNIQUE constraint.
+
+    Still the authority, and still atomic, even though _refuse_a_disagreeing_database has
+    usually read the stamp already: that read is a fast refusal, NOT a check whose result this
+    function may trust. Demoting this to a plain verify would turn stamp-or-verify back into
+    the check-then-write it exists to abolish.
+    """
+    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+                 (str(SCHEMA_VERSION),))
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    _validate_version(row["value"])
