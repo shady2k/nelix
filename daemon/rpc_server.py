@@ -271,6 +271,21 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 # manager.screen owner-gates via _owned. Note `force` bypasses the anti-poll
                 # withhold, NOT the owner gate: they are checked in that order inside screen().
                 self._send(200, manager.screen(sid, owner_id=owner_id, raw=raw, force=force))
+            elif p.path == "/capabilities":
+                # spec §8: per-session capabilities. NOTE the query key is `sid` (not
+                # `session_id` like every other route) — verbatim per the brief. owner_id is
+                # required regardless of whether `sid` is present, exactly like /status (the same
+                # `_owner` helper, the same missing-owner 400 shape; no new auth path).
+                qs = parse_qs(p.query)
+                sid = qs.get("sid", [None])[0]
+                owner_id = self._owner(qs.get("owner_id", [None])[0])
+                result = manager.capabilities(sid, owner_id=owner_id)
+                if sid is not None and result is None:
+                    self._send(404, error_envelope(
+                        "unknown_session",
+                        "unknown session, or not this owner's", retryable=False))
+                    return
+                self._send(200, {**result, "rpc_protocol": RPC_PROTOCOL_VERSION})
             else:
                 self._send(404, {"error": "not found"})
 

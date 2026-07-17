@@ -30,6 +30,14 @@ _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the C
 # deliberately rejected: one canonical casing, so two spellings of one id never look like two ids.
 _SESSION_ID_RE = re.compile(r"^s-[0-9a-f]{8,64}$")
 
+# The caller-facing operations /capabilities (spec §8) reports on. These five never vary with a
+# session's driver/launcher facts TODAY (respond/stop/restart/dialog/screen all go through the
+# manager/session machinery uniformly, regardless of which driver or launcher backs a session) —
+# only `message` does, via `hook_capable` (see `_session_capabilities` below). Listed here, not
+# inferred, so the set is a single visible source of truth rather than implicit in the code that
+# builds the response.
+_STATIC_CALLER_OPERATIONS = ("respond", "stop", "restart", "dialog", "screen")
+
 
 class ModelRejected(ValueError):
     """A per-session `model` override that nelix refuses BEFORE spawning: a bad-shape value
@@ -177,6 +185,39 @@ def gc_sessions(keep_ids, retain, max_age_days, now=None, logger=None):
         survivors.sort(key=_session_activity)              # oldest first
         for d in survivors[:len(survivors) - retain]:
             _rmtree(d, logger)
+
+
+def _session_capabilities(session_id, sess):
+    """The per-session /capabilities payload (spec §8) for a LIVE session, built from real facts:
+    `sess._driver.hook_capable` and `sess._launcher.capabilities` (the same private attributes
+    `screen()` already reads `sess._cols`/`sess._rows` off — reaching into a live Session from the
+    manager is an established pattern here, not a new one).
+
+    `message` is the one caller-facing operation gated on `hook_capable`: the nelix-question/
+    nelix-note tools (the ONLY way an executor calls POST /message) are injected into argv only
+    for a hook-capable driver's session (daemon/launchers/local.py `_driver_hook_capable`) — a
+    hookless session has no working message channel. Every other operation
+    (`_STATIC_CALLER_OPERATIONS`) goes through the manager/session machinery uniformly regardless
+    of driver/launcher, so it is unconditionally supported today.
+
+    `unsupported_by_generation` names the code a caller of `message` on THIS session would need
+    to know about (nelix-9a4.6 deliverable D): the ONE reachable+tested use of that code, by
+    design — see the module docstring discussion in the task brief for why a real cross-generation
+    gate would be dead code with a single generation.
+    """
+    hook_capable = bool(getattr(sess._driver, "hook_capable", False))
+    caps = sess._launcher.capabilities
+    operations = {op: {"supported": True} for op in _STATIC_CALLER_OPERATIONS}
+    operations["message"] = ({"supported": True} if hook_capable else
+                             {"supported": False, "code": "unsupported_by_generation"})
+    return {
+        "session_id": session_id,
+        "executor": sess.executor,
+        "hook_capable": hook_capable,
+        "isolation_class": caps.isolation_class,
+        "can_attach": caps.can_attach,
+        "operations": operations,
+    }
 
 
 def _default_session_factory(sid, executor, spec, events, launcher_factory,
@@ -788,6 +829,45 @@ class SessionManager:
                 "limit": self._limit,
                 "cursor": cursor,
                 "recent_terminal": recent}
+
+    def capabilities(self, session_id=None, *, owner_id):
+        """spec §8 "Internal overlap contract": "An operation unavailable on an older session
+        needs a stable `unsupported_by_generation` response OR per-session capabilities. A single
+        global capabilities response from N is insufficient for operations targeting N-1."
+
+        `session_id` given: the PER-SESSION form (the primary deliverable) — owner-gated exactly
+        like `status()` (`_owned`, i.e. `owner.owns_session`), so a non-owner or unknown id gets
+        the same `None` sentinel `status()`'s per-session branch would treat as "unknown session"
+        (rpc_server maps that to the stable error envelope, code `unknown_session`). Sourced from
+        REAL per-session facts: the executor name, the driver's `hook_capable`, and the launcher's
+        `ExecutorCapabilities` — never from a second generation, because there is only one.
+
+        `session_id` omitted: the generation-level BASELINE — protocol version (stamped by
+        rpc_server, same as /status) and the generation's configured executors with their static
+        capabilities. Deliberately minimal (see the brief): a global response cannot answer a
+        per-session question (that is the whole §8 point), so it stays a convenience, not the
+        primary surface.
+        """
+        if session_id is not None:
+            sess = self._owned(session_id, owner_id)
+            if sess is None:
+                return None
+            return _session_capabilities(session_id, sess)
+        return self._generation_capabilities()
+
+    def _generation_capabilities(self):
+        executors = {}
+        for name, spec in self._specs.items():
+            driver = self._driver_factory(spec.driver)
+            caps = self._launcher_factory(spec.launcher).capabilities
+            executors[name] = {
+                "driver": spec.driver,
+                "launcher": spec.launcher,
+                "hook_capable": bool(getattr(driver, "hook_capable", False)),
+                "isolation_class": caps.isolation_class,
+                "can_attach": caps.can_attach,
+            }
+        return {"executors": executors}
 
     def stop(self, session_id, *, owner_id, reason="user_stop"):
         """The CALLER-facing stop. Owner-gated: killing another harness's session is destructive

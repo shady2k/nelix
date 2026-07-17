@@ -13,4 +13,9 @@ No project imports here (stdlib-free, in fact) so both the package-mode in-proce
 top-level-module daemon resolve the identical constant.
 """
 
-RPC_PROTOCOL_VERSION = 6
+RPC_PROTOCOL_VERSION = 7
+# Bumped 6 -> 7 (nelix-9a4.6): the additive arrival of GET /health, GET /capabilities, and POST
+# /start's optional `session_id` (spec §3/§8/§10 — the generation's side of the future
+# router<->generation contract). A stale daemon lacking these would 404 (health/capabilities) or
+# silently ignore the id (start) rather than honor the new contract, so the bump forces a recycle
+# per this module's own rule for "the ADDITIVE arrival of a new route".
