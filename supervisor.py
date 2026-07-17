@@ -1,9 +1,31 @@
-"""Lifecycle of the ephemeral orchestration daemon (one per Hermes gateway).
+"""Lifecycle of the ephemeral orchestration daemon.
 
-Modelled on plugins/google_meet/process_manager.py: detached child, single
-state file under $HERMES_HOME/workspace/nelix/, SIGTERM->SIGKILL teardown. The daemon is
-NOT meant to survive a Hermes restart (BR-11 dropped) — on_session_end tears it
-down; a fresh one is spawned on the next nelix_start.
+Detached child, single state file under $HERMES_HOME/workspace/nelix/, SIGTERM->SIGKILL
+teardown. (Modelled on plugins/google_meet/process_manager.py, back when this file lived
+inside a Hermes plugin.)
+
+THIS FILE IS TWO HALVES, and after the plugin extraction [nelix-4el.1] they have very
+different standing in this repo. Read that before changing anything here:
+
+  * DISCOVERY — endpoint, state_file, _read_state, _choose_transport, _healthy, _compatible,
+    _live_lock_holder, _reconcile_lock_holder. LIVE and core: bin/nelix-doctor and
+    bin/nelix-reap call supervisor.endpoint() to observe/reap a daemon they did not start.
+    This is why supervisor.py stayed when the plugin left.
+
+  * SPAWN + THE DEPS HACK — ensure_running, _daemon_argv, _ensure_deps, _venv_pip_install.
+    Nothing in bin/ calls these; only tests do. Their one production caller was the plugin's
+    __init__.py:77 (supervisor.ensure_running()), which left for shady2k/hermes-nelix. So the
+    spawn half is currently a Python API with no CLI and no production caller. It is NOT dead
+    code: it is the raw material for `nelix daemon ensure` (nelix-3rm / Plan 3), the core entry
+    point a harness is meant to call instead of reimplementing lifecycle — which is exactly the
+    thing whose absence keeps the extracted plugin parked. The deps hack dies with the
+    immutable versioned runtime (nelix-9a4 / Plan 2).
+
+Naming debt, deliberately left alone in the extraction pass: PLUGIN_ROOT below is now the CORE
+root. Its VALUE is right (it is where daemon/ and requirements-daemon.lock live, which is what
+the spawn needs — verified: the daemon spawns, answers RPC and tears down from this repo with
+no plugin present); only its NAME still says "plugin". Renaming it to CORE_ROOT is a pure
+rename and the natural first step of the locator work [nelix-4el.1].
 """
 import importlib
 import importlib.metadata
@@ -32,13 +54,19 @@ except ImportError:           # loaded as a top-level module (tests), not as a p
     from daemon.protocol import RPC_PROTOCOL_VERSION
     from daemon import reaper, singleton
 
-PLUGIN_ROOT = Path(__file__).parent
+PLUGIN_ROOT = Path(__file__).parent          # the CORE root now — see the module docstring
 _HEALTH_TIMEOUT = 10.0
 _log = logging.getLogger("nelix.supervisor")
 
-# Daemon deps live in the Hermes runtime venv (our sys.executable), which does
-# not ship them. No plugin.yaml field installs deps (pip_dependencies is a
-# no-op) — self-install venv-scoped, exactly like plugins/google_meet/cli.py.
+# Install the daemon's deps into whichever interpreter is about to run daemon.app (our
+# sys.executable), venv-scoped, because that interpreter does not ship them.
+#
+# The old reason written here was "the Hermes runtime venv ... no plugin.yaml field installs
+# deps (pip_dependencies is a no-op)". That was a fact about the harness this file used to live
+# inside; in the core it is no longer true — sys.executable here is the operator's venv (make
+# test, bin/nelix-*), not Hermes'. The MECHANISM still means something ("the interpreter that
+# will run the daemon must have wasmtime/ptyprocess"), so it is kept as-is; only the
+# justification changed. It dies with nelix-9a4 (Plan 2, immutable versioned runtimes).
 _DAEMON_DEPS = ("wasmtime==45.0.0", "ptyprocess==0.7.0")   # top-level imports; versions checked
 _DAEMON_MODULES = ("wasmtime", "ptyprocess")              # import names (== dist names here)
 _DAEMON_LOCK = PLUGIN_ROOT / "requirements-daemon.lock"   # hash-pinned full closure for install
