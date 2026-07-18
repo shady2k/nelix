@@ -137,17 +137,19 @@ class WaitForward:
                 # a seq-space that no longer exists. Resync -- never wait on a stale epoch's seq.
                 return 200, {"event": None, "cursor_expired": True}
 
-        # TRANSIENT (self-healing; documented here for 3c.4, not fixed here): this epoch check and
-        # the forward below are not atomic. If the daemon restarts in the GAP between this check
-        # passing and the daemon actually receiving the forwarded /wait, the request lands on the
-        # NEW incarnation (seq counters reset) still carrying the OLD after_seq. That one wait wastes
-        # its ~25s window (times out, no event) -- but it SELF-HEALS: the caller's next /wait
-        # re-captures the (now current) generation handle, this same epoch check sees the new
-        # incarnation's epoch != the cursor's recorded epoch, and returns cursor_expired IMMEDIATELY,
-        # so the caller resyncs via /status. No data loss -- the board is the source of truth. The
-        # robust fix -- the daemon's /wait reply carrying its own incarnation/epoch so the router can
-        # detect the mismatch on THIS call and return cursor_expired immediately instead of burning
-        # the window -- is out of scope here; it belongs to 3c.4 (router restart/reconcile).
+        # TRANSIENT (self-healing; NOT fixed here -- this is a DAEMON restart mid-wait, a different
+        # event from the ROUTER restart nelix-3rm 3c.4 covers, and 3c.4 explicitly leaves it deferred):
+        # this epoch check and the forward below are not atomic. If the daemon restarts in the GAP
+        # between this check passing and the daemon actually receiving the forwarded /wait, the
+        # request lands on the NEW incarnation (seq counters reset) still carrying the OLD after_seq.
+        # That one wait wastes its ~25s window (times out, no event) -- but it SELF-HEALS: the
+        # caller's next /wait re-captures the (now current) generation handle, this same epoch check
+        # sees the new incarnation's epoch != the cursor's recorded epoch, and returns cursor_expired
+        # IMMEDIATELY, so the caller resyncs via /status. No data loss -- the board is the source of
+        # truth. The robust fix -- the daemon's /wait reply carrying its own incarnation/epoch so the
+        # router can detect the mismatch on THIS call and return cursor_expired immediately instead of
+        # burning the window -- is filed as nelix-1hy, not this slice (3c.4 proves the ROUTER-restart
+        # story: the daemon here never restarts at all).
         return self._wait_on_generation(gen, owner_id, gen_sessions, after_seq, cursor)
 
     def _current_seq(self, gen, owner_id) -> int:
