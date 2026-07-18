@@ -118,6 +118,13 @@ class StartPath:
         self._ledger = ledger
         self._registry = registry
 
+    @property
+    def ledger(self):
+        """The shared StartLedger, so make_router_server can wire the orchestration /wait's
+        WaitForward off the SAME instance (nelix-91y: one shared ledger, never per-request) without
+        re-threading it through make_router_server's signature and every existing call site."""
+        return self._ledger
+
     def handle(self, body) -> "tuple[int, dict]":
         """Handle one POST /start. Returns (http_status, response_dict). Every NelixError becomes a
         stable envelope — never a bare 500/stacktrace to the caller."""
