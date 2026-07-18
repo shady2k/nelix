@@ -248,6 +248,40 @@ class StartLedger:
                 (reason, session_id))
 
     @translates_sqlite
+    def sessions_for_orchestration(self, owner_id: str, orchestration_id: str) -> "list[str]":
+        """The session_ids reserved under (owner_id, orchestration_id) that are CANDIDATES TO WAIT
+        ON — state in ('starting', 'started'), 'failed' excluded (a failed start never acquired a
+        worker, so waiting on it can never wake). This is how the router's orchestration /wait turns
+        an orchestration into the SET of sessions to long-poll.
+
+        OWNER-SCOPED, and that is the whole point: another owner's rows carrying the SAME
+        orchestration_id STRING are never returned, because the WHERE filters on BOTH owner_id and
+        orchestration_id. So owner Y can never derive owner Z's sessions from Z's orchestration id —
+        the same isolation `lookup` enforces (rev 1's owner-less lookup handed any caller another
+        owner's row). Deterministic order (created_at, session_id) so a caller sees a stable set.
+
+        Validate on the way OUT of storage, exactly like `_row_to_reservation`: a malformed stored
+        session_id is STORE_CORRUPT, never handed to the router (which routes on it), never a raw
+        crash."""
+        try:
+            validate_owner_id(owner_id)
+            validate_orchestration_id(orchestration_id)
+        except InvalidId as e:
+            raise NelixError(INVALID_REQUEST, str(e)) from None
+        rows = self._conn.execute(
+            "SELECT session_id FROM starts WHERE owner_id=? AND orchestration_id=? "
+            "AND state IN ('starting', 'started') ORDER BY created_at, session_id",
+            (owner_id, orchestration_id)).fetchall()
+        out = []
+        for row in rows:
+            try:
+                out.append(validate_session_id(row["session_id"]))
+            except InvalidId as e:
+                raise NelixError(STORE_CORRUPT,
+                                 f"stored session_id is unreadable: {e}") from None
+        return out
+
+    @translates_sqlite
     def lookup(self, idempotency_key: str, *, owner_id: str) -> "Reservation | None":
         """Owner-guarded: rev 1's lookup took no owner at all, so it handed any caller
         another owner's session_id, state and generation."""

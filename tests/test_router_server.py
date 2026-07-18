@@ -221,12 +221,48 @@ def test_board_status_bad_owner_id_shape_is_a_clean_400(wired):
     assert body["error"]["code"] == "invalid_request"
 
 
-def test_wait_route_404s_until_3c3(wired):
-    st, body = wired.client()._call("GET", f"/wait?owner_id={OWNER}&session_id=s-{'a' * 32}")
-    assert st == 404
-    assert body["error"]["code"] == "invalid_request"
-    assert body["error"]["retryable"] is False
-    assert "3c.3" in body["error"]["message"]
+def test_wait_orchestration_wakes_over_the_full_http_stack(wired):
+    # The ORCHESTRATION /wait (3c.3b) end-to-end through the REAL router HTTP server: start a
+    # session under an orchestration, read the board cursor, prime an event on the backend for that
+    # session, then /wait wakes with the event + an advanced cursor.
+    orch = "o-" + "a" * 32
+    _, sb = wired.client()._call(
+        "POST", "/start", {"executor": EXECUTOR, "task": "go", "cwd": "/repo", "owner_id": OWNER,
+                           "idempotency_key": "k-wait-1", "orchestration_id": orch})
+    sid = sb["session_id"]
+    _, board = wired.client()._call("GET", f"/status?owner_id={OWNER}")
+    cursor = board["cursor"]
+    wired.backend.wait_events[sid] = {"seq": 4, "session_id": sid, "kind": "waiting_for_user"}
+    st, wb = wired.client()._call(
+        "GET", f"/wait?owner_id={OWNER}&orchestration_id={orch}&cursor={cursor}")
+    assert st == 200
+    assert wb["event"]["session_id"] == sid and wb["event"]["seq"] == 4
+    new_cursor = decode(wb["cursor"], router_epoch=wired.epoch,
+                        topology_revision=wired.registry.topology_revision())
+    slot_id = wired.registry.generations()[0].slot_id
+    assert new_cursor.position_for(slot_id)[1] == 4       # ONLY this component advanced, to the seq
+
+
+def test_wait_empty_orchestration_is_an_explicit_no_wake_signal(wired):
+    orch = "o-" + "b" * 32
+    st, wb = wired.client()._call(
+        "GET", f"/wait?owner_id={OWNER}&orchestration_id={orch}")
+    assert st == 200
+    assert wb["event"] is None and wb["empty_orchestration"] is True
+
+
+def test_wait_bad_owner_shape_is_a_clean_400(wired):
+    st, wb = wired.client()._call(
+        "GET", "/wait?owner_id=has%20space&orchestration_id=o-" + "c" * 32)
+    assert st == 400
+    assert wb["error"]["code"] == "invalid_request"
+
+
+def test_wait_bad_orchestration_shape_is_a_clean_400(wired):
+    st, wb = wired.client()._call(
+        "GET", f"/wait?owner_id={OWNER}&orchestration_id=not-an-orch")
+    assert st == 400
+    assert wb["error"]["code"] == "invalid_request"
 
 
 # ============================================================ 3c.2: session-keyed OWNER routes

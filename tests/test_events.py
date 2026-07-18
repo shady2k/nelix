@@ -459,6 +459,112 @@ def test_wait_event_rejects_explicit_none_or_empty_session_id():
         q.wait_event(after_seq=0, timeout=0.1, session_id="")
 
 
+# ---------------------------------------------------------------------------
+# nelix-3rm 3c.3b: the MULTI-SESSION (session-set) wait primitive — one waiter for an
+# orchestration's N sessions. Wakes on the next event of ANY session in a SET, keeping every
+# 9a4.5 ring invariant intact (single self._cv, notify_all from publish only, no new lock,
+# pinned decisions / per-owner floor / monotonic watermarks untouched, expiry BEFORE delivery,
+# no empty/global wait).
+# ---------------------------------------------------------------------------
+
+def test_wait_event_any_wakes_on_an_event_of_any_session_in_the_set():
+    q = EventQueue(owner_resolver=_fixed_owner({"s1": "o", "s2": "o", "s3": "o"}))
+    a = q.publish("s2", "x", "waiting_for_user", "hi", "waiting_for_user")   # seq 1, a MEMBER
+    got = q.wait_event_any(after_seq=0, timeout=1, session_ids={"s1", "s2"})
+    assert got is a                                          # the member's event, returned by identity
+    assert got.session_id == "s2" and got.seq == 1          # tells the caller WHICH session + where
+
+
+def test_wait_event_any_ignores_events_outside_the_set():
+    # An event on a session NOT in the set must never wake a set waiter (that is the whole owner-
+    # isolation point: another orchestration's event must not be delivered here).
+    q = EventQueue(owner_resolver=_fixed_owner({"s1": "o", "s2": "o", "s-out": "o"}))
+    q.publish("s-out", "x", "working", "not mine", "working")               # seq 1, OUT of the set
+    assert q.wait_event_any(after_seq=0, timeout=0.1, session_ids={"s1", "s2"}) is None
+    # then a member publishes: NOW it wakes, and returns the member's (later) event, not the outsider.
+    b = q.publish("s1", "x", "waiting_for_user", "mine", "waiting_for_user")  # seq 2
+    assert q.wait_event_any(after_seq=0, timeout=1, session_ids={"s1", "s2"}) is b
+
+
+def test_wait_event_any_rejects_an_empty_set():
+    # An empty set matches EVERY session (a global wait), which would deliver another owner's event
+    # here — refused exactly like wait_event's missing-session_id guard. Structurally incapable of a
+    # global wait, not merely by convention.
+    import pytest
+    q = EventQueue()
+    with pytest.raises(ValueError):
+        q.wait_event_any(after_seq=0, timeout=0.1, session_ids=set())
+    with pytest.raises(ValueError):
+        q.wait_event_any(after_seq=0, timeout=0.1, session_ids=[])
+
+
+def test_wait_event_any_returns_cursor_expired_when_a_members_cursor_fell_off_the_ring():
+    # If the after_seq fell off the back for ANY session in the set (its evicted-high), the caller
+    # missed an event it cares about -> the explicit resync marker, immediately (no blocking).
+    import time as _t
+    q = EventQueue(max_history=5, owner_floor=0,
+                   owner_resolver=_fixed_owner({"s1": "o", "s2": "o", "flood": "o"}))
+    q.publish("s1", "x", "done", "old doorbell", "done_candidate")          # seq 1, s1's only event
+    for i in range(30):
+        q.publish("flood", "x", "working", "", "working")                  # evicts s1's seq 1
+    t0 = _t.time()
+    assert q.wait_event_any(after_seq=0, timeout=5, session_ids={"s1", "s2"}) is CURSOR_EXPIRED
+    assert _t.time() - t0 < 1.0                                            # returned at once, no block
+
+
+def test_wait_event_any_caught_up_member_does_not_spuriously_expire():
+    # A set whose after_seq is >= every member's evicted-high must NOT expire — only a genuine gap
+    # resyncs. Arming at the global latest_seq (a fully caught-up cursor) is the resync cursor and
+    # must clear expiry (no resync hot loop), exactly as the single-session path guarantees.
+    q = EventQueue(max_history=5, owner_floor=0,
+                   owner_resolver=_fixed_owner({"s1": "o", "s2": "o"}))
+    for i in range(40):
+        q.publish("s1", "x", "working", "", "working")                     # heavy churn
+    resync = q.latest_seq()                                                # fully caught-up
+    assert q.wait_event_any(after_seq=resync, timeout=0.1, session_ids={"s1", "s2"}) is None
+
+
+def test_wait_event_any_wakes_a_blocked_waiter_when_a_member_publishes():
+    # THE concurrency invariant: a waiter blocked on a SET wakes when ONE member publishes — via
+    # publish()'s own notify_all() (the multi-session wait adds no notify of its own).
+    import threading, time as _t
+    q = EventQueue(owner_resolver=_fixed_owner({"s1": "o", "s2": "o"}))
+    got = {}
+    started = threading.Event()
+
+    def waiter():
+        started.set()
+        got["evt"] = q.wait_event_any(after_seq=0, timeout=3, session_ids={"s1", "s2"})
+
+    t = threading.Thread(target=waiter, daemon=True); t.start()
+    assert started.wait(1)
+    _t.sleep(0.1)                                                          # let it reach _cv.wait
+    b = q.publish("s2", "x", "waiting_for_user", "wake up", "waiting_for_user")
+    t.join(3)
+    assert not t.is_alive()
+    assert got["evt"] is b                                                 # woken by the member, not stuck
+
+
+def test_wait_event_any_single_member_set_matches_the_single_session_wait():
+    # A one-element set is behaviorally identical to the single-session wait (the router's N=1
+    # orchestration collapses to it) — same event, same None-on-timeout.
+    q = EventQueue(owner_resolver=_fixed_owner({"s1": "o", "s2": "o"}))
+    q.publish("s2", "x", "working", "other", "working")                    # seq 1, not a member
+    assert q.wait_event_any(after_seq=0, timeout=0.1, session_ids={"s1"}) is None
+    a = q.publish("s1", "x", "waiting_for_user", "mine", "waiting_for_user")  # seq 2
+    assert q.wait_event_any(after_seq=0, timeout=1, session_ids={"s1"}) is a
+
+
+def test_single_session_wait_unchanged_after_generalizing_first_after():
+    # The single-session path (str filter) and the global query (None filter) still work after
+    # _first_after/_expired were generalized to accept a set — the existing 9a4.5 callers rely on it.
+    q = EventQueue(owner_resolver=_fixed_owner({"s1": "o", "s2": "o"}))
+    a = q.publish("s1", "x", "waiting_for_user", "a", "waiting_for_user")
+    b = q.publish("s2", "x", "done", "b", "done_candidate")
+    assert q.wait_event(after_seq=0, timeout=0.1, session_id="s1") is a    # str filter, unchanged
+    assert q.latest_after(0) is a and q.latest_after(1).seq == b.seq       # None filter, unchanged
+
+
 def test_publish_carries_range_and_hint_under_lock():
     from daemon.events import EventQueue
     q = EventQueue()

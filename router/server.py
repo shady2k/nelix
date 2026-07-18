@@ -17,12 +17,18 @@ what keeps the router stable (spec §1). 3c.1 implemented POST /start (ACTIVE_GE
     never owner-gated.
   * The router-LOCAL operator routes — GET /capabilities, /generation_list — answered by
     OperatorRoutes from the registry / the one active generation, never fanned out.
-3c.3a (this slice) adds:
+3c.3a adds:
   * The fan-out BOARD read — GET /status with NO session_id — merged across every tracked
     generation (N=1 today) by BoardForward, with an attached opaque vector cursor
     (nelix_contracts.cursor). See router/board.py for the merge + cursor construction.
-/wait remains an honest 404 — that is 3c.3b, not this slice. An unimplemented-yet route is honest,
-not dead code.
+3c.3b (this slice) adds:
+  * The ORCHESTRATION /wait — GET /wait with owner_id + orchestration_id + the opaque vector cursor
+    — one waiter for an orchestration's N workers, long-polling the generation(s) via the cursor
+    (WaitForward, router/wait.py). Decodes the cursor (CURSOR_EXPIRED/BOARD_CHANGED resync markers),
+    derives the orchestration's sessions from the owner-scoped ledger, and forwards the daemon's
+    MULTI-SESSION wait; explicit no-wake signals for an empty orchestration or an unownable set.
+Every route is now implemented; _dispatch_unimplemented remains for any still-classified operation
+that has no handler.
 """
 import json
 import socket
@@ -38,6 +44,7 @@ from router.board import BoardForward
 from router.operator import OperatorRoutes
 from router.session_forward import SessionForward
 from router.start import http_status
+from router.wait import WaitForward
 
 _MAX_BODY = 4 * 1024 * 1024        # 4 MiB post-auth body cap (mirrors the daemon's rpc_server)
 
@@ -105,6 +112,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
     session_forward = SessionForward(registry)
     operator_routes = OperatorRoutes(registry, router_epoch)
     board_forward = BoardForward(registry, router_epoch)
+    # The orchestration /wait waiter (3c.3b). Wired off the SAME shared StartLedger as the start
+    # path (start_path.ledger) — one instance, never per-request (nelix-91y).
+    wait_forward = WaitForward(start_path.ledger, registry, router_epoch)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -230,6 +240,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                 # No session_id: the fan-out BOARD read (3c.3a).
                 self._handle_board(qs)
                 return
+            if path == "/wait":
+                self._handle_wait()
+                return
             self._dispatch_unimplemented("GET", path)
 
         def _handle_start(self, raw):
@@ -314,6 +327,17 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             status, resp = session_forward.forward_secret("POST", path, headers, raw)
             self._send(status, resp)
 
+        def _handle_wait(self):
+            # The ORCHESTRATION /wait (3c.3b): owner_id + orchestration_id + the opaque vector
+            # cursor, all raw passthrough from the query string -- WaitForward validates the
+            # owner_id/orchestration_id shapes and decodes the cursor itself, exactly as the board
+            # read validates its own owner_id. A NelixError (bad shape, unavailable generation)
+            # propagates to _guarded, which maps it to its stable envelope.
+            qs = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            status, resp = wait_forward.wait(
+                _one(qs, "owner_id"), _one(qs, "orchestration_id"), _one(qs, "cursor"))
+            self._send(status, resp)
+
         def _handle_capabilities(self):
             status, resp = operator_routes.capabilities()
             self._send(status, resp)
@@ -356,9 +380,7 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                 return
             err = NelixError(
                 INVALID_REQUEST,
-                f"operation {op!r} (class {cls}) is not implemented in this router "
-                f"yet; the fan-out board (/status with no session_id) and /wait "
-                f"arrive in 3c.3")
+                f"operation {op!r} (class {cls}) is not implemented in this router")
             self._send(404, err.to_envelope())
 
     return _PreboundUnixHTTPServer(bound_socket, sock_path, Handler)

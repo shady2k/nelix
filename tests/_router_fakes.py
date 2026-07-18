@@ -43,6 +43,14 @@ class Backend:
         # 200 body instead of the normal owner-filtered shape -- lets a test produce a malformed
         # but 200 reply (e.g. a non-dict `sessions`) that `board_cursor` alone cannot express.
         self.board_reply_override = None
+        # nelix-3rm 3c.3b: the daemon MULTI-SESSION /wait shape (daemon/rpc_server.py). Owner-gates
+        # each session_id off `owns`; returns a primed event for the first owned member in
+        # `wait_events` (session_id -> event dict), a cursor_expired marker when
+        # `wait_cursor_expired` is set, a 404 when the owned subset is empty (the un-armable wait),
+        # else event:null. Settable directly so a router /wait test primes exactly one outcome.
+        self.wait_events = {}            # session_id -> event dict returned by /wait
+        self.wait_cursor_expired = False
+        self.wait_calls = []             # every /wait: {"after_seq", "session_ids", "owner_id"}
         backend = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -114,6 +122,21 @@ class Backend:
                 elif path == "/capabilities":
                     self._send(200, {"executors": {"demo": {"hook_capable": True}},
                                      "rpc_protocol": 1})
+                elif path == "/wait":
+                    ids = qs.get("session_id", [])
+                    backend.wait_calls.append({"after_seq": one("after_seq"),
+                                               "session_ids": ids, "owner_id": owner_id})
+                    owned = [s for s in dict.fromkeys(ids) if self._owned(s, owner_id)]
+                    if not owned:
+                        self._send(404, {"error": "unknown session",
+                                         "hint": "no session in the set is this owner's"}); return
+                    if backend.wait_cursor_expired:
+                        self._send(200, {"event": None, "cursor_expired": True}); return
+                    for s in owned:
+                        evt = backend.wait_events.get(s)
+                        if evt is not None:
+                            self._send(200, {"event": evt}); return
+                    self._send(200, {"event": None})
                 else:
                     self._send(404, {"error": "not found"})
 

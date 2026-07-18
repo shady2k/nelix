@@ -208,34 +208,61 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             elif p.path == "/wait":
                 qs = parse_qs(p.query)
                 after = self._int(qs.get("after_seq", ["0"])[0], 0)
-                sid = qs.get("session_id", [None])[0]
+                # ALL session_id values: ONE param = the single-session /wait (backward compatible,
+                # unchanged below); repeated params = the router's MULTI-SESSION orchestration wait
+                # (3c.3b — one waiter for an orchestration's N sessions).
+                sids = qs.get("session_id", [])
                 owner_id = self._owner(qs.get("owner_id", [None])[0])
-                if not sid:
+                if not sids:
                     # A global (session_id-less) wait returns on ANY session's event, leaking one
                     # session's result into another's orchestrator when the daemon is shared. Refuse
                     # it structurally: session_id is mandatory (mirrors the /dialog guard below).
                     self._send(400, {"error": "missing session_id"}); return
-                # Shape-check BEFORE owner.owns_session ever resolves `sessions_root() / sid`
-                # (nelix-9a4.6 review, follow-up finding: /wait was missed by the original pass).
-                if not self._require_valid_sid(sid):
-                    return
-                # Events are NOT owner-tagged (the queue is a global ordered log), so the filter has
-                # to be here: establish ownership of `sid` BEFORE arming, and never arm otherwise.
-                # This is the "arms a waiter for every session it sees" half of the bug — a waiter
-                # is how one harness ends up answering another's decision.
-                #
-                # 404, NOT a 200 with event:null. Both keep the event in, but a waiter's whole
-                # contract is "this call blocks ~25s, so a null means re-issue" — answering an
-                # un-armable wait instantly and nullly tells every correct waiter to try again at
-                # once, forever. MEASURED before this was a 404: bin/nelix-wait spun at ~3400
-                # req/s against the daemon. An unownable session is not "no events yet", it is a
-                # wait that can NEVER return, and the caller has to be able to tell the difference.
-                if not owner.owns_session(sid, owner_id):
-                    self._send(404, {"error": "unknown session",
-                                     "hint": "unknown session, or not this owner's; a wait on it"
-                                             " would never wake. Do not retry."})
-                    return
-                evt = manager._events.wait_event(after_seq=after, timeout=25, session_id=sid)
+                if len(sids) == 1:
+                    # ------------------------------- single-session /wait (UNCHANGED, backward compatible)
+                    sid = sids[0]
+                    # Shape-check BEFORE owner.owns_session ever resolves `sessions_root() / sid`
+                    # (nelix-9a4.6 review, follow-up finding: /wait was missed by the original pass).
+                    if not self._require_valid_sid(sid):
+                        return
+                    # Events are NOT owner-tagged (the queue is a global ordered log), so the filter
+                    # has to be here: establish ownership of `sid` BEFORE arming, and never arm
+                    # otherwise. This is the "arms a waiter for every session it sees" half of the bug
+                    # — a waiter is how one harness ends up answering another's decision.
+                    #
+                    # 404, NOT a 200 with event:null. Both keep the event in, but a waiter's whole
+                    # contract is "this call blocks ~25s, so a null means re-issue" — answering an
+                    # un-armable wait instantly and nullly tells every correct waiter to try again at
+                    # once, forever. MEASURED before this was a 404: bin/nelix-wait spun at ~3400
+                    # req/s against the daemon. An unownable session is not "no events yet", it is a
+                    # wait that can NEVER return, and the caller has to be able to tell the difference.
+                    if not owner.owns_session(sid, owner_id):
+                        self._send(404, {"error": "unknown session",
+                                         "hint": "unknown session, or not this owner's; a wait on it"
+                                                 " would never wake. Do not retry."})
+                        return
+                    evt = manager._events.wait_event(after_seq=after, timeout=25, session_id=sid)
+                else:
+                    # ------------------------------- multi-session (orchestration) /wait (3c.3b)
+                    # Shape-check EACH sid BEFORE any of them resolves `sessions_root() / sid`, same
+                    # rule as the single path (a bad-shape member is a 400 before any wait is armed).
+                    for sid in sids:
+                        if not self._require_valid_sid(sid):
+                            return
+                    # OWNER-GATE EACH sid and wait ONLY on the OWNED subset. A foreign/unowned sid is
+                    # SKIPPED, never waited on (arming it would deliver another owner's event here —
+                    # the same leak the single-session gate closes). dict.fromkeys dedups while
+                    # preserving order, so a repeated sid is armed once.
+                    owned = [s for s in dict.fromkeys(sids) if owner.owns_session(s, owner_id)]
+                    if not owned:
+                        # The set reduced to empty (every member foreign/unknown): a wait that can
+                        # NEVER wake. 404 like the single un-armable wait — never a 200/null spin.
+                        self._send(404, {"error": "unknown session",
+                                         "hint": "no session in the set is this owner's; a wait on"
+                                                 " it would never wake. Do not retry."})
+                        return
+                    evt = manager._events.wait_event_any(after_seq=after, timeout=25,
+                                                         session_ids=owned)
                 if evt is CURSOR_EXPIRED:
                     # The cursor fell off the back of the bounded ring: events this waiter never saw
                     # were evicted. Answer with an EXPLICIT resync marker (not a silent event:null),
