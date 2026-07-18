@@ -11,6 +11,24 @@ except ImportError:
     from daemon import owner
 
 
+class ForwardConnectError(Exception):
+    """A forward that failed BEFORE the request was fully delivered — the connection could not be
+    established, or the send did not complete (connection refused, host/network unreachable, a
+    permission/path error on connect, a DNS failure, a connect timeout, or a broken send). No
+    complete request reached the generation, so NO worker was created: the router may treat this as a
+    DEFINITE failure and record it, rather than stranding the reservation (nelix-3rm 3c.1 finding #2).
+    Classification is by PHASE (which step raised), not by exception type — so a PermissionError or a
+    generic OSError on connect is definite, not lumped with the ambiguous post-send failures."""
+
+
+class ForwardResponseError(Exception):
+    """A forward that delivered the request but then failed while AWAITING or READING the response —
+    a read timeout, the connection dropped after the request was sent, or a malformed/garbled reply.
+    The generation may already have created the worker, so this is AMBIGUOUS: the router must NOT
+    record a durable failure (that would strand an orphan worker behind a false `failed`); it leaves
+    the reservation `starting` and returns a retryable error (nelix-3rm 3c.1 findings #2/#3)."""
+
+
 class UnixHTTPConnection(http.client.HTTPConnection):
     def __init__(self, path, timeout=30):
         super().__init__("localhost", timeout=timeout)
@@ -42,11 +60,15 @@ class RpcClient:
             return UnixHTTPConnection(self._t.path, timeout=timeout)
         return http.client.HTTPConnection(self._t.host, self._t.port, timeout=timeout)
 
-    def _call(self, method, path, body=None, timeout=30):
+    def _prep(self, body):
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Content-Type": "application/json"}
         if self._t.kind == "tcp":
             headers["X-Nelix-Token"] = self._t.token
+        return data, headers
+
+    def _call(self, method, path, body=None, timeout=30):
+        data, headers = self._prep(body)
         conn = self._conn(timeout)
         try:
             conn.request(method, path, body=data, headers=headers)
@@ -55,13 +77,49 @@ class RpcClient:
         finally:
             conn.close()
 
-    def start(self, executor, task, cwd, model=None):
-        # model (nelix-9k0): the key is only ADDED when provided, so a default (no-model) call is
-        # byte-for-byte the same request as before this option existed (mirrors status's include_progress).
+    def _forward_call(self, method, path, body, timeout=30):
+        """Like _call, but with the connect+send and the response-read phases SEPARATED so the caller
+        can tell a DEFINITE pre-delivery failure (ForwardConnectError — the request never fully left,
+        so no worker) from an AMBIGUOUS post-send one (ForwardResponseError — the request was sent, so
+        a worker may exist). The router's /start forward relies on this phase split to decide whether
+        it may record a durable failure or must leave the reservation `starting` (findings #2/#3).
+        Returns the decoded JSON body."""
+        data, headers = self._prep(body)
+        conn = None
+        try:
+            try:
+                conn = self._conn(timeout)
+                conn.request(method, path, body=data, headers=headers)   # connect + send request
+            except Exception as e:
+                raise ForwardConnectError(str(e)) from e                 # no complete request delivered
+            try:
+                resp = conn.getresponse()                                # request sent — await the reply
+                return json.loads(resp.read() or b"{}")
+            except Exception as e:
+                raise ForwardResponseError(str(e)) from e                # reply lost/garbled: worker may exist
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def start(self, executor, task, cwd, model=None, session_id=None, timeout=30):
+        # model (nelix-9k0) and session_id (nelix-3rm) are only ADDED when provided, so a default
+        # call is byte-for-byte the same request as before either option existed (mirrors status's
+        # include_progress). session_id is the ROUTER-assigned id: the router allocates it before
+        # forwarding /start (spec §3), and the daemon's /start accepts it (nelix-9a4.6). The forward
+        # is PHASE-SPLIT (_forward_call) so the router can classify a failure as definite vs ambiguous.
         payload = {"executor": executor, "task": task, "cwd": cwd, "owner_id": self._owner}
         if model is not None:
             payload["model"] = model
-        _, body = self._call("POST", "/start", payload)
+        if session_id is not None:
+            payload["session_id"] = session_id
+        return self._forward_call("POST", "/start", payload, timeout=timeout)
+
+    def health(self, timeout=10):
+        """The generation's /health envelope (liveness + build-id `generation_id`). No owner and
+        no session (spec §8/§10): the route carries neither, so the router can probe a generation's
+        identity without impersonating a caller. `owner_id` is still required to CONSTRUCT this
+        client, but is not sent on the wire for /health."""
+        _, body = self._call("GET", "/health", timeout=timeout)
         return body
 
     def status(self, session_id=None, include_progress=False):

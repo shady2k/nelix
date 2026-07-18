@@ -115,11 +115,12 @@ def test_rpc_client_dialog(monkeypatch, tmp_path):
 
 def test_client_start_omits_model_when_not_provided(monkeypatch):
     # nelix-9k0: a default (no-model) call is byte-for-byte the same POST body as before this
-    # feature — "model" is only added when provided (mirrors status(include_progress=...)).
+    # feature — "model" is only added when provided (mirrors status(include_progress=...)). start()
+    # forwards through the phase-split _forward_call now, so that is the patch point.
     c = RpcClient(Transport.tcp("x", 80, "t"), OWNER)
     seen = {}
-    monkeypatch.setattr(c, "_call",
-                        lambda m, p, body=None: seen.update(m=m, p=p, body=body) or (200, {}))
+    monkeypatch.setattr(c, "_forward_call",
+                        lambda m, p, body, **k: seen.update(m=m, p=p, body=body) or {})
     c.start(EXECUTOR, "go", "/repo")
     assert seen["m"] == "POST" and seen["p"] == "/start"
     assert seen["body"] == {"executor": EXECUTOR, "task": "go", "cwd": "/repo",
@@ -130,8 +131,8 @@ def test_client_start_omits_model_when_not_provided(monkeypatch):
 def test_client_start_includes_model_when_provided(monkeypatch):
     c = RpcClient(Transport.tcp("x", 80, "t"), OWNER)
     seen = {}
-    monkeypatch.setattr(c, "_call",
-                        lambda m, p, body=None: seen.update(body=body) or (200, {}))
+    monkeypatch.setattr(c, "_forward_call",
+                        lambda m, p, body, **k: seen.update(body=body) or {})
     c.start(EXECUTOR, "go", "/repo", model="haiku")
     assert seen["body"] == {"executor": EXECUTOR, "task": "go", "cwd": "/repo", "model": "haiku",
                             "owner_id": OWNER}
