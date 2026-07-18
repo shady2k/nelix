@@ -82,20 +82,18 @@ class _Backend:
 
 
 class _Supervisor:
-    """A minimal supervisor stand-in whose endpoint() points at a given transport."""
+    """A minimal supervisor stand-in whose active_generation() returns a (transport, incarnation)
+    pair — read together, as the registry consumes it."""
 
     def __init__(self, transport, inc=None):
         self._t = transport
         self.inc = inc or {"pid": 1, "start_fingerprint": "fp"}
 
-    def endpoint(self):
-        return self._t
+    def active_generation(self):
+        return (self._t, self.inc)
 
     def ensure_running(self):
         return self._t
-
-    def incarnation(self):
-        return self.inc
 
 
 def _start_path(backend):
@@ -193,9 +191,8 @@ def test_generation_unavailable_when_no_backend_can_be_made():
     # A registry that cannot provide a generation at all -> GENERATION_UNAVAILABLE, and the
     # reservation is failed so a same-key retry replays the failure (never a fresh worker).
     class _DeadSupervisor:
-        def endpoint(self): return None
+        def active_generation(self): return None
         def ensure_running(self): raise RuntimeError("daemon did not become healthy")
-        def incarnation(self): return None
     ledger = StartLedger(paths.nelix_root())
     sp = StartPath(ledger, GenerationRegistry(supervisor=_DeadSupervisor(),
                                               health_probe=lambda t: None))
@@ -208,15 +205,88 @@ def test_generation_unavailable_when_no_backend_can_be_made():
 
 def test_forward_to_a_dead_transport_is_generation_unavailable():
     class _Sup:
-        def endpoint(self): return Transport.tcp("127.0.0.1", 9, "t")   # discard port: refused
-        def ensure_running(self): return self.endpoint()
-        def incarnation(self): return {"pid": 1, "start_fingerprint": "fp"}
+        _t = Transport.tcp("127.0.0.1", 9, "t")                          # discard port: refused
+        def active_generation(self): return (self._t, {"pid": 1, "start_fingerprint": "fp"})
+        def ensure_running(self): return self._t
     ledger = StartLedger(paths.nelix_root())
     sp = StartPath(ledger, GenerationRegistry(supervisor=_Sup(), health_probe=lambda t: None))
     status, resp = sp.handle(_body())
     assert status == 503
     assert resp["error"]["code"] == "generation_unavailable"
     assert ledger.lookup("k-1", owner_id=OWNER).state == "failed"
+
+
+def test_ambiguous_forward_timeout_leaves_reservation_starting_and_retry_replays(monkeypatch):
+    # Finding #1: a forward that TIMES OUT after the request was SENT is AMBIGUOUS — the daemon may
+    # already have created the worker. It must NOT be recorded as a durable failure (the ledger's
+    # create-then-fail guard is inert for a router forward: the daemon writes owner.json, not the
+    # store's sessions table). The reservation stays `starting`, a same-key retry replays it
+    # in-progress (not a failure), and NO second worker is forwarded.
+    forwards = []
+
+    class _TimeoutClient:
+        def __init__(self, transport, owner_id):
+            pass
+
+        def start(self, executor, task, cwd, model=None, session_id=None):
+            forwards.append(session_id)          # the request left the router (worker may exist)
+            raise TimeoutError("read timed out")  # ...but the reply never arrived: AMBIGUOUS
+
+    import rpc_client
+    monkeypatch.setattr(rpc_client, "RpcClient", _TimeoutClient)
+
+    backend = _Backend()
+    sp, ledger = _start_path(backend)
+    try:
+        status, resp = sp.handle(_body())
+        assert status == 503
+        assert resp["error"]["code"] == "generation_unavailable"
+        assert resp["error"]["retryable"] is True
+        row = ledger.lookup("k-1", owner_id=OWNER)
+        assert row.state == "starting"               # NOT durably failed — still in-progress
+        assert len(forwards) == 1
+        # A same-key retry replays the in-progress reservation and does NOT forward again.
+        status2, resp2 = sp.handle(_body())
+        assert status2 == 200
+        assert resp2["status"] == "starting"
+        assert resp2.get("replay") is True
+        assert len(forwards) == 1                     # NO second worker spawned
+    finally:
+        backend.close()
+
+
+def test_connection_refused_forward_definitely_fails_and_retry_replays_the_failure(monkeypatch):
+    # Finding #1: a ConnectionRefusedError on connect is a DEFINITE failure — the request never left
+    # the router, so no worker was created. It IS recorded as a failure, and a same-key retry replays
+    # that recorded failure (never a fresh worker).
+    forwards = []
+
+    class _RefusedClient:
+        def __init__(self, transport, owner_id):
+            pass
+
+        def start(self, executor, task, cwd, model=None, session_id=None):
+            forwards.append(session_id)
+            raise ConnectionRefusedError("connection refused")   # connect refused: worker not started
+
+    import rpc_client
+    monkeypatch.setattr(rpc_client, "RpcClient", _RefusedClient)
+
+    backend = _Backend()
+    sp, ledger = _start_path(backend)
+    try:
+        status, resp = sp.handle(_body())
+        assert status == 503
+        assert resp["error"]["code"] == "generation_unavailable"
+        row = ledger.lookup("k-1", owner_id=OWNER)
+        assert row.state == "failed"                 # DEFINITE: durably recorded as failed
+        assert len(forwards) == 1
+        status2, resp2 = sp.handle(_body())          # replays the recorded failure
+        assert status2 == 503
+        assert resp2["error"]["code"] == "generation_unavailable"
+        assert len(forwards) == 1                     # NOT forwarded again
+    finally:
+        backend.close()
 
 
 def test_missing_idempotency_key_is_rejected():

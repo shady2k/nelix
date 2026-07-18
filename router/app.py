@@ -30,11 +30,16 @@ def _new_router_epoch() -> str:
     return "r-" + uuid.uuid4().hex
 
 
-def _install_shutdown_handlers(server) -> None:
-    """SIGTERM/SIGINT -> orderly serve_forever() exit. Best-effort: signal.signal only works on the
-    main thread, so a non-main-thread launch (a test, an embedded run) simply skips it."""
-    def _stop(_signum, _frame):
-        server.shutdown()
+def _install_shutdown_handlers() -> None:
+    """SIGTERM/SIGINT -> orderly serve_forever() exit. Mirrors daemon/app.py's working shutdown: the
+    handler RAISES SystemExit to unwind serve_forever() from the SERVING (main) thread, then main()'s
+    finally releases the socket + flock. It must NOT call server.shutdown() from that thread —
+    BaseServer.shutdown() blocks until serve_forever() returns, which cannot happen from inside the
+    handler, so it would DEADLOCK (socket + flock retained forever). Best-effort: signal.signal only
+    works on the main thread, so a non-main-thread launch (a test, an embedded run) simply skips it."""
+    def _stop(signum, _frame):
+        _log.info("nelix router: shutdown requested (signal=%s)", signum)
+        raise SystemExit(0)
     try:
         signal.signal(signal.SIGTERM, _stop)
         signal.signal(signal.SIGINT, _stop)
@@ -57,7 +62,7 @@ def main() -> None:
     registry = GenerationRegistry()
     start_path = StartPath(ledger, registry)
     server = make_router_server(handle.socket, handle.sock_path, start_path, registry, router_epoch)
-    _install_shutdown_handlers(server)
+    _install_shutdown_handlers()
     _log.info("nelix router serving on %s (epoch=%s)", handle.sock_path, router_epoch)
     try:
         server.serve_forever()

@@ -20,6 +20,7 @@ Flow for `POST /start`:
 The router shares ONE StartLedger and ONE GenerationRegistry across request threads (both are
 thread-safe); this class holds no per-request state and is safe to share too."""
 import hashlib
+import http.client
 import json
 
 from nelix_contracts.errors import (
@@ -43,6 +44,22 @@ _HTTP_STATUS = {
 # A recorded failure reason is stored durably (the ledger's reason column has no length bound of its
 # own); cap it so a runaway upstream message cannot grow the database unboundedly.
 _MAX_REASON = 500
+
+# Forward-failure classification (finding #1): the outcome of forwarding /start to a generation is
+# either DEFINITE or AMBIGUOUS, and only a DEFINITE failure may be recorded as `failed`.
+#
+#   DEFINITE — the connection was REFUSED or the endpoint does not exist, so the request never left
+#   the router and no worker was created. Safe to fail() the reservation: a same-key retry then
+#   replays the recorded failure rather than spawning a worker.
+_DEFINITE_FORWARD_FAILURES = (ConnectionRefusedError, FileNotFoundError)
+#
+#   AMBIGUOUS — a socket/read TIMEOUT, or a connection dropped AFTER the request was sent. The daemon
+#   may already have created the worker, so this MUST NOT be recorded as a durable failure: the
+#   ledger's create-then-fail guard is inert for a router forward (the daemon writes owner.json
+#   filesystem metadata, not the store's `sessions` table), so a fail() here would durably record a
+#   FALSE failure while an orphan worker runs. Leave the reservation `starting` and return a
+#   retryable envelope; a same-key retry then replays the in-progress reservation (no second worker).
+_AMBIGUOUS_FORWARD_FAILURES = (TimeoutError, ConnectionError, http.client.HTTPException, OSError)
 
 
 def http_status(code: str) -> int:
@@ -174,10 +191,20 @@ class StartPath:
         try:
             reply = RpcClient(gen.transport, owner_id).start(
                 executor, task, cwd, model=model, session_id=sid)
-        except Exception as e:
-            reason = f"forward to generation failed: {e}"
+        except _DEFINITE_FORWARD_FAILURES as e:
+            # DEFINITE: connect refused / endpoint absent — the request never left, no worker was
+            # created. Record the failure so a same-key retry replays it (never a fresh worker).
+            reason = f"forward to generation was refused: {e}"
             self._fail(sid, reason)
             raise NelixError(GENERATION_UNAVAILABLE, reason) from None
+        except _AMBIGUOUS_FORWARD_FAILURES as e:
+            # AMBIGUOUS: timeout, or the connection dropped AFTER the request was sent — the daemon
+            # may already have created the worker. Do NOT fail() (that would durably record a false
+            # failure while an orphan runs); leave the reservation `starting` so a same-key retry
+            # replays it in-progress. Retryable — never a second worker.
+            raise NelixError(
+                GENERATION_UNAVAILABLE,
+                f"forward to generation was ambiguous (reservation left starting): {e}") from None
 
         # Success is decided by the generation's own /start contract: a 200 body reports
         # status "started" and echoes the ASSIGNED session id. Anything else is a failed start.

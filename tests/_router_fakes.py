@@ -63,17 +63,15 @@ class Backend:
 
 
 class Supervisor:
-    """Supervisor stand-in whose endpoint() points at a fixed transport."""
+    """Supervisor stand-in whose active_generation() returns a fixed (transport, incarnation) pair
+    — read together, exactly as the registry consumes it."""
 
     def __init__(self, transport, inc=None):
         self._t = transport
         self.inc = inc or {"pid": 1, "start_fingerprint": "fp"}
 
-    def endpoint(self):
-        return self._t
+    def active_generation(self):
+        return (self._t, self.inc)
 
     def ensure_running(self):
         return self._t
-
-    def incarnation(self):
-        return self.inc

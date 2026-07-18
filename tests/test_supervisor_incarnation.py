@@ -38,3 +38,39 @@ def test_incarnation_rejects_a_reused_pid_whose_fingerprint_differs(monkeypatch,
     monkeypatch.setattr(reaper.ProcessInspector, "start_fingerprint",
                         lambda self, pid: "different-fingerprint")
     assert supervisor.incarnation() is None
+
+
+def test_active_generation_reads_transport_and_incarnation_from_one_snapshot(monkeypatch, tmp_path):
+    """Finding #3: the router needs the transport and the incarnation from the SAME .active.json
+    read, so a restart cannot bind a new incarnation's epoch to a dead incarnation's transport.
+    active_generation() returns both, gated by the same liveness + fingerprint + health checks
+    endpoint()/incarnation() apply."""
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    t = Transport.unix(str(paths.rpc_sock()))
+    supervisor._write_state(os.getpid(), t)
+    monkeypatch.setattr(supervisor, "_healthy", lambda tr: True)   # a daemon answering our protocol
+    snap = supervisor.active_generation()
+    assert snap is not None
+    transport, inc = snap
+    assert transport.kind == t.kind and transport.path == t.path
+    assert inc["pid"] == os.getpid()
+    assert inc["start_fingerprint"] == reaper.ProcessInspector().start_fingerprint(os.getpid())
+
+
+def test_active_generation_is_none_when_unhealthy(monkeypatch, tmp_path):
+    """An unhealthy (or unreachable) recorded daemon yields no snapshot at all — never a transport
+    without its incarnation, or vice versa. Mirrors endpoint()'s health gate."""
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    supervisor._write_state(os.getpid(), Transport.unix(str(paths.rpc_sock())))
+    monkeypatch.setattr(supervisor, "_healthy", lambda tr: False)
+    assert supervisor.active_generation() is None
+
+
+def test_active_generation_is_none_when_no_daemon(monkeypatch, tmp_path):
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    assert supervisor.active_generation() is None

@@ -20,17 +20,21 @@ class FakeSupervisor:
         self.transport = transport or Transport.unix("/tmp/fake-gen.sock")
         self.inc = inc if inc is not None else {"pid": 100, "start_fingerprint": "fp-1"}
         self.ensure_calls = 0
-        self.endpoint_returns = self.transport
+        # Whether a live, healthy generation is currently recorded. Set False to model "no daemon
+        # yet"; ensure_running() (a spawn) publishes one.
+        self.recorded = True
 
-    def endpoint(self):
-        return self.endpoint_returns
+    def active_generation(self):
+        # transport + incarnation ALWAYS returned as one pair (the atomic snapshot the registry
+        # consumes) — or None when nothing live/healthy is recorded.
+        if not self.recorded or self.inc is None:
+            return None
+        return (self.transport, self.inc)
 
     def ensure_running(self):
         self.ensure_calls += 1
+        self.recorded = True                                   # a spawn publishes a live generation
         return self.transport
-
-    def incarnation(self):
-        return self.inc
 
 
 def _reg(sup, build_id="build-xyz"):
@@ -60,17 +64,51 @@ def test_a_restart_new_incarnation_mints_a_fresh_epoch():
     assert _EPOCH_RE.match(second)
 
 
-def test_endpoint_none_falls_back_to_ensure_running():
+def test_epoch_and_transport_are_paired_from_one_snapshot_across_a_restart():
+    """Finding #3: the registry must read the transport and the incarnation TOGETHER, so a new
+    incarnation's epoch is never paired with a prior incarnation's transport. The stub here ONLY
+    exposes active_generation() (no separate endpoint()/incarnation()), so a registry that tried the
+    old separate reads would AttributeError — proving the pairing is structural, not incidental. A
+    restart swaps BOTH transport and incarnation in one snapshot; the new epoch must arrive with the
+    NEW transport."""
+    class ConsistentSupervisor:
+        def __init__(self):
+            # transport and incarnation are always read as ONE pair.
+            self.snapshot = (Transport.unix("/tmp/gen-a.sock"),
+                             {"pid": 1, "start_fingerprint": "fp-a"})
+
+        def active_generation(self):
+            return self.snapshot
+
+        def ensure_running(self):
+            return self.snapshot[0] if self.snapshot else None
+
+    sup = ConsistentSupervisor()
+    reg = GenerationRegistry(supervisor=sup, health_probe=lambda t: None)
+    g1 = reg.active()
+    assert g1.transport == sup.snapshot[0]
+    assert g1.incarnation == sup.snapshot[1]
+
+    # Daemon restart: the snapshot swaps transport AND incarnation together.
+    sup.snapshot = (Transport.unix("/tmp/gen-b.sock"), {"pid": 2, "start_fingerprint": "fp-b"})
+    g2 = reg.active()
+    assert g2.epoch != g1.epoch                            # a fresh incarnation minted a fresh epoch
+    assert g2.transport == sup.snapshot[0]                 # ...paired with the NEW transport,
+    assert g2.transport != g1.transport                    #    never the stale one
+    assert _EPOCH_RE.match(g2.epoch)
+
+
+def test_no_recorded_generation_falls_back_to_ensure_running():
     sup = FakeSupervisor()
-    sup.endpoint_returns = None                            # no live endpoint yet
+    sup.recorded = False                                   # nothing live/healthy recorded yet
     gen = _reg(sup).active()
-    assert sup.ensure_calls == 1
+    assert sup.ensure_calls == 1                           # spawned one, then re-read the snapshot
     assert gen.transport == sup.transport
 
 
 def test_generation_unavailable_when_backend_cannot_be_made_available():
     sup = FakeSupervisor()
-    sup.endpoint_returns = None
+    sup.recorded = False
 
     def _boom():
         raise RuntimeError("daemon did not become healthy")

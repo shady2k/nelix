@@ -5,6 +5,7 @@ router_epoch). Session-keyed / fan-out / operator routes honestly 404 (a clear b
 
 The server is exercised over its REAL securely-established AF_UNIX socket (runtime_dir.establish())
 via a same-uid client — which is exactly the peercred allow path."""
+import socket as _socket
 import threading
 
 import pytest
@@ -49,6 +50,88 @@ def wired():
     w = _Wired()
     yield w
     w.close()
+
+
+def _raw_over_unix(sock_path, request_bytes, timeout=4):
+    """Send a HAND-CRAFTED HTTP request over the router's unix socket and return (status, body_text).
+
+    Used to exercise malformed Content-Length headers a normal client cannot produce. The request
+    sends `Connection: close` so the server closes after responding (no keep-alive hang), and a
+    socket timeout guards against a server that BLOCKS on an unbounded read instead of rejecting —
+    a timeout here IS the finding-#4 bug (rfile.read(-1) waiting for EOF)."""
+    c = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    c.settimeout(timeout)
+    c.connect(sock_path)
+    try:
+        c.sendall(request_bytes)
+        chunks = []
+        while True:
+            b = c.recv(4096)
+            if not b:
+                break
+            chunks.append(b)
+        data = b"".join(chunks)
+    finally:
+        c.close()
+    head, _, body = data.partition(b"\r\n\r\n")
+    status = int(head.split(b"\r\n", 1)[0].split(b" ")[1]) if head else 0
+    return status, body.decode(errors="replace")
+
+
+def test_negative_content_length_is_a_stable_400_without_an_unbounded_read(wired):
+    # Finding #4: a negative Content-Length must be rejected with a stable 400 envelope BEFORE any
+    # read — never reach rfile.read(-1), which blocks until EOF and bypasses the 4 MiB cap.
+    req = (b"POST /start HTTP/1.0\r\nHost: localhost\r\n"
+           b"Content-Length: -1\r\nConnection: close\r\n\r\n")
+    status, body = _raw_over_unix(wired.handle.sock_path, req)
+    assert status == 400
+    assert '"code": "invalid_request"' in body or '"code":"invalid_request"' in body
+
+
+def test_non_integer_content_length_is_a_stable_400(wired):
+    # Finding #4: a non-integer Content-Length must be a stable 400, not an unhandled exception that
+    # drops the connection with a stderr traceback.
+    req = (b"POST /start HTTP/1.0\r\nHost: localhost\r\n"
+           b"Content-Length: notanumber\r\nConnection: close\r\n\r\n")
+    status, body = _raw_over_unix(wired.handle.sock_path, req)
+    assert status == 400
+    assert "invalid_request" in body
+
+
+def test_over_large_content_length_is_a_clear_too_large_error(wired):
+    # Finding #4: an over-large body returns a clear "too large" error (413), not a misleading
+    # invalid_request:owner_id from a silently-dropped body. Rejected on the HEADER, before reading.
+    req = (b"POST /start HTTP/1.0\r\nHost: localhost\r\n"
+           b"Content-Length: 5000000\r\nConnection: close\r\n\r\n")
+    status, body = _raw_over_unix(wired.handle.sock_path, req)
+    assert status == 413
+    assert "too large" in body
+    assert "owner_id" not in body                       # NOT the misleading downstream error
+
+
+def test_foreign_uid_401_is_a_stable_envelope(wired, monkeypatch):
+    # Finding #5: the 401 must be the stable NelixError envelope (with `retryable`), not a hand-rolled
+    # body. A foreign uid cannot be forged over AF_UNIX, so drive the refuse path directly.
+    import router.server as rs
+    monkeypatch.setattr(rs, "peer_is_self", lambda conn: False)
+    st, body = wired.client()._call("GET", "/health")
+    assert st == 401
+    assert body["error"]["code"] == "owner_mismatch"
+    assert body["error"]["retryable"] is False
+
+
+def test_non_nelix_error_in_dispatch_becomes_a_500_internal_envelope(wired, monkeypatch):
+    # Finding #6: a non-NelixError escaping a handler (e.g. from registry.active()) must become a
+    # stable 500 INTERNAL_ERROR envelope, never a bare 500 / dropped connection.
+    def _boom(*a, **k):
+        raise RuntimeError("unexpected internal fault")
+    monkeypatch.setattr(wired.registry, "active", _boom)
+    st, body = wired.client()._call("POST", "/start",
+                                    {"executor": EXECUTOR, "task": "go", "cwd": "/repo",
+                                     "owner_id": OWNER, "idempotency_key": "k-boom"})
+    assert st == 500
+    assert body["error"]["code"] == "internal_error"
+    assert body["error"]["retryable"] is False
 
 
 def test_router_health_reports_epoch_and_active_generation(wired):

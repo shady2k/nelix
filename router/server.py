@@ -20,12 +20,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from nelix_contracts import routing
-from nelix_contracts.errors import INVALID_REQUEST, NelixError
+from nelix_contracts.errors import INTERNAL_ERROR, INVALID_REQUEST, OWNER_MISMATCH, NelixError
 
 from daemon.transport import peer_is_self
 from router.start import http_status
 
 _MAX_BODY = 4 * 1024 * 1024        # 4 MiB post-auth body cap (mirrors the daemon's rpc_server)
+
+# Returned by _read_raw_body when it has ALREADY sent an error response (a bad Content-Length): the
+# POST handler must stop, not respond again.
+_STOP = object()
 
 # URL path -> operation NAME. The router dispatches on the operation's CLASS (routing.classify), so
 # this table only has to turn a route into the operation name the classifier understands. /hook/<sid>
@@ -75,11 +79,12 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
 
         def _auth(self):
             # Unix peercred: reject only a KNOWN foreign uid; unknown/unreportable is allowed because
-            # the 0700 dir + 0600 socket are the real local boundary (peer_is_self's policy).
+            # the 0700 dir + 0600 socket are the real local boundary (peer_is_self's policy). The
+            # refusal is the STABLE envelope (with `retryable`), not a hand-rolled body.
             if peer_is_self(self.connection):
                 return True
-            self._send(401, {"error": {"code": "owner_mismatch",
-                                       "message": "peer uid is not this router's uid"}})
+            self._send(401, NelixError(OWNER_MISMATCH,
+                                       "peer uid is not this router's uid").to_envelope())
             return False
 
         def _send(self, code, obj):
@@ -90,24 +95,70 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             self.end_headers()
             self.wfile.write(body)
 
+        def _safe_send(self, code, obj):
+            """_send that tolerates a client that has already gone: the error path must not itself
+            raise (which would drop the connection with a stderr traceback)."""
+            try:
+                self._send(code, obj)
+            except OSError:
+                pass
+
+        def _guarded(self, dispatch):
+            """Run a dispatch body, turning ANY escaping error into a stable envelope — a NelixError
+            to its mapped status, anything else to a 500 INTERNAL_ERROR — so a raw exception (e.g. a
+            non-NelixError escaping registry.active() / the start path) never reaches the client as a
+            bare 500/stacktrace/dropped connection (finding #6)."""
+            try:
+                dispatch()
+            except NelixError as e:
+                self._safe_send(http_status(e.code), e.to_envelope())
+            except Exception:
+                self._safe_send(500, NelixError(INTERNAL_ERROR,
+                                                "internal router error").to_envelope())
+
         def _read_raw_body(self):
-            """Read the request body's Content-Length bytes, or None if it exceeds the cap. ALWAYS
-            called on a POST before responding — even for an unimplemented route — so the socket is
-            drained: a handler that answers without consuming the body leaves the client's in-flight
-            sendall racing a server-side connection close (a flaky BrokenPipe under load)."""
-            n = int(self.headers.get("Content-Length", 0) or 0)
+            """Read the request body's Content-Length bytes; on a bad length, SEND a stable error and
+            return _STOP. ALWAYS called on a POST before responding to a VALID body — even for an
+            unimplemented route — so the socket is drained: a handler that answers without consuming
+            the body leaves the client's in-flight sendall racing a server-side connection close.
+
+            Content-Length is parsed DEFENSIVELY before any read (finding #4): a non-integer or
+            negative length is rejected 400 (a negative one would otherwise reach rfile.read(-1) and
+            block until EOF — unbounded, past the 4 MiB cap; a non-integer would raise past every
+            guard into a bare 500), and a body over the cap is rejected 413 with a clear too-large
+            message — never read into memory, never silently dropped into a misleading downstream
+            'owner_id' error."""
+            raw_len = self.headers.get("Content-Length", "0")
+            try:
+                n = int(raw_len)
+            except (TypeError, ValueError):
+                self._send(400, NelixError(INVALID_REQUEST,
+                                           f"invalid Content-Length: {raw_len!r}").to_envelope())
+                return _STOP
+            if n < 0:
+                self._send(400, NelixError(INVALID_REQUEST,
+                                           "invalid Content-Length: must not be negative").to_envelope())
+                return _STOP
             if n > _MAX_BODY:
-                return None
+                self._send(413, NelixError(INVALID_REQUEST,
+                                           f"request body too large: {n} bytes exceeds the "
+                                           f"{_MAX_BODY}-byte limit").to_envelope())
+                return _STOP
             try:
                 return self.rfile.read(n)
             except OSError:
-                return None
+                return b""                         # truncated read: treat as empty (handler 400s on shape)
 
         def do_POST(self):
             if not self._auth():
                 return
+            self._guarded(self._dispatch_post)
+
+        def _dispatch_post(self):
             path = urlparse(self.path).path
             raw = self._read_raw_body()            # drain the body regardless of route (see above)
+            if raw is _STOP:                       # a bad Content-Length already answered
+                return
             if path == "/start":
                 self._handle_start(raw)
                 return
@@ -116,6 +167,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
         def do_GET(self):
             if not self._auth():
                 return
+            self._guarded(self._dispatch_get)
+
+        def _dispatch_get(self):
             path = urlparse(self.path).path
             if path == "/health":
                 self._handle_router_health()

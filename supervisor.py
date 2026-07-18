@@ -268,6 +268,34 @@ def incarnation():
     return {"pid": pid, "start_fingerprint": fp}
 
 
+def active_generation():
+    """The live daemon's `(transport, incarnation)` read from ONE validated .active.json
+    snapshot, or None if no live, fingerprint-matched, HEALTHY daemon is recorded.
+
+    This is `endpoint()` (transport + health) and `incarnation()` (identity) fused into a
+    SINGLE state read, on purpose: the router keys a generation epoch on the incarnation and
+    forwards over the transport, and reading the two separately lets a daemon RESTART land
+    between them — binding a new incarnation's epoch to a dead incarnation's transport (a
+    durable forward failure to a port/socket that moved). Reading both out of the same
+    `_read_state()` closes that window: the pair is always from one incarnation."""
+    st = _read_state()
+    if not st:
+        return None
+    pid = st.get("pid")
+    if not pid or not _pid_alive(pid):
+        return None
+    fp = st.get("start_fingerprint")
+    if reaper.ProcessInspector().start_fingerprint(pid) != fp:
+        return None
+    try:
+        t = Transport.from_state(st)
+    except ValueError:
+        return None
+    if not _healthy(t):
+        return None
+    return t, {"pid": pid, "start_fingerprint": fp}
+
+
 def _live_lock_holder():
     """The daemon.lock holder's metadata IF it names a live, fingerprint-matched process, else
     None. Fingerprint-matching (process start time) survives PID reuse, so a recycled pid can't
