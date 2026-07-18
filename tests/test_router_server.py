@@ -168,8 +168,8 @@ def test_start_routes_through_the_active_generation(wired):
 
 def test_board_status_returns_the_started_session_and_a_decodable_cursor(wired):
     # /status with NO session_id is the fan-out BOARD read (3c.3a): 200, with the started
-    # session merged in and an opaque vector cursor whose one (N=1) component is this
-    # generation's (epoch, int cursor).
+    # session merged in and an opaque vector cursor whose one (N=1) component is keyed on this
+    # generation's STABLE slot_id, valued (epoch, int cursor) -- fix-pass finding #1.
     _, start_body = wired.client()._call(
         "POST", "/start", {"executor": EXECUTOR, "task": "go", "cwd": "/repo",
                            "owner_id": OWNER, "idempotency_key": "k-board-1"})
@@ -182,7 +182,22 @@ def test_board_status_returns_the_started_session_and_a_decodable_cursor(wired):
     cursor = decode(body["cursor"], router_epoch=wired.epoch,
                     topology_revision=wired.registry.topology_revision())
     gen_epoch = start_body["generation_id"]
-    assert cursor.position_for(gen_epoch) == (gen_epoch, 9)
+    slot_id = wired.registry.generations()[0].slot_id
+    assert cursor.position_for(slot_id) == (gen_epoch, 9)
+
+
+def test_board_status_malformed_generation_reply_is_incomplete_not_a_hard_error(wired):
+    # fix-pass finding #2, exercised through the REAL HTTP server: a 200-but-malformed generation
+    # reply must never surface as a 400/500 for the whole board -- it is recorded in
+    # board_incomplete, same as an unreachable generation.
+    wired.client()._call(
+        "POST", "/start", {"executor": EXECUTOR, "task": "go", "cwd": "/repo",
+                           "owner_id": OWNER, "idempotency_key": "k-board-malformed"})
+    wired.backend.board_cursor = -1
+    st, body = wired.client()._call("GET", f"/status?owner_id={OWNER}")
+    assert st == 200
+    assert body["board_incomplete"] is not False
+    assert body["sessions"] == {}
 
 
 def test_board_status_owner_filtering_survives_the_router_merge(wired):

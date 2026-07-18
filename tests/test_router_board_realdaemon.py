@@ -153,6 +153,10 @@ def test_board_cursor_round_trips_against_the_real_daemons_int_cursor(router_ove
     assert st == 200
     cursor = decode(body["cursor"], router_epoch=epoch,
                     topology_revision=registry.topology_revision())
+    # fix-pass finding #1: the cursor's map KEY is the registry's STABLE slot_id, not the
+    # per-incarnation epoch (which is still `/start`'s `generation_id` -- the StartLedger key,
+    # unaffected by this fix); the epoch is carried as part of the VALUE.
     gen_epoch = x_body["generation_id"]
+    slot_id = registry.generations()[0].slot_id
     real_cursor = daemon.manager.status(owner_id=OWNER)["cursor"]
-    assert cursor.position_for(gen_epoch) == (gen_epoch, real_cursor)
+    assert cursor.position_for(slot_id) == (gen_epoch, real_cursor)

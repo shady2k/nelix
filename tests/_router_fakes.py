@@ -39,6 +39,10 @@ class Backend:
         self.board_cursor = 0
         self.recent_terminal = {}       # session_id -> snapshot dict, settable directly
         self.recent_terminal_owner = {}  # session_id -> owner_id, settable directly
+        # nelix-3rm 3c.3a fix-pass finding #2: when set, sent VERBATIM as the board-wide /status
+        # 200 body instead of the normal owner-filtered shape -- lets a test produce a malformed
+        # but 200 reply (e.g. a non-dict `sessions`) that `board_cursor` alone cannot express.
+        self.board_reply_override = None
         backend = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -78,6 +82,9 @@ class Backend:
                 if path == "/status":
                     if sid is None:
                         # The BOARD-WIDE form (nelix-3rm 3c.3a): owner-filtered, real daemon shape.
+                        if backend.board_reply_override is not None:
+                            self._send(200, backend.board_reply_override)
+                            return
                         mine = {s for s, o in backend.owns.items() if o == owner_id}
                         recent = {s: snap for s, snap in backend.recent_terminal.items()
                                  if backend.recent_terminal_owner.get(s) == owner_id}
