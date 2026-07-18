@@ -229,20 +229,42 @@ class EventQueue:
                 break
             self._drop(victim)
 
-    def _first_after(self, after_seq, session_id):
+    @staticmethod
+    def _in_scope(e, sessions):
+        """Does event `e` fall in the caller's wait scope? `sessions` is one of:
+          * None  -- GLOBAL (any session): the non-blocking latest_after query form;
+          * a str -- a SINGLE session (exact match): the session-scoped /wait;
+          * a set/frozenset -- MEMBERSHIP: the MULTI-SESSION orchestration wait (3c.3b).
+        ONE predicate for all three, so the single- and multi-session scans can never diverge on
+        what "belongs to this waiter" means."""
+        if sessions is None:
+            return True
+        if isinstance(sessions, str):
+            return e.session_id == sessions
+        return e.session_id in sessions
+
+    def _first_after(self, after_seq, sessions):
         for e in self._events:                    # ascending by seq
-            if e.seq > after_seq and (session_id is None or e.session_id == session_id):
+            if e.seq > after_seq and self._in_scope(e, sessions):
                 return e
         return None
 
-    def _expired(self, after_seq, session_id):
-        """True iff an event of interest (this session, or any if global) with seq > after_seq has
-        been evicted -- i.e. the caller's cursor fell off the back. Per-session (not global) so a
-        NOISY owner's evictions never spuriously expire a quiet session's still-live cursor."""
-        if session_id is None:
+    def _expired(self, after_seq, sessions):
+        """True iff an event of interest (in scope) with seq > after_seq has been evicted -- i.e.
+        the caller's cursor fell off the back. Per-session (not global) so a NOISY owner's
+        evictions never spuriously expire a quiet session's still-live cursor.
+
+        For a SET (the multi-session wait), the cursor is expired iff it fell below the evicted-high
+        of ANY session in the set -- equivalently, below the MAX evicted-high across the set: if
+        even one member evicted an event the caller had not yet seen, the caller missed an event of
+        a session it cares about and must resync. A member that never evicted contributes 0 and
+        cannot spuriously expire a caught-up cursor."""
+        if sessions is None:
             hw = self._evicted_high
+        elif isinstance(sessions, str):
+            hw = self._evicted_high_by_session.get(sessions, 0)
         else:
-            hw = self._evicted_high_by_session.get(session_id, 0)
+            hw = max((self._evicted_high_by_session.get(s, 0) for s in sessions), default=0)
         return after_seq < hw
 
     # ---- public API (signatures STABLE for session.py / manager.py / rpc_server.py) ----
@@ -340,6 +362,46 @@ class EventQueue:
                 if self._expired(after_seq, session_id):
                     return CURSOR_EXPIRED
                 evt = self._first_after(after_seq, session_id)
+                if evt is not None:
+                    return evt
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None
+                self._cv.wait(remaining)
+
+    def wait_event_any(self, after_seq, timeout, session_ids):
+        """MULTI-SESSION wait (nelix-3rm 3c.3b): wake on the next event whose session_id is in
+        `session_ids` (a NON-EMPTY collection) with seq > after_seq -- the set-scoped analogue of
+        wait_event, for the router's ORCHESTRATION /wait (one waiter for an orchestration's N
+        sessions). Returns the first matching Event (its session_id + seq tell the caller WHICH
+        session woke and where to advance), CURSOR_EXPIRED if the cursor fell off the ring for any
+        session in the set, or None on timeout.
+
+        Every 9a4.5 concurrency invariant is preserved BY CONSTRUCTION, not by a second review: it
+        runs under the SAME single self._cv (no new lock), NEVER notifies (only publish() does, and
+        still notify_all()s -- a blocked set waiter is woken by a member's publish exactly as a
+        single-session waiter is), never touches the pin index / per-owner floor / monotonic
+        watermarks, and checks expiry BEFORE delivery (a cursor that fell off the back resyncs NOW,
+        and a still-retained newer event never silently masks the gap). It reads the SAME ordered
+        self._events every scan reads, so a pinned unresolved decision of a member is deliverable
+        here just as it is to pending()/latest_after.
+
+        The set MUST be non-empty: an empty set matches EVERY session (a global wait), which would
+        deliver another owner's event to this waiter -- refused exactly like wait_event's
+        missing-session_id guard, so this primitive is likewise STRUCTURALLY incapable of a global
+        wait, not merely by convention."""
+        sessions = frozenset(session_ids)
+        if not sessions:
+            raise ValueError("wait_event_any requires a non-empty session_ids set -- an empty set "
+                             "would be a global wait, delivering another session's event here")
+        deadline = time.time() + timeout
+        with self._cv:
+            while True:
+                # Expiry BEFORE delivery, same discipline as wait_event: a cursor that fell off the
+                # back for any member must resync now, never block a doorbell that can never ring.
+                if self._expired(after_seq, sessions):
+                    return CURSOR_EXPIRED
+                evt = self._first_after(after_seq, sessions)
                 if evt is not None:
                     return evt
                 remaining = deadline - time.time()

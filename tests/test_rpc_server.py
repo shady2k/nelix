@@ -135,6 +135,108 @@ def test_wait_returns_cursor_expired_when_cursor_fell_off_the_ring():
         srv.shutdown()
 
 
+# ============================================================ 3c.3b: MULTI-SESSION /wait route
+#
+# The daemon /wait route accepts repeated session_id= params (the router's orchestration wait).
+# Owner-gates EACH sid, waits only on the OWNED subset, and an all-foreign set 404s like the
+# single un-armable wait — never a 200/null spin. Single-session /wait stays byte-for-byte
+# backward compatible (the roundtrip test above already pins it).
+
+def _wait_srv(port):
+    own("s-0000000a"); own("s-0000000b")
+    m = FakeManager()
+    srv = make_server(m, Transport.tcp("127.0.0.1", port, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return m, srv, f"http://127.0.0.1:{port}"
+
+
+def test_wait_multi_session_wakes_on_any_owned_member():
+    m, srv, base = _wait_srv(8901)
+    try:
+        m._events.publish("s-0000000b", EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
+        _, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0"
+                                   f"&session_id=s-0000000a&session_id=s-0000000b")
+        assert wb["event"]["session_id"] == "s-0000000b"    # the member that published woke it
+        assert wb["event"]["seq"] == 1
+    finally:
+        srv.shutdown()
+
+
+def test_wait_multi_session_skips_a_non_member_and_returns_the_member():
+    # A non-member event (LOWER seq) is out of scope and must be skipped; the member's event is
+    # returned instead. Proves the route filters the SET (without blocking the full 25s window).
+    m, srv, base = _wait_srv(8902)
+    try:
+        own("s-0000000c")
+        m._events.publish("s-0000000c", EXECUTOR, "working", "not mine", "working")   # seq 1, OUT
+        m._events.publish("s-0000000b", EXECUTOR, "waiting_for_user", "mine", "waiting_for_user")  # 2
+        _, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0"
+                                   f"&session_id=s-0000000a&session_id=s-0000000b")
+        assert wb["event"]["session_id"] == "s-0000000b"    # the member, not the outsider s-0000000c
+    finally:
+        srv.shutdown()
+
+
+def test_wait_multi_session_skips_an_unowned_sid_and_waits_on_the_owned_one():
+    # A foreign/unowned sid in the set is SKIPPED (never waited on — it would deliver another owner's
+    # event here); the owned member is still waited on and wakes.
+    m, srv, base = _wait_srv(8903)
+    try:
+        own("s-000000ff", owner_id="harness-y")             # a DIFFERENT owner's session
+        m._events.publish("s-0000000a", EXECUTOR, "waiting_for_user", "mine", "waiting_for_user")
+        _, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0"
+                                   f"&session_id=s-0000000a&session_id=s-000000ff")
+        assert wb["event"]["session_id"] == "s-0000000a"
+    finally:
+        srv.shutdown()
+
+
+def test_wait_multi_session_all_foreign_set_404s_never_a_null_spin():
+    # An all-foreign set reduces to empty -> a wait that can NEVER wake. 404 like the single
+    # un-armable wait, never a 200/null the caller would re-issue at ~3400 req/s.
+    m, srv, base = _wait_srv(8904)
+    try:
+        own("s-000000f1", owner_id="harness-y")
+        own("s-000000f2", owner_id="harness-y")
+        st, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0"
+                                    f"&session_id=s-000000f1&session_id=s-000000f2")
+        assert st == 404
+        assert "hint" in wb
+    finally:
+        srv.shutdown()
+
+
+def test_wait_multi_session_bad_shape_member_is_a_400_before_any_wait():
+    m, srv, base = _wait_srv(8905)
+    try:
+        st, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0"
+                                    f"&session_id=s-0000000a&session_id=not-a-session")
+        assert st == 400
+        assert wb["error"]["code"] == "invalid_session_id"
+    finally:
+        srv.shutdown()
+
+
+def test_wait_multi_session_cursor_expired_is_relayed_for_the_set():
+    own("s-0000000a")
+    m = FakeManager()
+    m._events = EventQueue(max_history=5, owner_floor=0)
+    own("s-flood01")
+    m._events.publish("s-0000000a", EXECUTOR, "done", "old doorbell", "done_candidate")
+    for _ in range(20):
+        m._events.publish("s-flood01", EXECUTOR, "working", "", "working")   # evicts the member's event
+    srv = make_server(m, Transport.tcp("127.0.0.1", 8906, "t"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:8906"
+    try:
+        own("s-0000000b")
+        _, wb = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0"
+                                   f"&session_id=s-0000000a&session_id=s-0000000b")
+        assert wb["event"] is None and wb["cursor_expired"] is True
+    finally:
+        srv.shutdown()
+
+
 def test_respond_without_decision_id_returns_409_missing():
     # A respond whose outcome is missing_decision_id surfaces as HTTP 409 with the pending
     # decision meta (incl. its text) so the orchestrator retries with the id — NOT a guessed 200.
