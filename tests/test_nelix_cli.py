@@ -194,22 +194,79 @@ def test_ensure_router_recovers_when_its_own_spawn_loses_the_lock_race(monkeypat
     assert result["health"]["router_epoch"] == "r-x"
 
 
-def test_ensure_router_raises_when_the_spawn_never_becomes_healthy(monkeypatch):
-    monkeypatch.setattr(nelix_cli, "_router_health", lambda timeout=2: None)
+def test_ensure_router_keeps_polling_past_a_lost_lock_race_until_the_winner_is_healthy(
+        monkeypatch):
+    """A single immediate re-probe after the spawned proc exits (RouterLockHeld) is spurious: the
+    WINNER may still be INITIALIZING and not yet serving /health at that exact instant. ensure_router
+    must keep polling /health up to the ORIGINAL deadline rather than failing on one re-probe --
+    only a timeout with nothing healthy by the deadline is a genuine failure."""
+    healths = iter([
+        None,                                                       # top-of-function probe
+        None,                                                       # loop iter 1 (also observes the exit)
+        None,                                                       # loop iter 2: still not up
+        None,                                                       # loop iter 3: still not up -- the OLD
+                                                                      # single-re-probe code would already
+                                                                      # have raised by here
+        {"status": "ok", "router_epoch": "r-y", "active_generation": None},  # loop iter 4: winner is up
+    ])
+    monkeypatch.setattr(nelix_cli, "_router_health", lambda timeout=2: next(healths))
 
-    class _FakeHangingProc:
-        pid = 999998
+    class _FakeExitedProc:
+        pid = 999997
+        returncode = 3
 
         def poll(self):
-            return None                                     # never exits, never becomes healthy
+            return self.returncode
 
         def terminate(self):
             pass
 
-    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakeHangingProc())
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: _FakeExitedProc())
+
+    result = nelix_cli.ensure_router(timeout=2)
+
+    assert result["spawned"] is False
+    assert result["pid"] is None
+    assert result["health"]["router_epoch"] == "r-y"
+
+
+def test_ensure_router_raises_when_the_spawn_never_becomes_healthy(monkeypatch):
+    monkeypatch.setattr(nelix_cli, "_router_health", lambda timeout=2: None)
+
+    class _FakeHangingProc:
+        """Simulates a truly stuck child: terminate() is requested but the process does not die
+        until kill() is also applied, so this exercises BOTH the wait(timeout=...) escalation and
+        the final kill()."""
+        pid = 999998
+
+        def __init__(self):
+            self.terminated = False
+            self.killed = False
+            self._dead = False
+
+        def poll(self):
+            return 0 if self._dead else None                # never exits on its own
+
+        def terminate(self):
+            self.terminated = True                           # requested, but does not actually die
+
+        def wait(self, timeout=None):
+            if not self._dead:
+                raise subprocess.TimeoutExpired(cmd="router", timeout=timeout)
+            return 0
+
+        def kill(self):
+            self.killed = True
+            self._dead = True
+
+    proc = _FakeHangingProc()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: proc)
 
     with pytest.raises(RuntimeError, match="did not become healthy"):
         nelix_cli.ensure_router(timeout=0.3)
+
+    assert proc.terminated is True                          # cleanup was attempted...
+    assert proc.killed is True                              # ...and escalated when it didn't exit
 
 
 # --------------------------------------------------------------------------------------------
@@ -372,7 +429,18 @@ def test_status_is_owner_filtered_through_the_cli_against_a_real_daemon(
 
 
 def test_wait_wakes_on_a_real_event_through_the_cli_against_a_real_daemon(
-        router_over_real_daemon, capsys):
+        router_over_real_daemon, capsys, monkeypatch):
+    """Proves the BLOCKED-wake path, not mere replay: `wait` is armed and PARKED inside the
+    daemon's real blocking primitive (EventQueue._cv.wait) with no event yet on the ring, and only
+    THEN -- from another thread -- does a real event get published onto the real daemon's event
+    ring. The CLI's `wait` (run synchronously in its own thread, exactly as a real caller invokes
+    it) must wake on that later event and return it.
+
+    The `_cv.wait` instance is instrumented (not the daemon's wake LOGIC) purely to observe timing:
+    it signals the instant the waiting thread is about to park, and only then delegates to the
+    real wait. Because publish() takes the SAME lock to notify, the main thread cannot get past
+    that lock and call publish() before the waiting thread has actually released it by parking --
+    so "signalled" here is equivalent to "genuinely blocked", with no sleep-based guessing."""
     daemon, tmp_path = router_over_real_daemon
     orch = "o-" + "c" * 32
     sid = _start(tmp_path, OWNER, "k-cli-wait", orch)
@@ -380,13 +448,36 @@ def test_wait_wakes_on_a_real_event_through_the_cli_against_a_real_daemon(
     assert nelix_cli.main(["daemon", "status", "--owner", OWNER]) == 0
     cursor = json.loads(capsys.readouterr().out)["cursor"]
 
-    evt = daemon.events.publish(sid, EXECUTOR, "waiting_for_user", "answer me",
-                                "waiting_for_user")
+    blocked = threading.Event()
+    real_cv_wait = daemon.events._cv.wait
 
-    rc = nelix_cli.main(["daemon", "wait", "--owner", OWNER, "--orchestration", orch,
-                        "--cursor", cursor])
+    def _spy_wait(timeout=None):
+        blocked.set()
+        return real_cv_wait(timeout)
 
-    assert rc == 0
+    monkeypatch.setattr(daemon.events._cv, "wait", _spy_wait)
+
+    result = {}
+
+    def _run_wait():
+        result["rc"] = nelix_cli.main(["daemon", "wait", "--owner", OWNER,
+                                       "--orchestration", orch, "--cursor", cursor])
+
+    waiter = threading.Thread(target=_run_wait, daemon=True)
+    waiter.start()
+    try:
+        assert blocked.wait(timeout=5), "the CLI wait never reached the blocking primitive"
+
+        # A REAL event, published ONLY after the wait is confirmed blocked -- not before.
+        evt = daemon.events.publish(sid, EXECUTOR, "waiting_for_user", "answer me",
+                                    "waiting_for_user")
+
+        waiter.join(timeout=10)
+        assert not waiter.is_alive(), "the CLI wait never woke on the published event"
+    finally:
+        waiter.join(timeout=5)                              # never leak a running waiter thread
+
+    assert result["rc"] == 0
     body = json.loads(capsys.readouterr().out)
     assert body["event"]["session_id"] == sid
     assert body["event"]["seq"] == evt.seq

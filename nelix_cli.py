@@ -90,8 +90,9 @@ def ensure_router(timeout: float = _ROUTER_HEALTH_TIMEOUT) -> dict:
     OWN establish() (router/runtime_dir.py) is what actually serializes concurrent spawns via its
     exclusive flock — if two `ensure` calls race, the loser's spawned router exits code 3
     (RouterLockHeld) while the winner keeps serving; this function does not need to inspect the
-    lock itself, only re-probe /health once more before reporting failure, since the winner's
-    router may already be healthy by the time ours gave up.
+    lock itself, it only has to keep polling /health up to the ORIGINAL deadline once its own spawn
+    has exited, since the winner may still be INITIALIZING (not yet serving /health) at the exact
+    moment ours gave up — a single immediate re-probe would fail spuriously.
 
     Returns {"endpoint", "spawned", "pid", "health"} on success — `pid` is the freshly spawned
     process's pid, or None when an existing router was reused. Raises RuntimeError if no healthy
@@ -117,23 +118,38 @@ def ensure_router(timeout: float = _ROUTER_HEALTH_TIMEOUT) -> dict:
         log.close()          # parent's copy; the child inherited its own fd
 
     deadline = time.time() + timeout
+    spawn_exited = False
     while time.time() < deadline:
+        if not spawn_exited and proc.poll() is not None:
+            # Exited before becoming healthy. Its own establish() exits 3 (RouterLockHeld) when a
+            # concurrent ensure won the race -- the winner may still be INITIALIZING (not yet
+            # serving /health) at this exact instant, so this is NOT a failure yet: keep polling
+            # /health up to the ORIGINAL deadline below, so the winner's startup has real room to
+            # finish and be adopted. Checked BEFORE the health probe below (same iteration), so a
+            # health reply that appears in the very iteration our spawn exited is still correctly
+            # attributed to the winner, never misreported as our own dead process.
+            spawn_exited = True
         health = _router_health()
         if health is not None:
-            return {"endpoint": str(paths.router_sock()), "spawned": True, "pid": proc.pid,
-                    "health": health}
-        if proc.poll() is not None:
-            # Exited before becoming healthy. Its own establish() exits 3 (RouterLockHeld) when a
-            # concurrent ensure won the race -- a healthy router may already exist under the
-            # winner's pid by now, so re-probe once more before calling this a failure.
-            health = _router_health()
-            if health is not None:
+            if spawn_exited:
+                # Our own spawn already exited; whichever router is answering /health now is the
+                # lock-race winner, not us (mirrors supervisor.ensure_running's "lost the startup
+                # race, reusing pid-holder" recovery).
                 return {"endpoint": str(paths.router_sock()), "spawned": False, "pid": None,
                         "health": health}
-            raise RuntimeError(
-                f"nelix router exited early (code {proc.returncode}); see {log_path}")
+            return {"endpoint": str(paths.router_sock()), "spawned": True, "pid": proc.pid,
+                    "health": health}
         time.sleep(0.1)
+
+    # Never became healthy within the deadline -- a genuine failure, not a lost race (a winner
+    # becoming healthy in time would already have returned above). Make sure a stuck child cannot
+    # outlive a failed ensure: escalate from a graceful terminate to a kill if it won't exit.
     proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
     raise RuntimeError(f"nelix router did not become healthy within {timeout}s; see {log_path}")
 
 
