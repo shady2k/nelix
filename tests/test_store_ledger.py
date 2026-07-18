@@ -521,6 +521,70 @@ def test_an_impossible_ledger_state_is_store_corrupt(ledger):
     assert ei.value.code == errors.STORE_CORRUPT
 
 
+# ============================================================ sessions_for_orchestration (3c.3b)
+#
+# The router turns an orchestration into the SET of sessions its /wait long-polls. This query is
+# that turn: the session_ids reserved under (owner_id, orchestration_id) that are candidates to wait
+# on (state in starting/started; failed excluded), owner-scoped.
+
+def _reserve_in(lg, key, owner, orch):
+    return lg.reserve(idempotency_key=key, owner_id=owner, orchestration_id=orch,
+                      request_fingerprint=FP).session_id
+
+
+def test_sessions_for_orchestration_returns_the_orchestrations_sessions(ledger):
+    s1 = _reserve_in(ledger, "k1", "hermes:local", OID)
+    s2 = _reserve_in(ledger, "k2", "hermes:local", OID)
+    got = ledger.sessions_for_orchestration("hermes:local", OID)
+    assert set(got) == {s1, s2}
+
+
+def test_sessions_for_orchestration_is_owner_isolated(ledger):
+    # THE isolation invariant: another owner's rows carrying the SAME orchestration_id STRING are
+    # never returned — the query filters on BOTH owner_id and orchestration_id.
+    mine = _reserve_in(ledger, "k1", "hermes:local", OID)
+    _reserve_in(ledger, "k1", "claude-code:1", OID)          # same orch string, different owner
+    got = ledger.sessions_for_orchestration("hermes:local", OID)
+    assert got == [mine]
+    # and the other owner sees only its own.
+    other = ledger.sessions_for_orchestration("claude-code:1", OID)
+    assert mine not in other and len(other) == 1
+
+
+def test_sessions_for_orchestration_excludes_failed(ledger):
+    live = _reserve_in(ledger, "k-live", "hermes:local", OID)
+    dead = _reserve_in(ledger, "k-dead", "hermes:local", OID)
+    ledger.fail(dead, "bad cwd")
+    got = ledger.sessions_for_orchestration("hermes:local", OID)
+    assert got == [live]                                     # failed excluded, starting/started kept
+
+
+def test_sessions_for_orchestration_includes_started(ledger):
+    s = _reserve_in(ledger, "k1", "hermes:local", OID)
+    ledger.assign_generation(s, GID)
+    ledger.commit(s, GID)
+    assert ledger.sessions_for_orchestration("hermes:local", OID) == [s]
+
+
+def test_sessions_for_orchestration_only_the_named_orchestration(ledger):
+    other_orch = "o-" + "8" * 32
+    mine = _reserve_in(ledger, "k1", "hermes:local", OID)
+    _reserve_in(ledger, "k2", "hermes:local", other_orch)
+    assert ledger.sessions_for_orchestration("hermes:local", OID) == [mine]
+
+
+def test_sessions_for_orchestration_of_an_unknown_orchestration_is_empty(ledger):
+    assert ledger.sessions_for_orchestration("hermes:local", "o-" + "9" * 32) == []
+
+
+@pytest.mark.parametrize("owner,orch", [
+    ("has space", OID), ("hermes:local", "not-an-orch"), ("hermes:local", "o-short")])
+def test_sessions_for_orchestration_rejects_malformed_ids(ledger, owner, orch):
+    with pytest.raises(NelixError) as ei:
+        ledger.sessions_for_orchestration(owner, orch)
+    assert ei.value.code == errors.INVALID_REQUEST
+
+
 def test_a_session_id_mint_collision_does_not_crash_reserve(tmp_path):
     # A minted-id collision raises IntegrityError on the PRIMARY KEY, not on the owner/key
     # UNIQUE — so rev 2's fall-through SELECT found no row and dereferenced None.
