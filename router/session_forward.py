@@ -30,6 +30,15 @@ generation's handle, not the active pointer. Leaving every call here as `registr
 than threading a ledger lookup nothing can act on yet — keeps that a one-line change per method
 instead of a reshape when Plan 4 lands.
 
+nelix-3rm 3c.4 (router restart/reconcile) verified the N=1 case of this exact seam end-to-end
+against a real daemon: the StartLedger is durable (SQLite under NELIX_HOME), so a FRESH router
+process's FRESH StartLedger instance already sees every pre-restart session's `starts` row with no
+reconcile step of its own — a router restart never loses that data, it just stops caching it in
+memory. With one tracked slot, "resolve session_id -> generation" collapses to "the one discovered
+generation" (`registry.active()`), so 3c.4 needed no new mechanism here. Plan 4's job when N>1 is
+exactly the lookup this paragraph already describes — the ledger already has what it needs; only the
+lookup (and the loop this module's single call site becomes) is unbuilt.
+
 Forward-failure mapping: NONE of these routes are reserve-tracked like /start (no ledger row to
 protect), so a transport failure of EITHER phase (connect or response) collapses to ONE retryable
 GENERATION_UNAVAILABLE — never a bare 500. A SUCCESSFUL forward's (status, body) is returned
