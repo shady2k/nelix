@@ -20,7 +20,6 @@ Flow for `POST /start`:
 The router shares ONE StartLedger and ONE GenerationRegistry across request threads (both are
 thread-safe); this class holds no per-request state and is safe to share too."""
 import hashlib
-import http.client
 import json
 
 from nelix_contracts.errors import (
@@ -45,21 +44,27 @@ _HTTP_STATUS = {
 # own); cap it so a runaway upstream message cannot grow the database unboundedly.
 _MAX_REASON = 500
 
-# Forward-failure classification (finding #1): the outcome of forwarding /start to a generation is
-# either DEFINITE or AMBIGUOUS, and only a DEFINITE failure may be recorded as `failed`.
+# Forward-failure classification (findings #2/#3): the outcome of forwarding /start to a generation
+# is either DEFINITE or AMBIGUOUS, and only a DEFINITE failure may be recorded as `failed`. The
+# distinction is made by PHASE, not by exception type — RpcClient.start()'s phase-split forward
+# raises ForwardConnectError before the request is fully delivered (no worker) and
+# ForwardResponseError once it has been sent (a worker may exist).
 #
-#   DEFINITE — the connection was REFUSED or the endpoint does not exist, so the request never left
-#   the router and no worker was created. Safe to fail() the reservation: a same-key retry then
-#   replays the recorded failure rather than spawning a worker.
-_DEFINITE_FORWARD_FAILURES = (ConnectionRefusedError, FileNotFoundError)
+#   DEFINITE (ForwardConnectError) — the connection could not be established or the send did not
+#   complete (refused, host/network unreachable, a permission/path error on connect, DNS failure, a
+#   connect timeout). The request never left the router, so no worker was created. Safe to fail() the
+#   reservation: a same-key retry then replays the recorded failure rather than spawning a worker.
+#   Classifying by phase is what stops a pre-connect OSError (PermissionError, ENOTDIR, EHOSTUNREACH,
+#   …) from being mis-read as ambiguous and stranding a genuinely-unstarted operation forever.
 #
-#   AMBIGUOUS — a socket/read TIMEOUT, or a connection dropped AFTER the request was sent. The daemon
-#   may already have created the worker, so this MUST NOT be recorded as a durable failure: the
-#   ledger's create-then-fail guard is inert for a router forward (the daemon writes owner.json
-#   filesystem metadata, not the store's `sessions` table), so a fail() here would durably record a
-#   FALSE failure while an orphan worker runs. Leave the reservation `starting` and return a
-#   retryable envelope; a same-key retry then replays the in-progress reservation (no second worker).
-_AMBIGUOUS_FORWARD_FAILURES = (TimeoutError, ConnectionError, http.client.HTTPException, OSError)
+#   AMBIGUOUS (ForwardResponseError) — the request WAS sent but the reply timed out, the connection
+#   dropped afterward, or the body was malformed. The daemon may already have created the worker, so
+#   this MUST NOT be recorded as a durable failure: the ledger's create-then-fail guard is inert for
+#   a router forward (the daemon writes owner.json filesystem metadata, not the store's `sessions`
+#   table), so a fail() here would durably record a FALSE failure while an orphan worker runs. Leave
+#   the reservation `starting` and return a retryable envelope; a same-key retry then replays the
+#   in-progress reservation (no second worker). Erring toward AMBIGUOUS is the safe default for any
+#   truly-ambiguous case — it never risks a second worker.
 
 
 def http_status(code: str) -> int:
@@ -185,23 +190,24 @@ class StartPath:
 
     def _forward(self, sid, gen, owner_id, executor, task, cwd, model):
         try:
-            from rpc_client import RpcClient
+            from rpc_client import RpcClient, ForwardConnectError, ForwardResponseError
         except ImportError:                                          # package mode
-            from .rpc_client import RpcClient
+            from .rpc_client import RpcClient, ForwardConnectError, ForwardResponseError
         try:
             reply = RpcClient(gen.transport, owner_id).start(
                 executor, task, cwd, model=model, session_id=sid)
-        except _DEFINITE_FORWARD_FAILURES as e:
-            # DEFINITE: connect refused / endpoint absent — the request never left, no worker was
-            # created. Record the failure so a same-key retry replays it (never a fresh worker).
-            reason = f"forward to generation was refused: {e}"
+        except ForwardConnectError as e:
+            # DEFINITE: the request was never fully delivered (connect failed / send broke) — no
+            # worker was created. Record the failure so a same-key retry replays it (never a fresh
+            # worker). This is the phase that reclaims pre-connect OSErrors from being stranded.
+            reason = f"forward to generation failed before delivery: {e}"
             self._fail(sid, reason)
             raise NelixError(GENERATION_UNAVAILABLE, reason) from None
-        except _AMBIGUOUS_FORWARD_FAILURES as e:
-            # AMBIGUOUS: timeout, or the connection dropped AFTER the request was sent — the daemon
-            # may already have created the worker. Do NOT fail() (that would durably record a false
-            # failure while an orphan runs); leave the reservation `starting` so a same-key retry
-            # replays it in-progress. Retryable — never a second worker.
+        except ForwardResponseError as e:
+            # AMBIGUOUS: the request was sent but the reply timed out / dropped / was malformed — the
+            # daemon may already have created the worker. Do NOT fail() (that would durably record a
+            # false failure while an orphan runs); leave the reservation `starting` so a same-key
+            # retry replays it in-progress. Retryable — never a second worker.
             raise NelixError(
                 GENERATION_UNAVAILABLE,
                 f"forward to generation was ambiguous (reservation left starting): {e}") from None

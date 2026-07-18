@@ -277,7 +277,11 @@ def active_generation():
     forwards over the transport, and reading the two separately lets a daemon RESTART land
     between them — binding a new incarnation's epoch to a dead incarnation's transport (a
     durable forward failure to a port/socket that moved). Reading both out of the same
-    `_read_state()` closes that window: the pair is always from one incarnation."""
+    `_read_state()` closes that window: the pair is always from one incarnation.
+
+    This is the FULL, slow read (it does a /health RPC). The router uses it OUTSIDE its epoch
+    lock to ensure a generation is available; the cheap, lock-safe identity read it performs
+    UNDER the lock is `current_generation()`."""
     st = _read_state()
     if not st:
         return None
@@ -292,6 +296,36 @@ def active_generation():
     except ValueError:
         return None
     if not _healthy(t):
+        return None
+    return t, {"pid": pid, "start_fingerprint": fp}
+
+
+def current_generation():
+    """The CHEAP, lock-safe read of the recorded generation's `(transport, incarnation)` — read
+    straight from .active.json with NO /health RPC and NO start-fingerprint re-probe (`ps`), only a
+    cheap pid-liveness check. The router calls this UNDER its epoch lock, AFTER
+    active_generation()/ensure_running() has already validated health + fingerprint OUTSIDE the lock:
+    the under-lock path needs only a CONSISTENT identity + transport snapshot to mint exactly one
+    epoch per incarnation, and the recorded (pid, start_fingerprint) IS that incarnation identity.
+    Returns None if nothing live is recorded or the transport cannot be parsed.
+
+    Splitting this out of active_generation() (which does the slow /health probe) is what lets the
+    router make the identity read + epoch mint ATOMIC under the lock without serializing every /start
+    behind a health RPC — the atomic read closes the race where a snapshot captured OUTSIDE the lock
+    could be installed STALE over a newer incarnation (nelix-3rm 3c.1 finding #1). Because .active.json
+    only ever advances to a new incarnation (a restart always changes pid or fingerprint), an
+    under-lock read here can never observe an OLDER incarnation than one already installed — so the
+    active pointer never rolls backward."""
+    st = _read_state()
+    if not st:
+        return None
+    pid = st.get("pid")
+    fp = st.get("start_fingerprint")
+    if not pid or fp is None or not _pid_alive(pid):
+        return None
+    try:
+        t = Transport.from_state(st)
+    except ValueError:
         return None
     return t, {"pid": pid, "start_fingerprint": fp}
 

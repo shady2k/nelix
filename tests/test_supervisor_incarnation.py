@@ -74,3 +74,32 @@ def test_active_generation_is_none_when_no_daemon(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     assert supervisor.active_generation() is None
+
+
+def test_current_generation_reads_the_pair_without_a_health_rpc(monkeypatch, tmp_path):
+    """Finding #1: current_generation() is the CHEAP under-lock read — it returns the recorded
+    (transport, incarnation) straight from .active.json and MUST NOT do a /health RPC (the ensure
+    outside the lock already health-checked). We make any health probe blow up to prove it is never
+    called."""
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    t = Transport.unix(str(paths.rpc_sock()))
+    supervisor._write_state(os.getpid(), t)
+
+    def _explode(_tr):
+        raise AssertionError("current_generation() must not call the health probe")
+    monkeypatch.setattr(supervisor, "_healthy", _explode)
+
+    snap = supervisor.current_generation()
+    assert snap is not None
+    transport, inc = snap
+    assert transport.kind == t.kind and transport.path == t.path
+    assert inc["pid"] == os.getpid()
+    assert inc["start_fingerprint"] == reaper.ProcessInspector().start_fingerprint(os.getpid())
+
+
+def test_current_generation_is_none_when_no_daemon(monkeypatch, tmp_path):
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    assert supervisor.current_generation() is None

@@ -25,8 +25,15 @@ class FakeSupervisor:
         self.recorded = True
 
     def active_generation(self):
-        # transport + incarnation ALWAYS returned as one pair (the atomic snapshot the registry
-        # consumes) — or None when nothing live/healthy is recorded.
+        # The FULL (health-checked) read the registry does OUTSIDE the lock to ensure availability —
+        # or None when nothing live/healthy is recorded.
+        if not self.recorded or self.inc is None:
+            return None
+        return (self.transport, self.inc)
+
+    def current_generation(self):
+        # The CHEAP read the registry does UNDER the lock to pin identity+transport; here it mirrors
+        # active_generation() (there is no separate health probe in this fake).
         if not self.recorded or self.inc is None:
             return None
         return (self.transport, self.inc)
@@ -65,12 +72,10 @@ def test_a_restart_new_incarnation_mints_a_fresh_epoch():
 
 
 def test_epoch_and_transport_are_paired_from_one_snapshot_across_a_restart():
-    """Finding #3: the registry must read the transport and the incarnation TOGETHER, so a new
-    incarnation's epoch is never paired with a prior incarnation's transport. The stub here ONLY
-    exposes active_generation() (no separate endpoint()/incarnation()), so a registry that tried the
-    old separate reads would AttributeError — proving the pairing is structural, not incidental. A
-    restart swaps BOTH transport and incarnation in one snapshot; the new epoch must arrive with the
-    NEW transport."""
+    """The registry reads the transport and the incarnation TOGETHER (from current_generation(),
+    UNDER the lock), so a new incarnation's epoch is never paired with a prior incarnation's
+    transport. A restart swaps BOTH transport and incarnation in one snapshot; the new epoch must
+    arrive with the NEW transport."""
     class ConsistentSupervisor:
         def __init__(self):
             # transport and incarnation are always read as ONE pair.
@@ -78,6 +83,9 @@ def test_epoch_and_transport_are_paired_from_one_snapshot_across_a_restart():
                              {"pid": 1, "start_fingerprint": "fp-a"})
 
         def active_generation(self):
+            return self.snapshot
+
+        def current_generation(self):
             return self.snapshot
 
         def ensure_running(self):
@@ -156,3 +164,66 @@ def test_concurrent_active_on_a_fresh_incarnation_mints_one_epoch():
     for t in threads:
         t.join()
     assert len(set(seen)) == 1                             # exactly ONE epoch across all threads
+
+
+def test_stale_snapshot_never_installs_over_a_newer_incarnation():
+    """Finding #1: the IDENTITY read + epoch mint are ATOMIC under the lock. A caller that did its
+    (slow) availability ensure while incarnation A was live must read the CURRENT incarnation UNDER
+    the lock — never install its STALE A over a newer B that a concurrent caller already installed.
+
+    We drive the exact A -> B -> stale-A interleaving:
+      * T1 begins its ensure while A is live, then PARKS just before taking the epoch lock.
+      * meanwhile the daemon restarts to B and a concurrent caller T2 fully installs B.
+      * T1 resumes, takes the lock, and reads the CURRENT incarnation (B) — not its stale A.
+    Asserted: exactly ONE epoch per incarnation, and the active pointer never rolls backward to A
+    (a re-observation of B keeps B's single epoch; A never gets an epoch of its own)."""
+    ta = Transport.unix("/tmp/gen-a.sock"); inc_a = {"pid": 1, "start_fingerprint": "fp-a"}
+    tb = Transport.unix("/tmp/gen-b.sock"); inc_b = {"pid": 2, "start_fingerprint": "fp-b"}
+
+    class SteppedSupervisor:
+        def __init__(self):
+            self._pair = (ta, inc_a)                       # the CURRENT recorded generation
+            self._pause_first_ensure = threading.Event()   # arm: the next ensure captures A then parks
+            self._ensured = threading.Event()              # set once the paused caller has ensured
+            self._release = threading.Event()              # the test releases the paused caller
+
+        def restart_to_b(self):
+            self._pair = (tb, inc_b)
+
+        def active_generation(self):                       # OUTSIDE the lock (the slow ensure)
+            captured = self._pair                          # what THIS caller observed (era A for T1)
+            if self._pause_first_ensure.is_set():
+                self._pause_first_ensure.clear()           # only the first caller parks
+                self._ensured.set()
+                self._release.wait(2)
+            return captured
+
+        def current_generation(self):                      # UNDER the lock (cheap identity read)
+            return self._pair                              # always the CURRENT recorded generation
+
+        def ensure_running(self):
+            return self._pair[0]
+
+    sup = SteppedSupervisor()
+    reg = GenerationRegistry(supervisor=sup, health_probe=lambda t: None)
+
+    out = {}
+    sup._pause_first_ensure.set()
+    t1 = threading.Thread(target=lambda: out.__setitem__("g1", reg.active()), name="T1")
+    t1.start()
+    assert sup._ensured.wait(2)                            # T1 ensured on era A and parked pre-lock
+
+    sup.restart_to_b()                                     # daemon restarts to incarnation B
+    g2 = reg.active()                                      # T2: ensure(B) -> lock -> mint+install B
+    assert g2.incarnation == inc_b
+
+    sup._release.set()                                     # release T1
+    t1.join(2)
+    g1 = out["g1"]
+
+    assert g1.incarnation == inc_b                         # under-lock read gave B, not the stale A
+    assert g1.epoch == g2.epoch                            # exactly ONE epoch for incarnation B
+    g3 = reg.active()                                      # no rollback: still B, same single epoch
+    assert g3.incarnation == inc_b and g3.epoch == g2.epoch
+    gens = reg.generations()
+    assert len(gens) == 1 and gens[0].incarnation == inc_b

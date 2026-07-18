@@ -63,14 +63,18 @@ class Backend:
 
 
 class Supervisor:
-    """Supervisor stand-in whose active_generation() returns a fixed (transport, incarnation) pair
-    — read together, exactly as the registry consumes it."""
+    """Supervisor stand-in whose active_generation()/current_generation() return a fixed
+    (transport, incarnation) pair — read together, exactly as the registry consumes it (the full
+    read outside the lock, the cheap read under it)."""
 
     def __init__(self, transport, inc=None):
         self._t = transport
         self.inc = inc or {"pid": 1, "start_fingerprint": "fp"}
 
     def active_generation(self):
+        return (self._t, self.inc)
+
+    def current_generation(self):
         return (self._t, self.inc)
 
     def ensure_running(self):

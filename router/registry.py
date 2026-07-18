@@ -12,10 +12,11 @@ Per generation it tracks:
     RESTART yields a NEW epoch (spec §4: "a fresh generation epoch is minted on EVERY incarnation").
     The daemon's own /health carries no incarnation id yet (that addition is a later slice), so the
     incarnation is keyed on supervisor identity — (pid, start_fingerprint).
-  * `transport` — the live daemon Transport. It is read TOGETHER with the incarnation from ONE
-    supervisor snapshot (supervisor.active_generation()), so the epoch minted for an incarnation is
-    never paired with a DIFFERENT incarnation's transport (a restart between two separate reads).
-    Only when no generation is recorded do we spawn one (ensure_running()) and re-read the pair.
+  * `transport` — the live daemon Transport. It is read TOGETHER with the incarnation UNDER THE
+    LOCK from ONE cheap consistent snapshot (supervisor.current_generation()), so the epoch minted
+    for an incarnation is never paired with a DIFFERENT incarnation's transport, and a snapshot
+    captured outside the lock can never be installed stale over a newer incarnation. Making a
+    generation available (spawn + health check) happens OUTSIDE the lock first (ensure_running()).
   * `build_id` — the daemon's /health `generation_id` (may be None in dev — handled). Informational.
 
 If a generation cannot be made available, callers get GENERATION_UNAVAILABLE (retryable)."""
@@ -77,17 +78,29 @@ class GenerationRegistry:
         """Return the active generation, ensuring a backend is available. Raises
         NelixError(GENERATION_UNAVAILABLE) if none can be made available.
 
-        The transport and the incarnation come from ONE supervisor snapshot (finding #3), and only
-        the epoch mint/refresh runs UNDER THE LOCK — exactly one epoch per incarnation. The two slow
-        steps stay OUTSIDE the lock (finding #7): ensuring the snapshot (which may spawn a daemon)
-        and the informational build-id probe (which can take up to the health timeout). Holding
-        either under the lock would serialize every other /start and /health behind a stalled
-        generation."""
-        transport, inc = self._ensure_snapshot()           # endpoint read / spawn — OUTSIDE the lock
+        The IDENTITY READ + epoch mint/install are ATOMIC under the lock (finding #1). The slow work
+        stays OUTSIDE the lock: `_ensure_available()` (which may spawn a daemon and health-checks it)
+        and the informational build-id probe (up to the health timeout). Then, UNDER the lock, the
+        current `(transport, incarnation)` is read from a SINGLE cheap consistent snapshot
+        (`supervisor.current_generation()` — no health RPC, no spawn) and the epoch is minted/installed
+        together with it. Reading the identity under the lock — rather than carrying a snapshot
+        captured OUTSIDE it — is what closes the race where a thread that observed incarnation A could
+        install its STALE A over a newer B a concurrent thread already installed, rolling the active
+        pointer backward and minting two epochs for one incarnation. .active.json only advances
+        (a restart always changes pid/fingerprint), so an under-lock read never observes an OLDER
+        incarnation than one already installed: no rollback, exactly one epoch per incarnation, and
+        the (epoch, transport, incarnation) a caller receives are all from the one under-lock snapshot."""
+        self._ensure_available()                            # spawn / health-check — OUTSIDE the lock
         with self._lock:
+            snap = self._sup.current_generation()           # cheap identity+transport read — no RPC
+            if snap is None:
+                raise NelixError(GENERATION_UNAVAILABLE,
+                                 "generation disappeared before it could be pinned")
+            transport, inc = snap
             if self._active is None or self._active["incarnation"] != inc:
-                # First observation of THIS incarnation -> mint a fresh epoch. build_id is filled by
-                # the unlocked probe below (None until then; it is informational and nullable).
+                # First observation of THIS (current) incarnation -> mint exactly one fresh epoch and
+                # install (epoch, transport, incarnation) together. build_id is filled by the unlocked
+                # probe below (None until then; it is informational and nullable).
                 self._active = {"incarnation": inc, "epoch": new_generation_id(),
                                 "transport": transport, "build_id": None, "build_id_probed": False}
                 need_probe = True
@@ -123,22 +136,19 @@ class GenerationRegistry:
         return GenerationHandle(epoch=a["epoch"], transport=a["transport"],
                                 build_id=a["build_id"], incarnation=a["incarnation"])
 
-    def _ensure_snapshot(self):
-        """One consistent `(transport, incarnation)` snapshot of the active generation, from a
-        SINGLE validated supervisor state read (supervisor.active_generation()). If nothing is
-        recorded yet, spawn a backend (ensure_running()) and re-read — so the returned transport and
-        incarnation are ALWAYS from the same read, never a transport from one incarnation paired with
-        the identity of another (finding #3). Any failure to produce one is GENERATION_UNAVAILABLE
-        (retryable)."""
+    def _ensure_available(self):
+        """Make a HEALTHY generation available, OUTSIDE the lock (this is the slow work). Uses the
+        full `active_generation()` read (which does the /health RPC); if nothing healthy is recorded,
+        spawns one (ensure_running()) and re-checks. Returns nothing — the identity the caller pins is
+        read separately UNDER the lock via `current_generation()`, so the epoch decision is atomic and
+        never carries a stale outside-the-lock snapshot (finding #1). Any failure to make one
+        available is GENERATION_UNAVAILABLE (retryable)."""
         try:
-            snap = self._sup.active_generation()
-            if snap is None:
-                # Nothing (healthy) recorded — spawn one, then re-read so the pair stays consistent.
+            if self._sup.active_generation() is None:
+                # Nothing healthy recorded — spawn one, then re-check it became healthy.
                 self._sup.ensure_running()
-                snap = self._sup.active_generation()
-            if snap is None:
-                raise NelixError(GENERATION_UNAVAILABLE, "no generation backend available")
-            return snap
+                if self._sup.active_generation() is None:
+                    raise NelixError(GENERATION_UNAVAILABLE, "no generation backend available")
         except NelixError:
             raise
         except Exception as e:
