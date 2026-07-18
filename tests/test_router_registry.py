@@ -31,9 +31,10 @@ class FakeSupervisor:
             return None
         return (self.transport, self.inc)
 
-    def current_generation(self):
-        # The CHEAP read the registry does UNDER the lock to pin identity+transport; here it mirrors
-        # active_generation() (there is no separate health probe in this fake).
+    def held_generation(self):
+        # The AUTHORITATIVE lock-holder read the registry does UNDER the lock to pin
+        # identity+transport; here it mirrors active_generation() (no divergence between the lock
+        # holder and .active.json in this fake — see the split-view fakes below for that).
         if not self.recorded or self.inc is None:
             return None
         return (self.transport, self.inc)
@@ -72,7 +73,7 @@ def test_a_restart_new_incarnation_mints_a_fresh_epoch():
 
 
 def test_epoch_and_transport_are_paired_from_one_snapshot_across_a_restart():
-    """The registry reads the transport and the incarnation TOGETHER (from current_generation(),
+    """The registry reads the transport and the incarnation TOGETHER (from held_generation(),
     UNDER the lock), so a new incarnation's epoch is never paired with a prior incarnation's
     transport. A restart swaps BOTH transport and incarnation in one snapshot; the new epoch must
     arrive with the NEW transport."""
@@ -85,7 +86,7 @@ def test_epoch_and_transport_are_paired_from_one_snapshot_across_a_restart():
         def active_generation(self):
             return self.snapshot
 
-        def current_generation(self):
+        def held_generation(self):
             return self.snapshot
 
         def ensure_running(self):
@@ -167,14 +168,16 @@ def test_concurrent_active_on_a_fresh_incarnation_mints_one_epoch():
 
 
 def test_stale_snapshot_never_installs_over_a_newer_incarnation():
-    """Finding #1: the IDENTITY read + epoch mint are ATOMIC under the lock. A caller that did its
-    (slow) availability ensure while incarnation A was live must read the CURRENT incarnation UNDER
-    the lock — never install its STALE A over a newer B that a concurrent caller already installed.
+    """Finding #1: the IDENTITY read + epoch mint are ATOMIC under the lock, and the identity comes
+    from the AUTHORITATIVE LIVE LOCK HOLDER (held_generation()). A caller that did its (slow)
+    availability ensure while incarnation A held the lock must read the CURRENT lock holder UNDER the
+    lock — never install its STALE A over a newer B that a concurrent caller already installed.
 
     We drive the exact A -> B -> stale-A interleaving:
-      * T1 begins its ensure while A is live, then PARKS just before taking the epoch lock.
-      * meanwhile the daemon restarts to B and a concurrent caller T2 fully installs B.
-      * T1 resumes, takes the lock, and reads the CURRENT incarnation (B) — not its stale A.
+      * T1 begins its ensure while A holds the lock, then PARKS just before taking the epoch lock.
+      * meanwhile the daemon restarts to B (B takes the released singleton lock) and a concurrent
+        caller T2 fully installs B.
+      * T1 resumes, takes the lock, and reads the CURRENT lock holder (B) — not its stale A.
     Asserted: exactly ONE epoch per incarnation, and the active pointer never rolls backward to A
     (a re-observation of B keeps B's single epoch; A never gets an epoch of its own)."""
     ta = Transport.unix("/tmp/gen-a.sock"); inc_a = {"pid": 1, "start_fingerprint": "fp-a"}
@@ -182,27 +185,27 @@ def test_stale_snapshot_never_installs_over_a_newer_incarnation():
 
     class SteppedSupervisor:
         def __init__(self):
-            self._pair = (ta, inc_a)                       # the CURRENT recorded generation
+            self._holder = (ta, inc_a)                     # the CURRENT singleton-lock holder
             self._pause_first_ensure = threading.Event()   # arm: the next ensure captures A then parks
             self._ensured = threading.Event()              # set once the paused caller has ensured
             self._release = threading.Event()              # the test releases the paused caller
 
         def restart_to_b(self):
-            self._pair = (tb, inc_b)
+            self._holder = (tb, inc_b)                     # B acquires the released singleton lock
 
         def active_generation(self):                       # OUTSIDE the lock (the slow ensure)
-            captured = self._pair                          # what THIS caller observed (era A for T1)
+            captured = self._holder                        # what THIS caller observed (era A for T1)
             if self._pause_first_ensure.is_set():
                 self._pause_first_ensure.clear()           # only the first caller parks
                 self._ensured.set()
                 self._release.wait(2)
             return captured
 
-        def current_generation(self):                      # UNDER the lock (cheap identity read)
-            return self._pair                              # always the CURRENT recorded generation
+        def held_generation(self):                         # UNDER the lock (authoritative identity)
+            return self._holder                            # always the CURRENT live lock holder
 
         def ensure_running(self):
-            return self._pair[0]
+            return self._holder[0]
 
     sup = SteppedSupervisor()
     reg = GenerationRegistry(supervisor=sup, health_probe=lambda t: None)
@@ -227,3 +230,50 @@ def test_stale_snapshot_never_installs_over_a_newer_incarnation():
     assert g3.incarnation == inc_b and g3.epoch == g2.epoch
     gens = reg.generations()
     assert len(gens) == 1 and gens[0].incarnation == inc_b
+
+
+def test_lock_holder_is_authoritative_over_a_rolled_back_active_json():
+    """Finding #1 (rev 3): the under-lock identity is the VALIDATED LIVE LOCK HOLDER
+    (held_generation()), NOT .active.json — which can ROLL BACK. Interleaving: an ensure_running
+    thread validates daemon A and pauses before _write_state(A); a teardown kills A; daemon B takes
+    the released singleton lock and publishes B; the paused thread resumes and writes A over B in
+    .active.json. A bare .active.json read then reports the superseded A (A's zombie still passes a
+    bare pid-liveness check) — a ROLLBACK that misroutes a start to A's dead transport and mints a
+    SECOND epoch for B.
+
+    Modeled by a supervisor whose .active.json VIEW (active_generation) can regress to A while its
+    singleton-LOCK HOLDER (held_generation) stays B. The registry MUST resolve to B: never install or
+    route A, never roll the active pointer back to A, and mint exactly ONE epoch for B."""
+    ta = Transport.unix("/tmp/gen-a.sock"); inc_a = {"pid": 1, "start_fingerprint": "fp-a"}
+    tb = Transport.unix("/tmp/gen-b.sock"); inc_b = {"pid": 2, "start_fingerprint": "fp-b"}
+
+    class SplitSupervisor:
+        """The .active.json view (active_generation) can DIVERGE from the singleton lock holder
+        (held_generation); the lock holder is the authoritative, monotonic incarnation."""
+        def __init__(self):
+            self.active_view = (tb, inc_b)     # what .active.json reports (the outside-the-lock ensure)
+            self.holder = (tb, inc_b)          # what the singleton lock holder reports (authoritative)
+
+        def active_generation(self):
+            return self.active_view
+
+        def held_generation(self):
+            return self.holder
+
+        def ensure_running(self):
+            return self.holder[0]
+
+    sup = SplitSupervisor()
+    reg = GenerationRegistry(supervisor=sup, health_probe=lambda t: None)
+    g_b = reg.active()                                      # B observed first: mint B's single epoch
+    assert g_b.incarnation == inc_b and g_b.transport == tb
+
+    # .active.json ROLLS BACK to the superseded incarnation A (the paused spawner's late write), but
+    # the singleton lock is STILL held by B. The registry pins identity from the LOCK HOLDER.
+    sup.active_view = (ta, inc_a)
+    g_again = reg.active()
+    assert g_again.incarnation == inc_b                     # never rolled back to A
+    assert g_again.transport == tb                          # routed to B's transport, not the stale A
+    assert g_again.epoch == g_b.epoch                       # exactly ONE epoch for B; A minted none
+    gens = reg.generations()
+    assert len(gens) == 1 and gens[0].incarnation == inc_b  # active pointer still B

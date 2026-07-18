@@ -13,10 +13,13 @@ Per generation it tracks:
     The daemon's own /health carries no incarnation id yet (that addition is a later slice), so the
     incarnation is keyed on supervisor identity — (pid, start_fingerprint).
   * `transport` — the live daemon Transport. It is read TOGETHER with the incarnation UNDER THE
-    LOCK from ONE cheap consistent snapshot (supervisor.current_generation()), so the epoch minted
-    for an incarnation is never paired with a DIFFERENT incarnation's transport, and a snapshot
-    captured outside the lock can never be installed stale over a newer incarnation. Making a
-    generation available (spawn + health check) happens OUTSIDE the lock first (ensure_running()).
+    LOCK from the AUTHORITATIVE lock holder (supervisor.held_generation()), so the epoch minted for
+    an incarnation is never paired with a DIFFERENT incarnation's transport, and a snapshot captured
+    outside the lock can never be installed stale over a newer incarnation. The incarnation is the
+    daemon's VALIDATED LIVE SINGLETON-LOCK HOLDER — authoritative and monotonic where .active.json is
+    not (a paused spawner can roll .active.json back to a superseded incarnation; a released lock
+    cannot be re-held by the dead pid). Making a generation available (spawn + health check) happens
+    OUTSIDE the lock first (ensure_running()).
   * `build_id` — the daemon's /health `generation_id` (may be None in dev — handled). Informational.
 
 If a generation cannot be made available, callers get GENERATION_UNAVAILABLE (retryable)."""
@@ -81,18 +84,24 @@ class GenerationRegistry:
         The IDENTITY READ + epoch mint/install are ATOMIC under the lock (finding #1). The slow work
         stays OUTSIDE the lock: `_ensure_available()` (which may spawn a daemon and health-checks it)
         and the informational build-id probe (up to the health timeout). Then, UNDER the lock, the
-        current `(transport, incarnation)` is read from a SINGLE cheap consistent snapshot
-        (`supervisor.current_generation()` — no health RPC, no spawn) and the epoch is minted/installed
-        together with it. Reading the identity under the lock — rather than carrying a snapshot
-        captured OUTSIDE it — is what closes the race where a thread that observed incarnation A could
-        install its STALE A over a newer B a concurrent thread already installed, rolling the active
-        pointer backward and minting two epochs for one incarnation. .active.json only advances
-        (a restart always changes pid/fingerprint), so an under-lock read never observes an OLDER
-        incarnation than one already installed: no rollback, exactly one epoch per incarnation, and
-        the (epoch, transport, incarnation) a caller receives are all from the one under-lock snapshot."""
+        current `(transport, incarnation)` is read from the AUTHORITATIVE LIVE LOCK HOLDER
+        (`supervisor.held_generation()` — a lock-file read + pid-liveness, no health RPC, no spawn) and
+        the epoch is minted/installed together with it. Reading the identity under the lock — rather
+        than carrying a snapshot captured OUTSIDE it — is what closes the race where a thread that
+        observed incarnation A could install its STALE A over a newer B a concurrent thread already
+        installed, rolling the active pointer backward and minting two epochs for one incarnation.
+
+        The incarnation comes from the SINGLETON LOCK, not .active.json: the kernel guarantees exactly
+        one live lock holder, so two concurrent callers read the SAME current incarnation (exactly one
+        epoch) and `_active` can never roll backward to a superseded incarnation — a paused spawner
+        that rewrites .active.json back to A cannot make the released lock be re-held by A's dead pid.
+        The transport held_generation() returns is CONSISTENT with that same holder (re-derived from a
+        unix holder's lock meta; for a tcp holder, paired with .active.json only when its incarnation
+        matches — else the generation is reported unavailable/retryable rather than routed to a stale
+        transport). If no authoritative holder is available, that is GENERATION_UNAVAILABLE."""
         self._ensure_available()                            # spawn / health-check — OUTSIDE the lock
         with self._lock:
-            snap = self._sup.current_generation()           # cheap identity+transport read — no RPC
+            snap = self._sup.held_generation()              # authoritative identity+transport — no RPC
             if snap is None:
                 raise NelixError(GENERATION_UNAVAILABLE,
                                  "generation disappeared before it could be pinned")
@@ -140,9 +149,9 @@ class GenerationRegistry:
         """Make a HEALTHY generation available, OUTSIDE the lock (this is the slow work). Uses the
         full `active_generation()` read (which does the /health RPC); if nothing healthy is recorded,
         spawns one (ensure_running()) and re-checks. Returns nothing — the identity the caller pins is
-        read separately UNDER the lock via `current_generation()`, so the epoch decision is atomic and
-        never carries a stale outside-the-lock snapshot (finding #1). Any failure to make one
-        available is GENERATION_UNAVAILABLE (retryable)."""
+        read separately UNDER the lock via `held_generation()` (the authoritative lock holder), so the
+        epoch decision is atomic and never carries a stale outside-the-lock snapshot (finding #1). Any
+        failure to make one available is GENERATION_UNAVAILABLE (retryable)."""
         try:
             if self._sup.active_generation() is None:
                 # Nothing healthy recorded — spawn one, then re-check it became healthy.

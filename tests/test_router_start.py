@@ -91,8 +91,9 @@ class _Backend:
 
 
 class _Supervisor:
-    """A minimal supervisor stand-in whose active_generation()/current_generation() return a
-    (transport, incarnation) pair — read together, as the registry consumes it."""
+    """A minimal supervisor stand-in whose active_generation()/held_generation() return a
+    (transport, incarnation) pair — as the registry consumes it (health-checked read outside the
+    lock, authoritative lock-holder read under it)."""
 
     def __init__(self, transport, inc=None):
         self._t = transport
@@ -101,7 +102,7 @@ class _Supervisor:
     def active_generation(self):
         return (self._t, self.inc)
 
-    def current_generation(self):
+    def held_generation(self):
         return (self._t, self.inc)
 
     def ensure_running(self):
@@ -204,7 +205,7 @@ def test_generation_unavailable_when_no_backend_can_be_made():
     # reservation is failed so a same-key retry replays the failure (never a fresh worker).
     class _DeadSupervisor:
         def active_generation(self): return None
-        def current_generation(self): return None
+        def held_generation(self): return None
         def ensure_running(self): raise RuntimeError("daemon did not become healthy")
     ledger = StartLedger(paths.nelix_root())
     sp = StartPath(ledger, GenerationRegistry(supervisor=_DeadSupervisor(),
@@ -220,7 +221,7 @@ def test_forward_to_a_dead_transport_is_generation_unavailable():
     class _Sup:
         _t = Transport.tcp("127.0.0.1", 9, "t")                          # discard port: refused
         def active_generation(self): return (self._t, {"pid": 1, "start_fingerprint": "fp"})
-        def current_generation(self): return (self._t, {"pid": 1, "start_fingerprint": "fp"})
+        def held_generation(self): return (self._t, {"pid": 1, "start_fingerprint": "fp"})
         def ensure_running(self): return self._t
     ledger = StartLedger(paths.nelix_root())
     sp = StartPath(ledger, GenerationRegistry(supervisor=_Sup(), health_probe=lambda t: None))
@@ -317,7 +318,7 @@ def test_pre_connect_oserror_is_definite_and_not_stranded(tmp_path):
 
     class _Sup:
         def active_generation(self): return (dead, {"pid": 1, "start_fingerprint": "fp"})
-        def current_generation(self): return (dead, {"pid": 1, "start_fingerprint": "fp"})
+        def held_generation(self): return (dead, {"pid": 1, "start_fingerprint": "fp"})
         def ensure_running(self): return dead
 
     ledger = StartLedger(paths.nelix_root())

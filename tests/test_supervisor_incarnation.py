@@ -3,11 +3,12 @@ incarnation so that a daemon RESTART (new pid, or a reused pid with a new start 
 epoch. supervisor.incarnation() surfaces that identity — (pid, start_fingerprint) — from the same
 .active.json state endpoint() already trusts, with the same liveness + fingerprint gate."""
 import importlib
+import json
 import os
 
 import paths
 import supervisor
-from daemon import reaper
+from daemon import reaper, singleton
 from daemon.transport import Transport
 
 
@@ -77,10 +78,10 @@ def test_active_generation_is_none_when_no_daemon(monkeypatch, tmp_path):
 
 
 def test_current_generation_reads_the_pair_without_a_health_rpc(monkeypatch, tmp_path):
-    """Finding #1: current_generation() is the CHEAP under-lock read — it returns the recorded
-    (transport, incarnation) straight from .active.json and MUST NOT do a /health RPC (the ensure
-    outside the lock already health-checked). We make any health probe blow up to prove it is never
-    called."""
+    """Finding #1: current_generation() is the CHEAP recorded read (held_generation()'s building
+    block for the TCP-holder reconcile) — it returns the recorded (transport, incarnation) straight
+    from .active.json and MUST NOT do a /health RPC. We make any health probe blow up to prove it is
+    never called."""
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     paths.ensure_private_dir(paths.nelix_root())
@@ -103,3 +104,85 @@ def test_current_generation_is_none_when_no_daemon(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths); importlib.reload(supervisor)
     assert supervisor.current_generation() is None
+
+
+def test_held_generation_is_the_live_lock_holder_authoritative_over_active_json(monkeypatch, tmp_path):
+    """Finding #1 (rev 3): the router's UNDER-LOCK identity read is the VALIDATED LIVE LOCK HOLDER,
+    not .active.json. .active.json is not monotonic — a paused spawner can rewrite it back to a
+    superseded incarnation A after a newer B took the released singleton lock. held_generation()
+    derives the incarnation from whoever HOLDS THE LOCK (kernel: exactly one live holder), so a stale
+    .active.json (even one naming the same pid with a superseded fingerprint) can never make the
+    caller route to A when B holds the lock. For a unix holder the transport is re-derived from the
+    holder's own lock meta, never taken from the possibly-stale .active.json."""
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    insp = reaper.ProcessInspector()
+    real_fp = insp.start_fingerprint(os.getpid())
+    b_sock = str(paths.rpc_sock())
+    # B (this live process) holds the singleton lock, serving a unix socket.
+    fd = singleton.acquire(paths.daemon_lock(),
+                           {"pid": os.getpid(), "start_fingerprint": real_fp,
+                            "transport": "unix", "path": b_sock})
+    assert fd is not None
+    try:
+        # .active.json is STALE: a superseded incarnation A pointing at a DIFFERENT socket.
+        paths.state_file().write_text(json.dumps(
+            {"pid": os.getpid(), "start_fingerprint": "stale-A-fingerprint",
+             "transport": "unix", "path": "/tmp/stale-a.sock"}))
+        snap = supervisor.held_generation()
+        assert snap is not None
+        transport, inc = snap
+        # incarnation is the LIVE LOCK HOLDER (B), never the stale .active.json (A).
+        assert inc == {"pid": os.getpid(), "start_fingerprint": real_fp}
+        assert inc["start_fingerprint"] != "stale-A-fingerprint"
+        # transport re-derived from the holder — never the stale A socket.
+        assert transport == Transport.unix(b_sock)
+    finally:
+        os.close(fd)
+
+
+def test_held_generation_is_none_when_no_live_lock_holder(monkeypatch, tmp_path):
+    """The SINGLETON LOCK is authoritative: with a perfectly valid .active.json but NO live lock
+    holder, there is no authoritative incarnation -> None (the caller spawns/retries)."""
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    supervisor._write_state(os.getpid(), Transport.unix(str(paths.rpc_sock())))
+    assert supervisor.held_generation() is None
+
+
+def test_held_generation_tcp_pairs_active_json_only_on_matching_incarnation(monkeypatch, tmp_path):
+    """A tcp lock holder carries NO token in the lock meta (unreachable from the lock alone), so
+    held_generation() re-derives its transport from .active.json — but ONLY when .active.json names
+    the SAME incarnation as the live lock holder. A stale/mismatched .active.json yields None
+    (GENERATION_UNAVAILABLE/retryable), never a start routed to a superseded incarnation's port."""
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    importlib.reload(paths); importlib.reload(supervisor)
+    paths.ensure_private_dir(paths.nelix_root())
+    insp = reaper.ProcessInspector()
+    real_fp = insp.start_fingerprint(os.getpid())
+    fd = singleton.acquire(paths.daemon_lock(),
+                           {"pid": os.getpid(), "start_fingerprint": real_fp,
+                            "transport": "tcp", "port": 4321})
+    assert fd is not None
+    try:
+        # Matching incarnation: .active.json is the SAME (pid, fingerprint) as the lock holder ->
+        # pair its (tokened) transport with the holder's identity.
+        paths.state_file().write_text(json.dumps(
+            {"pid": os.getpid(), "start_fingerprint": real_fp,
+             "transport": "tcp", "host": "127.0.0.1", "port": 4321, "token": "tok-B"}))
+        snap = supervisor.held_generation()
+        assert snap is not None
+        transport, inc = snap
+        assert transport == Transport.tcp("127.0.0.1", 4321, "tok-B")
+        assert inc == {"pid": os.getpid(), "start_fingerprint": real_fp}
+
+        # Stale incarnation: .active.json's fingerprint no longer matches the live lock holder ->
+        # cannot pair B's identity with A's transport -> None (never route to the stale port).
+        paths.state_file().write_text(json.dumps(
+            {"pid": os.getpid(), "start_fingerprint": "stale-A-fingerprint",
+             "transport": "tcp", "host": "127.0.0.1", "port": 9, "token": "tok-A"}))
+        assert supervisor.held_generation() is None
+    finally:
+        os.close(fd)

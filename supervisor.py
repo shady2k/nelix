@@ -301,21 +301,19 @@ def active_generation():
 
 
 def current_generation():
-    """The CHEAP, lock-safe read of the recorded generation's `(transport, incarnation)` — read
-    straight from .active.json with NO /health RPC and NO start-fingerprint re-probe (`ps`), only a
-    cheap pid-liveness check. The router calls this UNDER its epoch lock, AFTER
-    active_generation()/ensure_running() has already validated health + fingerprint OUTSIDE the lock:
-    the under-lock path needs only a CONSISTENT identity + transport snapshot to mint exactly one
-    epoch per incarnation, and the recorded (pid, start_fingerprint) IS that incarnation identity.
-    Returns None if nothing live is recorded or the transport cannot be parsed.
+    """The CHEAP read of the RECORDED generation's `(transport, incarnation)` — read straight from
+    .active.json with NO /health RPC and NO start-fingerprint re-probe (`ps`), only a cheap
+    pid-liveness check. Returns None if nothing live is recorded or the transport cannot be parsed.
 
-    Splitting this out of active_generation() (which does the slow /health probe) is what lets the
-    router make the identity read + epoch mint ATOMIC under the lock without serializing every /start
-    behind a health RPC — the atomic read closes the race where a snapshot captured OUTSIDE the lock
-    could be installed STALE over a newer incarnation (nelix-3rm 3c.1 finding #1). Because .active.json
-    only ever advances to a new incarnation (a restart always changes pid or fingerprint), an
-    under-lock read here can never observe an OLDER incarnation than one already installed — so the
-    active pointer never rolls backward."""
+    This reflects .active.json, which is NOT authoritative and NOT monotonic (a paused spawner can
+    roll it back to a superseded incarnation — see held_generation()). It is therefore NOT the
+    router's under-lock identity read; the router uses held_generation() (the validated live SINGLETON
+    LOCK holder) for that. current_generation() survives as held_generation()'s building block for a
+    TCP holder — whose lock meta carries no token — where .active.json is the only place the tokened
+    transport lives, and held_generation() pairs it in ONLY when its incarnation matches the live lock
+    holder (so a stale .active.json is never routed to). Splitting this cheap read out of
+    active_generation() (which does the slow /health probe) keeps that reconciliation off the health
+    RPC path."""
     st = _read_state()
     if not st:
         return None
@@ -328,6 +326,48 @@ def current_generation():
     except ValueError:
         return None
     return t, {"pid": pid, "start_fingerprint": fp}
+
+
+def held_generation():
+    """The AUTHORITATIVE `(transport, incarnation)` of the daemon that currently HOLDS THE SINGLETON
+    LOCK, or None if no live, fingerprint-matched daemon holds it (or no transport CONSISTENT with
+    that holder can be derived). This is the router's UNDER-LOCK identity read (nelix-3rm 3c.1
+    finding #1, rev 3).
+
+    Why not current_generation()? .active.json is NOT authoritative and NOT monotonic. A spawner
+    thread that validated a now-superseded incarnation A can PAUSE, let a newer B acquire the released
+    singleton lock and publish itself, then RESUME and rewrite .active.json back to A — a ROLLBACK a
+    bare .active.json read cannot detect (A's zombie still passes a bare pid-liveness check). The
+    SINGLETON LOCK cannot roll back this way: the kernel guarantees exactly one live holder, and a
+    released lock cannot be re-held by the dead pid. `_live_lock_holder()` (pid ALIVE — zombie-aware
+    via ProcessInspector.is_alive — AND its recorded start fingerprint still matches) names the one
+    current incarnation. Keying the epoch on THIS incarnation is what makes two concurrent callers
+    mint exactly one epoch and keeps the registry's active pointer from rolling backward to A.
+
+    TRANSPORT RECONCILIATION — the transport MUST belong to the SAME incarnation as the identity:
+      * unix holder -> the lock meta records the socket path, so the holder's own transport is
+        directly usable (a local unix socket is peercred/fs-gated, no token). Re-derived from the
+        holder via `_holder_transport()`, never taken from a possibly-stale .active.json.
+      * tcp holder -> the lock meta carries NO token, so the holder is not reachable from the lock
+        alone. We accept .active.json's transport ONLY when its incarnation MATCHES the live lock
+        holder's; a stale/mismatched .active.json yields None so the caller retries
+        (GENERATION_UNAVAILABLE) rather than routing a start to a superseded incarnation's endpoint.
+
+    Like current_generation(), this is the CHEAP, lock-safe read: a lock-file read + pid-liveness, no
+    /health RPC and no spawn (the ensure OUTSIDE the registry lock already health-checked)."""
+    meta = _live_lock_holder()
+    if not meta:
+        return None
+    inc = {"pid": meta["pid"], "start_fingerprint": meta.get("start_fingerprint")}
+    transport = _holder_transport(meta)
+    if transport is not None:                     # unix: reachable directly from the lock meta
+        return transport, inc
+    # tcp holder: no token in the lock meta -> pair with .active.json ONLY when it is the SAME
+    # incarnation (else its transport belongs to a superseded incarnation -> unavailable/retryable).
+    recorded = current_generation()
+    if recorded is not None and recorded[1] == inc:
+        return recorded[0], inc
+    return None
 
 
 def _live_lock_holder():
