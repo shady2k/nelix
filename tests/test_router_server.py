@@ -1,26 +1,33 @@
-"""nelix-3rm slice 3c.1 Part D: the router HTTP server — a ThreadingHTTPServer on the securely-bound
-router socket, unix peercred auth (peer_is_self), dispatch by routing.classify. THIS slice implements
-POST /start (ACTIVE_GENERATION) end-to-end plus a router GET /health (liveness + active generation +
-router_epoch). Session-keyed / fan-out / operator routes honestly 404 (a clear body) until 3c.2.
+"""nelix-3rm slice 3c.1 Part D (+ 3c.2): the router HTTP server — a ThreadingHTTPServer on the
+securely-bound router socket, unix peercred auth (peer_is_self), dispatch by routing.classify.
+3c.1 implemented POST /start (ACTIVE_GENERATION) + a router GET /health. 3c.2 adds the
+SESSION-KEYED owner routes (respond/stop/restart/screen/dialog/session-scoped status), the
+owner-EXEMPT executor plane (/hook/<sid>, /message/<sid>), and the router-local OPERATOR routes
+(capabilities, generation_list). The fan-out BOARD (/status with no session_id) and /wait remain
+honest 404s — that is 3c.3, not this slice.
 
 The server is exercised over its REAL securely-established AF_UNIX socket (runtime_dir.establish())
 via a same-uid client — which is exactly the peercred allow path."""
+import json
 import socket as _socket
 import threading
 
 import pytest
 
 import paths
+from nelix_contracts.errors import GENERATION_UNAVAILABLE, NelixError
 from nelix_store.ledger import StartLedger
 from router import runtime_dir as rd
 from router.registry import GenerationRegistry
 from router.server import make_router_server
 from router.start import StartPath
-from rpc_client import RpcClient
+from rpc_client import RpcClient, UnixHTTPConnection
 from daemon.transport import Transport
 
 from conftest import EXECUTOR, OWNER
 from _router_fakes import Backend, Supervisor
+
+OTHER_OWNER = "harness-y"
 
 
 class _Wired:
@@ -157,19 +164,207 @@ def test_start_routes_through_the_active_generation(wired):
     assert h["active_generation"]["epoch"] == body["generation_id"]
 
 
-def test_session_keyed_route_404s_until_3c2(wired):
-    st, body = wired.client()._call("POST", "/respond",
-                                    {"session_id": "s-" + "a" * 32, "answer": "1",
-                                     "owner_id": OWNER})
-    assert st == 404
-    assert body["error"]["class"] == "session-keyed"
-    assert "3c" in body["error"]["message"]
-
-
-def test_fan_out_route_404s_until_3c2(wired):
+def test_fan_out_route_404s_until_3c3(wired):
+    # /status with NO session_id is the fan-out BOARD read (3c.3): still honestly unimplemented.
     st, body = wired.client()._call("GET", f"/status?owner_id={OWNER}")
     assert st == 404
     assert body["error"]["class"] == "fan-out"
+
+
+def test_wait_route_404s_until_3c3(wired):
+    st, body = wired.client()._call("GET", f"/wait?owner_id={OWNER}&session_id=s-{'a' * 32}")
+    assert st == 404
+    assert body["error"]["class"] == "fan-out"
+
+
+# ============================================================ 3c.2: session-keyed OWNER routes
+
+def test_respond_forwards_to_the_active_generation_with_owner_passthrough(wired):
+    sid = "s-" + "b" * 32
+    wired.backend.owns[sid] = OWNER
+    st, body = wired.client()._call("POST", "/respond",
+                                    {"session_id": sid, "answer": "1", "owner_id": OWNER})
+    assert st == 200
+    assert body["answer"] == "1"
+
+
+def test_respond_wrong_owner_is_relayed_as_the_generations_404(wired):
+    # The spec ownership test on a forwarded route: a DIFFERENT owner_id must be rejected by the
+    # generation (relayed faithfully through the router), never accepted by a router-side gate.
+    sid = "s-" + "b" * 32
+    wired.backend.owns[sid] = OWNER
+    st, body = wired.client()._call("POST", "/respond",
+                                    {"session_id": sid, "answer": "1", "owner_id": OTHER_OWNER})
+    assert st == 404
+    assert body["status"] == "unknown_session"
+
+
+def test_stop_forwards_with_owner_passthrough(wired):
+    sid = "s-" + "c" * 32
+    wired.backend.owns[sid] = OWNER
+    st, body = wired.client()._call("POST", "/stop", {"session_id": sid, "owner_id": OWNER})
+    assert st == 200
+    assert body["status"] == "stopped"
+
+
+def test_restart_wrong_owner_is_relayed_as_the_generations_404(wired):
+    sid = "s-" + "d" * 32
+    wired.backend.owns[sid] = OWNER
+    st, body = wired.client()._call("POST", "/restart",
+                                    {"session_id": sid, "owner_id": OTHER_OWNER})
+    assert st == 404
+    assert body["status"] == "unknown_session"
+
+
+def test_screen_session_scoped_forwards(wired):
+    sid = "s-" + "e" * 32
+    wired.backend.owns[sid] = OWNER
+    st, body = wired.client()._call("GET", f"/screen?session_id={sid}&owner_id={OWNER}")
+    assert st == 200
+    assert body["screen"] == "SCREEN " + sid
+
+
+def test_screen_wrong_owner_is_relayed_as_the_generations_200_error_body(wired):
+    # /screen's own wrong-owner shape is a 200 with an error BODY (mirrors daemon/rpc_server.py) --
+    # the router must relay THAT faithfully, not translate it into some other status.
+    sid = "s-" + "e" * 32
+    wired.backend.owns[sid] = OWNER
+    st, body = wired.client()._call("GET", f"/screen?session_id={sid}&owner_id={OTHER_OWNER}")
+    assert st == 200
+    assert body == {"error": "unknown session"}
+
+
+def test_dialog_session_scoped_forwards(wired):
+    sid = "s-" + "f" * 32
+    wired.backend.owns[sid] = OWNER
+    st, body = wired.client()._call("GET", f"/dialog?session_id={sid}&owner_id={OWNER}")
+    assert st == 200
+    assert body["chunk"] == "DIALOG " + sid
+
+
+def test_status_with_session_id_forwards_as_session_keyed(wired):
+    sid = "s-" + "1" * 32
+    wired.backend.owns[sid] = OWNER
+    st, body = wired.client()._call("GET", f"/status?session_id={sid}&owner_id={OWNER}")
+    assert st == 200
+    assert body["session_id"] == sid
+
+
+def test_status_with_session_id_wrong_owner_is_relayed(wired):
+    sid = "s-" + "1" * 32
+    wired.backend.owns[sid] = OWNER
+    st, body = wired.client()._call("GET", f"/status?session_id={sid}&owner_id={OTHER_OWNER}")
+    assert st == 200
+    assert body == {"error": "unknown session"}
+
+
+def test_session_keyed_forward_failure_is_a_stable_retryable_envelope(wired, monkeypatch):
+    # A transport failure mid-forward -- through the FULL HTTP stack -- must be the stable
+    # retryable envelope, never a bare 500 (mirrors /start's own error contract).
+    def _boom():
+        raise NelixError(GENERATION_UNAVAILABLE, "no generation available")
+    monkeypatch.setattr(wired.registry, "active", _boom)
+    st, body = wired.client()._call("POST", "/respond",
+                                    {"session_id": "s-" + "2" * 32, "answer": "1",
+                                     "owner_id": OWNER})
+    assert st == 503
+    assert body["error"]["code"] == "generation_unavailable"
+    assert body["error"]["retryable"] is True
+
+
+def test_bad_owner_id_on_a_session_keyed_route_is_a_clean_400(wired):
+    st, body = wired.client()._call("POST", "/respond",
+                                    {"session_id": "s-" + "3" * 32, "answer": "1",
+                                     "owner_id": "has space"})
+    assert st == 400
+    assert body["error"]["code"] == "invalid_request"
+
+
+def test_respond_missing_answer_is_a_clean_400_not_a_null_forwarded(wired):
+    # A fully-absent "answer" must be caught as a clean 400 -- not silently forwarded as a JSON
+    # null (which the daemon's own `body["answer"]` would accept as PRESENT, since only a truly
+    # absent key raises its KeyError->400; forwarding a fabricated null would mask the caller's
+    # mistake behind whatever the daemon does with a null answer instead of naming it).
+    st, body = wired.client()._call("POST", "/respond",
+                                    {"session_id": "s-" + "7" * 32, "owner_id": OWNER})
+    assert st == 400
+    assert body["error"]["code"] == "invalid_request"
+
+
+# ============================================================ 3c.2: the executor plane (owner-EXEMPT)
+
+def test_hook_forward_passes_the_secret_header_and_relays_204(wired):
+    sid = "s-" + "4" * 32
+    conn = UnixHTTPConnection(wired.handle.sock_path, timeout=5)
+    conn.request("POST", f"/hook/{sid}", body=b'{"hook_event_name": "tool_call"}',
+                headers={"X-Nelix-Hook-Secret": wired.backend.hook_secret})
+    resp = conn.getresponse()
+    resp.read()
+    try:
+        assert resp.status == 204
+    finally:
+        conn.close()
+    call = wired.backend.calls[-1]
+    assert call["headers"]["X-Nelix-Hook-Secret"] == wired.backend.hook_secret
+    assert call["raw_body"] == b'{"hook_event_name": "tool_call"}'
+
+
+def test_hook_forward_never_carries_an_owner_id(wired):
+    sid = "s-" + "4" * 32
+    conn = UnixHTTPConnection(wired.handle.sock_path, timeout=5)
+    conn.request("POST", f"/hook/{sid}", body=b'{"hook_event_name": "tool_call"}',
+                headers={"X-Nelix-Hook-Secret": wired.backend.hook_secret})
+    conn.getresponse().read()
+    conn.close()
+    call = wired.backend.calls[-1]
+    assert "owner_id" not in call["headers"]
+    assert b"owner_id" not in call["raw_body"]
+
+
+def test_hook_wrong_secret_is_relayed_as_401(wired):
+    sid = "s-" + "5" * 32
+    conn = UnixHTTPConnection(wired.handle.sock_path, timeout=5)
+    conn.request("POST", f"/hook/{sid}", body=b'{"hook_event_name": "tool_call"}',
+                headers={"X-Nelix-Hook-Secret": "wrong-secret"})
+    resp = conn.getresponse()
+    resp.read()
+    try:
+        assert resp.status == 401
+    finally:
+        conn.close()
+
+
+def test_message_forward_relays_the_queued_body(wired):
+    sid = "s-" + "6" * 32
+    conn = UnixHTTPConnection(wired.handle.sock_path, timeout=5)
+    conn.request("POST", f"/message/{sid}", body=b'{"kind": "note", "text": "hi"}',
+                headers={"X-Nelix-Hook-Secret": wired.backend.hook_secret})
+    resp = conn.getresponse()
+    body = json.loads(resp.read())
+    try:
+        assert resp.status == 200
+        assert body == {"status": "queued", "id": "q_1"}
+    finally:
+        conn.close()
+
+
+# ============================================================ 3c.2: router-local OPERATOR routes
+
+def test_capabilities_reports_router_epoch_and_the_generations_capabilities(wired):
+    wired.registry.active()             # observe the one generation once
+    st, body = wired.client()._call("GET", "/capabilities")
+    assert st == 200
+    assert body["router_epoch"] == wired.epoch
+    assert body["capabilities"]["executors"]["demo"]["hook_capable"] is True
+
+
+def test_generation_list_reports_the_one_generation(wired):
+    wired.registry.active()
+    st, body = wired.client()._call("GET", "/generation_list")
+    assert st == 200
+    assert len(body["generations"]) == 1
+    assert body["generations"][0]["build_id"] == wired.backend.build_id
+    assert body["generations"][0]["transport_kind"] == "tcp"
 
 
 def test_unknown_route_404s(wired):
