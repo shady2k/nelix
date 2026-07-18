@@ -17,7 +17,10 @@ Two disjoint auth planes share this module because both are session-keyed by rou
   * The executor-facing plane (/hook/<sid>, /message/<sid>): owner-EXEMPT by design (a worker is
     not a caller — it authenticates with a per-session secret, a STRONGER check than an owner id).
     No owner_id is validated, constructed, or forwarded here at all; the secret header and the raw
-    body are passed through byte-for-byte.
+    body are passed through byte-for-byte. The <sid> path component IS shape-validated first (review
+    fix pass), for consistency with the owner routes' fail-fast pattern — not a security boundary
+    (the daemon re-validates independently, and prefix routing cannot traverse out of a session id),
+    just the same clean-400-before-the-wire discipline applied here too.
 
 ROUTING (structural seam for Plan 4): every method below resolves to `registry.active()` — the one
 generation the registry tracks today (N=1). When the registry holds N>1 generations, a session-keyed
@@ -129,6 +132,28 @@ class SessionForward:
         """POST /hook/<sid> or /message/<sid>: no owner_id anywhere — authenticated purely by the
         per-session secret HEADER the caller already supplied (in `headers`, passed through
         unchanged) and forwarded with the RAW `body` bytes, untouched. Same Plan-4 routing seam as
-        the owner-scoped methods above (today: the active generation)."""
+        the owner-scoped methods above (today: the active generation).
+
+        The <sid> path component is shape-validated FIRST (the same validate_session_id the
+        owner-scoped routes' `_session()` applies), for consistency with the router's fail-fast
+        pattern — every owner-scoped route above rejects a malformed session_id before ever
+        forwarding. This is not a new security boundary (the daemon independently re-validates, and
+        prefix-based path routing cannot traverse out of a session id): it just stops a bad-shape
+        sid from reaching the wire at all here too. The secret header and raw body are never
+        touched by this check and are forwarded byte-for-byte unchanged on success."""
+        _validate_secret_plane_sid(path)
         gen = self._registry.active()
         return relay(lambda: raw_forward(gen.transport, method, path, headers=headers, body=body))
+
+
+_SECRET_PLANE_PREFIXES = ("/hook/", "/message/")
+
+
+def _validate_secret_plane_sid(path):
+    """Extract and shape-validate the <sid> in /hook/<sid> or /message/<sid> (the only two paths
+    forward_secret is ever called with — server.py only dispatches here after matching one of these
+    prefixes). Raises NelixError(INVALID_REQUEST) on a bad shape, same as `_session()` above."""
+    for prefix in _SECRET_PLANE_PREFIXES:
+        if path.startswith(prefix):
+            _session(path[len(prefix):])
+            return

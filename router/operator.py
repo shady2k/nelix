@@ -9,6 +9,8 @@ facts, not from a caller's session.
 """
 import urllib.parse
 
+from nelix_contracts.errors import GENERATION_UNAVAILABLE, NelixError
+
 from router.forwarding import relay
 from router.registry import PROBE_OWNER
 
@@ -46,8 +48,17 @@ class OperatorRoutes:
         unfanned, not that it resolve a specific session; the global baseline already satisfies that
         honestly for a single-generation router. PROBE_OWNER (registry.py) constructs the RpcClient
         exactly as the health probe does: /capabilities requires an owner_id on the wire, but this
-        call carries no real caller to source one from."""
-        gen = self._registry.active()
+        call carries no real caller to source one from.
+
+        Reads registry.generations() — the same NON-SPAWNING snapshot /health and generation_list
+        read — never registry.active(): a "read-only" capabilities probe must not spawn a daemon as
+        a side effect (that would contradict /health's and /generation_list's own honesty). If no
+        generation is currently recorded, this is GENERATION_UNAVAILABLE (retryable), exactly what
+        /health would imply by reporting no active_generation — never a spawn-and-wait."""
+        gens = self._registry.generations()
+        if not gens:
+            raise NelixError(GENERATION_UNAVAILABLE, "no generation is currently available")
+        gen = gens[0]
         client = RpcClient(gen.transport, PROBE_OWNER)
         path = "/capabilities?" + urllib.parse.urlencode({"owner_id": PROBE_OWNER})
         status, body = relay(lambda: client.forward_raw("GET", path, None))

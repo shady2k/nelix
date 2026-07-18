@@ -182,6 +182,22 @@ def test_forward_secret_never_carries_an_owner_id(wired):
     assert "owner_id" not in call["headers"]
 
 
+# ---------------------------------------------- router-side sid shape validation (finding)
+
+@pytest.mark.parametrize("path", ["/hook/not-a-real-session-id", "/message/not-a-real-session-id"])
+def test_forward_secret_bad_shape_sid_is_invalid_request_before_any_forward(wired, path):
+    # Unlike every owner-scoped route above (_session() validates before forwarding), /hook and
+    # /message used to forward a caller-supplied sid to the wire unchecked. Not exploitable (the
+    # daemon validates independently), but inconsistent with the router's fail-fast pattern -- a
+    # bad-shape sid must now be rejected router-side, before ever reaching the backend.
+    forward, backend = wired
+    before = len(backend.calls)
+    with pytest.raises(NelixError) as exc:
+        forward.forward_secret("POST", path, {"X-Nelix-Hook-Secret": backend.hook_secret}, b"{}")
+    assert exc.value.code == "invalid_request"
+    assert len(backend.calls) == before          # never reached the wire
+
+
 # ============================================================ transport failure -> retryable
 
 def test_transport_failure_is_retryable_generation_unavailable():

@@ -165,16 +165,21 @@ def test_start_routes_through_the_active_generation(wired):
 
 
 def test_fan_out_route_404s_until_3c3(wired):
-    # /status with NO session_id is the fan-out BOARD read (3c.3): still honestly unimplemented.
+    # /status with NO session_id is the fan-out BOARD read (3c.3): still honestly unimplemented --
+    # but the 404 must still be the STABLE envelope (code + retryable), not an ad-hoc body.
     st, body = wired.client()._call("GET", f"/status?owner_id={OWNER}")
     assert st == 404
-    assert body["error"]["class"] == "fan-out"
+    assert body["error"]["code"] == "invalid_request"
+    assert body["error"]["retryable"] is False
+    assert "3c.3" in body["error"]["message"]
 
 
 def test_wait_route_404s_until_3c3(wired):
     st, body = wired.client()._call("GET", f"/wait?owner_id={OWNER}&session_id=s-{'a' * 32}")
     assert st == 404
-    assert body["error"]["class"] == "fan-out"
+    assert body["error"]["code"] == "invalid_request"
+    assert body["error"]["retryable"] is False
+    assert "3c.3" in body["error"]["message"]
 
 
 # ============================================================ 3c.2: session-keyed OWNER routes
@@ -348,6 +353,39 @@ def test_message_forward_relays_the_queued_body(wired):
         conn.close()
 
 
+def test_hook_malformed_sid_is_a_router_level_400_before_any_forward(wired):
+    # Finding: the router forwards <sid> to /hook/<sid> without shape-validating it first, unlike
+    # every owner-scoped route (which validates via _session()). A malformed sid must now get a
+    # router-level 400 stable envelope BEFORE ever reaching the backend.
+    conn = UnixHTTPConnection(wired.handle.sock_path, timeout=5)
+    conn.request("POST", "/hook/not-a-real-session-id", body=b'{"hook_event_name": "tool_call"}',
+                headers={"X-Nelix-Hook-Secret": "whatever"})
+    resp = conn.getresponse()
+    body = json.loads(resp.read())
+    try:
+        assert resp.status == 400
+        assert body["error"]["code"] == "invalid_request"
+        assert body["error"]["retryable"] is False
+    finally:
+        conn.close()
+    assert wired.backend.calls == []                # never reached the backend
+
+
+def test_message_malformed_sid_is_a_router_level_400_before_any_forward(wired):
+    conn = UnixHTTPConnection(wired.handle.sock_path, timeout=5)
+    conn.request("POST", "/message/not-a-real-session-id", body=b'{"kind": "note", "text": "hi"}',
+                headers={"X-Nelix-Hook-Secret": "whatever"})
+    resp = conn.getresponse()
+    body = json.loads(resp.read())
+    try:
+        assert resp.status == 400
+        assert body["error"]["code"] == "invalid_request"
+        assert body["error"]["retryable"] is False
+    finally:
+        conn.close()
+    assert wired.backend.calls == []                # never reached the backend
+
+
 # ============================================================ 3c.2: router-local OPERATOR routes
 
 def test_capabilities_reports_router_epoch_and_the_generations_capabilities(wired):
@@ -356,6 +394,21 @@ def test_capabilities_reports_router_epoch_and_the_generations_capabilities(wire
     assert st == 200
     assert body["router_epoch"] == wired.epoch
     assert body["capabilities"]["executors"]["demo"]["hook_capable"] is True
+
+
+def test_capabilities_before_any_generation_observed_is_retryable_and_non_spawning(wired):
+    # Finding: GET /capabilities must not spawn a generation as a side effect of a "read-only"
+    # probe -- unlike /health and /generation_list, it used to call registry.active() (which can
+    # subprocess.Popen a daemon). Before anything has observed one (no /start, no /health call), it
+    # must answer the same retryable GENERATION_UNAVAILABLE /health's null active_generation implies,
+    # and must NEVER have spawned one as a side effect.
+    st, body = wired.client()._call("GET", "/capabilities")
+    assert st == 503
+    assert body["error"]["code"] == "generation_unavailable"
+    assert body["error"]["retryable"] is True
+    # /health, read right after, is the witness: still nothing observed -- capabilities never spawned.
+    h = wired.client().health()
+    assert h["active_generation"] is None
 
 
 def test_generation_list_reports_the_one_generation(wired):
@@ -370,7 +423,8 @@ def test_generation_list_reports_the_one_generation(wired):
 def test_unknown_route_404s(wired):
     st, body = wired.client()._call("GET", "/nonesuch")
     assert st == 404
-    assert "error" in body
+    assert body["error"]["code"] == "invalid_request"
+    assert body["error"]["retryable"] is False
 
 
 def test_start_error_body_is_a_stable_envelope(wired):

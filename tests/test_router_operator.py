@@ -50,6 +50,7 @@ def test_generation_list_reports_the_one_active_generation(wired):
 
 def test_capabilities_forwards_the_generations_global_baseline(wired):
     ops, registry, backend = wired
+    registry.active()                           # observe it once (mirrors a prior /start or /health)
     status, body = ops.capabilities()
     assert status == 200
     assert body["router_epoch"] == _EPOCH
@@ -62,6 +63,7 @@ def test_capabilities_probe_never_carries_a_real_owner(wired):
     # real caller to source one from -- it must use the registry's own no-owner probe identity
     # (mirrors the /health build-id probe), never fabricate/borrow a caller's owner_id.
     ops, registry, backend = wired
+    registry.active()                           # observe it once (mirrors a prior /start or /health)
     ops.capabilities()
     call = backend.calls[-1]
     assert call["path"].startswith("/capabilities")
@@ -86,6 +88,33 @@ def test_capabilities_transport_failure_is_retryable_generation_unavailable():
             return self._t
 
     registry = GenerationRegistry(supervisor=_DeadSupervisor(), health_probe=lambda t: None)
+    registry.active()                           # observe the (unreachable) generation once
+    ops = OperatorRoutes(registry, _EPOCH)
+    with pytest.raises(NelixError) as exc:
+        ops.capabilities()
+    assert exc.value.code == "generation_unavailable"
+    assert exc.value.retryable is True
+
+
+def test_capabilities_is_non_spawning_when_no_generation_is_recorded():
+    # Finding: GET /capabilities must be as non-spawning as /health and /generation_list -- it must
+    # NEVER call registry.active() (which can subprocess.Popen a daemon). Before anything has
+    # observed a generation (no prior /start, no /health probe), it must answer the same retryable
+    # GENERATION_UNAVAILABLE /health's absent active_generation implies, and must never touch the
+    # supervisor at all (a touch would mean it tried to make one available -- i.e. spawn).
+    class _BoomSupervisor:
+        def active_generation(self):
+            raise AssertionError("capabilities must never probe for a generation to spawn one")
+
+        def ensure_running(self):
+            raise AssertionError("capabilities must never spawn a generation")
+
+        def held_generation(self):
+            raise AssertionError("capabilities must never read the lock holder to spawn one")
+
+    from nelix_contracts.errors import NelixError
+
+    registry = GenerationRegistry(supervisor=_BoomSupervisor())
     ops = OperatorRoutes(registry, _EPOCH)
     with pytest.raises(NelixError) as exc:
         ops.capabilities()

@@ -320,19 +320,30 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                              "active_generation": active})
 
         def _dispatch_unimplemented(self, method, path):
+            # Every ad-hoc 404 below is still the STABLE envelope ({error:{code,message,retryable}})
+            # — a client relying on that contract must not misclassify an unimplemented route.
+            # INVALID_REQUEST is the closest existing code: none of the others fit "operation not
+            # (yet) supported by this router" (UNSUPPORTED_BY_GENERATION is spec §8's CROSS-
+            # GENERATION incompatibility — a genuinely different case daemon/manager.py's
+            # _session_capabilities already documents NOT fabricating for an unrelated meaning; the
+            # same reasoning applies here). The 404 HTTP status and human message (naming that the
+            # board/wait arrive in 3c.3) are unchanged — only the body gains a real code+retryable.
             op = _operation_for(method, path)
             if op is None:
-                self._send(404, {"error": {"message": f"no such route: {method} {path}"}})
+                err = NelixError(INVALID_REQUEST, f"no such route: {method} {path}")
+                self._send(404, err.to_envelope())
                 return
             try:
                 cls = routing.classify(op)
             except routing.UnknownOperation:
-                self._send(404, {"error": {"message": f"unknown operation: {op}"}})
+                err = NelixError(INVALID_REQUEST, f"unknown operation: {op}")
+                self._send(404, err.to_envelope())
                 return
-            self._send(404, {"error": {
-                "operation": op, "class": cls,
-                "message": f"operation {op!r} (class {cls}) is not implemented in this router "
-                           f"yet; the fan-out board (/status with no session_id) and /wait "
-                           f"arrive in 3c.3"}})
+            err = NelixError(
+                INVALID_REQUEST,
+                f"operation {op!r} (class {cls}) is not implemented in this router "
+                f"yet; the fan-out board (/status with no session_id) and /wait "
+                f"arrive in 3c.3")
+            self._send(404, err.to_envelope())
 
     return _PreboundUnixHTTPServer(bound_socket, sock_path, Handler)
