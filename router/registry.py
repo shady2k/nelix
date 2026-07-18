@@ -76,6 +76,14 @@ class GenerationRegistry:
         # None before anything is observed. A dict, not the frozen handle, so the transport can be
         # refreshed in place while the epoch/build_id stay pinned to the incarnation.
         self._active = None
+        # nelix-3rm 3c.3a: the vector cursor's topology component (nelix_contracts.cursor). N=1
+        # today: the registry has exactly one slot and never adds/removes one, so this starts at a
+        # fixed 1 and never moves yet -- but it is REAL mutable state (never a literal baked into a
+        # cursor caller), so Plan 4's generation-add/remove surface has something to increment
+        # under `self._lock` when the SET of tracked generations changes. A daemon restart mints a
+        # fresh per-incarnation `epoch` (see `active()`) but is NOT a topology change -- the slot
+        # count never moved -- so it must never bump this.
+        self._topology_revision = 1
 
     def active(self) -> GenerationHandle:
         """Return the active generation, ensuring a backend is available. Raises
@@ -133,6 +141,13 @@ class GenerationRegistry:
                     build_id = self._active["build_id"]
         # Pin the returned handle to the (epoch, transport, incarnation) validated together above.
         return GenerationHandle(epoch=epoch, transport=transport, build_id=build_id, incarnation=inc)
+
+    def topology_revision(self) -> int:
+        """The vector cursor's topology component (nelix_contracts.cursor.new_cursor): bumped only
+        when a generation is added to or removed from the registry (Plan 4). N=1 today, so this is
+        a fixed 1 -- never a daemon-incarnation restart, which changes `epoch`, not the topology."""
+        with self._lock:
+            return self._topology_revision
 
     def generations(self) -> list:
         """The registry as a LIST (N=1 today): the active-generation pointer, or []. List-shaped so

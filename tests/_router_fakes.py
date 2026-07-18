@@ -31,6 +31,14 @@ class Backend:
         self.starts = []
         self.owns = {}                 # session_id -> owner_id that "started" it
         self.calls = []                 # every non-start/health request: {"method","path","headers","body"}
+        # nelix-3rm 3c.3a: the board-wide GET /status (no session_id) -- mirrors
+        # daemon/manager.py's status(session_id=None) shape (sessions/limit/cursor/
+        # recent_terminal), OWNER-FILTERED off `owns` (already the "who started this session"
+        # record) + `recent_terminal_owner`. `board_cursor` is settable directly so a test can
+        # assert the router's vector cursor carries this exact int through.
+        self.board_cursor = 0
+        self.recent_terminal = {}       # session_id -> snapshot dict, settable directly
+        self.recent_terminal_owner = {}  # session_id -> owner_id, settable directly
         backend = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -68,6 +76,19 @@ class Backend:
                 owner_id = one("owner_id")
                 sid = one("session_id")
                 if path == "/status":
+                    if sid is None:
+                        # The BOARD-WIDE form (nelix-3rm 3c.3a): owner-filtered, real daemon shape.
+                        mine = {s for s, o in backend.owns.items() if o == owner_id}
+                        recent = {s: snap for s, snap in backend.recent_terminal.items()
+                                 if backend.recent_terminal_owner.get(s) == owner_id}
+                        self._send(200, {
+                            "sessions": {s: {"session_id": s, "control_state": "idle", "seq": 0}
+                                        for s in mine},
+                            "limit": 5,
+                            "cursor": backend.board_cursor,
+                            "recent_terminal": recent,
+                        })
+                        return
                     if not self._owned(sid, owner_id):
                         self._send(200, {"error": "unknown session"}); return
                     self._send(200, {"session_id": sid, "control_state": "idle",

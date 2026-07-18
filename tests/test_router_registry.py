@@ -142,6 +142,28 @@ def test_build_id_may_be_null_in_dev():
     assert gen.build_id is None
 
 
+def test_topology_revision_starts_at_a_fixed_value():
+    # nelix-3rm 3c.3a: N=1 today, so the registry has never added/removed a generation -- the
+    # counter starts at a fixed value and the machinery (this getter) is what Plan 4 bumps when
+    # a generation is added or removed, never a hardcoded literal baked into the cursor caller.
+    reg = _reg(FakeSupervisor())
+    assert reg.topology_revision() == 1
+
+
+def test_topology_revision_is_unaffected_by_observing_or_restarting_a_generation():
+    # A daemon RESTART mints a fresh per-incarnation epoch (test above), but that is not a
+    # TOPOLOGY change -- the set of tracked generations (still just the one slot) never moved, so
+    # topology_revision must not move either. Only Plan 4's add/remove-generation surface may
+    # bump it.
+    sup = FakeSupervisor(inc={"pid": 100, "start_fingerprint": "fp-1"})
+    reg = _reg(sup)
+    before = reg.topology_revision()
+    reg.active()
+    sup.inc = {"pid": 200, "start_fingerprint": "fp-2"}      # daemon restarted: new incarnation
+    reg.active()
+    assert reg.topology_revision() == before
+
+
 def test_registry_is_list_shaped_n_equals_one():
     reg = _reg(FakeSupervisor())
     assert reg.generations() == []                         # nothing observed yet
