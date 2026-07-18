@@ -41,6 +41,57 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = s
 
 
+def _phase_split(connect, method, path, body, headers):
+    """The phase-split forward mechanic shared by every forward in this module (RpcClient's owner-
+    scoped forward_raw AND the owner-EXEMPT raw_forward below): connect+send is the DEFINITE phase
+    (a failure here means no complete request was delivered, so whatever the request would have
+    caused definitely did not happen — ForwardConnectError); awaiting/reading the reply is the
+    AMBIGUOUS phase (the request was sent, so it may already have taken effect —
+    ForwardResponseError). Returns (status, decoded_json_body) UNCHANGED on success — this is the
+    ONE place that decides definite-vs-ambiguous; every caller (start's /start forward, the
+    router's session-keyed forward, the router's hook/message passthrough) reuses it rather than
+    re-deriving the classification."""
+    conn = None
+    try:
+        try:
+            conn = connect()
+            conn.request(method, path, body=body, headers=headers)
+        except Exception as e:
+            raise ForwardConnectError(str(e)) from e
+        try:
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read() or b"{}")
+        except Exception as e:
+            raise ForwardResponseError(str(e)) from e
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def raw_forward(transport, method, path, *, headers=None, body=None, timeout=30):
+    """A transport-level phase-split forward carrying NO owner_id: sends `method path` with the
+    caller-supplied `headers` (plus the transport's own tcp token, exactly like RpcClient._prep)
+    and a RAW `body` (bytes or None, sent verbatim — never re-encoded), returning (status,
+    decoded_json_body) UNCHANGED.
+
+    For the router's owner-EXEMPT executor plane (/hook/<sid>, /message/<sid>, spec §7): those
+    routes authenticate by a per-session secret HEADER the caller already supplied, never by
+    owner_id, so there is no owner to construct an RpcClient with — fabricating one would be
+    exactly the re-implemented auth the passthrough must avoid. Phase-split via `_phase_split`
+    (see its docstring): a connect/send failure raises ForwardConnectError, a response-phase
+    failure raises ForwardResponseError."""
+    hdrs = dict(headers or {})
+    if transport.kind == "tcp":
+        hdrs.setdefault("X-Nelix-Token", transport.token)
+
+    def _connect():
+        if transport.kind == "unix":
+            return UnixHTTPConnection(transport.path, timeout=timeout)
+        return http.client.HTTPConnection(transport.host, transport.port, timeout=timeout)
+
+    return _phase_split(_connect, method, path, body, hdrs)
+
+
 class RpcClient:
     """A client speaking for ONE owner (daemon/owner.py).
 
@@ -77,29 +128,24 @@ class RpcClient:
         finally:
             conn.close()
 
-    def _forward_call(self, method, path, body, timeout=30):
-        """Like _call, but with the connect+send and the response-read phases SEPARATED so the caller
-        can tell a DEFINITE pre-delivery failure (ForwardConnectError — the request never fully left,
-        so no worker) from an AMBIGUOUS post-send one (ForwardResponseError — the request was sent, so
-        a worker may exist). The router's /start forward relies on this phase split to decide whether
-        it may record a durable failure or must leave the reservation `starting` (findings #2/#3).
-        Returns the decoded JSON body."""
+    def forward_raw(self, method, path, body, timeout=30):
+        """Like _call, but with the connect+send and the response-read phases SEPARATED (via the
+        shared `_phase_split`) so the caller can tell a DEFINITE pre-delivery failure
+        (ForwardConnectError — the request never fully left, so no worker/effect happened) from an
+        AMBIGUOUS post-send one (ForwardResponseError — the request was sent, so a worker/effect may
+        already exist). Returns (status, decoded_json_body) UNCHANGED — for a caller (the router's
+        session-keyed forward) that must relay the generation's exact response, not just infer
+        success from the body the way /start's own forward does (see _forward_call below)."""
         data, headers = self._prep(body)
-        conn = None
-        try:
-            try:
-                conn = self._conn(timeout)
-                conn.request(method, path, body=data, headers=headers)   # connect + send request
-            except Exception as e:
-                raise ForwardConnectError(str(e)) from e                 # no complete request delivered
-            try:
-                resp = conn.getresponse()                                # request sent — await the reply
-                return json.loads(resp.read() or b"{}")
-            except Exception as e:
-                raise ForwardResponseError(str(e)) from e                # reply lost/garbled: worker may exist
-        finally:
-            if conn is not None:
-                conn.close()
+        return _phase_split(lambda: self._conn(timeout), method, path, data, headers)
+
+    def _forward_call(self, method, path, body, timeout=30):
+        """/start's own forward: identical phase split (via forward_raw), but returns ONLY the
+        decoded body — /start's success is decided by the generation's OWN reply body
+        (status=="started" + the echoed session_id), not by the HTTP status code, so the status is
+        discarded here rather than threaded through every existing caller of this method."""
+        _, reply = self.forward_raw(method, path, body, timeout=timeout)
+        return reply
 
     def start(self, executor, task, cwd, model=None, session_id=None, timeout=30):
         # model (nelix-9k0) and session_id (nelix-3rm) are only ADDED when provided, so a default
