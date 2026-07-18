@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Checkout runner for the minimal `nelix` CLI (nelix_cli.py at the repo root) — lets a caller
+invoke `bin/nelix daemon ensure|status|wait` from any cwd without needing to know that
+`python -m nelix_cli` requires the repo root on sys.path. Not a console script and not shipped
+(no pyproject [project.scripts] entry): router/ is not in the wheel yet (Plan 5 ships that)."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from nelix_cli import main           # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())
