@@ -164,9 +164,15 @@ def establish() -> RuntimeDir:
     RouterLockHeld if another router already holds the lock, ValueError if the socket path overflows
     sun_path, or paths.RouterRuntimeBaseRejected if the base itself is unsafe (pathname pre-check).
     """
-    base = paths.verify_router_runtime_base()                  # resolved, ancestry-verified anchor
-    d, sock_path, _lock_path = paths.resolved_router_paths()   # same single resolution; d under base
-    rel_parts = d.relative_to(base).parts                      # ("nelix-<uid>", "<hash>")
+    # ONE resolution of NELIX_RUNTIME_BASE. resolved_router_paths() resolves + ancestry-verifies the
+    # base exactly once and derives (dir, sock, lock) from that single resolution; the anchor `base`
+    # is derived from `d` (d = <base>/nelix-<uid>/<hash>, so base = d.parent.parent) rather than by a
+    # SECOND verify_router_runtime_base() call — chaining two independent resolutions is precisely the
+    # double-resolve TOCTOU resolved_router_paths() exists to close (a symlinked base could resolve to
+    # two different targets across the two calls).
+    d, sock_path, _lock_path = paths.resolved_router_paths()
+    base = d.parent.parent                                     # the resolved, ancestry-verified anchor
+    rel_parts = (d.parent.name, d.name)                        # ("nelix-<uid>", "<hash>")
 
     intermediate_fds = []
     leaf_fd = None
