@@ -7,22 +7,31 @@ FOREIGN uid is refused 401; an unknown or unreportable uid is allowed, because t
 are the real local gate (peer_is_self's documented policy).
 
 DISPATCH is by operation CLASS (routing.classify), never by an operation's meaning — the table is
-what keeps the router stable (spec §1). THIS slice implements only:
-  * POST /start  (ACTIVE_GENERATION) end-to-end via StartPath.
-  * GET  /health (router-local liveness: router_epoch + the active generation, WITHOUT spawning one).
-Everything else honestly 404s with a body naming its class and that it lands in 3c.2 — an
-unimplemented-yet route is honest, not dead code.
+what keeps the router stable (spec §1). 3c.1 implemented POST /start (ACTIVE_GENERATION) + GET
+/health (router-local liveness). 3c.2 (this slice) adds:
+  * The SESSION-KEYED owner routes — GET /status (session-scoped)/dialog/screen, POST
+    /respond/stop/restart — forwarded via SessionForward with owner_id PASSED THROUGH unchanged
+    (spec §7: the router never interprets ownership, only the generation does).
+  * The owner-EXEMPT executor plane — POST /hook/<sid>, /message/<sid> — forwarded via
+    SessionForward.forward_secret with the per-session secret HEADER + raw body passed through,
+    never owner-gated.
+  * The router-LOCAL operator routes — GET /capabilities, /generation_list — answered by
+    OperatorRoutes from the registry / the one active generation, never fanned out.
+The fan-out BOARD (/status with NO session_id) and /wait remain honest 404s — that is 3c.3, not
+this slice. An unimplemented-yet route is honest, not dead code.
 """
 import json
 import socket
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from nelix_contracts import routing
 from nelix_contracts.errors import INTERNAL_ERROR, INVALID_REQUEST, OWNER_MISMATCH, NelixError
 
 from daemon.transport import peer_is_self
+from router.operator import OperatorRoutes
+from router.session_forward import SessionForward
 from router.start import http_status
 
 _MAX_BODY = 4 * 1024 * 1024        # 4 MiB post-auth body cap (mirrors the daemon's rpc_server)
@@ -34,9 +43,21 @@ _STOP = object()
 # URL path -> operation NAME. The router dispatches on the operation's CLASS (routing.classify), so
 # this table only has to turn a route into the operation name the classifier understands. /hook/<sid>
 # and /message/<sid> carry the id in the path (matched by prefix). /health is NOT here — it is a
-# router-local liveness route, not a generation operation.
+# router-local liveness route, not a generation operation. Every one of these paths is now handled
+# explicitly below (this table stays a complete route->operation map for whatever still falls
+# through to `_dispatch_unimplemented`, exactly as "/start" already did in 3c.1 despite never
+# reaching that fallback itself).
 _POST_OPS = {"/start": "start", "/respond": "respond", "/stop": "stop", "/restart": "restart"}
-_GET_OPS = {"/screen": "screen", "/dialog": "dialog", "/status": "status", "/wait": "wait"}
+_GET_OPS = {"/screen": "screen", "/dialog": "dialog", "/status": "status", "/wait": "wait",
+           "/capabilities": "capabilities", "/generation_list": "generation_list"}
+
+
+def _one(qs, key):
+    """The single value of `key` in a parsed query dict, or None if absent. Present-but-empty
+    (`key=`) is returned as `""`, not None — the session-keyed forward layer's own validators (not
+    this dispatch layer) decide whether an empty value is acceptable."""
+    vals = qs.get(key)
+    return vals[0] if vals else None
 
 
 def _operation_for(method, path):
@@ -73,6 +94,12 @@ class _PreboundUnixHTTPServer(ThreadingHTTPServer):
 
 
 def make_router_server(bound_socket, sock_path, start_path, registry, router_epoch):
+    # Constructed here (not threaded through the signature) so every existing caller of
+    # make_router_server keeps working unchanged — both take only `registry` (+ router_epoch),
+    # already parameters of this function.
+    session_forward = SessionForward(registry)
+    operator_routes = OperatorRoutes(registry, router_epoch)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -162,6 +189,12 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             if path == "/start":
                 self._handle_start(raw)
                 return
+            if path.startswith("/hook/") or path.startswith("/message/"):
+                self._handle_secret_forward(path, raw)
+                return
+            if path in ("/respond", "/stop", "/restart"):
+                self._handle_session_post(path, raw)
+                return
             self._dispatch_unimplemented("POST", path)
 
         def do_GET(self):
@@ -174,6 +207,22 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             if path == "/health":
                 self._handle_router_health()
                 return
+            if path == "/capabilities":
+                self._handle_capabilities()
+                return
+            if path == "/generation_list":
+                self._handle_generation_list()
+                return
+            if path in ("/screen", "/dialog"):
+                self._handle_session_get(path)
+                return
+            if path == "/status":
+                qs = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                if _one(qs, "session_id"):
+                    self._handle_session_get(path)
+                    return
+                # No session_id: the fan-out BOARD read is 3c.3 -- fall through to the honest
+                # unimplemented 404 below (still correctly classified fan-out by routing.classify).
             self._dispatch_unimplemented("GET", path)
 
         def _handle_start(self, raw):
@@ -186,6 +235,76 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                 self._send(http_status(err.code), err.to_envelope())
                 return
             status, resp = start_path.handle(body)
+            self._send(status, resp)
+
+        def _handle_session_get(self, path):
+            # SESSION-KEYED owner routes (GET half): session_id/owner_id/every other field is a raw
+            # PASSTHROUGH straight from the query string -- this dispatch layer does not type-check
+            # offset/limit/raw/force/include_progress; the generation already validates those (the
+            # router forwarding a bad one and relaying the generation's own 400 is exactly the
+            # "relay faithfully, never reinterpret" contract session_forward documents).
+            qs = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            owner_id = _one(qs, "owner_id")
+            session_id = _one(qs, "session_id")
+            if path == "/status":
+                status, resp = session_forward.status(
+                    owner_id, session_id, include_progress=_one(qs, "include_progress"))
+            elif path == "/dialog":
+                status, resp = session_forward.dialog(
+                    owner_id, session_id, offset=_one(qs, "offset"), limit=_one(qs, "limit"))
+            else:                                          # /screen
+                status, resp = session_forward.screen(
+                    owner_id, session_id, raw=_one(qs, "raw"), force=_one(qs, "force"))
+            self._send(status, resp)
+
+        def _handle_session_post(self, path, raw):
+            # SESSION-KEYED owner routes (POST half): respond/stop/restart. owner_id is the
+            # CALLER's own, validated for SHAPE only and then forwarded UNCHANGED (spec §7) — the
+            # generation is the only party that decides ownership; a NelixError from
+            # session_forward (bad shape, or a forward-machinery failure) propagates to _guarded,
+            # which maps it to its stable envelope. A successful forward's (status, body) is sent
+            # back exactly as the generation answered it, including its own ownership verdict.
+            try:
+                body = json.loads(raw or b"{}")
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                raise NelixError(INVALID_REQUEST, f"{path} body must be a JSON object")
+            owner_id = body.get("owner_id")
+            session_id = body.get("session_id")
+            if path == "/respond":
+                if "answer" not in body:
+                    # A truly-absent "answer" must be its own clean 400, not a fabricated JSON
+                    # null forwarded in its place — the daemon's own `body["answer"]` would accept
+                    # a present-but-null value (only a MISSING key raises), which would silently
+                    # mask the caller's mistake behind whatever the daemon does with a null answer.
+                    raise NelixError(INVALID_REQUEST, "missing field: 'answer'")
+                status, resp = session_forward.respond(
+                    owner_id, session_id, body["answer"], decision_id=body.get("decision_id"))
+            elif path == "/stop":
+                status, resp = session_forward.stop(owner_id, session_id)
+            else:                                          # /restart
+                status, resp = session_forward.restart(owner_id, session_id,
+                                                        force=body.get("force"))
+            self._send(status, resp)
+
+        def _handle_secret_forward(self, path, raw):
+            # The owner-EXEMPT executor plane (spec §7): /hook/<sid>, /message/<sid>. NO owner_id
+            # anywhere -- authenticated purely by the per-session secret HEADER, passed through
+            # unchanged, alongside the RAW body (never parsed/re-serialized by the router).
+            headers = {"X-Nelix-Hook-Secret": self.headers.get("X-Nelix-Hook-Secret", "")}
+            content_type = self.headers.get("Content-Type")
+            if content_type:
+                headers["Content-Type"] = content_type
+            status, resp = session_forward.forward_secret("POST", path, headers, raw)
+            self._send(status, resp)
+
+        def _handle_capabilities(self):
+            status, resp = operator_routes.capabilities()
+            self._send(status, resp)
+
+        def _handle_generation_list(self):
+            status, resp = operator_routes.generation_list()
             self._send(status, resp)
 
         def _handle_router_health(self):
@@ -201,18 +320,30 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                              "active_generation": active})
 
         def _dispatch_unimplemented(self, method, path):
+            # Every ad-hoc 404 below is still the STABLE envelope ({error:{code,message,retryable}})
+            # — a client relying on that contract must not misclassify an unimplemented route.
+            # INVALID_REQUEST is the closest existing code: none of the others fit "operation not
+            # (yet) supported by this router" (UNSUPPORTED_BY_GENERATION is spec §8's CROSS-
+            # GENERATION incompatibility — a genuinely different case daemon/manager.py's
+            # _session_capabilities already documents NOT fabricating for an unrelated meaning; the
+            # same reasoning applies here). The 404 HTTP status and human message (naming that the
+            # board/wait arrive in 3c.3) are unchanged — only the body gains a real code+retryable.
             op = _operation_for(method, path)
             if op is None:
-                self._send(404, {"error": {"message": f"no such route: {method} {path}"}})
+                err = NelixError(INVALID_REQUEST, f"no such route: {method} {path}")
+                self._send(404, err.to_envelope())
                 return
             try:
                 cls = routing.classify(op)
             except routing.UnknownOperation:
-                self._send(404, {"error": {"message": f"unknown operation: {op}"}})
+                err = NelixError(INVALID_REQUEST, f"unknown operation: {op}")
+                self._send(404, err.to_envelope())
                 return
-            self._send(404, {"error": {
-                "operation": op, "class": cls,
-                "message": f"operation {op!r} (class {cls}) is not implemented in this router "
-                           f"slice (3c.1); session-keyed/fan-out/operator routes arrive in 3c.2"}})
+            err = NelixError(
+                INVALID_REQUEST,
+                f"operation {op!r} (class {cls}) is not implemented in this router "
+                f"yet; the fan-out board (/status with no session_id) and /wait "
+                f"arrive in 3c.3")
+            self._send(404, err.to_envelope())
 
     return _PreboundUnixHTTPServer(bound_socket, sock_path, Handler)
