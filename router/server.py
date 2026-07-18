@@ -335,8 +335,7 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             # propagates to _guarded, which maps it to its stable envelope.
             qs = parse_qs(urlparse(self.path).query, keep_blank_values=True)
             status, resp = wait_forward.wait(
-                _one(qs, "owner_id"), _one(qs, "orchestration_id"), _one(qs, "cursor"),
-                timeout=_one(qs, "timeout"))
+                _one(qs, "owner_id"), _one(qs, "orchestration_id"), _one(qs, "cursor"))
             self._send(status, resp)
 
         def _handle_capabilities(self):
