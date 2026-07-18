@@ -1,10 +1,11 @@
-"""nelix-3rm slice 3c.1 Part D (+ 3c.2): the router HTTP server — a ThreadingHTTPServer on the
-securely-bound router socket, unix peercred auth (peer_is_self), dispatch by routing.classify.
-3c.1 implemented POST /start (ACTIVE_GENERATION) + a router GET /health. 3c.2 adds the
+"""nelix-3rm slice 3c.1 Part D (+ 3c.2, 3c.3a): the router HTTP server — a ThreadingHTTPServer on
+the securely-bound router socket, unix peercred auth (peer_is_self), dispatch by routing.classify.
+3c.1 implemented POST /start (ACTIVE_GENERATION) + a router GET /health. 3c.2 added the
 SESSION-KEYED owner routes (respond/stop/restart/screen/dialog/session-scoped status), the
 owner-EXEMPT executor plane (/hook/<sid>, /message/<sid>), and the router-local OPERATOR routes
-(capabilities, generation_list). The fan-out BOARD (/status with no session_id) and /wait remain
-honest 404s — that is 3c.3, not this slice.
+(capabilities, generation_list). 3c.3a (this slice) adds the fan-out BOARD read: GET /status with
+NO session_id, merged across generations (router/board.py) with an attached vector cursor. /wait
+remains an honest 404 -- that is 3c.3b, not this slice.
 
 The server is exercised over its REAL securely-established AF_UNIX socket (runtime_dir.establish())
 via a same-uid client — which is exactly the peercred allow path."""
@@ -15,6 +16,7 @@ import threading
 import pytest
 
 import paths
+from nelix_contracts.cursor import decode
 from nelix_contracts.errors import GENERATION_UNAVAILABLE, NelixError
 from nelix_store.ledger import StartLedger
 from router import runtime_dir as rd
@@ -164,14 +166,59 @@ def test_start_routes_through_the_active_generation(wired):
     assert h["active_generation"]["epoch"] == body["generation_id"]
 
 
-def test_fan_out_route_404s_until_3c3(wired):
-    # /status with NO session_id is the fan-out BOARD read (3c.3): still honestly unimplemented --
-    # but the 404 must still be the STABLE envelope (code + retryable), not an ad-hoc body.
+def test_board_status_returns_the_started_session_and_a_decodable_cursor(wired):
+    # /status with NO session_id is the fan-out BOARD read (3c.3a): 200, with the started
+    # session merged in and an opaque vector cursor whose one (N=1) component is keyed on this
+    # generation's STABLE slot_id, valued (epoch, int cursor) -- fix-pass finding #1.
+    _, start_body = wired.client()._call(
+        "POST", "/start", {"executor": EXECUTOR, "task": "go", "cwd": "/repo",
+                           "owner_id": OWNER, "idempotency_key": "k-board-1"})
+    sid = start_body["session_id"]
+    wired.backend.board_cursor = 9
     st, body = wired.client()._call("GET", f"/status?owner_id={OWNER}")
-    assert st == 404
+    assert st == 200
+    assert sid in body["sessions"]
+    assert body["board_incomplete"] is False
+    cursor = decode(body["cursor"], router_epoch=wired.epoch,
+                    topology_revision=wired.registry.topology_revision())
+    gen_epoch = start_body["generation_id"]
+    slot_id = wired.registry.generations()[0].slot_id
+    assert cursor.position_for(slot_id) == (gen_epoch, 9)
+
+
+def test_board_status_malformed_generation_reply_is_incomplete_not_a_hard_error(wired):
+    # fix-pass finding #2, exercised through the REAL HTTP server: a 200-but-malformed generation
+    # reply must never surface as a 400/500 for the whole board -- it is recorded in
+    # board_incomplete, same as an unreachable generation.
+    wired.client()._call(
+        "POST", "/start", {"executor": EXECUTOR, "task": "go", "cwd": "/repo",
+                           "owner_id": OWNER, "idempotency_key": "k-board-malformed"})
+    wired.backend.board_cursor = -1
+    st, body = wired.client()._call("GET", f"/status?owner_id={OWNER}")
+    assert st == 200
+    assert body["board_incomplete"] is not False
+    assert body["sessions"] == {}
+
+
+def test_board_status_owner_filtering_survives_the_router_merge(wired):
+    # The daemon filters; the router must relay that faithfully, never un-filter it on merge.
+    _, x_body = wired.client()._call(
+        "POST", "/start", {"executor": EXECUTOR, "task": "go", "cwd": "/repo",
+                           "owner_id": OWNER, "idempotency_key": "k-board-x"})
+    other_client = RpcClient(Transport.unix(wired.handle.sock_path), OTHER_OWNER)
+    _, y_body = other_client._call(
+        "POST", "/start", {"executor": EXECUTOR, "task": "go", "cwd": "/repo",
+                           "owner_id": OTHER_OWNER, "idempotency_key": "k-board-y"})
+    st, body = wired.client()._call("GET", f"/status?owner_id={OWNER}")
+    assert st == 200
+    assert x_body["session_id"] in body["sessions"]
+    assert y_body["session_id"] not in body["sessions"]
+
+
+def test_board_status_bad_owner_id_shape_is_a_clean_400(wired):
+    st, body = wired.client()._call("GET", "/status?owner_id=has%20space")
+    assert st == 400
     assert body["error"]["code"] == "invalid_request"
-    assert body["error"]["retryable"] is False
-    assert "3c.3" in body["error"]["message"]
 
 
 def test_wait_route_404s_until_3c3(wired):

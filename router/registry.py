@@ -6,12 +6,20 @@ add generations without reshaping this — nothing hard-codes "one generation" i
 must tear out.
 
 Per generation it tracks:
+  * `slot_id` — a STABLE per-slot `g-<32hex>` id (`new_generation_id()`), minted ONCE by the
+    registry itself (analogous to how the router mints its own `router_epoch` once per process —
+    see `router/app.py`) and reused for every incarnation this registry's one slot ever observes. It
+    SURVIVES a daemon restart (unlike `epoch` below): it identifies the registry's generation SLOT,
+    not any one incarnation of a daemon occupying it. This is the vector cursor's `generation_id`
+    map KEY (`nelix_contracts.cursor`, `router/board.py`) — a caller's prior cursor position for
+    this slot must not be orphaned by a daemon restart (nelix-3rm 3c.3a fix-pass finding #1).
   * `epoch` — a per-INCARNATION `generation_epoch` MINTED by the router (`new_generation_id()`, a
     g-<32hex> id — the exact shape the StartLedger stores and validates). The epoch is what
     assign_generation/commit bind a reservation to; keyed on the daemon's INCARNATION so a daemon
     RESTART yields a NEW epoch (spec §4: "a fresh generation epoch is minted on EVERY incarnation").
     The daemon's own /health carries no incarnation id yet (that addition is a later slice), so the
-    incarnation is keyed on supervisor identity — (pid, start_fingerprint).
+    incarnation is keyed on supervisor identity — (pid, start_fingerprint). Carried as the vector
+    cursor's per-generation VALUE (paired with the seq), never its map key.
   * `transport` — the live daemon Transport. It is read TOGETHER with the incarnation UNDER THE
     LOCK from the AUTHORITATIVE lock holder (supervisor.held_generation()), so the epoch minted for
     an incarnation is never paired with a DIFFERENT incarnation's transport, and a snapshot captured
@@ -39,9 +47,12 @@ PROBE_OWNER = "nelix-router-probe"
 
 @dataclass(frozen=True)
 class GenerationHandle:
-    """A snapshot of one tracked generation. `epoch` is the router's per-incarnation id (the ledger
-    key); `transport` reaches the backend; `build_id` is the daemon's self-reported identity (or
-    None); `incarnation` is the supervisor identity the epoch is keyed on."""
+    """A snapshot of one tracked generation. `slot_id` is the registry's STABLE per-slot id — minted
+    once, survives a daemon restart, and is what the vector cursor keys on. `epoch` is the router's
+    per-incarnation id (the ledger key; fresh on every restart). `transport` reaches the backend;
+    `build_id` is the daemon's self-reported identity (or None); `incarnation` is the supervisor
+    identity the epoch is keyed on."""
+    slot_id: str
     epoch: str
     transport: object
     build_id: "str | None"
@@ -72,10 +83,23 @@ class GenerationRegistry:
         self._sup = supervisor
         self._probe = health_probe
         self._lock = threading.Lock()
+        # nelix-3rm 3c.3a fix-pass finding #1: the registry's ONE slot's STABLE id, minted exactly
+        # once for the lifetime of this registry (analogous to router_epoch being minted once per
+        # router process) -- it identifies the SLOT, never any one incarnation occupying it, so it
+        # survives every daemon restart this registry ever observes.
+        self._slot_id = new_generation_id()
         # The active-generation pointer, N=1: {"incarnation", "epoch", "build_id", "transport"} or
         # None before anything is observed. A dict, not the frozen handle, so the transport can be
         # refreshed in place while the epoch/build_id stay pinned to the incarnation.
         self._active = None
+        # nelix-3rm 3c.3a: the vector cursor's topology component (nelix_contracts.cursor). N=1
+        # today: the registry has exactly one slot and never adds/removes one, so this starts at a
+        # fixed 1 and never moves yet -- but it is REAL mutable state (never a literal baked into a
+        # cursor caller), so Plan 4's generation-add/remove surface has something to increment
+        # under `self._lock` when the SET of tracked generations changes. A daemon restart mints a
+        # fresh per-incarnation `epoch` (see `active()`) but is NOT a topology change -- the slot
+        # count never moved -- so it must never bump this.
+        self._topology_revision = 1
 
     def active(self) -> GenerationHandle:
         """Return the active generation, ensuring a backend is available. Raises
@@ -132,17 +156,56 @@ class GenerationRegistry:
                 if self._active is not None and self._active["incarnation"] == inc:
                     build_id = self._active["build_id"]
         # Pin the returned handle to the (epoch, transport, incarnation) validated together above.
-        return GenerationHandle(epoch=epoch, transport=transport, build_id=build_id, incarnation=inc)
+        # slot_id is the registry's one stable slot id -- never re-minted, never per-incarnation.
+        return GenerationHandle(slot_id=self._slot_id, epoch=epoch, transport=transport,
+                                build_id=build_id, incarnation=inc)
 
-    def generations(self) -> list:
-        """The registry as a LIST (N=1 today): the active-generation pointer, or []. List-shaped so
-        3c.2/Plan 4 can return N generations without reshaping this interface."""
+    def topology_revision(self) -> int:
+        """The vector cursor's topology component (nelix_contracts.cursor.new_cursor): bumped only
+        when a generation is added to or removed from the registry (Plan 4). N=1 today, so this is
+        a fixed 1 -- never a daemon-incarnation restart, which changes `epoch`, not the topology."""
         with self._lock:
+            return self._topology_revision
+
+    def generations(self, *, discover=False) -> list:
+        """The registry as a LIST (N=1 today): the active-generation pointer, or []. List-shaped so
+        3c.2/Plan 4 can return N generations without reshaping this interface.
+
+        `discover=True` (nelix-3rm 3c.3a fix-pass finding #3 -- used ONLY by the fan-out board read,
+        `router/board.py`): if nothing has been observed YET (`_active is None`), take one
+        NON-SPAWNING discovery probe (`_discover_locked`, under the same lock `active()` uses)
+        before answering `[]`. A router restart empties this registry but kills no daemon, so an
+        unconditional `[]` would report an honestly-empty BOARD while a daemon already holds the
+        singleton lock and serves live sessions the board must not hide. Only when that probe also
+        finds nothing running is the board genuinely empty.
+
+        The default (`discover=False` -- /health, /capabilities, /generation_list, unchanged) never
+        takes this probe: those routes answer strictly from what this registry has already observed,
+        exactly as before this fix-pass; widening THEIR contract is not this fix."""
+        with self._lock:
+            if self._active is None and discover:
+                self._discover_locked()
             return [] if self._active is None else [self._handle(self._active)]
 
-    @staticmethod
-    def _handle(a) -> GenerationHandle:
-        return GenerationHandle(epoch=a["epoch"], transport=a["transport"],
+    def _discover_locked(self):
+        """Must be called with `self._lock` held, and only when `self._active is None`. A single
+        NON-SPAWNING probe of the CURRENT singleton-lock holder (`supervisor.held_generation()` — the
+        same cheap lock-file read + pid-liveness `active()` uses UNDER ITS OWN LOCK; no /health RPC, no
+        spawn). If a daemon currently holds the lock, install it as the active generation — minting its
+        epoch under THIS SAME lock, so a concurrent `active()` call observing the identical incarnation
+        never mints a second, racing epoch for it (the same one-epoch-per-incarnation invariant
+        `active()` itself upholds). `slot_id` is never re-minted here: it is this registry's one
+        already-existing stable slot id. If no daemon holds the lock, leave `_active` as None — the
+        board really is empty, nothing to discover."""
+        snap = self._sup.held_generation()
+        if snap is None:
+            return
+        transport, inc = snap
+        self._active = {"incarnation": inc, "epoch": new_generation_id(), "transport": transport,
+                        "build_id": None, "build_id_probed": False}
+
+    def _handle(self, a) -> GenerationHandle:
+        return GenerationHandle(slot_id=self._slot_id, epoch=a["epoch"], transport=a["transport"],
                                 build_id=a["build_id"], incarnation=a["incarnation"])
 
     def _ensure_available(self):

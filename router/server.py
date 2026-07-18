@@ -17,8 +17,12 @@ what keeps the router stable (spec §1). 3c.1 implemented POST /start (ACTIVE_GE
     never owner-gated.
   * The router-LOCAL operator routes — GET /capabilities, /generation_list — answered by
     OperatorRoutes from the registry / the one active generation, never fanned out.
-The fan-out BOARD (/status with NO session_id) and /wait remain honest 404s — that is 3c.3, not
-this slice. An unimplemented-yet route is honest, not dead code.
+3c.3a (this slice) adds:
+  * The fan-out BOARD read — GET /status with NO session_id — merged across every tracked
+    generation (N=1 today) by BoardForward, with an attached opaque vector cursor
+    (nelix_contracts.cursor). See router/board.py for the merge + cursor construction.
+/wait remains an honest 404 — that is 3c.3b, not this slice. An unimplemented-yet route is honest,
+not dead code.
 """
 import json
 import socket
@@ -30,6 +34,7 @@ from nelix_contracts import routing
 from nelix_contracts.errors import INTERNAL_ERROR, INVALID_REQUEST, OWNER_MISMATCH, NelixError
 
 from daemon.transport import peer_is_self
+from router.board import BoardForward
 from router.operator import OperatorRoutes
 from router.session_forward import SessionForward
 from router.start import http_status
@@ -99,6 +104,7 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
     # already parameters of this function.
     session_forward = SessionForward(registry)
     operator_routes = OperatorRoutes(registry, router_epoch)
+    board_forward = BoardForward(registry, router_epoch)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -221,8 +227,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                 if _one(qs, "session_id"):
                     self._handle_session_get(path)
                     return
-                # No session_id: the fan-out BOARD read is 3c.3 -- fall through to the honest
-                # unimplemented 404 below (still correctly classified fan-out by routing.classify).
+                # No session_id: the fan-out BOARD read (3c.3a).
+                self._handle_board(qs)
+                return
             self._dispatch_unimplemented("GET", path)
 
         def _handle_start(self, raw):
@@ -255,6 +262,14 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             else:                                          # /screen
                 status, resp = session_forward.screen(
                     owner_id, session_id, raw=_one(qs, "raw"), force=_one(qs, "force"))
+            self._send(status, resp)
+
+        def _handle_board(self, qs):
+            # The fan-out BOARD read (3c.3a): GET /status with no session_id. owner_id is a raw
+            # passthrough from the query string -- BoardForward validates its shape (same as every
+            # owner-scoped route) and answers 200 with the merged board + vector cursor even when a
+            # generation is unavailable (board_incomplete, never a hard error; see router/board.py).
+            status, resp = board_forward.status(_one(qs, "owner_id"))
             self._send(status, resp)
 
         def _handle_session_post(self, path, raw):

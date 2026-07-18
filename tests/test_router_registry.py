@@ -142,6 +142,28 @@ def test_build_id_may_be_null_in_dev():
     assert gen.build_id is None
 
 
+def test_topology_revision_starts_at_a_fixed_value():
+    # nelix-3rm 3c.3a: N=1 today, so the registry has never added/removed a generation -- the
+    # counter starts at a fixed value and the machinery (this getter) is what Plan 4 bumps when
+    # a generation is added or removed, never a hardcoded literal baked into the cursor caller.
+    reg = _reg(FakeSupervisor())
+    assert reg.topology_revision() == 1
+
+
+def test_topology_revision_is_unaffected_by_observing_or_restarting_a_generation():
+    # A daemon RESTART mints a fresh per-incarnation epoch (test above), but that is not a
+    # TOPOLOGY change -- the set of tracked generations (still just the one slot) never moved, so
+    # topology_revision must not move either. Only Plan 4's add/remove-generation surface may
+    # bump it.
+    sup = FakeSupervisor(inc={"pid": 100, "start_fingerprint": "fp-1"})
+    reg = _reg(sup)
+    before = reg.topology_revision()
+    reg.active()
+    sup.inc = {"pid": 200, "start_fingerprint": "fp-2"}      # daemon restarted: new incarnation
+    reg.active()
+    assert reg.topology_revision() == before
+
+
 def test_registry_is_list_shaped_n_equals_one():
     reg = _reg(FakeSupervisor())
     assert reg.generations() == []                         # nothing observed yet
@@ -277,3 +299,113 @@ def test_lock_holder_is_authoritative_over_a_rolled_back_active_json():
     assert g_again.epoch == g_b.epoch                       # exactly ONE epoch for B; A minted none
     gens = reg.generations()
     assert len(gens) == 1 and gens[0].incarnation == inc_b  # active pointer still B
+
+
+# ================================================= nelix-3rm 3c.3a fix-pass finding #1: slot_id
+
+def test_slot_id_is_stable_across_a_restart_while_epoch_is_not():
+    # The cursor's map KEY must be the STABLE slot id, not the volatile per-incarnation epoch --
+    # a daemon restart must never orphan a caller's prior cursor position for this generation.
+    sup = FakeSupervisor(inc={"pid": 100, "start_fingerprint": "fp-1"})
+    reg = _reg(sup)
+    first = reg.active()
+    sup.inc = {"pid": 200, "start_fingerprint": "fp-2"}     # daemon restarted: new incarnation
+    second = reg.active()
+    assert first.epoch != second.epoch                     # epoch: per-incarnation, as before
+    assert first.slot_id == second.slot_id                  # slot_id: stable across the restart
+    assert _EPOCH_RE.match(first.slot_id)                   # same g-<32hex> shape as epoch
+
+
+def test_slot_id_is_stable_across_repeated_observations_of_the_same_incarnation():
+    reg = _reg(FakeSupervisor())
+    assert reg.active().slot_id == reg.active().slot_id
+
+
+def test_slot_id_is_never_the_nullable_build_id():
+    # The fix explicitly forbids reusing build_id (nullable, and not validate_generation_id-shaped
+    # in dev where the health probe reports None) as the cursor's stable key.
+    gen = GenerationRegistry(supervisor=FakeSupervisor(), health_probe=lambda t: None).active()
+    assert gen.build_id is None
+    assert gen.slot_id is not None
+    assert _EPOCH_RE.match(gen.slot_id)
+
+
+def test_generations_reports_the_same_slot_id_as_active():
+    sup = FakeSupervisor()
+    reg = _reg(sup)
+    pinned = reg.active()
+    listed = reg.generations()[0]
+    assert listed.slot_id == pinned.slot_id
+
+
+# ============================================ nelix-3rm 3c.3a fix-pass finding #3: discovery
+
+def test_generations_default_never_discovers_a_daemon_it_has_not_observed():
+    # The default (discover=False -- /health, /capabilities, /generation_list) is UNCHANGED by this
+    # fix-pass: an empty registry stays honestly [] unless a caller explicitly opts into discovery.
+    sup = FakeSupervisor()                                  # held_generation() would report a live one
+    reg = _reg(sup)
+    assert reg.generations() == []
+
+
+def test_generations_discover_true_discovers_a_currently_held_incarnation_when_empty():
+    # nelix-3rm 3c.3a fix-pass finding #3: a router restart empties the registry but kills no
+    # daemon -- discover=True finds the daemon already holding the singleton lock via the same
+    # non-spawning held_generation() read active() uses under its own lock.
+    sup = FakeSupervisor()                                  # recorded=True: a daemon IS currently held
+    reg = _reg(sup)
+    gens = reg.generations(discover=True)
+    assert len(gens) == 1
+    g = gens[0]
+    assert g.incarnation == sup.inc
+    assert g.transport == sup.transport
+    assert _EPOCH_RE.match(g.epoch)
+    assert _EPOCH_RE.match(g.slot_id)
+
+
+def test_generations_discover_true_is_honestly_empty_when_no_daemon_is_held():
+    sup = FakeSupervisor()
+    sup.recorded = False                                    # no live incarnation to discover
+    reg = _reg(sup)
+    assert reg.generations(discover=True) == []
+
+
+def test_generations_discover_true_never_calls_the_spawning_ensure_path():
+    class _BoomIfSpawned:
+        def __init__(self, transport, inc):
+            self._t, self._inc = transport, inc
+
+        def held_generation(self):
+            return (self._t, self._inc)
+
+        def active_generation(self):
+            raise AssertionError("discovery must never take the spawning ensure path")
+
+        def ensure_running(self):
+            raise AssertionError("discovery must never spawn a generation")
+
+    sup = _BoomIfSpawned(Transport.unix("/tmp/discover.sock"),
+                         {"pid": 9, "start_fingerprint": "fp-9"})
+    reg = GenerationRegistry(supervisor=sup, health_probe=lambda t: None)
+    gens = reg.generations(discover=True)
+    assert len(gens) == 1 and gens[0].incarnation == sup._inc
+
+
+def test_generations_discover_true_installs_the_same_epoch_and_slot_id_active_then_returns():
+    # Discovery must mint exactly ONE epoch for the discovered incarnation: a subsequent active()
+    # call for the SAME incarnation must reuse it, never mint a second, racing one.
+    sup = FakeSupervisor()
+    reg = _reg(sup)
+    discovered = reg.generations(discover=True)[0]
+    pinned = reg.active()
+    assert discovered.epoch == pinned.epoch
+    assert discovered.slot_id == pinned.slot_id
+    assert discovered.incarnation == pinned.incarnation
+
+
+def test_generations_discover_true_is_idempotent_across_repeated_calls():
+    sup = FakeSupervisor()
+    reg = _reg(sup)
+    first = reg.generations(discover=True)[0]
+    second = reg.generations(discover=True)[0]
+    assert first.epoch == second.epoch and first.slot_id == second.slot_id
