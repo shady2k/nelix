@@ -165,7 +165,11 @@ class LocalLauncher:
         # --settings hook config into argv and the NELIX_* addressing into env BEFORE the spawn.
         # Never touches the user's config; injection is skipped for hookless drivers (fallback path).
         if session_id and hook_secret and _driver_hook_capable(spec.driver):
-            inj = hook_launch(session_id, str(paths.rpc_sock()), hook_secret)
+            # Use the daemon's ACTUAL socket path — NELIX_RPC_SOCK if set (per-generation daemon),
+            # else the uid-wide default. This ensures per-generation hooks reach the per-generation
+            # daemon's socket, not the uid-wide one (Spec S1c-1 trap #5).
+            daemon_sock = os.environ.get("NELIX_RPC_SOCK") or str(paths.rpc_sock())
+            inj = hook_launch(session_id, daemon_sock, hook_secret)
             argv = _fold_hook_settings(argv, inj["argv_extra"])
             argv = _fold_system_prompt(argv, executor_message_instructions())
             env = {**env, **inj["env"]}

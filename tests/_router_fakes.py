@@ -80,7 +80,9 @@ class Backend:
                 path = urlparse(self.path).path
                 if path == "/health":
                     self._send(200, {"status": "ok", "rpc_protocol": 1,
-                                     "generation_id": backend.build_id})
+                                     "generation_id": None,
+                                     "generation_epoch": None,
+                                     "build_id": backend.build_id})
                     return
                 qs = self._qs()
                 backend.calls.append({"method": "GET", "path": self.path, "query": qs})

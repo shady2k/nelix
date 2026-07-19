@@ -290,6 +290,112 @@ def daemon_latest() -> Path:
 # Per-spawn files only. Two wildcards ⇒ never matches single-dash daemon-latest.log.
 DAEMON_LOG_GLOB = "daemon-*-*.log"
 
+# Per-generation log glob (only daemon spawn logs, never latest-pointers or other files).
+GENERATION_LOG_GLOB = "gen-*-*-*.log"
+
+
+def _validate_generation_id(generation_id: str) -> None:
+    """Validate generation_id shape BEFORE building any path component from it. A ``..`` or
+    ``/`` in an unvalidated id is a path-traversal attack. Imported lazily so paths.py stays
+    import-safe (stdlib only, no project imports) — this function is only called from
+    functions that already do a project import.
+    """
+    from nelix_contracts.ids import validate_generation_id as _validate
+    _validate(generation_id)
+
+
+def generations_root() -> Path:
+    """Root of all per-generation state directories: ``nelix_root()/generations``."""
+    return nelix_root() / "generations"
+
+
+def generation_dir(generation_id: str) -> Path:
+    """A single generation's state directory: ``generations_root()/<generation-id>``.
+
+    The entire path, including the id, is validated: ``ensure_owned_private_dir()`` (the
+    stronger owned + non-symlink check) must be applied at the generations_root() level
+    first, then at this level — see the per-generation supervisor for that pattern.
+    """
+    _validate_generation_id(generation_id)
+    return generations_root() / generation_id
+
+
+def generation_lock(generation_id: str) -> Path:
+    """The advisory flock file inside a generation's state directory."""
+    return generation_dir(generation_id) / "daemon.lock"
+
+
+def generation_state(generation_id: str) -> Path:
+    """The per-generation .active.json equivalent inside a generation's state directory."""
+    return generation_dir(generation_id) / ".active.json"
+
+
+# The socket node name inside the per-generation runtime dir. Short and fixed-width so the
+# total path stays comfortably inside sun_path regardless of the generation id length.
+GENERATION_SOCK_NAME = "gen.sock"
+
+
+def generation_runtime_base() -> Path:
+    """Short base for per-generation socket directories, shared with the router's runtime
+    base — reuses ``NELIX_RUNTIME_BASE`` (same env var, same default ``/tmp``) so there is
+    exactly ONE place the operator configures a short path, not two separate env vars that
+    could drift. This is NOT a code-sharing cost: ``ensure_owned_private_dir`` (the stronger
+    owned + non-symlink dir check) and ``sun_path_overflow`` already exist for the router's
+    scheme and the generation supervisor uses the same functions and same base.
+    """
+    return router_runtime_base()
+
+
+def _generation_runtime_dir_from(resolved_base: Path, generation_id: str) -> Path:
+    """``<resolved_base>/nelix-<uid>/gen-<hash>/<generation_id>`` where the hash is over
+    ``str(nelix_root()) + generation_id`` — the root-hash prevents cross-root alias confusion
+    (same property as the router's ``_router_runtime_dir_from``), and appending the
+    generation id itself names the generation's socket directory so a concurrent supervisor
+    for a different generation id writes to a separate directory.
+    """
+    key = hashlib.sha256((str(nelix_root()) + generation_id).encode()).hexdigest()[:ROUTER_HASH_LEN]
+    return resolved_base / f"nelix-{os.getuid()}" / f"gen-{key}" / generation_id
+
+
+def generation_runtime_dir(generation_id: str) -> Path:
+    """Short, per-uid, per-generation runtime directory for the generation's AF_UNIX socket.
+    Follows the same hash-keyed /tmp namespace pattern as the router's runtime dir, so the
+    total socket path is bounded by the fixed-width components regardless of NELIX_HOME depth.
+
+    The caller must verify-then-build this directory with ``ensure_owned_private_dir()`` at
+    each level (parent first, then the dir), same as ``ensure_router_runtime_dir()`` does for
+    the router's runtime dir.
+    """
+    _validate_generation_id(generation_id)
+    return _generation_runtime_dir_from(generation_runtime_base().resolve(), generation_id)
+
+
+def generation_sock(generation_id: str) -> Path:
+    """AF_UNIX socket node for a per-generation daemon. Lives in the short runtime dir
+    (same scheme as ``router_sock()``) so the socket path always fits inside
+    ``sun_path`` regardless of NELIX_HOME.
+    """
+    _validate_generation_id(generation_id)
+    return generation_runtime_dir(generation_id) / GENERATION_SOCK_NAME
+
+
+# --- per-generation logs ----------------------------------------------------
+# A generation daemon writes ``gen-<generation_id>-<stamp>-<pid>.log`` in the same
+# logs directory as the uid-wide daemon. The generation_id component disambiguates
+# concurrent spawns from two generations in the same clock tick.
+
+
+def generation_log(generation_id: str, stamp: str, pid: int) -> Path:
+    """A single per-generation daemon's log file."""
+    _validate_generation_id(generation_id)
+    return logs_dir() / f"gen-{generation_id}-{stamp}-{pid}.log"
+
+
+def generation_latest(generation_id: str) -> Path:
+    """Symlink to the latest per-generation log."""
+    _validate_generation_id(generation_id)
+    return logs_dir() / f"gen-{generation_id}-latest.log"
+
 
 def ensure_private_dir(path) -> Path:
     """Create `path` (with parents) and tighten it and every ancestor down to nelix_root to

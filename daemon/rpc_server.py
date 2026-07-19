@@ -203,8 +203,14 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 # spec §8/§10: a liveness/identity probe. Deliberately NO owner_id and NO session
                 # id — every other caller-facing route needs one or both; this one must not, or a
                 # health check would need to already know a caller identity to ask "are you up".
+                # generation_id and generation_epoch come from env (None on the singleton path);
+                # build_id is the interpreter-derived build (was previously called generation_id).
+                gen_id = os.environ.get("NELIX_GENERATION_ID")
+                gen_epoch = os.environ.get("NELIX_GENERATION_EPOCH")
                 self._send(200, {"status": "ok", "rpc_protocol": RPC_PROTOCOL_VERSION,
-                                 "generation_id": generation_id()})
+                                 "generation_id": gen_id,
+                                 "generation_epoch": gen_epoch,
+                                 "build_id": generation_id()})
             elif p.path == "/wait":
                 qs = parse_qs(p.query)
                 after = self._int(qs.get("after_seq", ["0"])[0], 0)
