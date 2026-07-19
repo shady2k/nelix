@@ -6,11 +6,9 @@ import threading
 import urllib.error
 import urllib.request
 
-from tests.conftest import EXECUTOR, OWNER
+from tests.conftest import EXECUTOR, OWNER, serve
 from daemon.events import EventQueue
 from daemon.manager import SessionIdInUse, SessionIdRejected, StartOutcome
-from daemon.rpc_server import make_server
-from daemon.transport import Transport
 
 
 def _req(method, url, body=None):
@@ -52,15 +50,10 @@ class FakeManagerSessionIdInUse:
         raise SessionIdInUse(session_id)
 
 
-def _serve(manager, port):
-    srv = make_server(manager, Transport.tcp("127.0.0.1", port, "t"))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, f"http://127.0.0.1:{port}"
-
-
 def test_start_without_session_id_passes_none():
     m = FakeManager()
-    srv, base = _serve(m, 8901)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", base + "/start",
                      {"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "owner_id": OWNER})
@@ -73,7 +66,8 @@ def test_start_without_session_id_passes_none():
 
 def test_start_threads_router_assigned_session_id_to_manager():
     m = FakeManager()
-    srv, base = _serve(m, 8902)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", base + "/start",
                      {"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "owner_id": OWNER,
@@ -87,7 +81,8 @@ def test_start_threads_router_assigned_session_id_to_manager():
 
 def test_start_session_id_rejected_returns_400_envelope():
     m = FakeManagerRejectsSessionId()
-    srv, base = _serve(m, 8903)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", base + "/start",
                      {"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "owner_id": OWNER,
@@ -102,7 +97,8 @@ def test_start_session_id_rejected_returns_400_envelope():
 
 def test_start_session_id_in_use_returns_409_envelope():
     m = FakeManagerSessionIdInUse()
-    srv, base = _serve(m, 8904)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", base + "/start",
                      {"executor": EXECUTOR, "task": "hi", "cwd": "/repo", "owner_id": OWNER,

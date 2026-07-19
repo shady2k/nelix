@@ -118,10 +118,10 @@ def test_t1_restart_via_restartpath_returns_200_restarted(tmp_path):
     # Simplest approach: create a local TCP server for this test.
     from daemon.rpc_server import make_server
     import threading
-    port = 8999
-    srv = make_server(mgr, Transport.tcp("127.0.0.1", port, "tok"))
+    srv = make_server(mgr, Transport.tcp("127.0.0.1", 0, "tok"))
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
+    _, port = srv.server_address
     try:
         client = RpcClient(Transport.tcp("127.0.0.1", port, "tok"), OWNER)
         body = client.restart(old_sid, new_session_id=new_sid, force=True,

@@ -5,7 +5,7 @@ import threading
 import pytest
 
 import paths
-from tests.conftest import EXECUTOR, OWNER
+from tests.conftest import EXECUTOR, OWNER, serve
 from daemon import owner
 from daemon.events import EventQueue
 from daemon.manager import StartOutcome, StopOutcome
@@ -57,10 +57,11 @@ def unix_sock(tmp_path):
 
 def test_rpc_client_roundtrip():
     m = FakeManager()
-    srv = make_server(m, Transport.tcp("127.0.0.1", 8781, "t"))
+    srv, base = serve(m)
+    _, port = srv.server_address
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        c = RpcClient(Transport.tcp("127.0.0.1", 8781, "t"), OWNER)
+        c = RpcClient(Transport.tcp("127.0.0.1", port, "t"), OWNER)
         assert c.start(EXECUTOR, "go", "/repo")["session_id"] == "s-00000001"
         assert ("start", EXECUTOR, "go", "/repo") in m.calls
         ok, body = c.respond("s-00000001", "yes")
@@ -99,10 +100,11 @@ def test_rpc_client_dialog(monkeypatch, tmp_path):
     # session id and someone else's transcript.
     owner.write(paths.sessions_root() / "s-00000001", OWNER)
     m = FakeManagerDialog()
-    srv = make_server(m, Transport.tcp("127.0.0.1", 8782, "t"))
+    srv, base = serve(m)
+    _, port = srv.server_address
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        c = RpcClient(Transport.tcp("127.0.0.1", 8782, "t"), OWNER)
+        c = RpcClient(Transport.tcp("127.0.0.1", port, "t"), OWNER)
         # Offset-based pagination (no turn parameter)
         d = c.dialog("s-00000001", offset=42)
         assert d["text"] == "transcript@42"

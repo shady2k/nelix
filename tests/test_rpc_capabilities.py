@@ -6,11 +6,9 @@ import threading
 import urllib.error
 import urllib.request
 
-from tests.conftest import OWNER
+from tests.conftest import OWNER, serve
 from daemon.events import EventQueue
 from daemon.protocol import RPC_PROTOCOL_VERSION
-from daemon.rpc_server import make_server
-from daemon.transport import Transport
 
 
 class FakeManager:
@@ -27,12 +25,6 @@ class FakeManager:
         return self._per_session.get(session_id)   # None -> unknown/foreign, mirrors manager
 
 
-def _serve(manager, port):
-    srv = make_server(manager, Transport.tcp("127.0.0.1", port, "t"))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, f"http://127.0.0.1:{port}"
-
-
 def _get(url):
     r = urllib.request.Request(url, headers={"X-Nelix-Token": "t"})
     try:
@@ -46,7 +38,8 @@ def test_capabilities_per_session_returns_the_manager_shape_plus_protocol():
     caps = {"session_id": "s-00000001", "executor": "demo", "hook_capable": True,
             "isolation_class": "host", "can_attach": False}
     m = FakeManager(per_session={"s-00000001": caps})
-    srv, base = _serve(m, 8920)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + f"/capabilities?sid=s-00000001&owner_id={OWNER}")
         assert st == 200
@@ -63,7 +56,8 @@ def test_capabilities_unknown_sid_is_404_stable_envelope():
     # Valid-shaped (passes the wire-layer shape check) but not in the fake's per-session map — the
     # "unknown/foreign session" case, distinct from a bad-SHAPE sid (test_capabilities_bad_shape_sid...).
     m = FakeManager(per_session={})
-    srv, base = _serve(m, 8921)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + f"/capabilities?sid=s-00000099&owner_id={OWNER}")
         assert st == 404
@@ -76,7 +70,8 @@ def test_capabilities_unknown_sid_is_404_stable_envelope():
 
 def test_capabilities_requires_owner_id_same_as_status():
     m = FakeManager()
-    srv, base = _serve(m, 8922)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + "/capabilities?sid=s-00000001")           # no owner_id at all
         assert st == 400
@@ -90,7 +85,8 @@ def test_capabilities_bad_shape_sid_is_400_before_reaching_the_manager():
     # nelix-9a4.6 review finding #3/#4: a bad-shape sid must 400 with the stable envelope BEFORE
     # the manager (and any filesystem access behind it) is ever consulted.
     m = FakeManager(per_session={})
-    srv, base = _serve(m, 8926)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + f"/capabilities?sid=../../etc/passwd&owner_id={OWNER}")
         assert st == 400
@@ -106,7 +102,8 @@ def test_capabilities_empty_sid_is_400_not_the_global_payload():
     # as "sid omitted" and silently returned the 200 global baseline instead of rejecting the
     # caller's (probably-templating-bug) empty id.
     m = FakeManager(baseline={"executors": {"demo": {}}})
-    srv, base = _serve(m, 8927)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + f"/capabilities?sid=&owner_id={OWNER}")
         assert st == 400
@@ -122,7 +119,8 @@ def test_capabilities_without_sid_returns_generation_baseline():
                                        "hook_capable": True, "isolation_class": "host",
                                        "can_attach": False}}}
     m = FakeManager(baseline=baseline)
-    srv, base = _serve(m, 8923)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + f"/capabilities?owner_id={OWNER}")
         assert st == 200
@@ -136,7 +134,8 @@ def test_capabilities_without_sid_returns_generation_baseline():
 def test_capabilities_baseline_also_requires_owner_id():
     # Matches /status exactly: owner_id is required regardless of whether a session is named.
     m = FakeManager()
-    srv, base = _serve(m, 8924)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + "/capabilities")
         assert st == 400
@@ -154,7 +153,8 @@ def test_capabilities_reports_hookless_as_a_fact_not_a_fabricated_operation_code
     caps = {"session_id": "s-00000002", "executor": "demo", "hook_capable": False,
             "isolation_class": "host", "can_attach": False}
     m = FakeManager(per_session={"s-00000002": caps})
-    srv, base = _serve(m, 8925)
+    srv, base = serve(m)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + f"/capabilities?sid=s-00000002&owner_id={OWNER}")
         assert st == 200
