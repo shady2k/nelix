@@ -10,7 +10,7 @@ import pytest
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
 from daemon.config import ExecutorSpec, load_idle_retained_limit
-from conftest import OWNER, reserve_start
+from tests.conftest import OWNER, reserve_start
 
 
 class FakeSession:

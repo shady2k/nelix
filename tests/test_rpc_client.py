@@ -5,7 +5,7 @@ import threading
 import pytest
 
 import paths
-from conftest import EXECUTOR, OWNER
+from tests.conftest import EXECUTOR, OWNER
 from daemon import owner
 from daemon.events import EventQueue
 from daemon.manager import StartOutcome, StopOutcome

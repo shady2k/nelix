@@ -12,7 +12,7 @@ import pytest
 from nelix_store.store import Store
 from nelix_store.ledger import StartLedger
 
-from conftest import EXECUTOR, OWNER, make_spec, reserve_start
+from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start
 from daemon.env_resolver import EnvResolveError, resolve_env_cmds
 from daemon.events import EventQueue
 from daemon.launchers.local import LocalLauncher

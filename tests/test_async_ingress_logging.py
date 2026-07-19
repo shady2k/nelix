@@ -27,7 +27,7 @@ from daemon.messages import AsyncQuestion, ProgressNote  # noqa: E402
 from daemon.obs import Logger                   # noqa: E402
 from daemon.session import Session              # noqa: E402
 
-from test_async_question import Spec, FakeHandle  # noqa: E402
+from tests.test_async_question import Spec, FakeHandle  # noqa: E402
 
 
 def _records(buf):

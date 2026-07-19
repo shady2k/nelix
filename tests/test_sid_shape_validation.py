@@ -1,26 +1,10 @@
-"""nelix-9a4.6 review fix pass, finding #3: "/start alone shape-checked a caller-supplied
-session_id; every other route that takes one read straight past it onto
-`paths.sessions_root() / sid` (/dialog's transcript read, /restart's crashed-session disk-meta
-fallback, and the owner-gate every other route relies on)." Codex demonstrated
-`/dialog?session_id=../../x` and a traversal `/restart` reading `owner.json`/`meta.json` outside
-the sessions root.
-
-Fix: ONE shared validator (`daemon.manager.validate_session_id_shape`, the same shape `/start`
-already enforced) is now applied at the RPC layer to every route that takes a caller-supplied
-session id used as a path component: /status, /dialog, /screen, /restart, /hook/<sid>,
-/message/<sid> -- plus /capabilities (finding #4's blank-sid fix reuses the same validator).
-
-This file uses a REAL SessionManager + REAL make_server (like test_owner_isolation.py), never a
-FakeManager stand-in for the routes under test here: the claim being proved is "a bad-shape sid is
-refused BEFORE the filesystem/owner layer is ever touched", which only a real owner/manager stack
-can falsify.
-"""
+"""nelix-9a4.6 review fix pass + nelix-9a4.4 update: sid shape validation."""
 import threading
 from urllib.parse import quote
 
 import pytest
 
-from conftest import EXECUTOR, OWNER, make_spec
+from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start
 from daemon import owner
 from daemon.events import EventQueue
 from daemon.launchers.base import ExecutorCapabilities
@@ -28,12 +12,11 @@ from daemon.manager import SessionManager
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
 from daemon.transport import Transport
-from test_rpc_server import _req
+from tests.test_rpc_server import _req
 
 _PORT = iter(range(9200, 9300))
 
 TRAVERSAL = "../../etc/passwd"
-WIDE_ID = "s-" + "b" * 32          # router-assigned wide id (spec §3): must still pass everywhere
 
 
 class _StubDriver:
@@ -45,18 +28,15 @@ class _StubLauncher:
 
 
 class FakeSession:
-    """No PTY. Real disk state (owner.json etc.) still comes from the REAL manager/owner code --
-    only the process is faked, exactly as test_owner_isolation.py's FakeSession does."""
-
     def __init__(self, sid, executor, *a, **k):
         self.sid = sid
         self.executor = executor
         self.task = self.cwd = None
         self.hook_secret = f"secret-{sid}"
         self.on_terminal = None
-        self.dialog = None                    # /dialog's live-session fallback checks this
-        self._driver = _StubDriver()          # /capabilities reads hook_capable off this
-        self._launcher = _StubLauncher()       # /capabilities reads .capabilities off this
+        self.dialog = None
+        self._driver = _StubDriver()
+        self._launcher = _StubLauncher()
 
     def start(self, task, cwd):
         self.task, self.cwd = task, cwd
@@ -78,15 +58,13 @@ class FakeSession:
         pass
 
     def respond(self, answer, decision_id=None):
-        # /respond's non-idle, no-pending-async fall-through (manager.respond) lands here for this
-        # double -- enough to prove the shape check let a VALID sid reach the manager at all,
-        # which is the only thing this file cares about for /respond.
         return RespondOutcome("resumed", seq=1, decision_id=decision_id,
                               answered_decision_id=decision_id, snapshot=self.snapshot())
 
 
 @pytest.fixture
-def daemon():
+def daemon(store_and_ledger):
+    store, ledger = store_and_ledger
     made = {}
 
     def session_factory(sid, executor, spec, events):
@@ -94,21 +72,20 @@ def daemon():
         made[sid] = s
         return s
 
-    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(),
+    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), store,
                          session_factory=session_factory, concurrency_limit=10)
     port = next(_PORT)
     srv = make_server(mgr, Transport.tcp("127.0.0.1", port, "t"))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        yield f"http://127.0.0.1:{port}", mgr, made
+        yield f"http://127.0.0.1:{port}", mgr, made, ledger
     finally:
         srv.shutdown()
 
 
-def _start(base, tmp_path, session_id=None):
-    body = {"executor": EXECUTOR, "task": "t", "cwd": str(tmp_path), "owner_id": OWNER}
-    if session_id is not None:
-        body["session_id"] = session_id
+def _start(base, tmp_path, session_id):
+    body = {"executor": EXECUTOR, "task": "t", "cwd": str(tmp_path), "owner_id": OWNER,
+            "session_id": session_id}
     st, b = _req("POST", base + "/start", body=body)
     assert st == 200, b
     return b["session_id"]
@@ -124,7 +101,7 @@ def _start(base, tmp_path, session_id=None):
     lambda base, sid: _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id={sid}"),
 ], ids=["status", "dialog", "screen", "capabilities", "wait"])
 def test_traversal_sid_is_400_and_never_reaches_the_owner_check(daemon, monkeypatch, make_req):
-    base, mgr, made = daemon
+    base, mgr, made, ledger = daemon
 
     def boom(*a, **k):
         raise AssertionError("owner.owns_session must never be called for a bad-shape sid")
@@ -136,8 +113,6 @@ def test_traversal_sid_is_400_and_never_reaches_the_owner_check(daemon, monkeypa
     assert b["error"]["retryable"] is False
     assert "message" in b["error"]
 
-
-# ---- follow-up review pass: /wait, /respond, /stop were missed by the sweep above -----------
 
 BAD_SHAPES = [TRAVERSAL, "s-BADUPPER", "s-deadbeef\n"]
 
@@ -152,20 +127,10 @@ BAD_SHAPES = [TRAVERSAL, "s-BADUPPER", "s-deadbeef\n"]
 @pytest.mark.parametrize("bad_sid", BAD_SHAPES, ids=["traversal", "upper", "trailing_newline"])
 def test_wait_respond_stop_bad_shape_sid_is_400_and_never_reaches_the_owner_check(
         daemon, monkeypatch, make_req, bad_sid):
-    """A re-review found /wait (sid from the query string), /respond and /stop (sid from the JSON
-    body) still funneled a caller-supplied sid straight into owner.owns_session ->
-    paths.sessions_root() / sid, unvalidated -- the same class of gap the original pass (finding
-    #3, see test_traversal_sid_is_400_and_never_reaches_the_owner_check above) fixed for /status,
-    /dialog, /screen, /restart, /hook, /message and /capabilities, just on three routes that sweep
-    missed. Covers the traversal Codex demonstrated, an uppercase id (outside the accepted
-    alphabet), and a trailing newline (the exact `.fullmatch()` vs `.match(r"...$")` gap
-    `validate_session_id_shape`'s docstring calls out)."""
-    base, mgr, made = daemon
-
+    base, mgr, made, ledger = daemon
     def boom(*a, **k):
         raise AssertionError("owner.owns_session must never be called for a bad-shape sid")
     monkeypatch.setattr(owner, "owns_session", boom)
-
     st, b = make_req(base, bad_sid)
     assert st == 400, (st, b)
     assert b["error"]["code"] == "invalid_session_id"
@@ -173,29 +138,23 @@ def test_wait_respond_stop_bad_shape_sid_is_400_and_never_reaches_the_owner_chec
 
 
 def test_dialog_traversal_sid_performs_no_out_of_root_read(daemon, monkeypatch):
-    # The concrete Codex exploit: /dialog?session_id=../../x reading ../../x/owner.json +
-    # transcript.jsonl. DialogReader must never even be constructed for a bad-shape sid.
-    base, mgr, made = daemon
-
+    base, mgr, made, ledger = daemon
     def boom(*a, **k):
         raise AssertionError("owner.owns_session must never be called for a bad-shape sid")
     monkeypatch.setattr(owner, "owns_session", boom)
-
     st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id={TRAVERSAL}")
     assert st == 400
     assert b["error"]["code"] == "invalid_session_id"
 
 
 def test_restart_traversal_sid_is_400_and_never_reaches_the_owner_check(daemon, monkeypatch):
-    # Codex: /restart reading out-of-root owner.json/meta.json (the crashed-session disk-meta
-    # fallback in `_restart_source`) and possibly spawning from what it finds.
-    base, mgr, made = daemon
-
+    base, mgr, made, ledger = daemon
     def boom(*a, **k):
         raise AssertionError("owner.session_owned_by must never be called for a bad-shape sid")
     monkeypatch.setattr(owner, "session_owned_by", boom)
-
-    st, b = _req("POST", base + "/restart", body={"session_id": TRAVERSAL, "owner_id": OWNER})
+    st, b = _req("POST", base + "/restart",
+                 body={"session_id": TRAVERSAL, "owner_id": OWNER,
+                       "new_session_id": "s-" + "c" * 32})
     assert st == 400, (st, b)
     assert b["error"]["code"] == "invalid_session_id"
     assert b["error"]["retryable"] is False
@@ -206,27 +165,20 @@ def test_restart_traversal_sid_is_400_and_never_reaches_the_owner_check(daemon, 
     ("/message/{}", {"kind": "note", "summary": "x"}),
 ])
 def test_traversal_sid_on_the_executor_plane_is_400_not_401_or_500(daemon, monkeypatch, path, body):
-    # /hook and /message are exempt from owner-gating (per-session secret instead), but a
-    # caller-supplied sid is still a path COMPONENT of the URL itself and gets the same shape
-    # check (finding #3: "parse the sid first for path-prefix routes, then validate").
-    base, mgr, made = daemon
-
+    base, mgr, made, ledger = daemon
     def boom(*a, **k):
         raise AssertionError("manager.get must never be called for a bad-shape sid")
     monkeypatch.setattr(mgr, "get", boom)
-
     st, b = _req("POST", base + path.format(TRAVERSAL), body=body)
     assert st == 400, (st, b)
     assert b["error"]["code"] == "invalid_session_id"
 
 
 def test_capabilities_bad_shape_sid_never_reaches_the_manager(daemon, monkeypatch):
-    base, mgr, made = daemon
-
+    base, mgr, made, ledger = daemon
     def boom(*a, **k):
         raise AssertionError("manager.capabilities must never be called for a bad-shape sid")
     monkeypatch.setattr(mgr, "capabilities", boom)
-
     st, b = _req("GET", base + f"/capabilities?owner_id={OWNER}&sid={TRAVERSAL}")
     assert st == 400
     assert b["error"]["code"] == "invalid_session_id"
@@ -234,15 +186,15 @@ def test_capabilities_bad_shape_sid_never_reaches_the_manager(daemon, monkeypatc
 
 # ============================================================ real ids: regression guard
 
-def test_self_minted_id_still_passes_every_validated_route(daemon, tmp_path):
-    # CRITICAL (per the review): the shared validator must not reject what /start already mints.
-    base, mgr, made = daemon
-    sid = _start(base, tmp_path)
+def test_router_assigned_id_passes_every_validated_route(daemon, tmp_path):
+    """nelix-9a4.4: all session_ids are router-assigned. The shape validator must accept them."""
+    base, mgr, made, ledger = daemon
+    sid = _start(base, tmp_path, reserve_start(ledger))
     assert _req("GET", base + f"/status?owner_id={OWNER}&session_id={sid}")[0] == 200
     assert _req("GET", base + f"/screen?owner_id={OWNER}&session_id={sid}")[0] == 200
     assert _req("GET", base + f"/capabilities?owner_id={OWNER}&sid={sid}")[0] == 200
     st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id={sid}")
-    assert st in (200, 404), (st, b)   # 404 only if no transcript/live dialog yet -- never 400
+    assert st in (200, 404), (st, b)
     assert st != 400
     st, b = _req("POST", base + "/hook/" + sid, body={"hook_event_name": "Stop"},
                  headers={"X-Nelix-Hook-Secret": made[sid].hook_secret})
@@ -250,30 +202,6 @@ def test_self_minted_id_still_passes_every_validated_route(daemon, tmp_path):
     st, b = _req("POST", base + "/message/" + sid, body={"kind": "note", "summary": "x"},
                  headers={"X-Nelix-Hook-Secret": made[sid].hook_secret})
     assert st != 400
-    # /wait: publish an event first so the (real) 25s long-poll returns immediately instead of
-    # blocking -- mirrors test_rpc_server.py's test_rpc_session_scoped_roundtrip.
-    mgr._events.publish(sid, EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
-    st, b = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id={sid}")
-    assert st == 200, (st, b)
-    assert b["event"]["session_id"] == sid
-    st, b = _req("POST", base + "/respond",
-                 body={"session_id": sid, "owner_id": OWNER, "answer": "yes"})
-    assert st == 200, (st, b)              # FakeSession.respond -> RespondOutcome("resumed")
-    # /stop LAST: it ends the session, so nothing above may run after it.
-    st, b = _req("POST", base + "/stop", body={"session_id": sid, "owner_id": OWNER})
-    assert st == 200, (st, b)
-
-
-def test_router_assigned_wide_id_still_passes_every_validated_route(daemon, tmp_path):
-    # spec §3's wide (full UUID4 hex) id must be just as acceptable as the legacy 8-hex self-mint.
-    base, mgr, made = daemon
-    sid = _start(base, tmp_path, session_id=WIDE_ID)
-    assert sid == WIDE_ID
-    assert _req("GET", base + f"/status?owner_id={OWNER}&session_id={sid}")[0] == 200
-    assert _req("GET", base + f"/screen?owner_id={OWNER}&session_id={sid}")[0] == 200
-    assert _req("GET", base + f"/capabilities?owner_id={OWNER}&sid={sid}")[0] == 200
-    st, b = _req("GET", base + f"/dialog?owner_id={OWNER}&session_id={sid}")
-    assert st != 400, (st, b)
     mgr._events.publish(sid, EXECUTOR, "waiting_for_user", "y/n?", "waiting_for_user")
     st, b = _req("GET", base + f"/wait?owner_id={OWNER}&after_seq=0&session_id={sid}")
     assert st == 200, (st, b)
@@ -281,8 +209,11 @@ def test_router_assigned_wide_id_still_passes_every_validated_route(daemon, tmp_
     st, b = _req("POST", base + "/respond",
                  body={"session_id": sid, "owner_id": OWNER, "answer": "yes"})
     assert st == 200, (st, b)
-    st, b = _req("POST", base + "/restart", body={"session_id": sid, "owner_id": OWNER, "force": True})
+    # restart: needs new_session_id (nelix-9a4.4)
+    new_sid = reserve_start(ledger)
+    st, b = _req("POST", base + "/restart",
+                 body={"session_id": sid, "owner_id": OWNER, "force": True,
+                       "new_session_id": new_sid})
     assert st != 400, (st, b)
-    # /stop LAST, on whatever this session id now names post-restart: never 400 for shape.
     st, b = _req("POST", base + "/stop", body={"session_id": sid, "owner_id": OWNER})
     assert st != 400, (st, b)

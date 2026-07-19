@@ -22,12 +22,12 @@ requires-python = "==3.11.*"
 # wasmtime is a native wheel; pin it exactly. requirements-runtime.lock is COMPILED from this list
 # and adds the hashes every installed generation is frozen from (tests/test_runtime_lock.py fails if
 # the two disagree), so this line is the single place the runtime closure is declared.
-dependencies = ["wasmtime==45.0.0"]
+# nelix-9a4.4: nelix_store and nelix_contracts are NOW runtime deps — daemon/app.py imports
+# nelix_store.store.Store to open the durable terminal-records database.
+dependencies = ["wasmtime==45.0.0", "nelix_store==0.1.0", "nelix_contracts==0.1.0"]
 
 [project.optional-dependencies]
-# Not installed by the core. `pyyaml` is here because bin/nelix-doctor (a repo tool, not a shipped
-# one) imports it, and `nelix_store`/`nelix_contracts` are test-only today: nothing under daemon/,
-# bin/ or the top-level modules references either package (verified by grep, 2026-07-17).
+# pyyaml is here because bin/nelix-doctor (a repo tool, not a shipped one) imports it.
 dev = ["pytest==8.3.4", "pyyaml==6.0.3"]
 
 # Only the two WORKER-facing CLIs ship. daemon/hook_settings.py hands their absolute paths to every

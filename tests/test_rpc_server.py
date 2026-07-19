@@ -2,7 +2,7 @@ import http.client
 import json, threading, urllib.error, urllib.request
 import socket as _socket
 import pytest
-from conftest import EXECUTOR, OWNER, own
+from tests.conftest import EXECUTOR, OWNER, own
 from daemon.events import EventQueue
 from daemon.manager import StartOutcome, StopOutcome
 from daemon.rpc_server import make_server

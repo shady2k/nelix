@@ -6,7 +6,7 @@ import threading
 import urllib.error
 import urllib.request
 
-from conftest import OWNER
+from tests.conftest import OWNER
 from daemon.events import EventQueue
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon.rpc_server import make_server

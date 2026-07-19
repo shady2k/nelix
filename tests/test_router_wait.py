@@ -19,7 +19,7 @@ test_router_wait_realdaemon.py."""
 import pytest
 
 import paths
-from conftest import OWNER
+from tests.conftest import OWNER
 from nelix_contracts.cursor import decode, encode, new_cursor
 from nelix_contracts.errors import NelixError
 from nelix_store.ledger import StartLedger
@@ -27,7 +27,7 @@ from router.board import BoardForward
 from router.registry import GenerationRegistry
 from router.wait import WaitForward
 
-from _router_fakes import Backend, Supervisor
+from tests._router_fakes import Backend, Supervisor
 
 OTHER_OWNER = "harness-y"
 EPOCH = "r-" + "0" * 32

@@ -29,20 +29,19 @@ import pytest
 
 import nelix_cli
 import paths
-from conftest import EXECUTOR, OWNER, make_spec
+from tests.conftest import EXECUTOR, OWNER, make_spec
 from daemon.events import EventQueue
 from daemon.launchers.base import ExecutorCapabilities
 from daemon.manager import SessionManager
 from daemon.rpc_server import make_server
 from daemon.transport import Transport
-from nelix_store.ledger import StartLedger
 from router import runtime_dir as rd
 from router.registry import GenerationRegistry
 from router.server import make_router_server
 from router.start import StartPath
 from rpc_client import RpcClient
 
-from _router_fakes import Supervisor
+from tests._router_fakes import Supervisor
 
 OTHER_OWNER = "harness-y"
 _VALID_ORCH = "o-" + "1" * 32
@@ -351,7 +350,7 @@ class _FakeSession:
 
 
 class _RealDaemon:
-    def __init__(self, sock_path):
+    def __init__(self, sock_path, store):
         self.created = {}
         daemon = self
 
@@ -361,7 +360,7 @@ class _RealDaemon:
             return s
 
         self.events = EventQueue()
-        self.manager = SessionManager({EXECUTOR: make_spec()}, self.events,
+        self.manager = SessionManager({EXECUTOR: make_spec()}, self.events, store,
                                       session_factory=factory, concurrency_limit=5)
         self.server = make_server(self.manager, Transport.unix(sock_path))
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -384,10 +383,10 @@ def daemon_sock(tmp_path):
 
 
 @pytest.fixture
-def router_over_real_daemon(daemon_sock, tmp_path):
-    daemon = _RealDaemon(daemon_sock)
+def router_over_real_daemon(daemon_sock, tmp_path, store_and_ledger):
+    store, ledger = store_and_ledger
+    daemon = _RealDaemon(daemon_sock, store=store)
     router = rd.establish()
-    ledger = StartLedger(paths.nelix_root())
     registry = GenerationRegistry(supervisor=Supervisor(daemon.transport))
     epoch = "r-" + "0" * 32
     server = make_router_server(router.socket, router.sock_path,

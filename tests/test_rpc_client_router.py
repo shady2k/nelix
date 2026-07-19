@@ -8,7 +8,7 @@ import threading
 
 import pytest
 
-from conftest import EXECUTOR, OWNER
+from tests.conftest import EXECUTOR, OWNER
 from daemon.transport import Transport
 from rpc_client import ForwardConnectError, ForwardResponseError, RpcClient, raw_forward
 

@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 import paths
-from conftest import EXECUTOR, make_spec, reserve_start
+from tests.conftest import EXECUTOR, make_spec, reserve_start
 from daemon import owner
 from daemon.events import EventQueue
 from daemon.launchers.base import ExecutorCapabilities
@@ -35,7 +35,7 @@ from daemon.manager import SessionManager
 from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
 from daemon.transport import Transport
-from test_rpc_server import _req
+from tests.test_rpc_server import _req
 
 
 class _StubDriver:

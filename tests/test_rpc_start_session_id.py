@@ -6,7 +6,7 @@ import threading
 import urllib.error
 import urllib.request
 
-from conftest import EXECUTOR, OWNER
+from tests.conftest import EXECUTOR, OWNER
 from daemon.events import EventQueue
 from daemon.manager import SessionIdInUse, SessionIdRejected, StartOutcome
 from daemon.rpc_server import make_server

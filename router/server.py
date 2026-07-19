@@ -42,6 +42,7 @@ from nelix_contracts.errors import INTERNAL_ERROR, INVALID_REQUEST, OWNER_MISMAT
 from daemon.transport import peer_is_self
 from router.board import BoardForward
 from router.operator import OperatorRoutes
+from router.restart import RestartPath
 from router.session_forward import SessionForward
 from router.start import http_status
 from router.wait import WaitForward
@@ -110,6 +111,7 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
     # make_router_server keeps working unchanged — both take only `registry` (+ router_epoch),
     # already parameters of this function.
     session_forward = SessionForward(registry)
+    restart_path = RestartPath(start_path.ledger, registry)
     operator_routes = OperatorRoutes(registry, router_epoch)
     board_forward = BoardForward(registry, router_epoch)
     # The orchestration /wait waiter (3c.3b). Wired off the SAME shared StartLedger as the start
@@ -205,10 +207,13 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             if path == "/start":
                 self._handle_start(raw)
                 return
+            if path == "/restart":
+                self._handle_restart(raw)
+                return
             if path.startswith("/hook/") or path.startswith("/message/"):
                 self._handle_secret_forward(path, raw)
                 return
-            if path in ("/respond", "/stop", "/restart"):
+            if path in ("/respond", "/stop"):
                 self._handle_session_post(path, raw)
                 return
             self._dispatch_unimplemented("POST", path)
@@ -255,6 +260,18 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                 self._send(http_status(err.code), err.to_envelope())
                 return
             status, resp = start_path.handle(body)
+            self._send(status, resp)
+
+        def _handle_restart(self, raw):
+            try:
+                body = json.loads(raw or b"{}")
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                err = NelixError(INVALID_REQUEST, "restart body must be a JSON object")
+                self._send(http_status(err.code), err.to_envelope())
+                return
+            status, resp = restart_path.handle(body)
             self._send(status, resp)
 
         def _handle_session_get(self, path):

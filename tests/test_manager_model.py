@@ -7,7 +7,7 @@ import io
 
 import pytest
 
-from conftest import EXECUTOR, OWNER, make_spec, reserve_start
+from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start
 from daemon.events import EventQueue
 from daemon.manager import SessionManager, ModelRejected
 from daemon.obs import Logger

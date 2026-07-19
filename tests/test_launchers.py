@@ -1,5 +1,5 @@
 import pytest
-from conftest import make_spec
+from tests.conftest import make_spec
 from daemon.launchers import get_launcher
 from daemon.launchers.base import ExecutorCapabilities
 

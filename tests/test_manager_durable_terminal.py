@@ -8,7 +8,7 @@ answer: persist terminal records to nelix_store before removing the live session
 from nelix_store.ledger import StartLedger
 from nelix_store.store import Store
 
-from conftest import EXECUTOR, OWNER, make_spec, own
+from tests.conftest import EXECUTOR, OWNER, make_spec, own
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
 

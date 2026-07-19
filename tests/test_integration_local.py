@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import supervisor
 from daemon.transport import Transport
 from rpc_client import RpcClient
-from conftest import OWNER
+from tests.conftest import OWNER
 
 NELIX_LIVE = os.environ.get("NELIX_LIVE")
 

@@ -23,14 +23,14 @@ board is CONSTRUCTED and the cursor is ENCODED.
 """
 import pytest
 
-from conftest import OWNER
+from tests.conftest import OWNER
 from daemon.transport import Transport
 from nelix_contracts.cursor import decode
 from nelix_contracts.errors import NelixError
 from router.board import BoardForward, merge_boards
 from router.registry import GenerationRegistry
 
-from _router_fakes import Backend, Supervisor
+from tests._router_fakes import Backend, Supervisor
 
 OTHER_OWNER = "harness-y"
 EPOCH = "r-" + "0" * 32

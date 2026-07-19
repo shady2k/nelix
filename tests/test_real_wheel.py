@@ -69,15 +69,22 @@ def installed(tmp_path_factory):
     build = _run(["uv", "build", "--wheel", "--out-dir", dist, src], cwd=tmp, env=env)
     assert build.returncode == 0, f"wheel build failed:\n{build.stdout}\n{build.stderr}"
 
+    # nelix-9a4.4: nelix_store and nelix_contracts are now runtime deps of the core.
+    # Build their wheels too so the installed core can find them.
+    for pkg in ("packages/nelix_contracts", "packages/nelix_store"):
+        b = _run(["uv", "build", "--wheel", "--out-dir", dist, src / pkg], cwd=tmp, env=env)
+        assert b.returncode == 0, f"{pkg} wheel build failed:\n{b.stdout}\n{b.stderr}"
+
     wheels = list(dist.glob("*.whl"))
-    assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
+    assert len(wheels) == 3, f"expected 3 wheels (core + nelix_contracts + nelix_store), got {wheels}"
 
     mk = _run(["uv", "venv", "--python", "3.11", venv], cwd=tmp, env=env)
     assert mk.returncode == 0, f"venv creation failed:\n{mk.stdout}\n{mk.stderr}"
 
     py = venv / "bin" / "python"
-    # Only the wheel. No -e, no requirements.txt, no repo.
-    inst = _run(["uv", "pip", "install", "--python", py, wheels[0]], cwd=tmp, env=env)
+    # Install all three wheels (core + nelix_contracts + nelix_store).
+    # No -e, no requirements.txt, no repo.
+    inst = _run(["uv", "pip", "install", "--python", py, *wheels], cwd=tmp, env=env)
     assert inst.returncode == 0, f"wheel install failed:\n{inst.stdout}\n{inst.stderr}"
     return py, tmp
 

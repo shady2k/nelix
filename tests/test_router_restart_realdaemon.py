@@ -69,8 +69,8 @@ from router.server import make_router_server
 from router.start import StartPath
 from rpc_client import RpcClient
 
-from conftest import EXECUTOR, OWNER, make_spec
-from _router_fakes import Supervisor
+from tests.conftest import EXECUTOR, OWNER, make_spec
+from tests._router_fakes import Supervisor
 
 
 class _StubDriver:
@@ -125,6 +125,8 @@ class _RealDaemon:
     simulated router restart exactly as the spec says a real daemon does."""
 
     def __init__(self, sock_path):
+        from nelix_store.store import Store
+        store = Store(paths.nelix_root())
         self.created = {}
         daemon = self
 
@@ -134,7 +136,7 @@ class _RealDaemon:
             return s
 
         self.events = EventQueue()
-        self.manager = SessionManager({EXECUTOR: make_spec()}, self.events,
+        self.manager = SessionManager({EXECUTOR: make_spec()}, self.events, store,
                                       session_factory=factory, concurrency_limit=5)
         self.server = make_server(self.manager, Transport.unix(sock_path))
         threading.Thread(target=self.server.serve_forever, daemon=True).start()

@@ -34,12 +34,17 @@ def _locked():
 
 def test_lock_pins_exactly_the_declared_runtime_deps():
     """Same dependency SET both sides. A dep added to pyproject and not compiled in would be
-    installed into a generation unpinned and unhashed — or not at all."""
+    installed into a generation unpinned and unhashed — or not at all.
+    nelix-9a4.4: nelix_store and nelix_contracts are LOCAL packages (not third-party), so they
+    are built + installed alongside the core wheel rather than pinned in the lock file."""
     declared = {}
     for spec in _pyproject_deps():
         m = re.match(r"^([A-Za-z0-9._-]+)==([^\s;]+)$", spec)
         assert m, f"{spec!r} in pyproject is not an exact pin; the runtime closure must be frozen"
-        declared[m.group(1).lower().replace("_", "-")] = m.group(2)
+        name = m.group(1).lower().replace("_", "-")
+        if name in ("nelix-store", "nelix-contracts"):
+            continue  # local packages, not in the lock
+        declared[name] = m.group(2)
     assert set(_locked()) >= set(declared), (
         f"declared in pyproject but not locked: {set(declared) - set(_locked())} — recompile: "
         f"uv pip compile pyproject.toml --generate-hashes --no-header --python-version 3.11 "
@@ -51,9 +56,12 @@ def test_lock_pins_exactly_the_declared_runtime_deps():
 
 def test_every_locked_pin_carries_hashes():
     """--require-hashes is the whole point: an unhashed pin lets a redirected index substitute an
-    artifact into a generation. uv omits hashes silently if --generate-hashes is forgotten."""
+    artifact into a generation. uv omits hashes silently if --generate-hashes is forgotten.
+    Local packages (nelix_store, nelix_contracts) are exempt — they ship with the core wheel."""
     body = LOCK.read_text()
     for name in _locked():
+        if name in ("nelix-store", "nelix-contracts"):
+            continue
         block = body.split(f"{name}==", 1)[1]
         block = block.split("\n\n", 1)[0]
         assert "--hash=sha256:" in block, f"{name} is pinned without hashes in {LOCK.name}"

@@ -26,7 +26,7 @@ from daemon.hooks import HookEvent                # noqa: E402
 from daemon.manager import SessionManager         # noqa: E402
 from daemon.messages import AsyncQuestion, ProgressNote, format_async_reply  # noqa: E402
 from daemon.session import Session                # noqa: E402
-from conftest import OWNER, own
+from tests.conftest import OWNER, own, reserve_start
 
 
 class Spec:
@@ -93,40 +93,40 @@ class HookFakeHandle:
         pass
 
 
-_SID = "s1"
-
-
-def _manager_session(tmp_path, limit=3, wire_free_slot=True,
+def _manager_session(tmp_path, store, sid, limit=3, wire_free_slot=True,
                      frame="✦ Working… (esc to interrupt)"):
     """A REAL Session wired to a HookFakeHandle and REGISTERED into a REAL SessionManager exactly as
     _spawn wires a live session (on_terminal + deliver_turn). Returns (sess, mgr, ev)."""
+    import time
     ev = EventQueue()
     clock = FakeClock(0.0)
     specs = {"demo": ExecutorSpec(command="demo", args=[], env={}, driver="claude")}
-    mgr = SessionManager(specs, ev, concurrency_limit=limit,
+    mgr = SessionManager(specs, ev, store, concurrency_limit=limit,
                          session_retain=0, session_max_age_days=0)
-    sess = Session(_SID, "demo", ClaudeDriver(), None, Spec(), ev, clock=clock)
+    store.create_session(sid, state="busy", executor="demo", task="do the work",
+                         cwd=str(tmp_path), model=None, created_at=time.time())
+    sess = Session(sid, "demo", ClaudeDriver(), None, Spec(), ev, clock=clock)
     sess._handle = HookFakeHandle(frame, clock=clock, step=1.0)
-    sess._dialog = Dialog(tmp_path / _SID, tail_lines=Spec.tail_lines,
+    sess._dialog = Dialog(tmp_path / sid, tail_lines=Spec.tail_lines,
                           spool_max_bytes=Spec.spool_max_bytes)
     sess._handle._dialog = sess._dialog
     sess._task_delivery = "delivered"
     sess._clock = clock
     with mgr._lock:
-        own(_SID); mgr._sessions[_SID] = sess
+        own(sid); mgr._sessions[sid] = sess
     if wire_free_slot:
         sess.on_terminal = mgr._free_slot
-    sess.deliver_turn = lambda text: mgr.send_turn(_SID, text)
+    sess.deliver_turn = lambda text: mgr.send_turn(sid, text)
     return sess, mgr, ev
 
 
 def _drive_busy(sess):
-    sess.on_hook(HookEvent(_SID, "UserPromptSubmit"))
+    sess.on_hook(HookEvent(sess._id, "UserPromptSubmit"))
     sess._loop_once()
 
 
 def _drive_idle(sess):
-    sess.on_hook(HookEvent(_SID, "Stop"))
+    sess.on_hook(HookEvent(sess._id, "Stop"))
     sess._loop_once()
 
 
@@ -151,14 +151,16 @@ def test_format_reply_without_assumption():
 
 # ---- delivery: idle now / queue if busy / not delivered if terminal ----
 
-def test_answer_delivered_at_idle(tmp_path):
-    sess, mgr, _ = _manager_session(tmp_path)
+def test_answer_delivered_at_idle(tmp_path, store_and_ledger):
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, _ = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     qid, err = sess.record_async_question(_Q)
     assert err is None
     _drive_idle(sess)                                  # executor finished its turn -> idle
     assert sess.snapshot()["control_state"] == "idle"
-    out = mgr.respond(_SID, "use a", decision_id=qid, owner_id=OWNER)
+    out = mgr.respond(sid, "use a", decision_id=qid, owner_id=OWNER)
     # idle -> delivered NOW as a fresh turn containing the reply block (via slot-reacquiring send_turn)
     assert out.status == "resumed"
     w = "".join(sess._handle.writes)
@@ -167,11 +169,13 @@ def test_answer_delivered_at_idle(tmp_path):
     assert not sess.has_pending_async()                # the slot was cleared (correlation)
 
 
-def test_answer_queued_while_busy_then_delivered(tmp_path):
-    sess, mgr, _ = _manager_session(tmp_path)
+def test_answer_queued_while_busy_then_delivered(tmp_path, store_and_ledger):
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, _ = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     qid, _ = sess.record_async_question(_Q)
-    out = mgr.respond(_SID, "use a", decision_id=qid, owner_id=OWNER)
+    out = mgr.respond(sid, "use a", decision_id=qid, owner_id=OWNER)
     assert out.status == "queued"                      # busy -> accepted, not written yet
     assert sess._handle.writes == []                   # busy -> nothing typed
     assert not sess.has_pending_async()                # correlated + slot cleared immediately
@@ -181,87 +185,99 @@ def test_answer_queued_while_busy_then_delivered(tmp_path):
     assert "Hermes: use a" in w
 
 
-def test_terminal_before_answer_is_not_delivered(tmp_path):
+def test_terminal_before_answer_is_not_delivered(tmp_path, store_and_ledger):
     # In-Session terminal guard: the session went terminal before the answer arrived -> not_delivered,
     # NOTHING typed. (The MANAGER-freed-session sub-case — respond after the slot is freed returning
     # not_delivered/executor_finished instead of unknown_session — is Task 6; here the terminal session
     # is still registered so the id-dispatch reaches resolve_async_question.)
-    sess, mgr, _ = _manager_session(tmp_path, wire_free_slot=False)
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, _ = _manager_session(tmp_path, store, sid, wire_free_slot=False)
     _drive_busy(sess)
     qid, _ = sess.record_async_question(_Q)
     sess._stop.set()
     sess._finish()                                     # real terminal funnel (stopped)
     assert sess.snapshot()["control_state"] == "terminal"
-    out = mgr.respond(_SID, "use a", decision_id=qid, owner_id=OWNER)
+    out = mgr.respond(sid, "use a", decision_id=qid, owner_id=OWNER)
     assert out.status == "not_delivered"
     assert sess._handle.writes == []                   # nothing typed into a dead session
 
 
-def test_respond_after_finish_returns_not_delivered(tmp_path):
+def test_respond_after_finish_returns_not_delivered(tmp_path, store_and_ledger):
     # The MANAGER-freed-session sub-case (Task 6): the executor exits WHILE its async question is
     # still outstanding. Terminal cleanup (on_terminal -> Manager._free_slot, wire_free_slot=True is
     # the default here) auto-resolves the question (executor_finished) into a manager-level
     # recent-terminal async store (same key/expiry as self._terminal). A subsequent respond() naming
     # that decision_id must get a clean not_delivered/executor_finished, never a bare unknown_session
     # (which would look like a typo'd/unrelated session id to the orchestrator).
-    sess, mgr, _ = _manager_session(tmp_path)             # wire_free_slot=True (default)
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, _ = _manager_session(tmp_path, store, sid)             # wire_free_slot=True (default)
     _drive_busy(sess)
     qid, _ = sess.record_async_question(_Q)
     sess._stop.set()
     sess._finish()                                        # real terminal funnel -> _free_slot runs
-    assert mgr.get(_SID) is None                          # deregistered: the slot was freed
-    out = mgr.respond(_SID, "use a", decision_id=qid, owner_id=OWNER)
+    assert mgr.get(sid) is None                          # deregistered: the slot was freed
+    out = mgr.respond(sid, "use a", decision_id=qid, owner_id=OWNER)
     assert out.status == "not_delivered" and out.reason == "executor_finished"
     assert sess._handle.writes == []                      # nothing typed — the executor is gone
 
 
-def test_terminal_snapshot_carries_progress_trail(tmp_path):
+def test_terminal_snapshot_carries_progress_trail(tmp_path, store_and_ledger):
     # I1 (final whole-branch review): _finish publishes the terminal event then synchronously frees
     # the slot (Manager._free_slot), so by the time Hermes reads status the session lives only in
     # recent_terminal / status()'s terminal_snapshot() path. Progress notes recorded before exit must
     # still be visible there — otherwise the curated progress trail (spec §7/§1: what the executor
     # accomplished) is lost exactly at completion, the one moment it matters most.
-    sess, mgr, _ = _manager_session(tmp_path)
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, _ = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     sess.append_progress_note(ProgressNote("did step 1", None))
     sess.append_progress_note(ProgressNote("did step 2", "more detail"))
     sess._stop.set()
     sess._finish()                                        # real terminal funnel -> _free_slot runs
-    assert mgr.get(_SID) is None                          # deregistered: the slot was freed
+    assert mgr.get(sid) is None                          # deregistered: the slot was freed
     board = mgr.status(owner_id=OWNER)
-    snap = board["recent_terminal"][_SID]
+    snap = board["recent_terminal"][sid]
     assert snap["progress_total"] == 2
     summaries = [n["summary"] for n in snap["progress"]]
     assert summaries == ["did step 1", "did step 2"]
 
 
-def test_respond_after_finish_wrong_id_is_unknown_session(tmp_path):
+def test_respond_after_finish_wrong_id_is_unknown_session(tmp_path, store_and_ledger):
     # The terminal-survival fallback is narrowly scoped to the id that was actually auto-resolved;
     # any other decision_id for the same freed session still falls through to unknown_session.
-    sess, mgr, _ = _manager_session(tmp_path)
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, _ = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     sess.record_async_question(_Q)
     sess._stop.set()
     sess._finish()
-    out = mgr.respond(_SID, "use a", decision_id="q_999", owner_id=OWNER)
+    out = mgr.respond(sid, "use a", decision_id="q_999", owner_id=OWNER)
     assert out.status == "unknown_session"
 
 
 # ---- resolution / dispatch invariants ----
 
-def test_resolve_marks_the_async_event_answered(tmp_path):
-    sess, mgr, ev = _manager_session(tmp_path)
+def test_resolve_marks_the_async_event_answered(tmp_path, store_and_ledger):
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, ev = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     qid, _ = sess.record_async_question(_Q)
     async_evt = [e for e in ev._events if e.kind == "async_question"][-1]
     assert async_evt.resolved_reason is None
-    mgr.respond(_SID, "use a", decision_id=qid, owner_id=OWNER)
+    mgr.respond(sid, "use a", decision_id=qid, owner_id=OWNER)
     assert async_evt.resolved_reason == "answered"     # correlated by decision_id -> mark_answered
 
 
-def test_resolve_async_question_busy_does_not_write(tmp_path):
+def test_resolve_async_question_busy_does_not_write(tmp_path, store_and_ledger):
     # The RPC-thread resolve NEVER writes the PTY when busy — it only enqueues; the monitor writes.
-    sess, _, _ = _manager_session(tmp_path)
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, _, _ = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     qid, _ = sess.record_async_question(_Q)
     disposition, text = sess.resolve_async_question(qid, "use a")
@@ -270,8 +286,10 @@ def test_resolve_async_question_busy_does_not_write(tmp_path):
     assert sess._handle.writes == []                   # RPC thread typed nothing
 
 
-def test_wrong_id_does_not_resolve(tmp_path):
-    sess, _, _ = _manager_session(tmp_path)
+def test_wrong_id_does_not_resolve(tmp_path, store_and_ledger):
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, _, _ = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     sess.record_async_question(_Q)
     disposition, text = sess.resolve_async_question("q_999", "use a")
@@ -286,19 +304,21 @@ class _BusyStub:
         return {"control_state": "busy"}
 
 
-def test_idle_now_at_capacity_requeues_full_frame_not_lost(tmp_path):
+def test_idle_now_at_capacity_requeues_full_frame_not_lost(tmp_path, store_and_ledger):
     # Important-fix regression: an async question answered while the session is idle-now but the
     # concurrency limit is saturated -> send_turn refuses at_capacity. The slot was already cleared +
     # the event marked answered, so the FRAMED reply must be re-queued (not lost, not later delivered
     # as a bare answer) and delivered with the full frame once capacity frees at the next idle.
-    sess, mgr, _ = _manager_session(tmp_path, limit=1)
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, _ = _manager_session(tmp_path, store, sid, limit=1)
     _drive_busy(sess)
     qid, _ = sess.record_async_question(_Q)
     _drive_idle(sess)                                    # sess idle (freed its own active slot)
     assert sess.snapshot()["control_state"] == "idle"
     with mgr._lock:
         own("other"); mgr._sessions["other"] = _BusyStub()            # a second busy session saturates limit=1
-    out = mgr.respond(_SID, "use a", decision_id=qid, owner_id=OWNER)
+    out = mgr.respond(sid, "use a", decision_id=qid, owner_id=OWNER)
     assert out.status == "at_capacity"
     assert sess._handle.writes == []                     # nothing typed on the refusal
     assert sess._async_reply_pending is not None          # re-queued, NOT lost
@@ -312,12 +332,14 @@ def test_idle_now_at_capacity_requeues_full_frame_not_lost(tmp_path):
     assert sess._async_reply_pending is None
 
 
-def test_busy_reply_requeued_when_delivery_declines(tmp_path):
+def test_busy_reply_requeued_when_delivery_declines(tmp_path, store_and_ledger):
     # If send_turn declines at the idle edge WITHOUT typing (no free slot now, or a concurrent idle
     # follow-up already resumed the session), the queued reply is retried at the next idle — never
     # silently dropped. A partial write / terminal outcome is deliberately NOT retried.
     from daemon.session import RespondOutcome
-    sess, _, _ = _manager_session(tmp_path)
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, _, _ = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     qid, _ = sess.record_async_question(_Q)
     sess.resolve_async_question(qid, "use a")            # busy -> enqueued
@@ -336,18 +358,20 @@ def test_busy_reply_requeued_when_delivery_declines(tmp_path):
     assert len(calls) == 2 and "Hermes: use a" in calls[-1]
 
 
-def test_second_question_rejected_while_earlier_reply_still_queued(tmp_path):
+def test_second_question_rejected_while_earlier_reply_still_queued(tmp_path, store_and_ledger):
     # M2 (final whole-branch review): the already_pending guard in record_async_question checks
     # only self._async_question, which is cleared the moment an answer is CORRELATED (even though
     # the reply itself is only QUEUED, not yet delivered, while busy). Without this guard: busy ->
     # ask q1 -> answer q1 (slot cleared, reply1 queued) -> still busy -> ask q2 (wrongly accepted,
     # since the slot was cleared) -> answer q2 -> reply2 OVERWRITES reply1 in the single
     # _async_reply_pending slot -> reply1 is silently lost even though Hermes was told "queued".
-    sess, mgr, _ = _manager_session(tmp_path)
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, _ = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     qid1, err1 = sess.record_async_question(_Q)
     assert err1 is None
-    out1 = mgr.respond(_SID, "use a", decision_id=qid1, owner_id=OWNER)
+    out1 = mgr.respond(sid, "use a", decision_id=qid1, owner_id=OWNER)
     assert out1.status == "queued"                      # busy -> reply1 enqueued, not delivered yet
     assert not sess.has_pending_async()                  # q1's slot was cleared (correlation)
     reply1 = sess._async_reply_pending
@@ -369,12 +393,14 @@ def test_second_question_rejected_while_earlier_reply_still_queued(tmp_path):
     assert "c or d?" not in w                             # q2 was never accepted, never answered
 
 
-def test_plain_idle_followup_still_routes_to_send_turn(tmp_path):
+def test_plain_idle_followup_still_routes_to_send_turn(tmp_path, store_and_ledger):
     # Regression: an idle follow-up with NO async question outstanding still resumes via send_turn
     # (the existing idle routing must stay untouched — the async dispatch only fires on a pending id).
-    sess, mgr, _ = _manager_session(tmp_path)
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    sess, mgr, _ = _manager_session(tmp_path, store, sid)
     _drive_busy(sess)
     _drive_idle(sess)
-    out = mgr.respond(_SID, "keep going", owner_id=OWNER)
+    out = mgr.respond(sid, "keep going", owner_id=OWNER)
     assert out.status == "resumed"
     assert "keep going" in "".join(sess._handle.writes)

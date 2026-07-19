@@ -5,9 +5,9 @@ before any real sidecar files exist on disk.
 """
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 import yaml
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.golden._harness import load_expectation, build_ctx, assert_observation
 from daemon.drivers.claude import ClaudeDriver
 

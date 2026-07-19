@@ -73,8 +73,25 @@ def generations(tmp_path_factory):
     os.environ["NELIX_HOME"] = str(home)
     os.environ.pop("NELIX_RUNTIME", None)
     try:
-        build_a = runtime.install(_build_wheel(src, dist, "0.1.0"), lock=src / RUNTIME_LOCK_NAME)
-        build_b = runtime.install(_build_wheel(src, dist, "0.2.0"), lock=src / RUNTIME_LOCK_NAME)
+        # nelix-9a4.4: build + install local packages alongside the core wheel
+        _build_local = lambda pkg: _run(
+            ["uv", "build", "--wheel", "--out-dir", dist, src / "packages" / pkg],
+            cwd=tmp).returncode == 0
+        _find = lambda name: next(iter(dist.glob(f"{name}*.whl")))
+        extra = []
+        for pkg, name in [("nelix_contracts", "nelix_contracts"),
+                          ("nelix_store", "nelix_store")]:
+            assert _build_local(pkg), f"{name} wheel build failed"
+            extra.append(_find(name))
+        build_a = runtime.install(_build_wheel(src, dist, "0.1.0"), lock=src / RUNTIME_LOCK_NAME,
+                                   extra_wheels=extra)
+        # Rebuild for 0.2.0 (different version stamp)
+        extra2 = []
+        for pkg, name in [("nelix_contracts", "nelix_contracts"),
+                          ("nelix_store", "nelix_store")]:
+            extra2.append(_find(name))
+        build_b = runtime.install(_build_wheel(src, dist, "0.2.0"), lock=src / RUNTIME_LOCK_NAME,
+                                   extra_wheels=extra2)
         runtime.activate(build_b)                       # the upgrade lands; A is still live
         yield home, build_a, build_b
     finally:
