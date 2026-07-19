@@ -14,17 +14,13 @@ from .ids import (
     validate_session_id,
 )
 
-# 2: TerminalRecord gained the lifecycle fields (published_at, expired_at, expire_reason).
+# 3: TerminalRecord gained terminal_seq — per-generation monotonic watermark for retirement
+#     (nelix-gm3). Bumped together with db.SCHEMA_VERSION.
 #
-# THE nelix-165 TRAP, still armed for whoever moves this next: this constant is SEPARATE from
-# db.SCHEMA_VERSION, and list_sessions/list_terminal filter `schema_version = ?` EXACTLY while
-# get_* does not. So bumping THIS alone makes every existing row vanish from the board while a
-# direct get still reads it — a silently emptied board, not an error. It does not bite here only
-# because both constants moved together and the db version gate refuses an older file outright;
-# that is a coincidence of this change, not a defence, since the two can move independently.
-# Fixing it properly means deciding migration policy (version dispatch in from_dict) and has its
-# own plan — do not paper over it here.
-SCHEMA_VERSION = 2
+# THE nelix-165 TRAP: this constant is SEPARATE from db.SCHEMA_VERSION. Both moved together
+# (1→2→3) but nothing enforces that. The nelix-165 fix is still planned; for now the two
+# continue to move together by convention.
+SCHEMA_VERSION = 3
 
 
 def _check_version(d):
@@ -129,6 +125,7 @@ class TerminalRecord:
     summary: str
     ended_at: float
     published_at: float
+    terminal_seq: int = 0
     acknowledged_at: float | None = None
     expired_at: float | None = None
     expire_reason: str | None = None

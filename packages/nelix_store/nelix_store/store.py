@@ -40,7 +40,8 @@ _SESSION_SELECT = (
 # `PRAGMA foreign_keys=ON` connection.
 _TERMINAL_SELECT = (
     "SELECT t.session_id, st.owner_id, st.orchestration_id, st.generation_id, "
-    "t.terminal_kind, t.summary, t.ended_at, t.published_at, t.acknowledged_at, "
+    "t.terminal_kind, t.summary, t.ended_at, t.published_at, t.terminal_seq, "
+    "t.acknowledged_at, "
     "t.expired_at, t.expire_reason, t.schema_version "
     "FROM terminal t JOIN starts st ON st.session_id = t.session_id")
 
@@ -216,6 +217,9 @@ class Store:
         ledger.fail() already applies to the same question. Silently discarding a
         conflicting retry (rev 4) reports success while keeping the old result, and no
         higher layer can repair that afterwards.
+
+        Assigns a per-generation monotonic terminal_seq atomically inside the transaction,
+        so the caller (daemon/manager.py _free_slot) does NOT need to change.
         """
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -235,10 +239,11 @@ class Store:
             # retry — deliberate: such a Store cannot publish anything, and one answer for one
             # call beats an answer that depends on whether a row happens to exist.
             published_at = timestamp(self._clock(), "clock")
+            generation_id = start["generation_id"]
             # Validate before writing; identity from the join cannot disagree.
             TerminalRecord(session_id=session_id, owner_id=start["owner_id"],
                            orchestration_id=start["orchestration_id"],
-                           generation_id=start["generation_id"],
+                           generation_id=generation_id,
                            terminal_kind=terminal_kind, summary=summary, ended_at=ended_at,
                            published_at=published_at)
             existing = self._conn.execute(
@@ -253,11 +258,24 @@ class Store:
                     return
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  f"{session_id} already ended as {existing['terminal_kind']!r}")
+            # Atomically assign a per-generation terminal_seq. Initialize the counter if this
+            # is the first terminal for this generation (INSERT OR IGNORE), then increment.
+            self._conn.execute(
+                "INSERT OR IGNORE INTO generation_progress (generation_id, next_terminal_seq) "
+                "VALUES (?, 1)", (generation_id,))
+            self._conn.execute(
+                "UPDATE generation_progress SET next_terminal_seq = next_terminal_seq + 1 "
+                "WHERE generation_id=?", (generation_id,))
+            row = self._conn.execute(
+                "SELECT next_terminal_seq - 1 AS terminal_seq FROM generation_progress "
+                "WHERE generation_id=?", (generation_id,)).fetchone()
+            terminal_seq = row["terminal_seq"]
             self._conn.execute(
                 "INSERT INTO terminal (session_id, terminal_kind, summary, ended_at, "
-                "published_at, acknowledged_at, schema_version) VALUES (?,?,?,?,?,?,?)",
-                (session_id, terminal_kind, summary, ended_at, published_at, None,
-                 SCHEMA_VERSION))
+                "published_at, terminal_seq, acknowledged_at, schema_version) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (session_id, terminal_kind, summary, ended_at, published_at, terminal_seq,
+                 None, SCHEMA_VERSION))
 
     @translates_sqlite
     def get_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
@@ -293,6 +311,20 @@ class Store:
             "ORDER BY t.ended_at, t.session_id", (owner_id, SCHEMA_VERSION)).fetchall()
         records, _skipped = _read_rows(rows, TerminalRecord)
         return records
+
+    @translates_sqlite
+    def get_generation_persisted_high_water(self, generation_id: str) -> int:
+        """Return the highest terminal_seq persisted for this generation (0 if none).
+
+        Used by the retirement oracle: terminal_persisted_high_water must be compared against
+        router_visible_high_water (the highest seq the router has confirmed). A generation
+        with no terminals returns 0 so it is immediately \"watermark-satisfied\".
+        """
+        row = self._conn.execute(
+            "SELECT MAX(t.terminal_seq) AS hw FROM terminal t "
+            "JOIN starts st ON st.session_id = t.session_id "
+            "WHERE st.generation_id=?", (generation_id,)).fetchone()
+        return row["hw"] if row and row["hw"] is not None else 0
 
     @translates_sqlite
     def ack_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:

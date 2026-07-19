@@ -26,11 +26,9 @@ from nelix_contracts.errors import (
 )
 
 DB_FILENAME = "nelix.db"
-# 2: the terminal lifecycle — published_at (store-owned retention) plus the receipt fields.
-# ONE bump for the whole redesign: intermediate versions buy no compatibility when the package
-# has no writers and no migration machinery, and every extra version is another refusal path to
-# keep honest. Moves TOGETHER with records.SCHEMA_VERSION — see the nelix-165 note there.
-SCHEMA_VERSION = 2
+# 3: the per-generation monotonic terminal_seq for retirement watermarks + generation_progress
+#     counter table (nelix-gm3). Moves TOGETHER with records.SCHEMA_VERSION (nelix-165).
+SCHEMA_VERSION = 3
 
 # prune_terminal's ROW_NUMBER() window function needs SQLite >= 3.25 (2018). Asserted at
 # open because the daemon runs a different interpreter than the test venv — a feature that
@@ -104,6 +102,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- clock decided how long its own result was kept — a stale one reaped it before the owner ever
 -- looked, a future one made it immortal. Retention is this package's policy, so it ages from
 -- this package's clock.
+-- terminal_seq is a per-generation monotonic ordinal assigned by put_terminal, providing the
+-- durable, ordered high-water for retirement watermarks (nelix-gm3). Seqs start at 1 per
+-- generation and are assigned atomically inside put_terminal's transaction. 0 means unset
+-- (legacy row before the column was added, set to 0 by migration; never assigned by current code).
 --
 -- RECEIPT LIFETIME, written down rather than enforced as a horizon we cannot honour: a receipt
 -- lives at least as long as its session and its start. There is no retry horizon and no
@@ -116,6 +118,7 @@ CREATE TABLE IF NOT EXISTS terminal (
     summary         TEXT NOT NULL,
     ended_at        REAL NOT NULL,
     published_at    REAL NOT NULL,
+    terminal_seq    INTEGER NOT NULL DEFAULT 0,
     acknowledged_at REAL,          -- the OWNER dismissed it (their decision, at once)
     expired_at      REAL,          -- the PRUNER retired it (ours, later). Never both.
     expire_reason   TEXT,
@@ -135,6 +138,15 @@ CREATE TABLE IF NOT EXISTS terminal (
 -- Indexed on published_at, not ended_at: this index exists to serve pruning, and pruning now
 -- orders and bounds by published_at.
 CREATE INDEX IF NOT EXISTS terminal_by_published ON terminal (published_at);
+
+-- Per-generation monotonic terminal_seq counter. put_terminal atomically increments
+-- next_terminal_seq and assigns it as the new terminal's terminal_seq within the SAME
+-- transaction, so concurrent put_terminal calls from different sessions of one generation
+-- never produce duplicate seqs. Seqs start at 1 (first terminal for a generation gets seq=1).
+CREATE TABLE IF NOT EXISTS generation_progress (
+    generation_id   TEXT PRIMARY KEY,
+    next_terminal_seq INTEGER NOT NULL DEFAULT 1
+);
 """
 
 LOCK_FILENAME = ".db-init.lock"
@@ -320,7 +332,9 @@ def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
             # BEFORE any DDL: a file whose stamp disagrees with this build must be refused
             # without being touched. The DDL below is not read-only — it is what makes this
             # ordering load-bearing rather than cosmetic.
-            _refuse_a_disagreeing_database(conn)
+            found = _refuse_a_disagreeing_database(conn)
+            if found is not None and int(found) < SCHEMA_VERSION:
+                _migrate(conn, int(found))
             _stamp_before_the_ddl(conn)
             conn.executescript(_SCHEMA)
             _check_or_stamp_version(conn)
@@ -582,17 +596,55 @@ def _refuse_a_disagreeing_database(conn):
 
     Reads nothing but the catalogue and one row, and writes nothing at all — a refusal here is
     guaranteed clean because there is nothing yet to roll back.
+
+    Returns the found version string, or None for a fresh/unstamped file — the caller uses
+    this to decide whether a migration is needed.
     """
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
                     ).fetchone() is None:
-        return          # a fresh file: no stamp can disagree, and the DDL is what creates it
+        return None          # a fresh file: no stamp can disagree
     row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if row is None:
         # meta exists but was never stamped: a bootstrap that died between its DDL and its
-        # stamp. Not a disagreement — there is nothing to disagree with — so let the DDL and
-        # the stamp below complete it. They are both idempotent.
-        return
-    _validate_version(row["value"])
+        # stamp. Not a disagreement — let the DDL below complete it.
+        return None
+    raw = row["value"]
+    try:
+        found = int(raw)
+    except (TypeError, ValueError):
+        raise NelixError(STORE_CORRUPT,
+                         f"database version stamp is unreadable: {raw!r}") from None
+    if found > SCHEMA_VERSION:
+        raise NelixError(STORE_CORRUPT,
+                         f"database schema {found} is newer than this build supports "
+                         f"({SCHEMA_VERSION}); refusing to open it")
+    if found == SCHEMA_VERSION:
+        return raw            # same version: ready to go
+    return raw                # found < SCHEMA_VERSION — caller decides migration
+
+
+def _migrate(conn, from_version: int):
+    """Run the migration path from `from_version` to SCHEMA_VERSION."""
+    if from_version == 2:
+        _migrate_v2_to_v3(conn)
+    else:
+        raise NelixError(STORE_CORRUPT,
+                         f"database schema {from_version} predates this build "
+                         f"({SCHEMA_VERSION}) and no migration exists; refusing to open it")
+
+
+def _migrate_v2_to_v3(conn):
+    """Migrate a v2 database to v3: add terminal_seq column and generation_progress table."""
+    try:
+        conn.execute("ALTER TABLE terminal ADD COLUMN terminal_seq INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e):
+            raise
+    conn.execute("CREATE TABLE IF NOT EXISTS generation_progress ("
+                 "generation_id TEXT PRIMARY KEY, "
+                 "next_terminal_seq INTEGER NOT NULL DEFAULT 1)")
+    # Update the stamp so subsequent opens skip migration.
+    conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
 
 
 def _stamp_before_the_ddl(conn):
