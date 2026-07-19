@@ -16,6 +16,7 @@ from daemon.manager import SessionManager
 from daemon.obs import Logger
 from daemon.rpc_server import make_server
 from daemon.transport import Transport
+from nelix_store.store import Store
 
 _LOCK_FD = None   # held for the daemon's lifetime: closing it releases the singleton flock
 
@@ -124,6 +125,7 @@ def main():
     retention = load_retention(cfg_path)
     manager = SessionManager(
         specs, events,
+        Store(paths.nelix_root()),
         launcher_factory=get_launcher, driver_factory=get_driver,
         concurrency_limit=limit, idle_retained_limit=idle_limit, logger=logger,
         session_retain=retention.session_retain,

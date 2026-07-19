@@ -1,7 +1,7 @@
 import re
 
 import pytest
-from conftest import EXECUTOR, OWNER, make_spec
+from conftest import EXECUTOR, OWNER, make_spec, reserve_start
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
 
@@ -19,80 +19,83 @@ class FakeSession:
     def stop(self): self.stopped = True
 
 
-def _mgr(limit=1):
+def _mgr(store_and_ledger, limit=1):
+    store, ledger = store_and_ledger
     specs = {EXECUTOR: make_spec()}
     q = EventQueue()
     captured = []
     def session_factory(sid, executor, spec, events):
         s = FakeSession(sid, executor); captured.append(s); return s
-    m = SessionManager(specs, q, session_factory=session_factory, concurrency_limit=limit)
-    return m, captured
+    m = SessionManager(specs, q, store, session_factory=session_factory, concurrency_limit=limit)
+    return m, captured, ledger
 
 
-def test_start_returns_id_and_enforces_limit():
-    m, captured = _mgr(limit=1)
-    _out = m.start(EXECUTOR, "task A", "/tmp", owner_id=OWNER); sid = _out.session_id; base_seq = _out.base_seq
+def test_start_returns_id_and_enforces_limit(store_and_ledger):
+    m, captured, ledger = _mgr(store_and_ledger, limit=1)
+    sid = reserve_start(ledger)
+    _out = m.start(EXECUTOR, "task A", "/tmp", owner_id=OWNER, session_id=sid)
+    assert _out.session_id == sid
     assert captured[0].started == "task A" and m.get(sid) is captured[0]
-    assert base_seq == 0                           # daemon-owned cursor: high-water before start
-    # session ids are uuid-based (not a per-daemon sequential counter that resets to
-    # "s1" on restart and collides with stale references); consistent with evt-<hex>.
-    assert re.match(r"^s-[0-9a-f]{8}$", sid), f"non-uuid session id: {sid!r}"
+    assert _out.base_seq == 0
+    assert re.match(r"^s-[0-9a-f]{32}$", sid), f"non-uuid session id: {sid!r}"
+    sid2 = reserve_start(ledger)
     with pytest.raises(RuntimeError):
-        m.start(EXECUTOR, "task B", "/tmp", owner_id=OWNER)        # limit reached
+        m.start(EXECUTOR, "task B", "/tmp", owner_id=OWNER, session_id=sid2)  # limit reached
 
 
-def test_unknown_executor_raises():
-    m, _ = _mgr()
+def test_unknown_executor_raises(store_and_ledger):
+    m, _, ledger = _mgr(store_and_ledger)
+    sid = reserve_start(ledger)
     with pytest.raises(RuntimeError):
-        m.start("nope", "x", "/repo", owner_id=OWNER)
+        m.start("nope", "x", "/repo", owner_id=OWNER, session_id=sid)
 
 
-def test_base_seq_skips_a_prior_sessions_event():
-    # A prior session left an event in the global queue. A new session's base_seq is the
-    # high-water at start, so a session-scoped wait from there does NOT surface the stale
-    # prior-session event — only this session's future events wake the orchestrator.
-    m, _ = _mgr(limit=2)
+def test_base_seq_skips_a_prior_sessions_event(store_and_ledger):
+    m, _, ledger = _mgr(store_and_ledger, limit=2)
     prior = m._events.publish("s-old", EXECUTOR, "done", "x", "exited")
-    _out = m.start(EXECUTOR, "task", "/tmp", owner_id=OWNER); sid = _out.session_id; base_seq = _out.base_seq
-    assert base_seq == prior.seq                              # high-water before the new session
-    # nothing for the new session yet -> no wake (the prior event is filtered out by session_id)
-    assert m._events.wait_event(after_seq=base_seq, session_id=sid, timeout=0.1) is None
+    sid = reserve_start(ledger)
+    _out = m.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
+    assert _out.base_seq == prior.seq
+    assert m._events.wait_event(after_seq=_out.base_seq, session_id=sid, timeout=0.1) is None
     mine = m._events.publish(sid, EXECUTOR, "waiting_for_user", "?", "idle_prompt")
-    assert m._events.wait_event(after_seq=base_seq, session_id=sid, timeout=0.1) is mine
+    assert m._events.wait_event(after_seq=_out.base_seq, session_id=sid, timeout=0.1) is mine
 
 
-def test_start_threads_cwd_to_session(tmp_path):
-    m, captured = _mgr()
-    m.start(EXECUTOR, "t", str(tmp_path), owner_id=OWNER)
+def test_start_threads_cwd_to_session(tmp_path, store_and_ledger):
+    m, captured, ledger = _mgr(store_and_ledger)
+    sid = reserve_start(ledger)
+    m.start(EXECUTOR, "t", str(tmp_path), owner_id=OWNER, session_id=sid)
     assert captured[0].started_cwd == str(tmp_path)
 
 
-def test_start_expands_user_and_makes_cwd_absolute():
+def test_start_expands_user_and_makes_cwd_absolute(store_and_ledger):
     import os
-    m, captured = _mgr()
-    m.start(EXECUTOR, "t", "~", owner_id=OWNER)                 # home exists -> passes validation
+    m, captured, ledger = _mgr(store_and_ledger)
+    sid = reserve_start(ledger)
+    m.start(EXECUTOR, "t", "~", owner_id=OWNER, session_id=sid)
     assert captured[0].started_cwd == os.path.expanduser("~")
     assert os.path.isabs(captured[0].started_cwd)
 
 
-def test_start_rejects_nonexistent_cwd():
-    m, captured = _mgr()
+def test_start_rejects_nonexistent_cwd(store_and_ledger):
+    m, captured, ledger = _mgr(store_and_ledger)
+    sid = reserve_start(ledger)
     with pytest.raises(ValueError):
-        m.start(EXECUTOR, "t", "/no/such/dir/definitely-not-here", owner_id=OWNER)
-    assert captured == []                       # invalid cwd -> no session created
-
-
-def test_start_rejects_cwd_that_is_a_file(tmp_path):
-    m, captured = _mgr()
-    f = tmp_path / "afile"; f.write_text("x")
-    with pytest.raises(ValueError):
-        m.start(EXECUTOR, "t", str(f), owner_id=OWNER)
+        m.start(EXECUTOR, "t", "/no/such/dir/definitely-not-here", owner_id=OWNER, session_id=sid)
     assert captured == []
 
 
-def test_start_failure_does_not_leak_session():
-    # If session.start() raises (rejected task / spawn failure), the manager must not leave a
-    # registered-but-unstarted session behind, and the concurrency slot must be freed.
+def test_start_rejects_cwd_that_is_a_file(tmp_path, store_and_ledger):
+    m, captured, ledger = _mgr(store_and_ledger)
+    f = tmp_path / "afile"; f.write_text("x")
+    sid = reserve_start(ledger)
+    with pytest.raises(ValueError):
+        m.start(EXECUTOR, "t", str(f), owner_id=OWNER, session_id=sid)
+    assert captured == []
+
+
+def test_start_failure_does_not_leak_session(store_and_ledger):
+    store, ledger = store_and_ledger
     specs = {EXECUTOR: make_spec()}
     q = EventQueue()
     calls = {"n": 0}
@@ -102,31 +105,29 @@ def test_start_failure_does_not_leak_session():
         def start(self, task, cwd):
             calls["n"] += 1
             if calls["n"] == 1:
-                raise ValueError("rejected")       # first start fails
-            super().start(task, cwd)               # later starts behave normally
+                raise ValueError("rejected")
+            super().start(task, cwd)
 
     def factory(sid, ex, spec, ev):
         s = MaybeBoom(sid, ex); made.append(s); return s
 
-    m = SessionManager(specs, q, session_factory=factory, concurrency_limit=1)
+    m = SessionManager(specs, q, store, session_factory=factory, concurrency_limit=1)
+    sid = reserve_start(ledger)
     with pytest.raises(ValueError):
-        m.start(EXECUTOR, "task", "/tmp", owner_id=OWNER)
-    assert m.status(owner_id=OWNER)["sessions"] == {}            # no leaked session
-    assert made[0].stopped is True                 # partially-started session was torn down
-    _out = m.start(EXECUTOR, "task2", "/tmp", owner_id=OWNER); sid = _out.session_id    # slot freed: a fresh start still works
-    assert sid is not None and m.status(owner_id=OWNER)["sessions"][sid]["control_state"] == "busy"
+        m.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
+    assert m.status(owner_id=OWNER)["sessions"] == {}
+    assert made[0].stopped is True
+    sid2 = reserve_start(ledger)
+    _out = m.start(EXECUTOR, "task2", "/tmp", owner_id=OWNER, session_id=sid2)
+    assert _out.session_id is not None
+    assert m.status(owner_id=OWNER)["sessions"][sid2]["control_state"] == "busy"
 
 
-def test_operator_stop_publishes_single_stopped_event(tmp_path):
-    """A live agent stopped by the operator must emit exactly one terminal 'stopped' event (so the
-    per-session waiter fires and exits), recorded in recent_terminal, with no deadlock and no double
-    done/crashed event. manager.stop(owner_id=OWNER) must NOT self-pop — _free_slot captures recent_terminal."""
+def test_operator_stop_publishes_single_stopped_event(tmp_path, store_and_ledger):
+    store, ledger = store_and_ledger
     events = EventQueue()
 
     class StoppingSession:
-        # Drives the real terminal path: on stop() publish ONE 'stopped' event, then invoke
-        # on_terminal (manager._free_slot, which re-enters manager._lock) — exactly what the real
-        # monitor's _finish_publish + _finish_cleanup do for an operator stop.
         def __init__(self, sid, executor):
             self.sid = sid; self.executor = executor
             self.on_terminal = None; self.reaper_ctx = None
@@ -136,33 +137,33 @@ def test_operator_stop_publishes_single_stopped_event(tmp_path):
         def terminal_snapshot(self):
             return {"session_id": self.sid, "state": "stopped", "terminal_kind": "stopped",
                     "terminal": True, "lineage_id": self.lineage_id,
-                    "restarted_from": None, "restart_count": 0}
+                    "restarted_from": None, "restart_count": 0,
+                    "screen_excerpt": ""}
         def stop(self):
             events.publish(self.sid, self.executor, "stopped", "", "stopped")
             if self.on_terminal is not None:
                 self.on_terminal(self.sid)
 
     specs = {EXECUTOR: make_spec()}
-    mgr = SessionManager(specs, events, concurrency_limit=2,
+    mgr = SessionManager(specs, events, store, concurrency_limit=2,
                          session_factory=lambda sid, ex, spec, ev: StoppingSession(sid, ex),
                          session_retain=0, session_max_age_days=0)
-    _out = mgr.start(EXECUTOR, "t", str(tmp_path), owner_id=OWNER); sid = _out.session_id; base = _out.base_seq
+    sid = reserve_start(ledger)
+    _out = mgr.start(EXECUTOR, "t", str(tmp_path), owner_id=OWNER, session_id=sid)
     before = events.latest_seq(sid)
 
-    assert mgr.stop(sid, owner_id=OWNER).status in ("stopped", "stop_requested")   # returns, no deadlock
+    assert mgr.stop(sid, owner_id=OWNER).status in ("stopped", "stop_requested")
 
-    # exactly one new terminal event for this session, kind == "stopped"
     new = [e for e in events._events if e.session_id == sid and e.seq > before]
     assert [e.kind for e in new] == ["stopped"]
-    # a session-scoped waiter parked at `before` would now see it
     assert events.wait_event(after_seq=before, timeout=0, session_id=sid).kind == "stopped"
-    # recorded in recent_terminal so the board read can show it
     assert sid in mgr.status(owner_id=OWNER)["recent_terminal"]
 
 
-def test_status_lists_all_and_stop():
-    m, captured = _mgr(limit=2)
-    _out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER); sid = _out.session_id
+def test_status_lists_all_and_stop(store_and_ledger):
+    m, captured, ledger = _mgr(store_and_ledger, limit=2)
+    sid = reserve_start(ledger)
+    _out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id=sid)
     all_status = m.status(owner_id=OWNER)
     assert sid in all_status["sessions"]
     assert m.stop(sid, owner_id=OWNER).status in ("stopped", "stop_requested") and captured[0].stopped is True
@@ -188,15 +189,14 @@ def test_gc_count_prunes_oldest_keeps_active(monkeypatch, tmp_path):
     root = paths.sessions_root()
     now = 1_000_000.0
     for i in range(4):
-        _seed_session(root, f"s-{i:08x}", age_days=i, now=now)   # s-0 newest ... s-3 oldest
-    active = "s-00000003"  # the OLDEST by mtime, but registered -> must survive
-    # 3 inactive dirs (s-0/s-1/s-2); count rake keeps the newest retain=2 of them.
+        _seed_session(root, f"s-{i:08x}", age_days=i, now=now)
+    active = "s-00000003"
     gc_sessions({active}, retain=2, max_age_days=0, now=now)
     remaining = sorted(p.name for p in root.iterdir())
-    assert active in remaining                       # excluded despite being oldest
-    assert "s-00000000" in remaining                 # newest kept
-    assert "s-00000002" not in remaining             # oldest inactive pruned by count rake
-    assert len(remaining) == 3                        # active + newest 2 inactive survivors
+    assert active in remaining
+    assert "s-00000000" in remaining
+    assert "s-00000002" not in remaining
+    assert len(remaining) == 3
 
 
 def test_gc_age_prunes_old(monkeypatch, tmp_path):
@@ -207,7 +207,7 @@ def test_gc_age_prunes_old(monkeypatch, tmp_path):
     now = 1_000_000.0
     _seed_session(root, "s-young", age_days=1, now=now)
     _seed_session(root, "s-old", age_days=30, now=now)
-    gc_sessions(set(), retain=0, max_age_days=7, now=now)   # retain 0 disables count rake
+    gc_sessions(set(), retain=0, max_age_days=7, now=now)
     names = {p.name for p in root.iterdir()}
     assert names == {"s-young"}
 
@@ -221,48 +221,54 @@ def test_gc_rmtree_failure_is_skipped(monkeypatch, tmp_path):
     _seed_session(root, "s-a", age_days=30, now=now)
     monkeypatch.setattr(manager.shutil, "rmtree",
                         lambda d: (_ for _ in ()).throw(OSError("locked")))
-    manager.gc_sessions(set(), retain=0, max_age_days=7, now=now)   # must not raise
+    manager.gc_sessions(set(), retain=0, max_age_days=7, now=now)
     assert (root / "s-a").exists()
 
 
-def test_session_created_and_stopped_logged(tmp_path, monkeypatch):
+def test_session_created_and_stopped_logged(tmp_path, store_and_ledger, monkeypatch):
     import io, json
     from daemon.obs import Logger
+    store, ledger = store_and_ledger
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     buf = io.StringIO()
-    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), concurrency_limit=1,
+    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), store, concurrency_limit=1,
                          logger=Logger(level="debug", stream=buf),
                          session_factory=lambda sid, ex, spec, ev: FakeSession(sid, ex))
-    _out = mgr.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER); sid = _out.session_id      # real dir for the isdir() check
+    sid = reserve_start(ledger)
+    _out = mgr.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER, session_id=sid)
     mgr.stop(sid, owner_id=OWNER)
     events = [json.loads(l)["event"] for l in buf.getvalue().splitlines() if l.strip()]
     assert "session_created" in events and "session_stopped" in events
 
 
-def test_unknown_executor_logs_rejected(tmp_path, monkeypatch):
+def test_unknown_executor_logs_rejected(tmp_path, store_and_ledger, monkeypatch):
     import io
     from daemon.obs import Logger
+    store, ledger = store_and_ledger
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     buf = io.StringIO()
-    mgr = SessionManager({}, EventQueue(), logger=Logger(level="debug", stream=buf))
+    mgr = SessionManager({}, EventQueue(), store, logger=Logger(level="debug", stream=buf))
+    sid = reserve_start(ledger)
     try:
-        mgr.start("nope", "t", str(tmp_path), owner_id=OWNER)
+        mgr.start("nope", "t", str(tmp_path), owner_id=OWNER, session_id=sid)
     except Exception:
         pass
     assert "session_start_rejected" in buf.getvalue()
 
 
-def test_terminal_callback_frees_slot_for_next_start():
-    m, captured = _mgr(limit=1)
-    _out = m.start(EXECUTOR, "task A", "/tmp", owner_id=OWNER); sid = _out.session_id
-    # simulate the session reaching a terminal state and invoking its on_terminal callback
+def test_terminal_callback_frees_slot_for_next_start(store_and_ledger):
+    m, captured, ledger = _mgr(store_and_ledger, limit=1)
+    sid = reserve_start(ledger)
+    _out = m.start(EXECUTOR, "task A", "/tmp", owner_id=OWNER, session_id=sid)
     captured[0].on_terminal(sid)
-    assert m.get(sid) is None                            # deregistered
-    _out2 = m.start(EXECUTOR, "task B", "/tmp", owner_id=OWNER); sid2 = _out2.session_id        # slot freed -> next start succeeds
+    assert m.get(sid) is None
+    sid2 = reserve_start(ledger)
+    _out2 = m.start(EXECUTOR, "task B", "/tmp", owner_id=OWNER, session_id=sid2)
     assert sid2 is not None
 
 
-def test_manager_sets_on_terminal_and_reaper_ctx():
+def test_manager_sets_on_terminal_and_reaper_ctx(store_and_ledger):
+    store, ledger = store_and_ledger
     specs = {EXECUTOR: make_spec()}
     q = EventQueue()
     made = []
@@ -270,39 +276,43 @@ def test_manager_sets_on_terminal_and_reaper_ctx():
         s = FakeSession(sid, ex); made.append(s); return s
     from daemon import reaper
     ctx = reaper.ReaperContext(10, "d1", 5.0, reaper.ProcessInspector(), reaper.ProcessKiller())
-    m = SessionManager(specs, q, session_factory=factory, concurrency_limit=1, reaper_ctx=ctx)
-    m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)
+    m = SessionManager(specs, q, store, session_factory=factory, concurrency_limit=1, reaper_ctx=ctx)
+    sid = reserve_start(ledger)
+    m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id=sid)
     assert made[0].reaper_ctx is ctx
     assert callable(made[0].on_terminal)
 
 
-def test_stop_all_uses_shutdown_reason(tmp_path, monkeypatch):
+def test_stop_all_uses_shutdown_reason(tmp_path, store_and_ledger, monkeypatch):
     import io, json
     from daemon.obs import Logger
+    store, ledger = store_and_ledger
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     buf = io.StringIO()
-    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), concurrency_limit=1,
+    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), store, concurrency_limit=1,
                          logger=Logger(level="debug", stream=buf),
                          session_factory=lambda sid, ex, spec, ev: FakeSession(sid, ex))
-    mgr.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER)
+    sid = reserve_start(ledger)
+    mgr.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER, session_id=sid)
     mgr.stop_all()
     rec = [json.loads(l) for l in buf.getvalue().splitlines()
            if json.loads(l)["event"] == "session_stopped"][0]
     assert rec["reason"] == "shutdown"
 
 
-def test_start_returns_outcome_with_snapshot(tmp_path):
-    m, _ = _mgr()
-    out = m.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER)
-    assert out.session_id.startswith("s-")
+def test_start_returns_outcome_with_snapshot(store_and_ledger):
+    m, _, ledger = _mgr(store_and_ledger)
+    sid = reserve_start(ledger)
+    out = m.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER, session_id=sid)
+    assert out.session_id == sid
     assert out.base_seq == 0
-    assert out.snapshot["session_id"] == out.session_id
+    assert out.snapshot["session_id"] == sid
     assert out.snapshot["task_delivery"] == "pending"
     assert out.snapshot["control_state"] == "busy"
 
 
-def test_stop_unknown_session_outcome(tmp_path):
-    m, _ = _mgr()
+def test_stop_unknown_session_outcome(store_and_ledger):
+    m, _, _ = _mgr(store_and_ledger)
     out = m.stop("s-nope", owner_id=OWNER)
     assert out.status == "unknown_session" and out.snapshot is None
 
@@ -318,29 +328,34 @@ class _StoppedSession:
     def terminal_snapshot(self):
         return {"session_id": self.sid, "control_state": "terminal", "terminal_kind": "stopped",
                 "task_delivery": "delivered", "pending": False, "lineage_id": self.sid,
-                "restarted_from": None, "restart_count": 0, "terminal": True}
+                "restarted_from": None, "restart_count": 0, "terminal": True,
+                "screen_excerpt": ""}
     def stop(self):
         self.stopped = True
         if self.on_terminal is not None:
-            self.on_terminal(self.sid)        # mimic the monitor finalizing -> _free_slot captures
+            self.on_terminal(self.sid)
 
 
-def test_stop_confirmed_terminal_outcome():
+def test_stop_confirmed_terminal_outcome(store_and_ledger):
+    store, ledger = store_and_ledger
     specs = {EXECUTOR: make_spec()}
     def factory(sid, executor, spec, events):
         return _StoppedSession(sid, executor)
-    m = SessionManager(specs, EventQueue(), session_factory=factory, concurrency_limit=1)
-    out0 = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)
+    m = SessionManager(specs, EventQueue(), store, session_factory=factory, concurrency_limit=1)
+    sid = reserve_start(ledger)
+    out0 = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id=sid)
     out = m.stop(out0.session_id, owner_id=OWNER)
     assert out.status == "stopped"
     assert out.snapshot["terminal_kind"] == "stopped"
     assert out.snapshot["control_state"] == "terminal"
 
 
-def test_restart_outcome_carries_new_snapshot(tmp_path):
-    m, _ = _mgr(limit=2)
-    out0 = m.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER)
-    out = m.restart(out0.session_id, force=True, owner_id=OWNER)
+def test_restart_outcome_carries_new_snapshot(store_and_ledger):
+    m, _, ledger = _mgr(store_and_ledger, limit=2)
+    sid = reserve_start(ledger)
+    out0 = m.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER, session_id=sid)
+    new_sid = reserve_start(ledger)
+    out = m.restart(out0.session_id, new_session_id=new_sid, force=True, owner_id=OWNER)
     assert out.status == "restarted"
     assert out.snapshot["session_id"] == out.session_id
     assert out.snapshot["control_state"] == "busy"

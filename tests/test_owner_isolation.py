@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 import paths
-from conftest import EXECUTOR, make_spec
+from conftest import EXECUTOR, make_spec, reserve_start
 from daemon import owner
 from daemon.events import EventQueue
 from daemon.launchers.base import ExecutorCapabilities
@@ -124,8 +124,9 @@ class FakeSession:
 
 
 @pytest.fixture
-def daemon():
+def daemon(store_and_ledger):
     """A real manager behind real routes. Yields (base_url, manager, sessions_by_id)."""
+    store, ledger = store_and_ledger
     made = {}
 
     def session_factory(sid, executor, spec, events):
@@ -133,7 +134,7 @@ def daemon():
         made[sid] = s
         return s
 
-    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(),
+    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), store,
                          session_factory=session_factory, concurrency_limit=10)
     port = next(_PORT)
     srv = make_server(mgr, Transport.tcp("127.0.0.1", port, "t"))
@@ -144,36 +145,41 @@ def daemon():
         srv.shutdown()
 
 
-def _start(base, owner_id, task, tmp_path):
-    st, b = _req("POST", base + "/start",
-                 body={"executor": EXECUTOR, "task": task, "cwd": str(tmp_path),
-                       "owner_id": owner_id})
+def _start(base, owner_id, task, tmp_path, session_id=None):
+    body = {"executor": EXECUTOR, "task": task, "cwd": str(tmp_path),
+            "owner_id": owner_id}
+    if session_id is not None:
+        body["session_id"] = session_id
+    st, b = _req("POST", base + "/start", body=body)
     assert st == 200, b
     return b["session_id"]
 
 
 @pytest.fixture
-def two_harnesses(daemon, tmp_path):
+def two_harnesses(daemon, tmp_path, store_and_ledger):
     """X owns one session, Y owns another. The setup every isolation test starts from."""
+    store, ledger = store_and_ledger
     base, mgr, made = daemon
-    sx = _start(base, X, "X SECRET TASK", tmp_path)
-    sy = _start(base, Y, "Y SECRET TASK", tmp_path)
+    sx = _start(base, X, "X SECRET TASK", tmp_path, session_id=reserve_start(ledger))
+    sy = _start(base, Y, "Y SECRET TASK", tmp_path, session_id=reserve_start(ledger))
     return base, mgr, made, sx, sy
 
 
 # ============================================================ the record itself
 
-def test_start_persists_the_owner_before_it_answers(daemon, tmp_path):
+def test_start_persists_the_owner_before_it_answers(daemon, tmp_path, store_and_ledger):
+    store, ledger = store_and_ledger
     base, mgr, made = daemon
-    sid = _start(base, X, "t", tmp_path)
+    sid = _start(base, X, "t", tmp_path, session_id=reserve_start(ledger))
     # Durable and on disk by the time the caller learned the id — not a lease, not in-memory.
     assert owner.owner_of(paths.sessions_root() / sid) == X
     assert json.loads(paths.session_owner(paths.sessions_root() / sid).read_text()) == {"owner_id": X}
 
 
-def test_start_fails_and_spawns_nothing_when_the_owner_cannot_be_written(daemon, tmp_path, monkeypatch):
+def test_start_fails_and_spawns_nothing_when_the_owner_cannot_be_written(daemon, tmp_path, monkeypatch, store_and_ledger):
     # spec §7: the record is written BEFORE a successful start response, and start FAILS if it
     # cannot be written. The session must not exist, and no PTY may have been spawned for it.
+    store, ledger = store_and_ledger
     base, mgr, made = daemon
 
     def boom(*a, **k):
@@ -181,7 +187,8 @@ def test_start_fails_and_spawns_nothing_when_the_owner_cannot_be_written(daemon,
 
     monkeypatch.setattr("daemon.manager.owner.write", boom)
     st, b = _req("POST", base + "/start",
-                 body={"executor": EXECUTOR, "task": "t", "cwd": str(tmp_path), "owner_id": X})
+                 body={"executor": EXECUTOR, "task": "t", "cwd": str(tmp_path), "owner_id": X,
+                       "session_id": reserve_start(ledger)})
     assert st == 500, (st, b)                       # daemon failed a well-formed request
     # The Session OBJECT is constructed before the record is written (it is inert until start()),
     # so the invariant is not "nothing was built" — it is that nothing was ever SPAWNED, nothing
@@ -192,14 +199,16 @@ def test_start_fails_and_spawns_nothing_when_the_owner_cannot_be_written(daemon,
     assert mgr._sessions == {}, "an unattributable session stayed registered"
     # and the slot was released — an unattributable start must not leak capacity
     monkeypatch.undo()
-    assert _start(base, X, "t2", tmp_path)
+    assert _start(base, X, "t2", tmp_path, session_id=reserve_start(ledger))
 
 
 @pytest.mark.parametrize("bad", [None, "", "has space", "-lead", "x" * 129])
-def test_start_rejects_a_bad_owner_with_400_not_409(daemon, tmp_path, bad):
+def test_start_rejects_a_bad_owner_with_400_not_409(daemon, tmp_path, bad, store_and_ledger):
     # 400 (your input) not 409 (daemon full): a 409 invites a retry loop that can never succeed.
+    store, ledger = store_and_ledger
     base, mgr, made = daemon
-    body = {"executor": EXECUTOR, "task": "t", "cwd": str(tmp_path)}
+    body = {"executor": EXECUTOR, "task": "t", "cwd": str(tmp_path),
+            "session_id": reserve_start(ledger)}
     if bad is not None:
         body["owner_id"] = bad
     st, b = _req("POST", base + "/start", body=body)
@@ -207,7 +216,7 @@ def test_start_rejects_a_bad_owner_with_400_not_409(daemon, tmp_path, bad):
     assert made == {}
 
 
-def test_bad_owner_is_400_even_when_the_daemon_is_FULL(tmp_path):
+def test_bad_owner_is_400_even_when_the_daemon_is_FULL(tmp_path, store_and_ledger):
     """A bad owner_id must read as the caller's mistake even at capacity.
 
     The route's own shape check cannot prove this: it rejects a bad owner at the door, so it
@@ -218,6 +227,7 @@ def test_bad_owner_is_400_even_when_the_daemon_is_FULL(tmp_path):
 
     (Found by mutation: deleting `owner.validate` from _spawn left every other owner test green.)
     """
+    store, ledger = store_and_ledger
     made = {}
 
     def session_factory(sid, executor, spec, events):
@@ -225,31 +235,37 @@ def test_bad_owner_is_400_even_when_the_daemon_is_FULL(tmp_path):
         made[sid] = s
         return s
 
-    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(),
+    mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), store,
                          session_factory=session_factory, concurrency_limit=1)
-    mgr.start(EXECUTOR, "filler", str(tmp_path), owner_id=X)      # the one slot is now taken
+    mgr.start(EXECUTOR, "filler", str(tmp_path), owner_id=X,
+              session_id=reserve_start(ledger))                  # the one slot is now taken
     with pytest.raises(RuntimeError):                             # sanity: the daemon IS full
-        mgr.start(EXECUTOR, "second", str(tmp_path), owner_id=X)
+        mgr.start(EXECUTOR, "second", str(tmp_path), owner_id=X,
+                  session_id=reserve_start(ledger))
     # ...and a BAD owner against that full daemon is still OwnerRejected (-> 400), not the
     # RuntimeError (-> 409) the cap would raise.
     with pytest.raises(owner.OwnerRejected):
-        mgr.start(EXECUTOR, "bad", str(tmp_path), owner_id="has space")
+        mgr.start(EXECUTOR, "bad", str(tmp_path), owner_id="has space",
+                  session_id=reserve_start(ledger))
 
 
-def test_manager_start_rejects_a_bad_owner_directly(daemon, tmp_path):
+def test_manager_start_rejects_a_bad_owner_directly(daemon, tmp_path, store_and_ledger):
     # The manager is the API; the route is one caller of it. A bad owner must be refused here
     # too, not only at the HTTP door.
+    store, ledger = store_and_ledger
     base, mgr, made = daemon
     with pytest.raises(owner.OwnerRejected):
-        mgr.start(EXECUTOR, "t", str(tmp_path), owner_id="-lead")
+        mgr.start(EXECUTOR, "t", str(tmp_path), owner_id="-lead",
+                  session_id=reserve_start(ledger))
     assert made == {}
 
 
-def test_owner_record_is_written_even_when_meta_write_fails(daemon, tmp_path, monkeypatch):
+def test_owner_record_is_written_even_when_meta_write_fails(daemon, tmp_path, monkeypatch, store_and_ledger):
     # The whole reason owner.json is not a field in meta.json: Session._write_meta swallows OSError
     # (fine for a capture sidecar), and an access invariant must not inherit that.
+    store, ledger = store_and_ledger
     base, mgr, made = daemon
-    sid = _start(base, X, "t", tmp_path)
+    sid = _start(base, X, "t", tmp_path, session_id=reserve_start(ledger))
     assert owner.owner_of(paths.sessions_root() / sid) == X
 
 
@@ -497,18 +513,24 @@ def test_stop_all_still_stops_every_owners_sessions(two_harnesses):
 
 # ============================================================ /restart — inherits, never trusts
 
-def test_restart_cannot_restart_another_harnesss_session(two_harnesses):
+def test_restart_cannot_restart_another_harnesss_session(two_harnesses, store_and_ledger):
+    store, ledger = store_and_ledger
     base, mgr, made, sx, sy = two_harnesses
     before = set(made)
-    st, b = _req("POST", base + "/restart", body={"session_id": sx, "owner_id": Y})
+    st, b = _req("POST", base + "/restart",
+                 body={"session_id": sx, "owner_id": Y,
+                       "new_session_id": reserve_start(ledger)})
     assert st == 404 and b["status"] == "unknown_session"
     assert set(made) == before, "Y's restart spawned a session from X's"
     assert made[sx].stopped is False
 
 
-def test_restart_inherits_the_stored_owner(two_harnesses):
+def test_restart_inherits_the_stored_owner(two_harnesses, store_and_ledger):
+    store, ledger = store_and_ledger
     base, mgr, made, sx, sy = two_harnesses
-    st, b = _req("POST", base + "/restart", body={"session_id": sx, "owner_id": X, "force": True})
+    st, b = _req("POST", base + "/restart",
+                 body={"session_id": sx, "owner_id": X, "force": True,
+                       "new_session_id": reserve_start(ledger)})
     assert st == 200, b
     new_sid = b["session_id"]
     assert owner.owner_of(paths.sessions_root() / new_sid) == X   # from disk, not from the body
@@ -517,44 +539,55 @@ def test_restart_inherits_the_stored_owner(two_harnesses):
     assert new_sid not in _req("GET", base + f"/status?owner_id={Y}")[1]["sessions"]
 
 
-def test_restart_refuses_a_session_whose_owner_record_is_gone(two_harnesses):
+def test_restart_refuses_a_session_whose_owner_record_is_gone(two_harnesses, store_and_ledger):
     # THE case that proves "inherits, never trusts the caller". A crashed session is resolved from
     # DISK meta, and every crashed session takes this path. If restart trusted the request's
     # owner_id, an ownerless session would be a free session — anyone could restart it and become
     # its owner. Fail closed instead.
+    store, ledger = store_and_ledger
     base, mgr, made, sx, sy = two_harnesses
     mgr._free_slot(sx)                                    # gone from _sessions: the disk-meta path
     paths.session_owner(paths.sessions_root() / sx).unlink()
-    st, b = _req("POST", base + "/restart", body={"session_id": sx, "owner_id": X, "force": True})
+    st, b = _req("POST", base + "/restart",
+                 body={"session_id": sx, "owner_id": X, "force": True,
+                       "new_session_id": reserve_start(ledger)})
     assert st == 404 and b["status"] == "unknown_session"
 
 
-def test_restart_refuses_a_session_whose_owner_record_is_malformed(two_harnesses):
+def test_restart_refuses_a_session_whose_owner_record_is_malformed(two_harnesses, store_and_ledger):
+    store, ledger = store_and_ledger
     base, mgr, made, sx, sy = two_harnesses
     mgr._free_slot(sx)
     paths.session_owner(paths.sessions_root() / sx).write_text("{tor")
-    st, b = _req("POST", base + "/restart", body={"session_id": sx, "owner_id": X, "force": True})
+    st, b = _req("POST", base + "/restart",
+                 body={"session_id": sx, "owner_id": X, "force": True,
+                       "new_session_id": reserve_start(ledger)})
     assert st == 404 and b["status"] == "unknown_session"
 
 
-def test_restart_of_a_crashed_session_inherits_from_disk(two_harnesses):
+def test_restart_of_a_crashed_session_inherits_from_disk(two_harnesses, store_and_ledger):
     # The main restart path: session already gone from _sessions, resolved from meta.json on disk.
+    store, ledger = store_and_ledger
     base, mgr, made, sx, sy = two_harnesses
     mgr._free_slot(sx)
-    st, b = _req("POST", base + "/restart", body={"session_id": sx, "owner_id": X, "force": True})
+    st, b = _req("POST", base + "/restart",
+                 body={"session_id": sx, "owner_id": X, "force": True,
+                       "new_session_id": reserve_start(ledger)})
     assert st == 200, b
     assert owner.owner_of(paths.sessions_root() / b["session_id"]) == X
 
 
-def test_restart_requires_an_owner(two_harnesses):
+def test_restart_requires_an_owner(two_harnesses, store_and_ledger):
+    store, ledger = store_and_ledger
     base, mgr, made, sx, sy = two_harnesses
-    st, b = _req("POST", base + "/restart", body={"session_id": sx})
+    st, b = _req("POST", base + "/restart",
+                 body={"session_id": sx, "new_session_id": reserve_start(ledger)})
     assert st == 400 and b["error"] == "missing owner_id"
 
 
 @pytest.mark.parametrize("caller", [None, "", "has space"])
 def test_restart_direct_manager_call_refuses_a_bad_owner_on_an_ownerless_session(
-        two_harnesses, caller):
+        two_harnesses, caller, store_and_ledger):
     """The manager is the API; the RPC route is one caller of it.
 
     Every route-level test of this is blind here — /restart shape-checks owner_id at the door, so
@@ -563,19 +596,22 @@ def test_restart_direct_manager_call_refuses_a_bad_owner_on_an_ownerless_session
     would compare None to None, find them equal, and hand an ownerless session to a caller who
     passed no owner at all. Found by mutation; this is the test that keeps it shut.
     """
+    store, ledger = store_and_ledger
     base, mgr, made, sx, sy = two_harnesses
     mgr._free_slot(sx)
     paths.session_owner(paths.sessions_root() / sx).unlink()      # ownerless
     before = set(made)
-    assert mgr.restart(sx, owner_id=caller, force=True).status == "unknown_session"
+    assert mgr.restart(sx, new_session_id=reserve_start(ledger),
+                       owner_id=caller, force=True).status == "unknown_session"
     assert set(made) == before, "an ownerless session was restarted by a caller with no owner"
 
 
 # ============================================================ fail-closed on a broken record
 
-def test_a_session_with_no_owner_record_is_reachable_by_nobody(two_harnesses):
+def test_a_session_with_no_owner_record_is_reachable_by_nobody(two_harnesses, store_and_ledger):
     # Fail CLOSED, not open: the failure mode of a lost record is "nobody can drive it", never
     # "everybody can". Checked on every route, because one fail-open route is enough.
+    store, ledger = store_and_ledger
     base, mgr, made, sx, sy = two_harnesses
     paths.session_owner(paths.sessions_root() / sx).unlink()
     for who in (X, Y, "harness-z"):
@@ -587,7 +623,9 @@ def test_a_session_with_no_owner_record_is_reachable_by_nobody(two_harnesses):
         assert _req("POST", base + "/respond",
                     body={"session_id": sx, "answer": "a", "owner_id": who})[0] == 404
         assert _req("POST", base + "/stop", body={"session_id": sx, "owner_id": who})[0] == 404
-        assert _req("POST", base + "/restart", body={"session_id": sx, "owner_id": who})[0] == 404
+        assert _req("POST", base + "/restart",
+                    body={"session_id": sx, "owner_id": who,
+                          "new_session_id": reserve_start(ledger)})[0] == 404
     assert made[sx].answers == [] and made[sx].stopped is False
 
 

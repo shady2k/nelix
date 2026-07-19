@@ -15,7 +15,10 @@ these tests exercise that real axis of variation as FACTS, not as a fabricated o
 code. A genuine `unsupported_by_generation` RESPONSE is deferred to Plan 4 (multi-generation
 lifecycle), where more than one generation coexisting makes the cross-generation case real.
 """
-from conftest import EXECUTOR, OWNER, make_spec, own
+from nelix_store.store import Store
+from nelix_store.ledger import StartLedger
+
+from conftest import EXECUTOR, OWNER, make_spec, own, reserve_start
 from daemon.events import EventQueue
 from daemon.launchers.base import ExecutorCapabilities
 from daemon.manager import SessionManager
@@ -49,31 +52,42 @@ class _FakeSession:
         pass
 
 
-def _mgr(driver, launcher, limit=5):
+def _mgr(driver, launcher, tmp_path, limit=5):
+    root = tmp_path / "nelix-db"
+    root.mkdir()
+    store = Store(root)
+    ledger = StartLedger(root)
     specs = {EXECUTOR: make_spec()}
     q = EventQueue()
 
     def session_factory(sid, executor, spec, events):
         return _FakeSession(sid, executor, driver, launcher)
 
-    return SessionManager(specs, q, session_factory=session_factory, concurrency_limit=limit)
+    mgr = SessionManager(specs, q, store, session_factory=session_factory,
+                         concurrency_limit=limit)
+    return mgr, ledger
 
 
-def test_capabilities_unknown_session_is_none():
-    m = _mgr(_FakeDriver(True), _FakeLauncher(ExecutorCapabilities(isolation_class="host")))
+def test_capabilities_unknown_session_is_none(tmp_path):
+    m, _ledger = _mgr(_FakeDriver(True), _FakeLauncher(ExecutorCapabilities(isolation_class="host")),
+                      tmp_path)
     assert m.capabilities("s-nope", owner_id=OWNER) is None
 
 
-def test_capabilities_foreign_owner_is_none():
-    m = _mgr(_FakeDriver(True), _FakeLauncher(ExecutorCapabilities(isolation_class="host")))
-    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)
+def test_capabilities_foreign_owner_is_none(tmp_path):
+    m, ledger = _mgr(_FakeDriver(True), _FakeLauncher(ExecutorCapabilities(isolation_class="host")),
+                     tmp_path)
+    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER,
+                  session_id=reserve_start(ledger))
     assert m.capabilities(out.session_id, owner_id="someone-else") is None
 
 
-def test_capabilities_hook_capable_session_reports_the_facts():
-    m = _mgr(_FakeDriver(True),
-             _FakeLauncher(ExecutorCapabilities(isolation_class="host", can_attach=False)))
-    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)
+def test_capabilities_hook_capable_session_reports_the_facts(tmp_path):
+    m, ledger = _mgr(_FakeDriver(True),
+                     _FakeLauncher(ExecutorCapabilities(isolation_class="host", can_attach=False)),
+                     tmp_path)
+    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER,
+                  session_id=reserve_start(ledger))
     caps = m.capabilities(out.session_id, owner_id=OWNER)
     assert caps == {
         "session_id": out.session_id,
@@ -84,7 +98,7 @@ def test_capabilities_hook_capable_session_reports_the_facts():
     }
 
 
-def test_capabilities_hookless_session_reports_hook_capable_false_as_a_fact():
+def test_capabilities_hookless_session_reports_hook_capable_false_as_a_fact(tmp_path):
     # Fix pass (review): this used to assert a fabricated `operations["message"]` entry coded
     # `unsupported_by_generation`. That code name is a spec §8 CROSS-GENERATION concept and
     # /message never actually gated on hook_capable, so the entry was fictional. What IS real: a
@@ -92,9 +106,11 @@ def test_capabilities_hookless_session_reports_hook_capable_false_as_a_fact():
     # nelix-note are only injected for a hook-capable driver's session — daemon/launchers/local.py
     # `_driver_hook_capable`) — the response reports that as a plain FACT, no operation-support
     # code attached.
-    m = _mgr(_FakeDriver(False),
-             _FakeLauncher(ExecutorCapabilities(isolation_class="host", can_attach=False)))
-    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)
+    m, ledger = _mgr(_FakeDriver(False),
+                     _FakeLauncher(ExecutorCapabilities(isolation_class="host", can_attach=False)),
+                     tmp_path)
+    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER,
+                  session_id=reserve_start(ledger))
     caps = m.capabilities(out.session_id, owner_id=OWNER)
     assert caps == {
         "session_id": out.session_id,
@@ -106,17 +122,20 @@ def test_capabilities_hookless_session_reports_hook_capable_false_as_a_fact():
     assert "operations" not in caps
 
 
-def test_capabilities_reflects_launcher_isolation_and_attach_facts():
-    m = _mgr(_FakeDriver(True),
-             _FakeLauncher(ExecutorCapabilities(isolation_class="container", can_attach=True)))
-    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)
+def test_capabilities_reflects_launcher_isolation_and_attach_facts(tmp_path):
+    m, ledger = _mgr(_FakeDriver(True),
+                     _FakeLauncher(ExecutorCapabilities(isolation_class="container", can_attach=True)),
+                     tmp_path)
+    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER,
+                  session_id=reserve_start(ledger))
     caps = m.capabilities(out.session_id, owner_id=OWNER)
     assert caps["isolation_class"] == "container"
     assert caps["can_attach"] is True
 
 
-def test_capabilities_baseline_without_session_id_lists_known_executors():
-    m = _mgr(_FakeDriver(True), _FakeLauncher(ExecutorCapabilities(isolation_class="host")))
+def test_capabilities_baseline_without_session_id_lists_known_executors(tmp_path):
+    m, _ledger = _mgr(_FakeDriver(True), _FakeLauncher(ExecutorCapabilities(isolation_class="host")),
+                      tmp_path)
     baseline = m.capabilities(owner_id=OWNER)          # no session_id -> generation-level baseline
     assert "executors" in baseline
     assert EXECUTOR in baseline["executors"]
@@ -127,8 +146,9 @@ def test_capabilities_baseline_without_session_id_lists_known_executors():
     assert "hook_capable" in entry and "isolation_class" in entry and "can_attach" in entry
 
 
-def test_capabilities_baseline_works_with_no_sessions_started():
+def test_capabilities_baseline_works_with_no_sessions_started(tmp_path):
     # The generation-level baseline is not session-scoped: it must answer before anything starts.
-    m = _mgr(_FakeDriver(True), _FakeLauncher(ExecutorCapabilities(isolation_class="host")))
+    m, _ledger = _mgr(_FakeDriver(True), _FakeLauncher(ExecutorCapabilities(isolation_class="host")),
+                      tmp_path)
     baseline = m.capabilities(owner_id=OWNER)
     assert EXECUTOR in baseline["executors"]

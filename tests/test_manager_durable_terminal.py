@@ -5,7 +5,6 @@ status — harness away 6 minutes and the result is GONE from the board. The dur
 answer: persist terminal records to nelix_store before removing the live session.
 """
 
-from nelix_contracts.ids import validate_owner_id
 from nelix_store.ledger import StartLedger
 from nelix_store.store import Store
 
@@ -106,9 +105,9 @@ def _mgr_with_store(tmp_path, clock, store, events=None):
         captured.append(s)
         return s
 
-    mgr = SessionManager(specs, events, session_factory=session_factory,
+    mgr = SessionManager(specs, events, store, session_factory=session_factory,
                          concurrency_limit=5, terminal_snapshot_ttl=300.0,
-                         clock=clock, store=store)
+                         clock=clock)
     return mgr, captured
 
 
@@ -222,85 +221,3 @@ def test_status_merges_store_and_volatile_without_duplicates(tmp_path):
     assert sid in status["recent_terminal"]
     # No double-counting
     assert len([k for k in status["recent_terminal"] if k == sid]) == 1
-
-
-def test_volatile_fallback_without_store(tmp_path):
-    """Without a store, the SessionManager MUST behave exactly as before
-    (pure volatile terminal dict, swept at TTL). No regression."""
-    clock = FakeClock(1000.0)
-    events = EventQueue()
-    specs = {EXECUTOR: make_spec()}
-    captured = []
-
-    def session_factory(sid, executor, spec, ev):
-        s = TerminatingSession(sid, executor, ev)
-        captured.append(s)
-        return s
-
-    mgr = SessionManager(specs, events, session_factory=session_factory,
-                         concurrency_limit=5, terminal_snapshot_ttl=300.0,
-                         clock=clock)
-    _out = mgr.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER)
-    sid = _out.session_id
-    own(sid, OWNER)
-    mgr.stop(sid, owner_id=OWNER)
-
-    # Fresh: volatile dict has it
-    assert sid in mgr._terminal
-    assert sid in mgr.status(owner_id=OWNER)["recent_terminal"]
-
-    # Advance past TTL
-    clock.t = 2000.0
-
-    # After sweep: gone from volatile dict (this is the old behavior; without a
-    # store there is no durable fallback)
-    status = mgr.status(owner_id=OWNER)
-    assert sid not in mgr._terminal
-    # Without store, the result is gone — this is the old defect, preserved
-    # as backward-compatible behavior when no store is wired
-    assert sid not in status["recent_terminal"]
-
-
-def test_store_create_session_handles_missing_start_gracefully(tmp_path):
-    """When the daemon mints its own session_id (no router, no start row),
-    store.create_session() MUST fail gracefully — the session keeps working
-    without store durability, and nothing crashes."""
-    clock = FakeClock(1000.0)
-    store, ledger = _setup_store_and_ledger(tmp_path, clock)
-    # Do NOT reserve a start — this simulates a daemon-minted session
-    events = EventQueue()
-    mgr, captured = _mgr_with_store(tmp_path, clock, store, events)
-
-    # Start without a router-supplied session_id — daemon mints its own
-    _out = mgr.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER)
-    sid = _out.session_id
-    own(sid, OWNER)
-
-    # The session MUST exist in the manager registry
-    assert sid in mgr._sessions
-
-    # stop() MUST not crash even though there's no store session row
-    mgr.stop(sid, owner_id=OWNER)
-
-    # The volatile terminal dict still has it (normal path)
-    assert sid in mgr._terminal
-
-
-def test_store_put_terminal_handles_missing_session_gracefully(tmp_path):
-    """When a session exists in the manager but NOT in the store (daemon-minted
-    id, no start row), put_terminal MUST fail gracefully — the volatile path
-    still works, nothing crashes."""
-    clock = FakeClock(1000.0)
-    store, ledger = _setup_store_and_ledger(tmp_path, clock)
-    events = EventQueue()
-    mgr, captured = _mgr_with_store(tmp_path, clock, store, events)
-
-    # Daemon-minted session: no store.create_session() succeeds, so no session
-    # row exists in the store
-    _out = mgr.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER)
-    sid = _out.session_id
-    own(sid, OWNER)
-
-    # stop MUST not crash even though put_terminal will fail (no session row)
-    mgr.stop(sid, owner_id=OWNER)
-    assert sid in mgr._terminal  # volatile path still works
