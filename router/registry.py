@@ -58,13 +58,16 @@ class GenerationHandle:
 def _default_health_probe(transport) -> "str | None":
     """Read a generation's build-id from GET /health, or None if it cannot be read (dev runtimes
     report None, and an unreachable/odd backend must not make the whole registry fail here — the
-    build-id is informational; availability is decided by the transport, not by this probe)."""
+    build-id is informational; availability is decided by the transport, not by this probe).
+    Reads the ``build_id`` field (S1c-1: /health now returns explicit
+    ``{generation_id, generation_epoch, build_id}``).
+    """
     try:
         from rpc_client import RpcClient
     except ImportError:                                    # package mode
         from .rpc_client import RpcClient
     try:
-        return RpcClient(transport, PROBE_OWNER).health().get("generation_id")
+        return RpcClient(transport, PROBE_OWNER).health().get("build_id")
     except Exception:
         return None
 

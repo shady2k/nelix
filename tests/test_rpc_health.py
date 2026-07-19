@@ -33,6 +33,8 @@ def test_health_returns_ok_with_protocol_and_generation_id():
         assert b["status"] == "ok"
         assert b["rpc_protocol"] == RPC_PROTOCOL_VERSION
         assert "generation_id" in b            # None in this dev/test environment
+        assert "generation_epoch" in b          # None in the singleton path
+        assert "build_id" in b                  # None in dev checkout (not an installed runtime)
     finally:
         srv.shutdown()
 

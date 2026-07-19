@@ -51,9 +51,17 @@ def acquire_singleton(logger, transport=None):
         # adopts/probes the path the holder ACTUALLY bound rather than assuming the default.
         "path": transport.path if (transport is not None and transport.kind == "unix") else None,
     }
-    fd = singleton.acquire(paths.daemon_lock(), meta)
+    # When NELIX_GENERATION_ID is set, use the per-generation lock instead of the uid-wide one.
+    gid = os.environ.get("NELIX_GENERATION_ID")
+    if gid:
+        from nelix_contracts.ids import validate_generation_id
+        validate_generation_id(gid)
+        lock_path = paths.generation_lock(gid)
+    else:
+        lock_path = paths.daemon_lock()
+    fd = singleton.acquire(lock_path, meta)
     if fd is None and logger is not None:
-        holder = singleton.read_holder(paths.daemon_lock())
+        holder = singleton.read_holder(lock_path)
         logger.warning("app", "daemon_lock_conflict", holder=holder)
     return fd
 
