@@ -491,13 +491,13 @@ class SessionManager:
                               lineage_id=sess.lineage_id, restarted_from=restarted_from,
                               slot=f"{len(keep)}/{self._limit}")
         gc_sessions(keep, self._session_retain, self._session_max_age_days, logger=self._logger)
-        # nelix-9a4.4: create the session row in the durable store BEFORE the owner record
-        # and the PTY spawn. The router owns the start ledger (nelix-3rm), so the start row
-        # always exists — the store reads owner/orchestration/generation from it.
-        self._store.create_session(
-            sid, state="starting", executor=executor_name, task=task,
-            cwd=cwd, model=applied_model, created_at=self._clock())
+        # The session is now in memory but NOT yet durable. The try block below creates
+        # the durable row, writes the owner record, and spawns the PTY — in that order.
+        # On any failure, ALL durable state is rolled back (nelix-9a4.4).
         try:
+            self._store.create_session(
+                sid, state="starting", executor=executor_name, task=task,
+                cwd=cwd, model=applied_model, created_at=self._clock())
             # AUTHORITATIVE, and ordered: the owner record is durable BEFORE the PTY spawns and
             # therefore before /start can return the session id. An unwritable record raises
             # OwnerWriteFailed and the existing teardown below un-registers the session, so a
@@ -511,6 +511,12 @@ class SessionManager:
         except Exception as e:
             try:
                 sess.stop()                       # tear down any partially-spawned PTY / open dialog
+            except Exception:
+                pass
+            # Roll back durable state: transition the store's session row to "failed"
+            # so the router's ledger.fail() does not conflict with a live sessions row.
+            try:
+                self._store.transition_session(sid, owner_id=owner_id, state="failed")
             except Exception:
                 pass
             with self._lock:                      # don't leak a registered-but-unstarted session
@@ -663,27 +669,33 @@ class SessionManager:
             # possible restart. Keyed on terminal_kind, not a state string (NIT-16).
             if snap is not None and snap.get("terminal_kind") == "done":
                 self._lineages.pop(snap.get("lineage_id"), None)
-            existed = self._sessions.pop(session_id, None) is not None
-            if self._terminal_ttl > 0:
-                # ONE expiry computed here, reused for BOTH stores below: the recent-terminal async
-                # record must share self._terminal's exact retention policy, never a second one.
-                expires_at = self._clock() + self._terminal_ttl
-                # nelix-9a4.4: persist the generation-neutral record to the durable store
-                # BEFORE making it board-visible (spec §5 ordering: persist -> board-visible ->
-                # remove live session). The store's put_terminal reads identity from the start
-                # row; the router always creates a start row (nelix-3rm), so this never fails
-                # because of a missing reservation.
-                if snap is not None:
+            # nelix-9a4.4: persist the generation-neutral record to the durable store
+            # BEFORE making it board-visible (spec §5 ordering: persist -> board-visible ->
+            # remove live session). Persist runs UNCONDITIONALLY regardless of terminal_ttl —
+            # the TTL only governs the volatile _terminal dict. The store's put_terminal reads
+            # identity from the start row; the router always creates one, so this never fails
+            # because of a missing reservation. If the session was created outside the normal
+            # SessionManager.start() flow (no store row), unknown_session is caught and logged.
+            if snap is not None:
+                try:
                     self._store.put_terminal(
                         session_id,
                         terminal_kind=snap.get("terminal_kind", "unknown"),
                         summary=snap.get("screen_excerpt", ""),
                         ended_at=self._clock())
+                except Exception as _pe:
+                    if str(getattr(_pe, "code", "")) != "unknown_session":
+                        raise
+            if self._terminal_ttl > 0:
+                # ONE expiry computed here, reused for BOTH stores below: the recent-terminal async
+                # record must share self._terminal's exact retention policy, never a second one.
+                expires_at = self._clock() + self._terminal_ttl
                 if snap is not None:
                     self._terminal[session_id] = (snap, expires_at)
                 if qid is not None:
                     self._terminal_async[session_id] = (
                         {"id": qid, "reason": "executor_finished"}, expires_at)
+            existed = self._sessions.pop(session_id, None) is not None
             # NB: the event ring is NOT forgotten here. forget_session is wired at exactly ONE seam —
             # the terminal-snapshot TTL-expiry sweep in status() — which waits out the terminal TTL so
             # spec §5's final wake is never discarded before a waiter can read it. Pruning the
@@ -883,10 +895,9 @@ class SessionManager:
         # volatile entry has expired past the TTL. A store-backed result that is still on the
         # board (unacknowledged, not expired) is surfaced here — this is the fix for the live
         # defect: a harness away past the TTL still sees its terminal results.
-        try:
-            store_records = self._store.list_terminal(owner_id)
-        except Exception:
-            store_records = []
+        # A store read failure propagates as a NelixError — the caller sees "store unavailable"
+        # instead of a silently empty board (nelix-9a4.4).
+        store_records = self._store.list_terminal(owner_id)
         for tr in store_records:
             if tr.session_id in recent:
                 continue  # volatile entry is fresher (within TTL window)

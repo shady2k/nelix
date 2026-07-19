@@ -215,9 +215,11 @@ class RpcClient:
     def restart(self, session_id, *, new_session_id, force=False, owner_id=None):
         """POST /restart with a router-assigned new_session_id (nelix-9a4.4).
         owner_id is passed through from the caller explicitly for the router path;
-        when omitted (direct RpcClient use), self._owner is used."""
+        when omitted (direct RpcClient use), self._owner is used.
+        Phase-split (_forward_call) so the router can classify failure as definite
+        (ForwardConnectError) vs ambiguous (ForwardResponseError). Returns the body dict,
+        same contract as start()/_forward_call."""
         payload = {"session_id": session_id, "force": force,
                    "new_session_id": new_session_id,
                    "owner_id": owner_id or self._owner}
-        st, body = self._call("POST", "/restart", payload)
-        return st == 200, body
+        return self._forward_call("POST", "/restart", payload)

@@ -46,15 +46,19 @@ def _require_str(value, name):
     return value
 
 
-def _request_fingerprint(owner_id, old_session_id) -> str:
-    """A stable digest over the restart's semantic identity."""
-    canonical = f"{owner_id}\x00{old_session_id}\x00restart"
+def _request_fingerprint(owner_id, old_session_id, force) -> str:
+    """A stable digest over the restart's semantic identity. Includes `force` so
+    a non-forced restart that recorded budget-exhausted does not replay that failure
+    on a force:true retry (nelix-9a4.4)."""
+    canonical = f"{owner_id}\x00{old_session_id}\x00restart\x00force:{force}"
     return hashlib.sha256(canonical.encode()).hexdigest()[:64]
 
 
 def _derive_orchestration_id(owner_id, old_session_id) -> str:
-    """Deterministic orchestration id from (owner, old_session)."""
-    digest = hashlib.sha256(f"{owner_id}\x00{old_session_id}".encode()).hexdigest()[:32]
+    """Deterministic orchestration id from (owner, old_session). Uses a DISTINCT hash
+    domain from router/start.py (includes 'restart' discriminator) so the same
+    owner+idempotency-key values do not collide between /start and /restart (nelix-9a4.4)."""
+    digest = hashlib.sha256(f"{owner_id}\x00{old_session_id}\x00restart".encode()).hexdigest()[:32]
     return "o-" + digest
 
 
@@ -84,9 +88,9 @@ class RestartPath:
             raise NelixError(INVALID_REQUEST, str(e)) from None
         force = bool(body.get("force", False))
 
-        idem_key = f"restart:{old_sid}"
+        idem_key = f"restart:{old_sid}:force:{force}"
         orch_id = _derive_orchestration_id(owner_id, old_sid)
-        fingerprint = _request_fingerprint(owner_id, old_sid)
+        fingerprint = _request_fingerprint(owner_id, old_sid, force)
 
         res = self._ledger.reserve(idempotency_key=idem_key, owner_id=owner_id,
                                    orchestration_id=orch_id,
