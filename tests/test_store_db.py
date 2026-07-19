@@ -1102,9 +1102,13 @@ def test_v2_to_v3_migration_preserves_all_rows_and_backfills_terminal_seq(tmp_pa
         assert g2_seqs == [1, 2], f"gen2 terminal_seq: {g2_seqs}"
 
         # ---- (c) high-water per generation is correct and generation_progress continues ----
-        g1_hw = store_instance.get_generation_persisted_high_water(ctx["gid1"])
+        # After v2→v3→v4 chained migration, starts.generation_id has been backfilled to
+        # "g-legacy-<epoch>" so get_generation_persisted_high_water uses the synthetic id.
+        synth_gid1 = "g-legacy-" + ctx["gid1"]
+        synth_gid2 = "g-legacy-" + ctx["gid2"]
+        g1_hw = store_instance.get_generation_persisted_high_water(synth_gid1)
         assert g1_hw == 3, f"gen1 high water = {g1_hw}"
-        g2_hw = store_instance.get_generation_persisted_high_water(ctx["gid2"])
+        g2_hw = store_instance.get_generation_persisted_high_water(synth_gid2)
         assert g2_hw == 2, f"gen2 high water = {g2_hw}"
 
         # generation_progress.next_terminal_seq continues from the max

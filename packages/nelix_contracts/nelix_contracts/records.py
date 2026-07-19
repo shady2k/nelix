@@ -14,13 +14,12 @@ from .ids import (
     validate_session_id,
 )
 
-# 3: TerminalRecord gained terminal_seq — per-generation monotonic watermark for retirement
-#     (nelix-gm3). Bumped together with db.SCHEMA_VERSION.
+# 4: generations/epochs identity records (nelix-80e-s1a). Bumped together with db.SCHEMA_VERSION.
 #
 # THE nelix-165 TRAP: this constant is SEPARATE from db.SCHEMA_VERSION. Both moved together
-# (1→2→3) but nothing enforces that. The nelix-165 fix is still planned; for now the two
+# (1→2→3→4) but nothing enforces that. The nelix-165 fix is still planned; for now the two
 # continue to move together by convention.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _check_version(d):
@@ -166,6 +165,96 @@ class TerminalRecord:
         if not isinstance(d, dict):
             raise NelixError(INVALID_REQUEST, "record must be an object")
         _check_version(d)          # SCHEMA_TOO_NEW before any field is interpreted
+        try:
+            return cls(**d)
+        except TypeError as e:
+            raise NelixError(INVALID_REQUEST, f"malformed record: {e}") from None
+
+
+# ---- generations/epochs identity records (nelix-80e-s1a) ----
+
+
+def _id_or_empty(value, name):
+    """Validate an identity field: must be a non-empty string or None.
+    
+    Unlike `validate_generation_id` (which enforces a `g-{hex32}` format),
+    this accepts any non-empty string — needed for legacy synthetic ids like
+    `g-legacy-<epoch>` produced by the v4 migration backfill.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise NelixError(INVALID_REQUEST, f"{name} must be a non-empty string: {value!r}")
+    return value
+
+
+@dataclass(frozen=True)
+class GenerationRecord:
+    generation_id: str
+    build_id: str | None
+    lifecycle_state: str
+    current_epoch: str | None
+    capability_snapshot: str | None
+    created_at: float
+
+    def __post_init__(self):
+        _text(self.generation_id, "generation_id")
+        self._validate_optional_build()
+        _text(self.lifecycle_state, "lifecycle_state")
+        _id_or_empty(self.current_epoch, "current_epoch")
+        _id_or_empty(self.capability_snapshot, "capability_snapshot")
+        timestamp(self.created_at, "created_at")
+
+    def _validate_optional_build(self):
+        if self.build_id is not None:
+            _text(self.build_id, "build_id")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GenerationRecord":
+        if not isinstance(d, dict):
+            raise NelixError(INVALID_REQUEST, "record must be an object")
+        try:
+            return cls(**d)
+        except TypeError as e:
+            raise NelixError(INVALID_REQUEST, f"malformed record: {e}") from None
+
+
+@dataclass(frozen=True)
+class EpochRecord:
+    generation_epoch: str
+    generation_id: str
+    process_state: str
+    retirement_state: str
+    certificate: str | None
+    final_high_water: int | None
+    incarnation_meta: str | None
+    created_at: float
+
+    def __post_init__(self):
+        _text(self.generation_epoch, "generation_epoch")
+        _text(self.generation_id, "generation_id")
+        _text(self.process_state, "process_state")
+        _text(self.retirement_state, "retirement_state")
+        _id_or_empty(self.certificate, "certificate")
+        if self.final_high_water is not None:
+            if isinstance(self.final_high_water, bool) or not isinstance(
+                    self.final_high_water, int) or self.final_high_water < 0:
+                raise NelixError(
+                    INVALID_REQUEST,
+                    f"final_high_water must be a non-negative int: {self.final_high_water!r}")
+        _id_or_empty(self.incarnation_meta, "incarnation_meta")
+        timestamp(self.created_at, "created_at")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "EpochRecord":
+        if not isinstance(d, dict):
+            raise NelixError(INVALID_REQUEST, "record must be an object")
         try:
             return cls(**d)
         except TypeError as e:

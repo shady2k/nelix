@@ -26,9 +26,9 @@ from nelix_contracts.errors import (
 )
 
 DB_FILENAME = "nelix.db"
-# 3: the per-generation monotonic terminal_seq for retirement watermarks + generation_progress
-#     counter table (nelix-gm3). Moves TOGETHER with records.SCHEMA_VERSION (nelix-165).
-SCHEMA_VERSION = 3
+# 4: durable generations/epochs identity tables + v4 migration (nelix-80e-s1a). Moves TOGETHER
+#     with records.SCHEMA_VERSION (nelix-165).
+SCHEMA_VERSION = 4
 
 # prune_terminal's ROW_NUMBER() window function needs SQLite >= 3.25 (2018). Asserted at
 # open because the daemon runs a different interpreter than the test venv — a feature that
@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS starts (
     request_fingerprint TEXT NOT NULL,
     state               TEXT NOT NULL,
     generation_id       TEXT,
+    generation_epoch    TEXT,           -- nelix-80e-s1a: per-incarnation epoch (NULL in legacy rows)
     reason              TEXT,
     created_at          REAL NOT NULL,
     UNIQUE (owner_id, idempotency_key)
@@ -150,6 +151,37 @@ CREATE TABLE IF NOT EXISTS generation_progress (
     next_terminal_seq    INTEGER NOT NULL DEFAULT 1,
     confirmed_high_water INTEGER NOT NULL DEFAULT 0
 );
+
+-- S1a: durable generations/epochs identity (nelix-80e). Circular FK broken by disabling
+-- foreign_keys during CREATE: SQLite stores the FK definitions but does not enforce them
+-- until foreign_keys is re-enabled, avoiding the chicken-and-egg problem.
+PRAGMA foreign_keys=OFF;
+CREATE TABLE IF NOT EXISTS epochs (
+    generation_epoch  TEXT PRIMARY KEY,
+    generation_id     TEXT NOT NULL REFERENCES generations (generation_id) ON DELETE RESTRICT,
+    process_state     TEXT NOT NULL,
+    retirement_state  TEXT NOT NULL,
+    certificate       TEXT,
+    final_high_water  INTEGER,
+    incarnation_meta  TEXT,
+    created_at        REAL NOT NULL,
+    UNIQUE (generation_id, generation_epoch),
+    CHECK (process_state IN ('starting','serving','dead')),
+    CHECK (retirement_state IN ('open','quiescing','certified'))
+);
+CREATE TABLE IF NOT EXISTS generations (
+    generation_id        TEXT PRIMARY KEY,
+    build_id             TEXT,
+    lifecycle_state      TEXT NOT NULL,
+    current_epoch        TEXT,
+    capability_snapshot  TEXT,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (generation_id, current_epoch)
+        REFERENCES epochs (generation_id, generation_epoch) ON DELETE RESTRICT
+);
+PRAGMA foreign_keys=ON;
+CREATE UNIQUE INDEX IF NOT EXISTS epochs_one_serving
+    ON epochs (generation_id) WHERE process_state = 'serving';
 """
 
 LOCK_FILENAME = ".db-init.lock"
@@ -630,6 +662,9 @@ def _migrate(conn, from_version: int):
     """Run the migration path from `from_version` to SCHEMA_VERSION."""
     if from_version == 2:
         _migrate_v2_to_v3(conn)
+        _migrate_v3_to_v4(conn)
+    elif from_version == 3:
+        _migrate_v3_to_v4(conn)
     else:
         raise NelixError(STORE_CORRUPT,
                          f"database schema {from_version} predates this build "
@@ -675,6 +710,97 @@ def _migrate_v2_to_v3(conn):
                  "GROUP BY st.generation_id")
     # Update the stamp so subsequent opens skip migration.
     conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
+
+
+def _migrate_v3_to_v4(conn):
+    """Migrate a v3 database to v4: add generations/epochs tables + backfill identity.
+
+    Idempotent via IF NOT EXISTS / INSERT OR IGNORE / duplicate-column tolerance.
+    Also bumps row-level schema_version on existing rows (nelix-165) so list_*
+    does not silently drop them.
+    """
+    # Create the new identity tables. Toggle foreign_keys off briefly to handle the
+    # circular FK between epochs and generations.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS epochs (
+            generation_epoch  TEXT PRIMARY KEY,
+            generation_id     TEXT NOT NULL REFERENCES generations (generation_id) ON DELETE RESTRICT,
+            process_state     TEXT NOT NULL,
+            retirement_state  TEXT NOT NULL,
+            certificate       TEXT,
+            final_high_water  INTEGER,
+            incarnation_meta  TEXT,
+            created_at        REAL NOT NULL,
+            UNIQUE (generation_id, generation_epoch),
+            CHECK (process_state IN ('starting','serving','dead')),
+            CHECK (retirement_state IN ('open','quiescing','certified'))
+        );
+        CREATE TABLE IF NOT EXISTS generations (
+            generation_id        TEXT PRIMARY KEY,
+            build_id             TEXT,
+            lifecycle_state      TEXT NOT NULL,
+            current_epoch        TEXT,
+            capability_snapshot  TEXT,
+            created_at           REAL NOT NULL,
+            FOREIGN KEY (generation_id, current_epoch)
+                REFERENCES epochs (generation_id, generation_epoch) ON DELETE RESTRICT
+        );
+    """)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS epochs_one_serving
+            ON epochs (generation_id) WHERE process_state = 'serving'
+    """)
+    # Add generation_epoch column to starts (tolerate "duplicate column").
+    try:
+        conn.execute("ALTER TABLE starts ADD COLUMN generation_epoch TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e):
+            raise
+    # Backfill identity: for each distinct non-NULL legacy epoch value in starts,
+    # create one synthetic generation + one epoch row, then update starts to carry
+    # both the stable id and the preserved legacy epoch.
+    rows = conn.execute(
+        "SELECT DISTINCT generation_id FROM starts "
+        "WHERE generation_id IS NOT NULL AND generation_id != ''").fetchall()
+    for row in rows:
+        legacy_epoch = row["generation_id"]
+        synthetic_id = "g-legacy-" + legacy_epoch
+        now = conn.execute("SELECT unixepoch('subsec')").fetchone()[0]
+        conn.execute(
+            "INSERT OR IGNORE INTO generations "
+            "(generation_id, build_id, lifecycle_state, current_epoch, "
+            " capability_snapshot, created_at) VALUES (?,?,?,?,?,?)",
+            (synthetic_id, None, "retired", None, None, now))
+        # final_high_water: max terminal_seq for this legacy epoch value.
+        hw_row = conn.execute(
+            "SELECT MAX(t.terminal_seq) AS hw FROM terminal t "
+            "JOIN starts st ON st.session_id = t.session_id "
+            "WHERE st.generation_id=?", (legacy_epoch,)).fetchone()
+        final_hw = hw_row["hw"] if hw_row and hw_row["hw"] is not None else None
+        conn.execute(
+            "INSERT OR IGNORE INTO epochs "
+            "(generation_epoch, generation_id, process_state, retirement_state, "
+            " certificate, final_high_water, incarnation_meta, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (legacy_epoch, synthetic_id, "dead", "certified",
+             None, final_hw, None, now))
+        # Copy legacy epoch to generation_epoch BEFORE overwriting generation_id.
+        conn.execute(
+            "UPDATE starts SET generation_epoch = generation_id "
+            "WHERE generation_id=?", (legacy_epoch,))
+        conn.execute(
+            "UPDATE starts SET generation_id=? WHERE generation_id=?",
+            (synthetic_id, legacy_epoch))
+    # Bump row-level schema_version on existing rows (nelix-165).
+    conn.execute("UPDATE sessions SET schema_version=? WHERE schema_version<?",
+                 (SCHEMA_VERSION, SCHEMA_VERSION))
+    conn.execute("UPDATE terminal SET schema_version=? WHERE schema_version<?",
+                 (SCHEMA_VERSION, SCHEMA_VERSION))
+    # Update the stamp.
+    conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
+                 (str(SCHEMA_VERSION),))
 
 
 def _stamp_before_the_ddl(conn):
