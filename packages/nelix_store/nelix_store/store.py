@@ -473,8 +473,9 @@ class Store:
             # or retire ones still being shown.
             expired = self._conn.execute(
                 "UPDATE terminal AS t SET expired_at=?, expire_reason='age' "
-                f"WHERE {_ON_THE_BOARD} AND (? - t.published_at) > ?",
-                (now, now, max_age_seconds)).rowcount
+                f"WHERE {_ON_THE_BOARD} AND (? - t.published_at) > ? "
+                "RETURNING session_id",
+                (now, now, max_age_seconds)).fetchall()
             # Runs AFTER the age pass, and reads what that pass wrote: rows it just expired are
             # no longer on the board, so they neither survive the count bound nor get counted
             # twice into the return value.
@@ -487,18 +488,23 @@ class Store:
                 "    ) AS rn FROM terminal t "
                 "    JOIN starts st ON st.session_id = t.session_id "
                 f"    WHERE {_ON_THE_BOARD}"
-                "  ) WHERE rn > ?)", (now, max_count)).rowcount
+                "  ) WHERE rn > ?) RETURNING session_id",
+                (now, max_count)).fetchall()
             # Bump board_seq for EVERY distinct owner whose rows actually changed
-            # in either pass, exactly once each. Both passes set expired_at=now.
-            if expired:
+            # in either pass, exactly once each. Collect session_ids from both
+            # RETURNING result sets (they contain only rows THIS call just changed).
+            all_ids = tuple(r["session_id"] for batch in (expired, ) for r in batch)
+            n_expired = len(all_ids)
+            if all_ids:
+                placeholders = ",".join("?" * len(all_ids))
                 affected = self._conn.execute(
-                    "SELECT DISTINCT st.owner_id FROM terminal t "
-                    "JOIN starts st ON st.session_id = t.session_id "
-                    "WHERE t.expired_at=? AND t.expire_reason IN ('age','count')",
-                    (now,)).fetchall()
+                    f"SELECT DISTINCT st.owner_id FROM terminal t "
+                    f"JOIN starts st ON st.session_id = t.session_id "
+                    f"WHERE t.session_id IN ({placeholders})",
+                    all_ids).fetchall()
                 for row in affected:
                     self._bump_board_seq(self._conn, row["owner_id"])
-        return expired
+        return n_expired
 
     # ---- generations/epochs identity API (nelix-80e-s1a) ----
 

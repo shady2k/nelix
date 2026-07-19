@@ -71,6 +71,7 @@ class Cursor:
             if (not isinstance(arch, tuple) or len(arch) != 2
                     or isinstance(arch[1], bool)
                     or not isinstance(arch[1], int) or arch[1] < 0
+                    or isinstance(arch[0], bool)
                     or not isinstance(arch[0], int)):
                 raise NelixError(INVALID_REQUEST,
                                  f"archive must be (int, non-negative int) or None: {arch!r}")

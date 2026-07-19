@@ -166,3 +166,14 @@ def test_decode_token_without_archive_returns_none():
     token = encode(c)
     decoded = decode(token, router_epoch="re-1", topology_revision=5)
     assert decoded.archive_position is None
+
+
+# ---- regression: bool archive_epoch rejected in __post_init__ (S2a.1 fix 2) -
+
+def test_cursor_with_bool_archive_epoch_raises_invalid_request():
+    """Cursor(..., _archive=(True, 0)) must raise INVALID_REQUEST, not silently
+    accept True as an int epoch."""
+    from nelix_contracts.cursor import Cursor
+    with pytest.raises(Exception) as ei:
+        Cursor(router_epoch="r", topology_revision=0, _archive=(True, 0))
+    assert ei.value.code == INVALID_REQUEST

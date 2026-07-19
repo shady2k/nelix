@@ -277,3 +277,47 @@ def test_prune_two_owners_in_one_call_bumps_each_once(store, ledger, clock):
         "owner A: exactly one increment for the prune (not per-row)"
     assert store.get_owner_board_seq("o14b") == seq_b + 1, \
         "owner B: exactly one increment for the prune"
+
+
+# ---- regression: fixed clock double-prune (S2a.1 fix 1) --------------------
+
+def test_prune_with_fixed_clock_does_not_over_increment_unaffected_owners(
+        tmp_path):
+    """Two prune calls at the SAME clock value must only bump owners whose rows
+    actually changed in THIS call — not revisit rows expired by the first call."""
+    from nelix_store.ledger import StartLedger
+    from nelix_store.store import Store
+
+    clock = FakeClock(500.0)
+    store = Store(tmp_path, clock=clock)
+    lg = StartLedger(tmp_path, clock=lambda: 500.0)
+    try:
+        # Prune #1: expires owner A only. Terminal was published_at=500.
+        sid_a = _started_session(store, lg, owner="o15a", key="k-fc-a")
+        store.put_terminal(sid_a, terminal_kind="done", summary="a", ended_at=5.0)
+        clock.t = 1000.0
+        n1 = store.prune_terminal(max_age_seconds=400, max_count=100)
+        assert n1 == 1, f"prune #1 should expire 1 row, got {n1}"
+        seq_a_after_1 = store.get_owner_board_seq("o15a")
+        # Owner A was bumped once by put + once by prune = 2
+        assert seq_a_after_1 == 2, f"o15a board_seq after prune #1: {seq_a_after_1}"
+
+        # Owner B publishes after prune #1 (clock still 1000).
+        sid_b = _started_session(store, lg, owner="o15b", key="k-fc-b")
+        store.put_terminal(sid_b, terminal_kind="done", summary="b", ended_at=5.0)
+
+        # Prune #2 at the SAME clock (1000): expires only B.
+        # B was just published at 1000, so (now - published_at) = 0 — not expired.
+        # Use count-based expiry instead.
+        n2 = store.prune_terminal(max_age_seconds=86400, max_count=0)
+        assert n2 == 1, f"prune #2 should expire 1 row, got {n2}"
+
+        # Owner A's board_seq must NOT have changed.
+        assert store.get_owner_board_seq("o15a") == seq_a_after_1, \
+            "owner A board_seq increased by prune #2 which did not touch A"
+        # Owner B was bumped once by put + once by prune = 2
+        assert store.get_owner_board_seq("o15b") == 2, \
+            "o15b board_seq after prune #2 should be 2"
+    finally:
+        store.close()
+        lg.close()
