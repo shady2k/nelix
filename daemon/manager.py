@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,8 @@ from daemon.launchers import get_launcher
 from daemon.model_cache import ModelCache
 from daemon.model_discovery import discover, auth_of, DiscoveryError
 from daemon.session import RespondOutcome, Session
+
+_log = logging.getLogger(__name__)
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
 
@@ -239,7 +242,7 @@ class SessionManager:
     def __init__(self, specs, events, launcher_factory=None, driver_factory=None,
                  concurrency_limit=5, idle_retained_limit=None, logger=None, session_factory=None,
                  session_retain=20, session_max_age_days=7, reaper_ctx=None,
-                 terminal_snapshot_ttl=300.0, clock=time.time):
+                 terminal_snapshot_ttl=300.0, clock=time.time, store=None):
         self._specs = specs
         self._events = events
         self._limit = concurrency_limit
@@ -261,6 +264,11 @@ class SessionManager:
         self._terminal_async = {}
         self._terminal_ttl = terminal_snapshot_ttl
         self._clock = clock
+        # nelix-9a4.4: the durable store for terminal records (generation-neutral). None until
+        # the router wires it in — without it, terminal records are volatile and expire at TTL
+        # (existing behavior). With it, terminal records are persisted BEFORE the live session
+        # is removed, and status() supplements the volatile dict from the store after TTL expiry.
+        self._store = store
         # Same seam _make uses for session construction, reused for the model-capability read (a
         # model override reads driver.model_flag). Never call get_driver() directly — that would
         # bypass an injected factory (tests / custom drivers).
@@ -493,6 +501,22 @@ class SessionManager:
                               lineage_id=sess.lineage_id, restarted_from=restarted_from,
                               slot=f"{len(keep)}/{self._limit}")
         gc_sessions(keep, self._session_retain, self._session_max_age_days, logger=self._logger)
+        # nelix-9a4.4: create the session row in the durable store BEFORE the owner record
+        # and the PTY spawn. For a router-supplied session_id the start row already exists
+        # (nelix-3rm), so the store reads owner/orchestration/generation from it. For a
+        # daemon-minted session_id there is no start row — log it and continue; the session
+        # still works, just without store durability.
+        if self._store is not None:
+            try:
+                self._store.create_session(
+                    sid, state="starting", executor=executor_name, task=task,
+                    cwd=cwd, model=applied_model, created_at=self._clock())
+            except Exception as e:
+                if getattr(e, "code", None) == "unknown_session":
+                    _log.debug("store.create_session skipped for %s (no start row — "
+                               "daemon-minted id, not router-supplied)", sid)
+                else:
+                    raise
         try:
             # AUTHORITATIVE, and ordered: the owner record is durable BEFORE the PTY spawns and
             # therefore before /start can return the session id. An unwritable record raises
@@ -663,6 +687,20 @@ class SessionManager:
                 # ONE expiry computed here, reused for BOTH stores below: the recent-terminal async
                 # record must share self._terminal's exact retention policy, never a second one.
                 expires_at = self._clock() + self._terminal_ttl
+                # nelix-9a4.4: persist the generation-neutral record to the durable store
+                # BEFORE making it board-visible (spec §5 ordering: persist -> board-visible ->
+                # remove live session). The store's put_terminal reads identity from the start
+                # row; for a daemon-minted session_id without a start row, it fails gracefully
+                # (the volatile dict still catches it for the TTL window).
+                if self._store is not None and snap is not None:
+                    try:
+                        self._store.put_terminal(
+                            session_id,
+                            terminal_kind=snap.get("terminal_kind", "unknown"),
+                            summary=snap.get("screen_excerpt", ""),
+                            ended_at=self._clock())
+                    except Exception:
+                        _log.debug("store.put_terminal skipped for %s", session_id)
                 if snap is not None:
                     self._terminal[session_id] = (snap, expires_at)
                 if qid is not None:
@@ -863,6 +901,42 @@ class SessionManager:
             sessions[sid] = {**s_snap, "seq": per_seq.get(sid, 0)}
         recent = {sid: snap for sid, snap in recent_all.items()
                   if owner.owns_session(sid, owner_id)}
+        # nelix-9a4.4: supplement recent_terminal from the durable store for sessions whose
+        # volatile entry has expired past the TTL. A store-backed result that is still on the
+        # board (unacknowledged, not expired) is surfaced here — this is the fix for the live
+        # defect: a harness away past the TTL still sees its terminal results.
+        if self._store is not None:
+            try:
+                store_records = self._store.list_terminal(owner_id)
+            except Exception:
+                store_records = []
+            for tr in store_records:
+                if tr.session_id in recent:
+                    continue  # volatile entry is fresher (within TTL window)
+                # Build a minimal dict compatible with recent_terminal consumers.
+                # The store has terminal_kind + summary; for executor/task/cwd we
+                # read the session record from the store (one query per unrepresented
+                # terminal — acceptable because the board is bounded by max_count).
+                entry = {
+                    "session_id": tr.session_id,
+                    "terminal_kind": tr.terminal_kind,
+                    "screen_excerpt": tr.summary,
+                    "control_state": "terminal",
+                    "pending": False,
+                    "terminal": True,
+                    "store_backed": True,
+                }
+                # Best-effort session enrichment: executor, task, cwd from the
+                # session record (the session row exists because put_terminal was
+                # called after create_session).
+                try:
+                    sr = self._store.get_session(tr.session_id, owner_id=owner_id)
+                    entry["executor"] = sr.executor
+                    entry["task"] = sr.task
+                    entry["cwd"] = sr.cwd
+                except Exception:
+                    pass
+                recent[tr.session_id] = entry
         return {"sessions": sessions,
                 "limit": self._limit,
                 "cursor": cursor,
