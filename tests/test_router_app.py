@@ -119,7 +119,7 @@ def test_main_wires_shared_pieces_and_serves_then_tears_down(monkeypatch):
 
     monkeypatch.setattr(app, "establish", lambda: handle)
     monkeypatch.setattr(app, "StartLedger", _FakeLedger)
-    monkeypatch.setattr(app, "GenerationRegistry", lambda: "REGISTRY")
+    monkeypatch.setattr(app, "GenerationRegistry", lambda **kw: "REGISTRY")
     monkeypatch.setattr(app, "make_router_server", _fake_make_server)
     monkeypatch.setattr(app, "_install_shutdown_handlers", lambda: None)
 

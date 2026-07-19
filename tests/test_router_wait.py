@@ -63,7 +63,7 @@ def _board_cursor(board, owner):
 
 def _slot_and_epoch(registry):
     g = registry.generations()[0]
-    return g.slot_id, g.epoch
+    return g.generation_id, g.epoch
 
 
 # ============================================================ the wake path

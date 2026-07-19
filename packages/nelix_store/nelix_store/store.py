@@ -29,7 +29,8 @@ from .db import ThreadLocalConnections, translates_sqlite
 # Identity is JOINED from starts, never stored in these tables (nelix-555). Three
 # independent copies could disagree; one row cannot disagree with itself.
 _SESSION_SELECT = (
-    "SELECT s.session_id, st.owner_id, st.orchestration_id, st.generation_id, s.state, "
+    "SELECT s.session_id, st.owner_id, st.orchestration_id, st.generation_id, "
+    "st.generation_epoch, s.state, "
     "s.executor, s.task, s.cwd, s.model, s.created_at, s.schema_version "
     "FROM sessions s JOIN starts st ON st.session_id = s.session_id")
 # f1k-rev5: this used to also `JOIN sessions s ON s.session_id = t.session_id`. It selected
@@ -41,6 +42,7 @@ _SESSION_SELECT = (
 # `PRAGMA foreign_keys=ON` connection.
 _TERMINAL_SELECT = (
     "SELECT t.session_id, st.owner_id, st.orchestration_id, st.generation_id, "
+    "st.generation_epoch, "
     "t.terminal_kind, t.summary, t.ended_at, t.published_at, t.terminal_seq, "
     "t.acknowledged_at, "
     "t.expired_at, t.expire_reason, t.schema_version "
@@ -125,7 +127,7 @@ class Store:
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             start = self._conn.execute(
-                "SELECT owner_id, orchestration_id, generation_id, state "
+                "SELECT owner_id, orchestration_id, generation_id, generation_epoch, state "
                 "FROM starts WHERE session_id=?", (session_id,)).fetchone()
             if start is None:
                 raise NelixError(UNKNOWN_SESSION, f"no start for session {session_id}")
@@ -144,7 +146,8 @@ class Store:
             # Identity comes from the start, so it cannot disagree.
             SessionRecord(session_id=session_id, owner_id=start["owner_id"],
                           orchestration_id=start["orchestration_id"],
-                          generation_id=start["generation_id"], state=state,
+                          generation_id=start["generation_id"],
+                          generation_epoch=start["generation_epoch"], state=state,
                           executor=executor, task=task, cwd=cwd, model=model,
                           created_at=created_at)
             try:
@@ -225,7 +228,8 @@ class Store:
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             start = self._conn.execute(
-                "SELECT st.owner_id, st.orchestration_id, st.generation_id FROM sessions s "
+                "SELECT st.owner_id, st.orchestration_id, st.generation_id, "
+                "st.generation_epoch FROM sessions s "
                 "JOIN starts st ON st.session_id = s.session_id WHERE s.session_id=?",
                 (session_id,)).fetchone()
             if start is None:
@@ -241,10 +245,12 @@ class Store:
             # call beats an answer that depends on whether a row happens to exist.
             published_at = timestamp(self._clock(), "clock")
             generation_id = start["generation_id"]
+            generation_epoch = start["generation_epoch"]
             # Validate before writing; identity from the join cannot disagree.
             TerminalRecord(session_id=session_id, owner_id=start["owner_id"],
                            orchestration_id=start["orchestration_id"],
                            generation_id=generation_id,
+                           generation_epoch=generation_epoch,
                            terminal_kind=terminal_kind, summary=summary, ended_at=ended_at,
                            published_at=published_at)
             existing = self._conn.execute(
@@ -260,16 +266,17 @@ class Store:
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  f"{session_id} already ended as {existing['terminal_kind']!r}")
             # Atomically assign a per-generation terminal_seq. Initialize the counter if this
-            # is the first terminal for this generation (INSERT OR IGNORE), then increment.
+            # is the first terminal for this epoch (INSERT OR IGNORE), then increment.
             self._conn.execute(
-                "INSERT OR IGNORE INTO generation_progress (generation_id, next_terminal_seq) "
-                "VALUES (?, 1)", (generation_id,))
+                "INSERT OR IGNORE INTO generation_progress "
+                "(generation_id, next_terminal_seq) "
+                "VALUES (?, 1)", (generation_epoch,))
             self._conn.execute(
                 "UPDATE generation_progress SET next_terminal_seq = next_terminal_seq + 1 "
-                "WHERE generation_id=?", (generation_id,))
+                "WHERE generation_id=?", (generation_epoch,))
             row = self._conn.execute(
                 "SELECT next_terminal_seq - 1 AS terminal_seq FROM generation_progress "
-                "WHERE generation_id=?", (generation_id,)).fetchone()
+                "WHERE generation_id=?", (generation_epoch,)).fetchone()
             terminal_seq = row["terminal_seq"]
             self._conn.execute(
                 "INSERT INTO terminal (session_id, terminal_kind, summary, ended_at, "
@@ -314,17 +321,20 @@ class Store:
         return records
 
     @translates_sqlite
-    def get_generation_persisted_high_water(self, generation_id: str) -> int:
-        """Return the highest terminal_seq persisted for this generation (0 if none).
+    def get_generation_persisted_high_water(self, generation_epoch: str) -> int:
+        """Return the highest terminal_seq persisted for this epoch (0 if none).
 
         Used by the retirement oracle: terminal_persisted_high_water must be compared against
-        router_visible_high_water (the highest seq the router has confirmed). A generation
-        with no terminals returns 0 so it is immediately \"watermark-satisfied\".
+        router_visible_high_water (the highest seq the router has confirmed). An epoch
+        with no terminals returns 0 so it is immediately "watermark-satisfied".
         """
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
         row = self._conn.execute(
             "SELECT MAX(t.terminal_seq) AS hw FROM terminal t "
             "JOIN starts st ON st.session_id = t.session_id "
-            "WHERE st.generation_id=?", (generation_id,)).fetchone()
+            "WHERE st.generation_epoch=?", (generation_epoch,)).fetchone()
         return row["hw"] if row and row["hw"] is not None else 0
 
     @translates_sqlite

@@ -150,15 +150,15 @@ def test_board_owner_filtering_survives_the_router_merge_against_the_real_daemon
 
 def test_board_cursor_round_trips_against_the_real_daemons_int_cursor(router_over_real_daemon):
     client, daemon, tmp_path, registry, epoch, _sock_path = router_over_real_daemon
-    x_body = _start_a_session(client, tmp_path, OWNER, "board-real-cursor")
+    _start_a_session(client, tmp_path, OWNER, "board-real-cursor")
     st, body = client._call("GET", f"/status?owner_id={OWNER}")
     assert st == 200
     cursor = decode(body["cursor"], router_epoch=epoch,
                     topology_revision=registry.topology_revision())
     # fix-pass finding #1: the cursor's map KEY is the registry's STABLE slot_id, not the
-    # per-incarnation epoch (which is still `/start`'s `generation_id` -- the StartLedger key,
-    # unaffected by this fix); the epoch is carried as part of the VALUE.
-    gen_epoch = x_body["generation_id"]
-    slot_id = registry.generations()[0].slot_id
+    # per-incarnation epoch (which is now `/start`'s `generation_epoch`); the epoch is carried
+    # as part of the VALUE.
+    slot_id = registry.generations()[0].generation_id
+    gen_epoch = registry.generations()[0].epoch
     real_cursor = daemon.manager.status(owner_id=OWNER)["cursor"]
     assert cursor.position_for(slot_id) == (gen_epoch, real_cursor)

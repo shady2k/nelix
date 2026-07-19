@@ -189,7 +189,7 @@ class StartPath:
             self._fail(sid, f"{e.code}: {e.message}")
             raise
         try:
-            self._ledger.assign_generation(sid, gen.epoch)          # BEFORE forwarding (spec §3)
+            self._ledger.assign_generation(sid, gen.generation_id, gen.epoch)          # BEFORE forwarding (spec §3)
         except NelixError as e:
             self._fail(sid, f"could not bind generation: {e.message}")
             raise
@@ -223,9 +223,9 @@ class StartPath:
         # status "started" and echoes the ASSIGNED session id. Anything else is a failed start.
         if isinstance(reply, dict) and reply.get("status") == "started" \
                 and reply.get("session_id") == sid:
-            self._ledger.commit(sid, gen.epoch)
+            self._ledger.commit(sid, gen.generation_id, gen.epoch)
             out = {"operation": "start", "status": "started", "session_id": sid,
-                   "generation_id": gen.epoch}
+                   "generation_id": gen.generation_id}
             for k in ("snapshot", "next_after_seq", "next_action"):
                 if k in reply:
                     out[k] = reply[k]

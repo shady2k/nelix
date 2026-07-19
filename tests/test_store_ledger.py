@@ -11,6 +11,7 @@ from nelix_store.ledger import (
 OID = "o-" + "2" * 32
 GID = "g-" + "3" * 32
 GID2 = "g-" + "4" * 32
+GEPOCH = "g-" + "6" * 32
 FP = "fingerprint-of-the-start-request"
 
 
@@ -39,7 +40,7 @@ def test_the_generation_is_persisted_before_forwarding(ledger):
     # generation_id=None — so the retry could not recover against the ORIGINAL generation,
     # which is the entire ambiguity the ledger exists to close.
     r = reserve(ledger)
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     replay = reserve(ledger)
     assert replay.replay is True
     assert replay.generation_id == GID
@@ -48,8 +49,8 @@ def test_the_generation_is_persisted_before_forwarding(ledger):
 
 def test_replaying_a_key_returns_the_same_session_never_a_second_worker(ledger):
     first = reserve(ledger)
-    ledger.assign_generation(first.session_id, GID)
-    ledger.commit(first.session_id, GID)
+    ledger.assign_generation(first.session_id, GID, GEPOCH)
+    ledger.commit(first.session_id, GID, GEPOCH)
     second = reserve(ledger)
     assert second.session_id == first.session_id
     assert second.replay is True
@@ -161,9 +162,9 @@ def test_a_failed_start_carries_its_reason_on_replay(ledger):
 
 def test_committing_twice_to_the_same_generation_is_idempotent(ledger):
     r = reserve(ledger)
-    ledger.assign_generation(r.session_id, GID)
-    ledger.commit(r.session_id, GID)
-    ledger.commit(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
+    ledger.commit(r.session_id, GID, GEPOCH)
+    ledger.commit(r.session_id, GID, GEPOCH)
     assert reserve(ledger).state == "started"
 
 
@@ -171,17 +172,17 @@ def test_committing_to_a_different_generation_is_a_conflict(ledger):
     # rev 1 had no state machine: a double commit silently REBOUND the session to another
     # generation.
     r = reserve(ledger)
-    ledger.assign_generation(r.session_id, GID)
-    ledger.commit(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
+    ledger.commit(r.session_id, GID, GEPOCH)
     with pytest.raises(NelixError) as ei:
-        ledger.commit(r.session_id, GID2)
+        ledger.commit(r.session_id, GID2, GEPOCH)
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
 
 
 def test_failing_an_already_started_session_is_refused(ledger):
     r = reserve(ledger)
-    ledger.assign_generation(r.session_id, GID)
-    ledger.commit(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
+    ledger.commit(r.session_id, GID, GEPOCH)
     with pytest.raises(NelixError) as ei:
         ledger.fail(r.session_id, "too late")
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
@@ -192,16 +193,16 @@ def test_committing_an_already_failed_session_is_refused(ledger):
     # Assign FIRST, so the commit below matches the assigned generation and the
     # collapsed-generation guard passes. Without this the generation guard fires instead
     # (None != GID) with the same code, and deleting the failed-check leaves this test green.
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     ledger.fail(r.session_id, "bad cwd")
     with pytest.raises(NelixError) as ei:
-        ledger.commit(r.session_id, GID)
+        ledger.commit(r.session_id, GID, GEPOCH)
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
 
 
 def test_commit_of_an_unknown_session_is_rejected(ledger):
     with pytest.raises(NelixError) as ei:
-        ledger.commit("s-" + "9" * 32, GID)
+        ledger.commit("s-" + "9" * 32, GID, GEPOCH)
     assert ei.value.code == errors.UNKNOWN_SESSION
 
 
@@ -210,7 +211,7 @@ def test_commit_without_a_prior_assignment_is_refused(ledger):
     # the request went somewhere the ledger never recorded.
     r = reserve(ledger)
     with pytest.raises(NelixError) as ei:
-        ledger.commit(r.session_id, GID)
+        ledger.commit(r.session_id, GID, GEPOCH)
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
 
 
@@ -218,18 +219,18 @@ def test_commit_cannot_rebind_an_assigned_generation_while_still_starting(ledger
     # THE rev 2 hole: the guard only fired once state was already "started", so the window
     # assign_generation exists for was exactly the window it did not cover.
     r = reserve(ledger)
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     with pytest.raises(NelixError) as ei:
-        ledger.commit(r.session_id, GID2)
+        ledger.commit(r.session_id, GID2, GEPOCH)
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
     assert reserve(ledger).generation_id == GID     # unchanged
 
 
 def test_commit_rejects_a_malformed_generation(ledger):
     r = reserve(ledger)
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     with pytest.raises(NelixError) as ei:
-        ledger.commit(r.session_id, "not-a-generation")
+        ledger.commit(r.session_id, "not-a-generation", GEPOCH)
     assert ei.value.code == errors.INVALID_REQUEST
 
 
@@ -367,10 +368,10 @@ def test_assign_generation_refuses_a_started_start(ledger):
     # to a different generation: the router then forwards the retry to the wrong backend,
     # which is the second worker this whole component exists to prevent.
     r = reserve(ledger)
-    ledger.assign_generation(r.session_id, GID)
-    ledger.commit(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
+    ledger.commit(r.session_id, GID, GEPOCH)
     with pytest.raises(NelixError) as ei:
-        ledger.assign_generation(r.session_id, GID2)
+        ledger.assign_generation(r.session_id, GID2, GEPOCH)
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
     assert reserve(ledger).generation_id == GID          # unchanged
 
@@ -379,7 +380,7 @@ def test_assign_generation_refuses_a_failed_start(ledger):
     r = reserve(ledger)
     ledger.fail(r.session_id, "bad cwd")
     with pytest.raises(NelixError) as ei:
-        ledger.assign_generation(r.session_id, GID)
+        ledger.assign_generation(r.session_id, GID, GEPOCH)
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
     assert reserve(ledger).generation_id is None
 
@@ -389,30 +390,30 @@ def test_assign_generation_refuses_a_rebind(ledger):
     # passes. Deleting the rebind guard therefore makes this SUCCEED rather than raise the
     # same code from a sibling — which is what makes it individually detectable.
     r = reserve(ledger)
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     with pytest.raises(NelixError) as ei:
-        ledger.assign_generation(r.session_id, GID2)
+        ledger.assign_generation(r.session_id, GID2, GEPOCH)
     assert ei.value.code == errors.IDEMPOTENCY_CONFLICT
     assert reserve(ledger).generation_id == GID
 
 
 def test_assign_generation_is_idempotent_for_the_same_generation(ledger):
     r = reserve(ledger)
-    ledger.assign_generation(r.session_id, GID)
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     assert reserve(ledger).generation_id == GID
 
 
 def test_assign_generation_rejects_a_malformed_generation(ledger):
     r = reserve(ledger)
     with pytest.raises(NelixError) as ei:
-        ledger.assign_generation(r.session_id, "not-a-generation")
+        ledger.assign_generation(r.session_id, "not-a-generation", GEPOCH)
     assert ei.value.code == errors.INVALID_REQUEST
 
 
 def test_assign_generation_rejects_an_unknown_session(ledger):
     with pytest.raises(NelixError) as ei:
-        ledger.assign_generation("s-" + "9" * 32, GID)
+        ledger.assign_generation("s-" + "9" * 32, GID, GEPOCH)
     assert ei.value.code == errors.UNKNOWN_SESSION
 
 
@@ -425,7 +426,7 @@ def test_a_start_that_already_acquired_a_session_cannot_be_failed(ledger, tmp_pa
     store = Store(tmp_path, clock=lambda: 1000.0)
     try:
         r = reserve(ledger)
-        ledger.assign_generation(r.session_id, GID)
+        ledger.assign_generation(r.session_id, GID, GEPOCH)
         store.create_session(r.session_id, state="running", executor="coder", task="t",
                              cwd="/repo", model=None, created_at=100.0)
         with pytest.raises(NelixError) as ei:
@@ -451,7 +452,7 @@ def test_a_session_and_a_failed_start_never_coexist_under_a_race(tmp_path):
         try:
             r = lg.reserve(idempotency_key="k1", owner_id="hermes:local",
                            orchestration_id=OID, request_fingerprint=FP)
-            lg.assign_generation(r.session_id, GID)
+            lg.assign_generation(r.session_id, GID, GEPOCH)
         finally:
             lg.close()
             store.close()
@@ -561,8 +562,8 @@ def test_sessions_for_orchestration_excludes_failed(ledger):
 
 def test_sessions_for_orchestration_includes_started(ledger):
     s = _reserve_in(ledger, "k1", "hermes:local", OID)
-    ledger.assign_generation(s, GID)
-    ledger.commit(s, GID)
+    ledger.assign_generation(s, GID, GEPOCH)
+    ledger.commit(s, GID, GEPOCH)
     assert ledger.sessions_for_orchestration("hermes:local", OID) == [s]
 
 

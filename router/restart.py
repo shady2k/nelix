@@ -117,7 +117,7 @@ class RestartPath:
             self._fail(new_sid, f"{e.code}: {e.message}")
             raise
         try:
-            self._ledger.assign_generation(new_sid, gen.epoch)
+            self._ledger.assign_generation(new_sid, gen.generation_id, gen.epoch)
         except NelixError as e:
             self._fail(new_sid, f"could not bind generation: {e.message}")
             raise
@@ -142,9 +142,9 @@ class RestartPath:
 
         if isinstance(reply, dict) and reply.get("status") == "restarted" \
                 and reply.get("session_id") == new_sid:
-            self._ledger.commit(new_sid, gen.epoch)
+            self._ledger.commit(new_sid, gen.generation_id, gen.epoch)
             out = {"operation": "restart", "status": "restarted",
-                   "session_id": new_sid, "generation_id": gen.epoch}
+                   "session_id": new_sid, "generation_id": gen.generation_id}
             for k in ("snapshot", "next_after_seq", "next_action", "lineage_id",
                       "restart_count", "restarted_from"):
                 if k in reply:

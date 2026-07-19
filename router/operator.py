@@ -35,7 +35,7 @@ class OperatorRoutes:
         return 200, {
             "router_epoch": self._router_epoch,
             "generations": [
-                {"generation_id": g.epoch, "build_id": g.build_id,
+                {"generation_id": g.generation_id, "build_id": g.build_id,
                  "transport_kind": getattr(g.transport, "kind", None)}
                 for g in gens
             ],
@@ -62,5 +62,5 @@ class OperatorRoutes:
         client = RpcClient(gen.transport, PROBE_OWNER)
         path = "/capabilities?" + urllib.parse.urlencode({"owner_id": PROBE_OWNER})
         status, body = relay(lambda: client.forward_raw("GET", path, None))
-        return status, {"router_epoch": self._router_epoch, "generation_id": gen.epoch,
+        return status, {"router_epoch": self._router_epoch, "generation_id": gen.generation_id,
                         "capabilities": body}

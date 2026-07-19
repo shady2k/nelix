@@ -25,6 +25,7 @@ from nelix_store.store import Store
 OWNER = "hermes:local"
 OID = "o-" + "2" * 32
 GID = "g-" + "3" * 32
+GEPOCH = "g-" + "6" * 32
 FP = "fingerprint-of-the-start-request"
 N = 8
 
@@ -77,7 +78,7 @@ def test_create_session_from_many_threads_sharing_one_store_all_succeed(tmp_path
     for i in range(N):
         r = ledger.reserve(idempotency_key=f"k{i}", owner_id=OWNER, orchestration_id=OID,
                            request_fingerprint=FP)
-        ledger.assign_generation(r.session_id, GID)
+        ledger.assign_generation(r.session_id, GID, GEPOCH)
         reserved.append(r.session_id)
     ledger.close()
 
@@ -117,7 +118,7 @@ def test_write_contention_on_a_shared_store_is_a_retryable_store_unavailable(tmp
     ledger = StartLedger(tmp_path, clock=lambda: 1000.0)
     r = ledger.reserve(idempotency_key="k1", owner_id=OWNER, orchestration_id=OID,
                        request_fingerprint=FP)
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     ledger.close()
 
     store = Store(tmp_path, clock=lambda: 1000.0, timeout=0.2)   # 200ms busy_timeout
@@ -167,7 +168,7 @@ def test_a_fresh_threads_first_read_succeeds_while_another_thread_holds_a_write(
     ledger = StartLedger(tmp_path, clock=lambda: 1000.0)
     r = ledger.reserve(idempotency_key="k1", owner_id=OWNER, orchestration_id=OID,
                        request_fingerprint=FP)
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     store.create_session(r.session_id, state="running", executor="coder", task="t",
                          cwd="/repo", model=None, created_at=100.0)
     ledger.close()
@@ -232,7 +233,7 @@ def test_a_long_lived_worker_pool_shares_one_store_across_many_requests_per_work
             for round_ in range(rounds):
                 r = ledger.reserve(idempotency_key=f"w{worker_id}-r{round_}", owner_id=OWNER,
                                    orchestration_id=OID, request_fingerprint=FP)
-                ledger.assign_generation(r.session_id, GID)
+                ledger.assign_generation(r.session_id, GID, GEPOCH)
                 store.create_session(r.session_id, state="running", executor="coder",
                                      task="t", cwd="/repo", model=None, created_at=100.0)
                 got = store.get_session(r.session_id, owner_id=OWNER)

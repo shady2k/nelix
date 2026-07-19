@@ -16,6 +16,7 @@ import uuid
 
 import paths
 from nelix_store.ledger import StartLedger
+from nelix_store.store import Store
 from router.registry import GenerationRegistry
 from router.runtime_dir import RouterLockHeld, establish
 from router.server import make_router_server
@@ -56,10 +57,11 @@ def main() -> None:
         _log.warning("nelix router: %s; exiting", e)
         raise SystemExit(3) from None
 
-    # ONE StartLedger and ONE registry, shared across every request thread (both are thread-safe;
-    # the ledger MUST NOT be opened per-request — nelix-91y made a single shared instance safe).
+    # ONE StartLedger, ONE Store, and ONE registry, shared across every request thread
+    # (all three are thread-safe; none must be opened per-request).
     ledger = StartLedger(paths.nelix_root())
-    registry = GenerationRegistry()
+    store = Store(paths.nelix_root())
+    registry = GenerationRegistry(store=store)
     start_path = StartPath(ledger, registry)
     server = make_router_server(handle.socket, handle.sock_path, start_path, registry, router_epoch)
     _install_shutdown_handlers()
@@ -67,6 +69,10 @@ def main() -> None:
     try:
         server.serve_forever()
     finally:
+        try:
+            store.close()
+        except Exception:
+            pass
         try:
             ledger.close()
         except Exception:

@@ -9,11 +9,12 @@ from nelix_contracts.records import (
 SID = "s-" + "1" * 32
 OID = "o-" + "2" * 32
 GID = "g-" + "3" * 32
+GEPOCH = "g-" + "6" * 32
 
 
 def make_session(**over):
     fields = dict(session_id=SID, owner_id="hermes:local", orchestration_id=OID,
-                  generation_id=GID, state="starting", executor="coder",
+                  generation_id=GID, generation_epoch=GEPOCH, state="starting", executor="coder",
                   task="fix login", cwd="/repo", model=None, created_at=100.0)
     fields.update(over)
     return SessionRecord(**fields)
@@ -21,7 +22,7 @@ def make_session(**over):
 
 def make_terminal(**over):
     fields = dict(session_id=SID, owner_id="hermes:local", orchestration_id=OID,
-                  generation_id=GID, terminal_kind="done", summary="all green",
+                  generation_id=GID, generation_epoch=GEPOCH, terminal_kind="done", summary="all green",
                   ended_at=500.0, published_at=1000.0)
     fields.update(over)
     return TerminalRecord(**fields)

@@ -38,7 +38,7 @@ from nelix_contracts.records import timestamp
 from .db import ThreadLocalConnections, translates_sqlite
 
 _COLS = ("session_id, owner_id, orchestration_id, idempotency_key, request_fingerprint, "
-         "state, generation_id, reason, created_at")
+         "state, generation_id, generation_epoch, reason, created_at")
 
 # Caller-supplied TEXT, stored durably, with no delete path for a reservation — so an
 # unbounded one is unbounded database growth. Bounded in BYTES, not characters: SQLite stores
@@ -131,9 +131,9 @@ class StartLedger:
                 # (owner, key) UNIQUE constraint and reports as store_corrupt. Validate the
                 # read itself; do not rely on a column constraint to catch one of four cases.
                 self._conn.execute(
-                    f"INSERT INTO starts ({_COLS}) VALUES (?,?,?,?,?,?,?,?,?)",
+                    f"INSERT INTO starts ({_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (session_id, owner_id, orchestration_id, idempotency_key,
-                     request_fingerprint, "starting", None, None,
+                     request_fingerprint, "starting", None, None, None,
                      timestamp(self._clock(), "clock")))
                 return Reservation(session_id=session_id, state="starting",
                                    generation_id=None, reason=None, replay=False)
@@ -164,11 +164,13 @@ class StartLedger:
         return row
 
     @translates_sqlite
-    def assign_generation(self, session_id: str, generation_id: str) -> None:
-        """Record the chosen generation BEFORE the request reaches it. Idempotent for the
-        same generation; a different one while still starting is a conflict."""
+    def assign_generation(self, session_id: str, generation_id: str,
+                          generation_epoch: str) -> None:
+        """Record the chosen generation AND epoch BEFORE the request reaches it. Idempotent for
+        the same generation; a different one while still starting is a conflict."""
         try:
             validate_generation_id(generation_id)
+            validate_generation_id(generation_epoch)
         except InvalidId as e:
             raise NelixError(INVALID_REQUEST, str(e)) from None
         with self._conn:
@@ -180,19 +182,23 @@ class StartLedger:
             if row["generation_id"] not in (None, generation_id):
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  "reservation is already assigned to another generation")
-            self._conn.execute("UPDATE starts SET generation_id=? WHERE session_id=?",
-                               (generation_id, session_id))
+            self._conn.execute(
+                "UPDATE starts SET generation_id=?, generation_epoch=? WHERE session_id=?",
+                (generation_id, generation_epoch, session_id))
 
     @translates_sqlite
-    def commit(self, session_id: str, generation_id: str) -> None:
-        """Mark the start succeeded — on the generation it was ASSIGNED to, and no other.
+    def commit(self, session_id: str, generation_id: str,
+               generation_epoch: str) -> None:
+        """Mark the start succeeded — on the generation AND epoch it was ASSIGNED to, and no
+        other.
 
-        `commit` never writes generation_id. Only `assign_generation` binds it, and it does
-        so BEFORE the request is forwarded; a commit that could rebind would reopen the exact
-        lost-response ambiguity the assignment exists to close.
+        `commit` never writes generation_id or generation_epoch. Only `assign_generation`
+        binds them, and it does so BEFORE the request is forwarded; a commit that could rebind
+        would reopen the exact lost-response ambiguity the assignment exists to close.
         """
         try:
             validate_generation_id(generation_id)
+            validate_generation_id(generation_epoch)
         except InvalidId as e:
             raise NelixError(INVALID_REQUEST, str(e)) from None
         with self._conn:
@@ -212,6 +218,10 @@ class StartLedger:
                                      "generation")
                 raise NelixError(IDEMPOTENCY_CONFLICT,
                                  "start was assigned to a different generation")
+            # Validate epoch matches too.
+            if row["generation_epoch"] != generation_epoch:
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 "start was assigned to a different generation epoch")
             # state only — the binding is assign_generation's alone.
             self._conn.execute("UPDATE starts SET state='started' WHERE session_id=?",
                                (session_id,))
