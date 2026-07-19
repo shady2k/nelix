@@ -11,6 +11,7 @@ from nelix_store.store import Store
 
 OID = "o-" + "2" * 32
 GID = "g-" + "3" * 32
+GID2 = "g-" + "4" * 32
 
 
 class FakeClock:
@@ -758,3 +759,73 @@ def test_ack_rejects_a_nonsense_clock(tmp_path, bad):
         assert ei.value.code == errors.INVALID_REQUEST
     finally:
         store.close()
+
+
+# ---- per-generation terminal_seq watermarks (nelix-gm3) ----
+
+def test_put_terminal_assigns_monotonic_terminal_seq_per_generation(store, ledger, clock):
+    """After N terminals persist on a generation, terminal_seq values are monotonic,
+    gap-free-enough ordinals per generation. Revert the seq assignment -> this test fails."""
+    r_b = ledger.reserve(idempotency_key="k-seq-b", owner_id="hermes:local",
+                          orchestration_id=OID, request_fingerprint="fp")
+    ledger.assign_generation(r_b.session_id, GID2)
+    store.create_session(r_b.session_id, state="running", executor="coder", task="t",
+                          cwd="/repo", model=None, created_at=100.0)
+    sid_b = r_b.session_id
+
+    seqs_a = []
+    for i in range(3):
+        clock.t = 1000.0 + i
+        sid = started_session(store, ledger, key=f"k-seq-a{i}", state="running")
+        store.put_terminal(sid, terminal_kind="done", summary=f"seq test {i}",
+                           ended_at=float(i))
+        rec = store.get_terminal(sid, owner_id="hermes:local")
+        seqs_a.append(rec.terminal_seq)
+
+    clock.t = 1000.0
+    r_b2 = ledger.reserve(idempotency_key="k-seq-b2", owner_id="hermes:local",
+                           orchestration_id=OID, request_fingerprint="fp")
+    ledger.assign_generation(r_b2.session_id, GID2)
+    store.create_session(r_b2.session_id, state="running", executor="coder", task="t",
+                          cwd="/repo", model=None, created_at=100.0)
+    sid_b2 = r_b2.session_id
+    store.put_terminal(sid_b2, terminal_kind="done", summary="gen2 first", ended_at=0.0)
+    r_c = ledger.reserve(idempotency_key="k-seq-b3", owner_id="hermes:local",
+                          orchestration_id=OID, request_fingerprint="fp")
+    ledger.assign_generation(r_c.session_id, GID2)
+    store.create_session(r_c.session_id, state="running", executor="coder", task="t",
+                          cwd="/repo", model=None, created_at=100.0)
+    sid_b3 = r_c.session_id
+    store.put_terminal(sid_b3, terminal_kind="done", summary="gen2 second", ended_at=1.0)
+
+    assert seqs_a == [1, 2, 3], f"expected [1, 2, 3], got {seqs_a}"
+    rec_b = store.get_terminal(sid_b2, owner_id="hermes:local")
+    assert rec_b.terminal_seq == 1, f"expected seq=1 for first terminal on gen2, got {rec_b.terminal_seq}"
+    rec_c = store.get_terminal(sid_b3, owner_id="hermes:local")
+    assert rec_c.terminal_seq == 2, f"expected seq=2 for second terminal on gen2, got {rec_c.terminal_seq}"
+
+
+def test_get_generation_persisted_high_water(store, ledger, clock):
+    """Verify get_generation_persisted_high_water returns the correct max per generation."""
+    # No terminals yet -> 0
+    assert store.get_generation_persisted_high_water(GID) == 0
+
+    # One terminal -> seq 1
+    sid1 = started_session(store, ledger, key="k-hw-1", state="running")
+    store.put_terminal(sid1, terminal_kind="done", summary="first", ended_at=1.0)
+    assert store.get_generation_persisted_high_water(GID) == 1
+
+    # Another terminal -> seq 2
+    sid2 = started_session(store, ledger, key="k-hw-2", state="running")
+    store.put_terminal(sid2, terminal_kind="done", summary="second", ended_at=2.0)
+    assert store.get_generation_persisted_high_water(GID) == 2
+
+    # Second generation separate counter
+    r = ledger.reserve(idempotency_key="k-hw-gen2", owner_id="hermes:local",
+                        orchestration_id=OID, request_fingerprint="fp")
+    ledger.assign_generation(r.session_id, GID2)
+    store.create_session(r.session_id, state="running", executor="coder", task="t",
+                          cwd="/repo", model=None, created_at=100.0)
+    store.put_terminal(r.session_id, terminal_kind="done", summary="gen2 only", ended_at=3.0)
+    assert store.get_generation_persisted_high_water(GID2) == 1
+    assert store.get_generation_persisted_high_water(GID) == 2  # unchanged
