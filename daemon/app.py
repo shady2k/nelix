@@ -122,8 +122,12 @@ def main():
     ring = load_event_ring(cfg_path)
     events = EventQueue(max_history=ring.max_history, owner_floor=ring.owner_floor)
     retention = load_retention(cfg_path)
+    # nelix-9a4.4: import locally so the Store import does not force a pyproject dep —
+    # nelix_store ships alongside the core wheel via the runtime installer.
+    from nelix_store.store import Store
     manager = SessionManager(
         specs, events,
+        Store(paths.nelix_root()),
         launcher_factory=get_launcher, driver_factory=get_driver,
         concurrency_limit=limit, idle_retained_limit=idle_limit, logger=logger,
         session_retain=retention.session_retain,

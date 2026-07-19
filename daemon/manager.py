@@ -4,7 +4,6 @@ import re
 import shutil
 import threading
 import time
-import uuid
 from dataclasses import dataclass, replace
 
 import paths
@@ -236,7 +235,7 @@ def _default_session_factory(sid, executor, spec, events, launcher_factory,
 class SessionManager:
     """Registry of sessions. Holds <= concurrency_limit (config-driven, default 5)."""
 
-    def __init__(self, specs, events, launcher_factory=None, driver_factory=None,
+    def __init__(self, specs, events, store, launcher_factory=None, driver_factory=None,
                  concurrency_limit=5, idle_retained_limit=None, logger=None, session_factory=None,
                  session_retain=20, session_max_age_days=7, reaper_ctx=None,
                  terminal_snapshot_ttl=300.0, clock=time.time):
@@ -261,6 +260,10 @@ class SessionManager:
         self._terminal_async = {}
         self._terminal_ttl = terminal_snapshot_ttl
         self._clock = clock
+        # nelix-9a4.4: the durable store for terminal records (generation-neutral). MANDATORY:
+        # a generation daemon is always router-fronted, and the router owns the start ledger —
+        # there is no standalone/storeless mode to support.
+        self._store = store
         # Same seam _make uses for session construction, reused for the model-capability read (a
         # model override reads driver.model_flag). Never call get_driver() directly — that would
         # bypass an injected factory (tests / custom drivers).
@@ -300,7 +303,7 @@ class SessionManager:
     def _owned_sids(self, session_ids, owner_id):
         return {sid for sid in session_ids if owner.owns_session(sid, owner_id)}
 
-    def start(self, executor_name, task, cwd, *, owner_id, model=None, session_id=None):
+    def start(self, executor_name, task, cwd, *, owner_id, session_id, model=None):
         return self._spawn(executor_name, task, cwd, lineage_id=None, restarted_from=None,
                            owner_id=owner_id, model=model, session_id=session_id)
 
@@ -387,7 +390,7 @@ class SessionManager:
             self._logger.error("manager", event, session_id=session_id, exc_info=True)
 
     def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, owner_id,
-               reserve=False, model=None, session_id=None):
+               session_id, reserve=False, model=None):
         # reserve=True: a slot reservation was made for us by restart() (old session popped +
         # self._reserved bumped under the lock). We OWN that reservation and must release it exactly
         # once: consume it ATOMICALLY with inserting the new session (so len(_sessions)+_reserved
@@ -414,22 +417,20 @@ class SessionManager:
                 raise ValueError(f"cwd does not exist or is not a directory: {cwd!r}")
             # Router-assigned session id (spec §3, nelix-9a4.6 deliverable A): validated + collision-
             # checked BEFORE the lock/cap checks, same reasoning as owner/model above — a bad-shape or
-            # colliding id is the caller's input error, never a 409 "daemon full". Omitted (None, the
-            # default) -> self-mint below, byte-identical to pre-feature. restart() never passes one
-            # (it has no session_id parameter of its own), so the self-mint path there is unaffected.
-            if session_id is not None:
-                try:
-                    validate_session_id_shape(session_id)
-                except SessionIdRejected:
-                    if self._logger is not None:
-                        self._logger.warning("manager", "session_start_rejected",
-                                             reason="invalid_session_id", executor=executor_name)
-                    raise
-                if self._session_id_exists(session_id):
-                    if self._logger is not None:
-                        self._logger.warning("manager", "session_start_rejected",
-                                             reason="session_id_in_use", executor=executor_name)
-                    raise SessionIdInUse(session_id)
+            # colliding id is the caller's input error, never a 409 "daemon full". ALWAYS required:
+            # every session arrives through the router, which owns the start ledger.
+            try:
+                validate_session_id_shape(session_id)
+            except SessionIdRejected:
+                if self._logger is not None:
+                    self._logger.warning("manager", "session_start_rejected",
+                                         reason="invalid_session_id", executor=executor_name)
+                raise
+            if self._session_id_exists(session_id):
+                if self._logger is not None:
+                    self._logger.warning("manager", "session_start_rejected",
+                                         reason="session_id_in_use", executor=executor_name)
+                raise SessionIdInUse(session_id)
             # Per-session model override (nelix-9k0): validate + fold BEFORE the lock/cap checks so a
             # bad-shape or unsupported-driver model returns 400, never a 409 "daemon full". Omitted
             # model -> spec is untouched (byte-identical to pre-feature). The validated value is stored
@@ -457,15 +458,12 @@ class SessionManager:
                     raise RuntimeError(
                         f"idle_retained_limit={self._idle_limit} reached "
                         f"(close a completed session with nelix_stop before starting more)")
-                if session_id is not None:
-                    if session_id in self._sessions:   # closes the TOCTOU window vs. the pre-lock check
-                        if self._logger is not None:
-                            self._logger.warning("manager", "session_start_rejected",
-                                                 reason="session_id_in_use", executor=executor_name)
-                        raise SessionIdInUse(session_id)
-                    sid = session_id
-                else:
-                    sid = f"s-{uuid.uuid4().hex[:8]}"
+                if session_id in self._sessions:   # closes the TOCTOU window vs. the pre-lock check
+                    if self._logger is not None:
+                        self._logger.warning("manager", "session_start_rejected",
+                                             reason="session_id_in_use", executor=executor_name)
+                    raise SessionIdInUse(session_id)
+                sid = session_id
                 base_seq = self._events.latest_seq()  # waiter arms past anything already emitted
                 sess = self._make(sid, executor_name, spec)
                 sess.on_terminal = self._free_slot
@@ -493,7 +491,13 @@ class SessionManager:
                               lineage_id=sess.lineage_id, restarted_from=restarted_from,
                               slot=f"{len(keep)}/{self._limit}")
         gc_sessions(keep, self._session_retain, self._session_max_age_days, logger=self._logger)
+        # The session is now in memory but NOT yet durable. The try block below creates
+        # the durable row, writes the owner record, and spawns the PTY — in that order.
+        # On any failure, ALL durable state is rolled back (nelix-9a4.4).
         try:
+            self._store.create_session(
+                sid, state="starting", executor=executor_name, task=task,
+                cwd=cwd, model=applied_model, created_at=self._clock())
             # AUTHORITATIVE, and ordered: the owner record is durable BEFORE the PTY spawns and
             # therefore before /start can return the session id. An unwritable record raises
             # OwnerWriteFailed and the existing teardown below un-registers the session, so a
@@ -507,6 +511,12 @@ class SessionManager:
         except Exception as e:
             try:
                 sess.stop()                       # tear down any partially-spawned PTY / open dialog
+            except Exception:
+                pass
+            # Roll back durable state: transition the store's session row to "failed"
+            # so the router's ledger.fail() does not conflict with a live sessions row.
+            try:
+                self._store.transition_session(sid, owner_id=owner_id, state="failed")
             except Exception:
                 pass
             with self._lock:                      # don't leak a registered-but-unstarted session
@@ -561,7 +571,7 @@ class SessionManager:
         return (meta["executor"], meta.get("task"), meta["cwd"],
                 meta.get("lineage_id") or session_id, None, meta.get("model"), stored_owner)
 
-    def restart(self, session_id, *, owner_id, force=False):
+    def restart(self, session_id, *, new_session_id, owner_id, force=False):
         src = self._restart_source(session_id, owner_id)
         if src is None:
             return RestartOutcome("unknown_session")
@@ -602,7 +612,8 @@ class SessionManager:
             # it). _spawn re-validates + re-folds against the fresh original spec (idempotent).
             started = self._spawn(executor, task, cwd, lineage_id=lineage_id,
                                   restarted_from=session_id, reserve=reserve, model=model,
-                                  owner_id=stored_owner)   # INHERITED from disk, never the request
+                                  owner_id=stored_owner,
+                                  session_id=new_session_id)   # INHERITED from disk, never the request
             new_sid, base_seq = started.session_id, started.base_seq
         except Exception as e:
             self._log_spawn_failure("restart_spawn_failed", session_id, e)
@@ -658,7 +669,23 @@ class SessionManager:
             # possible restart. Keyed on terminal_kind, not a state string (NIT-16).
             if snap is not None and snap.get("terminal_kind") == "done":
                 self._lineages.pop(snap.get("lineage_id"), None)
-            existed = self._sessions.pop(session_id, None) is not None
+            # nelix-9a4.4: persist the generation-neutral record to the durable store
+            # BEFORE making it board-visible (spec §5 ordering: persist -> board-visible ->
+            # remove live session). Persist runs UNCONDITIONALLY regardless of terminal_ttl —
+            # the TTL only governs the volatile _terminal dict. The store's put_terminal reads
+            # identity from the start row; the router always creates one, so this never fails
+            # because of a missing reservation. If the session was created outside the normal
+            # SessionManager.start() flow (no store row), unknown_session is caught and logged.
+            if snap is not None:
+                try:
+                    self._store.put_terminal(
+                        session_id,
+                        terminal_kind=snap.get("terminal_kind", "unknown"),
+                        summary=snap.get("screen_excerpt", ""),
+                        ended_at=self._clock())
+                except Exception as _pe:
+                    if str(getattr(_pe, "code", "")) != "unknown_session":
+                        raise
             if self._terminal_ttl > 0:
                 # ONE expiry computed here, reused for BOTH stores below: the recent-terminal async
                 # record must share self._terminal's exact retention policy, never a second one.
@@ -668,6 +695,7 @@ class SessionManager:
                 if qid is not None:
                     self._terminal_async[session_id] = (
                         {"id": qid, "reason": "executor_finished"}, expires_at)
+            existed = self._sessions.pop(session_id, None) is not None
             # NB: the event ring is NOT forgotten here. forget_session is wired at exactly ONE seam —
             # the terminal-snapshot TTL-expiry sweep in status() — which waits out the terminal TTL so
             # spec §5's final wake is never discarded before a waiter can read it. Pruning the
@@ -863,6 +891,40 @@ class SessionManager:
             sessions[sid] = {**s_snap, "seq": per_seq.get(sid, 0)}
         recent = {sid: snap for sid, snap in recent_all.items()
                   if owner.owns_session(sid, owner_id)}
+        # nelix-9a4.4: supplement recent_terminal from the durable store for sessions whose
+        # volatile entry has expired past the TTL. A store-backed result that is still on the
+        # board (unacknowledged, not expired) is surfaced here — this is the fix for the live
+        # defect: a harness away past the TTL still sees its terminal results.
+        # A store read failure propagates as a NelixError — the caller sees "store unavailable"
+        # instead of a silently empty board (nelix-9a4.4).
+        store_records = self._store.list_terminal(owner_id)
+        for tr in store_records:
+            if tr.session_id in recent:
+                continue  # volatile entry is fresher (within TTL window)
+            # Build a minimal dict compatible with recent_terminal consumers.
+            # The store has terminal_kind + summary; for executor/task/cwd we
+            # read the session record from the store (one query per unrepresented
+            # terminal — acceptable because the board is bounded by max_count).
+            entry = {
+                "session_id": tr.session_id,
+                "terminal_kind": tr.terminal_kind,
+                "screen_excerpt": tr.summary,
+                "control_state": "terminal",
+                "pending": False,
+                "terminal": True,
+                "store_backed": True,
+            }
+            # Best-effort session enrichment: executor, task, cwd from the
+            # session record (the session row exists because put_terminal was
+            # called after create_session).
+            try:
+                sr = self._store.get_session(tr.session_id, owner_id=owner_id)
+                entry["executor"] = sr.executor
+                entry["task"] = sr.task
+                entry["cwd"] = sr.cwd
+            except Exception:
+                pass
+            recent[tr.session_id] = entry
         return {"sessions": sessions,
                 "limit": self._limit,
                 "cursor": cursor,

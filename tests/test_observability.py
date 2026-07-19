@@ -15,9 +15,9 @@ from daemon.clock import FakeClock
 from daemon.observation import Observation, ObservationCtx, Heartbeat
 from daemon.config import BeliefConfig
 
-from test_session import (_session, respond_via_submit_monitor, _BOX, _WORKING, _echo,
+from tests.test_session import (_session, respond_via_submit_monitor, _BOX, _WORKING, _echo,
                           WedgedWriteHandle)
-from test_belief_engine import busy, idle, CTX
+from tests.test_belief_engine import busy, idle, CTX
 
 
 def _log_buf():

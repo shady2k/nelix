@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import EXECUTOR, OWNER, own
+from tests.conftest import EXECUTOR, OWNER, own
 
 ROOT = Path(__file__).resolve().parents[1]
 

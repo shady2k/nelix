@@ -4,7 +4,7 @@ import os
 import daemon.launchers.local as local
 import paths
 from daemon import hook_settings
-from conftest import make_spec
+from tests.conftest import make_spec
 
 
 class FakeBroker:

@@ -22,7 +22,7 @@ from daemon.events import EventQueue, RESPONDABLE_KINDS  # noqa: E402
 from daemon.manager import SessionManager       # noqa: E402
 from daemon.messages import AsyncQuestion, ProgressNote  # noqa: E402
 from daemon.session import Session              # noqa: E402
-from conftest import own
+from tests.conftest import own
 
 
 class Spec:
@@ -210,11 +210,12 @@ def _demo_specs():
 
 
 @pytest.fixture
-def manager_with_busy_session(tmp_path):
+def manager_with_busy_session(tmp_path, store_and_ledger):
+    store, _ledger = store_and_ledger
     sess, ev = _make_session(tmp_path, ["compiling…", "compiling…"])
     sess._loop()
     assert sess._decision is None and sess._state == "busy"
-    mgr = SessionManager(_demo_specs(), ev, concurrency_limit=3,
+    mgr = SessionManager(_demo_specs(), ev, store, concurrency_limit=3,
                          session_retain=0, session_max_age_days=0)
     with mgr._lock:
         own(sess._id); mgr._sessions[sess._id] = sess
@@ -228,12 +229,14 @@ def test_manager_record_and_note(manager_with_busy_session):
     assert mgr.append_progress_note("s1", ProgressNote("done step", None)) == 1
 
 
-def test_manager_record_async_question_unknown_session():
-    mgr = SessionManager(_demo_specs(), EventQueue(), concurrency_limit=1)
+def test_manager_record_async_question_unknown_session(store_and_ledger):
+    store, _ledger = store_and_ledger
+    mgr = SessionManager(_demo_specs(), EventQueue(), store, concurrency_limit=1)
     qid, err = mgr.record_async_question("nope", AsyncQuestion("a?", "c", None, None))
     assert qid is None and err == {"error": "unknown_session"}
 
 
-def test_manager_append_progress_note_unknown_session():
-    mgr = SessionManager(_demo_specs(), EventQueue(), concurrency_limit=1)
+def test_manager_append_progress_note_unknown_session(store_and_ledger):
+    store, _ledger = store_and_ledger
+    mgr = SessionManager(_demo_specs(), EventQueue(), store, concurrency_limit=1)
     assert mgr.append_progress_note("nope", ProgressNote("x", None)) is None

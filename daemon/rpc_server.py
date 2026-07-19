@@ -659,8 +659,14 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 # disk-meta fallback path (`_restart_source`), and may spawn from what it finds.
                 if not self._require_valid_sid(restart_sid):
                     return
+                # nelix-9a4.4: the new session_id is router-assigned — the router always allocates
+                # an id + start row before forwarding restart, same as /start.
+                new_sid = body.get("new_session_id") if isinstance(body, dict) else None
+                if not new_sid or not self._require_valid_sid(new_sid):
+                    self._send(400, {"error": "missing or invalid field: 'new_session_id'"}); return
                 try:
-                    outcome = manager.restart(restart_sid, owner_id=owner_id,
+                    outcome = manager.restart(restart_sid, new_session_id=new_sid,
+                                              owner_id=owner_id,
                                               force=bool(body.get("force", False)))
                 except KeyError as e:
                     self._send(400, {"error": f"missing field: {e.args[0]}"}); return

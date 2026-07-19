@@ -218,13 +218,17 @@ def is_installed(build: str) -> bool:
     return paths.runtime_manifest(build).is_file()
 
 
-def install(wheel, *, python_version: str = RUNTIME_PYTHON, lock=RUNTIME_LOCK) -> str:
+def install(wheel, *, python_version: str = RUNTIME_PYTHON, lock=RUNTIME_LOCK,
+            extra_wheels=()) -> str:
     """Install `wheel` as an immutable runtime and return its build id. Idempotent: if that build
     id is already committed, this touches nothing and returns it.
 
     The install is frozen in the strong sense — an exact interpreter patch, retained; the core
     wheel by content; and its third-party closure by hash from `lock`. A plain `uv tool install`
     freezes none of the three.
+
+    nelix-9a4.4: extra_wheels are local packages (nelix_store, nelix_contracts) that ship as
+    separate wheels alongside the core. They are installed without hash pinning.
     """
     wheel = Path(wheel).resolve()
     lock = Path(lock).resolve()
@@ -241,16 +245,18 @@ def install(wheel, *, python_version: str = RUNTIME_PYTHON, lock=RUNTIME_LOCK) -
     try:
         if is_installed(build):           # committed while we waited for the lock
             return build
-        _build_at(paths.runtime_dir(build), wheel, lock, base_python, build, python_version)
+        _build_at(paths.runtime_dir(build), wheel, lock, base_python, build, python_version,
+                  extra_wheels)
         return build
     finally:
         os.close(fd)
 
 
 def _build_at(rt: Path, wheel: Path, lock: Path, base_python: Path,
-              build: str, python_version: str) -> None:
+              build: str, python_version: str, extra_wheels=()) -> None:
     """Build the runtime AT its final path (a venv cannot be staged and renamed — see the module
-    docstring) and commit it by writing the manifest atomically, last."""
+    docstring) and commit it by writing the manifest atomically, last.
+    nelix-9a4.4: extra_wheels are local packages installed alongside the core wheel."""
     shutil.rmtree(rt, ignore_errors=True)          # a previous partial install, if any
     paths.ensure_private_dir(rt)
     env = _uv_env()
@@ -264,8 +270,17 @@ def _build_at(rt: Path, wheel: Path, lock: Path, base_python: Path,
             raise RuntimeInstallError(f"venv creation failed:\n{mk.stdout}\n{mk.stderr}")
 
         py = paths.runtime_python(build)
-        # --require-hashes covers the whole closure: the lock's pins by hash, and the wheel by the
-        # digest of the bytes we were handed. `uv pip install <wheel>` alone would preserve neither.
+        # Install local package wheels FIRST (no hash pinning — they ship with the core).
+        # Must be before the core wheel so its dependencies resolve (nelix-store depends on
+        # nelix-contracts). Install without --require-hashes since they're local.
+        for ew in extra_wheels:
+            ei = _run(["uv", "pip", "install", "--python", py, str(ew)],
+                      env={**env, "VIRTUAL_ENV": str(paths.runtime_dir(build) / "venv")})
+            if ei.returncode != 0:
+                raise RuntimeInstallError(f"extra wheel install failed ({ew}):\n{ei.stdout}\n{ei.stderr}")
+
+        # --require-hashes covers the whole third-party closure: the lock's pins by hash, and
+        # the wheel by the digest of the bytes we were handed.
         reqs = rt / "requirements.txt"
         reqs.write_text(f"{lock.read_text()}\n"
                         f"{wheel} --hash=sha256:{_file_sha256(wheel)}\n")

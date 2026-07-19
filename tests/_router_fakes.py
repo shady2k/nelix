@@ -181,10 +181,16 @@ class Backend:
                                          "session_id": sid}); return
                     self._send(200, {"operation": "stop", "status": "stopped", "session_id": sid})
                 elif path == "/restart":
+                    new_sid = body.get("new_session_id")
+                    if not new_sid:
+                        self._send(400, {"operation": "restart",
+                                         "error": "missing or invalid field: 'new_session_id'"}); return
                     if not self._owned(sid, owner_id):
                         self._send(404, {"operation": "restart", "status": "unknown_session"}); return
                     self._send(200, {"operation": "restart", "status": "restarted",
-                                     "session_id": sid, "force": body.get("force", False)})
+                                     "session_id": new_sid, "snapshot": {"session_id": new_sid,
+                                     "control_state": "busy", "task_delivery": "pending"},
+                                     "force": body.get("force", False)})
                 else:
                     self._send(404, {"error": "not found"})
 

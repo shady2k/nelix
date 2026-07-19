@@ -127,10 +127,12 @@ class SessionForward:
         sid = _session(session_id)
         return self._forward(owner_id, "POST", "/stop", {"session_id": sid, "owner_id": owner_id})
 
-    def restart(self, owner_id, session_id, force=None):
+    def restart(self, owner_id, session_id, *, new_session_id=None, force=None):
         owner_id = _owner(owner_id)
         sid = _session(session_id)
         body = {"session_id": sid, "owner_id": owner_id}
+        if new_session_id is not None:
+            body["new_session_id"] = new_session_id
         if force is not None:
             body["force"] = force
         return self._forward(owner_id, "POST", "/restart", body)

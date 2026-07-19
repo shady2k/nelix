@@ -1,7 +1,7 @@
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
 from daemon.config import ExecutorSpec
-from conftest import OWNER, own
+from tests.conftest import OWNER, own, reserve_start
 
 
 class _FakeSession:
@@ -19,75 +19,105 @@ class _FakeSession:
                 "restarted_from": None, "restart_count": 0, "terminal": True}
 
 
-def _mgr(ttl=300.0, clock=None):
+def _mgr(store_and_ledger, ttl=300.0, clock=None):
+    store, _ledger = store_and_ledger
     specs = {"claude": ExecutorSpec(command="c", args=[], env={}, driver="claude")}
-    return SessionManager(specs, EventQueue(), concurrency_limit=5,
+    return SessionManager(specs, EventQueue(), store, concurrency_limit=5,
                           session_factory=lambda sid, ex, spec, ev: _FakeSession(sid),
                           session_retain=0, session_max_age_days=0,
                           terminal_snapshot_ttl=ttl, clock=(clock or (lambda: 1000.0)))
 
 
-def test_free_slot_captures_terminal_snapshot_and_frees_slot():
-    mgr = _mgr()
-    sess = _FakeSession("s-1"); sess.on_terminal = mgr._free_slot
-    own("s-1"); mgr._sessions["s-1"] = sess
-    mgr._free_slot("s-1")
-    assert "s-1" not in mgr._sessions                       # slot freed
+def _inject(store, ledger, mgr, sid_suffix, state="crashed", terminal_kind="crashed"):
+    """Register a session in the store via the ledger, create the session row, write its
+    owner, then inject it into the manager's live session registry. Returns the
+    router-assigned session_id and the fake session object."""
+    import time
+    sid = reserve_start(ledger, idempotency_key=f"k-{sid_suffix}")
+    own(sid)
+    store.create_session(sid, state=state, executor="claude", task="t", cwd="/p",
+                         model=None, created_at=time.time())
+    sess = _FakeSession(sid, state=state, terminal_kind=terminal_kind)
+    with mgr._lock:
+        mgr._sessions[sid] = sess
+    return sid, sess
+
+
+def test_free_slot_captures_terminal_snapshot_and_frees_slot(store_and_ledger):
+    store, ledger = store_and_ledger
+    mgr = _mgr(store_and_ledger)
+    sid, sess = _inject(store, ledger, mgr, "t1")
+    sess.on_terminal = mgr._free_slot
+    mgr._free_slot(sid)
+    assert sid not in mgr._sessions                       # slot freed
     out = mgr.status(owner_id=OWNER)
-    assert out["recent_terminal"]["s-1"]["state"] == "crashed"
-    assert out["recent_terminal"]["s-1"]["screen_excerpt"] == "boom"
+    assert out["recent_terminal"][sid]["state"] == "crashed"
+    assert out["recent_terminal"][sid]["screen_excerpt"] == "boom"
 
 
-def test_terminal_snapshot_pruned_after_ttl():
+def test_terminal_snapshot_pruned_after_ttl(store_and_ledger):
+    store, ledger = store_and_ledger
     t = {"now": 1000.0}
-    mgr = _mgr(ttl=10.0, clock=lambda: t["now"])
-    sess = _FakeSession("s-1"); own("s-1"); mgr._sessions["s-1"] = sess
-    mgr._free_slot("s-1")
-    assert "s-1" in mgr.status(owner_id=OWNER)["recent_terminal"]
+    mgr = _mgr(store_and_ledger, ttl=10.0, clock=lambda: t["now"])
+    sid, sess = _inject(store, ledger, mgr, "t2")
+    mgr._free_slot(sid)
+    assert sid in mgr._terminal
+    assert sid in mgr.status(owner_id=OWNER)["recent_terminal"]
     t["now"] = 1011.0                                       # past ttl
-    assert "s-1" not in mgr.status(owner_id=OWNER).get("recent_terminal", {})
+    # In-memory TTL pruning: volatile entry removed, but store-backed
+    # record still surfaces via status()'s list_terminal supplement.
+    mgr.status(owner_id=OWNER)                             # triggers sweep
+    assert sid not in mgr._terminal                         # volatile pruned
+    assert sid in mgr.status(owner_id=OWNER).get("recent_terminal", {})  # store-backed
 
 
-def test_terminal_expiry_forgets_session_from_event_ring():
+def test_terminal_expiry_forgets_session_from_event_ring(store_and_ledger):
     # nelix-9a4.5 finding #4 wiring: when a session's terminal snapshot expires (its final result is
     # no longer observable), the manager releases its event-ring retention + per-session bookkeeping,
     # so the ring is bounded to live + not-yet-pruned sessions over the daemon's lifetime.
+    store, ledger = store_and_ledger
     t = {"now": 1000.0}
-    mgr = _mgr(ttl=10.0, clock=lambda: t["now"])
-    own("s-gone01"); mgr._sessions["s-gone01"] = _FakeSession("s-gone01")
-    mgr._events.publish("s-gone01", "claude", "working", "", "working")
-    mgr._events.publish("s-gone01", "claude", "done", "final result", "done_candidate")
-    assert mgr._events.latest_seq("s-gone01") > 0
-    mgr._free_slot("s-gone01")
+    mgr = _mgr(store_and_ledger, ttl=10.0, clock=lambda: t["now"])
+    sid, _sess = _inject(store, ledger, mgr, "gone01")
+    mgr._events.publish(sid, "claude", "working", "", "working")
+    mgr._events.publish(sid, "claude", "done", "final result", "done_candidate")
+    assert mgr._events.latest_seq(sid) > 0
+    mgr._free_slot(sid)
     # WITHIN ttl: the final result must still be observable, so the ring data is retained.
     mgr.status(owner_id=OWNER)
-    assert mgr._events.latest_seq("s-gone01") > 0
-    assert any(e.session_id == "s-gone01" for e in mgr._events._events)
+    assert mgr._events.latest_seq(sid) > 0
+    assert any(e.session_id == sid for e in mgr._events._events)
     # PAST ttl: the sweep that prunes the terminal snapshot also forgets the session's ring state.
     t["now"] = 1011.0
     mgr.status(owner_id=OWNER)
-    assert mgr._events.latest_seq("s-gone01") == 0
-    assert not any(e.session_id == "s-gone01" for e in mgr._events._events)
-    assert "s-gone01" not in mgr._events._last_seq_by_session
-    assert "s-gone01" not in mgr._events._evicted_high_by_session
-    assert "s-gone01" not in mgr._events._owner_cache
+    assert mgr._events.latest_seq(sid) == 0
+    assert not any(e.session_id == sid for e in mgr._events._events)
+    assert sid not in mgr._events._last_seq_by_session
+    assert sid not in mgr._events._evicted_high_by_session
+    assert sid not in mgr._events._owner_cache
 
 
-def test_multiple_terminal_snapshots_coexist_and_prune_independently():
+def test_multiple_terminal_snapshots_coexist_and_prune_independently(store_and_ledger):
+    store, ledger = store_and_ledger
     t = {"now": 1000.0}
-    mgr = _mgr(ttl=10.0, clock=lambda: t["now"])
-    for sid in ("s-1", "s-2"):
-        own(sid); mgr._sessions[sid] = _FakeSession(sid)
-    mgr._free_slot("s-1")
+    mgr = _mgr(store_and_ledger, ttl=10.0, clock=lambda: t["now"])
+    sid1, _sess1 = _inject(store, ledger, mgr, "ms1")
+    sid2, _sess2 = _inject(store, ledger, mgr, "ms2")
+    mgr._free_slot(sid1)
     t["now"] = 1005.0
-    mgr._free_slot("s-2")
-    t["now"] = 1011.0                                       # s-1 expired (>10s), s-2 not (6s)
+    mgr._free_slot(sid2)
+    t["now"] = 1011.0                                       # sid1 past ttl (>10s), sid2 not (6s)
+    mgr.status(owner_id=OWNER)                             # triggers sweep
+    # In-memory TTL: sid1 pruned from volatile, sid2 remains.
+    assert sid1 not in mgr._terminal
+    assert sid2 in mgr._terminal
+    # Board: both still surfaced via the store supplement.
     rt = mgr.status(owner_id=OWNER)["recent_terminal"]
-    assert "s-1" not in rt and "s-2" in rt
+    assert sid1 in rt and sid2 in rt
 
 
-def test_negative_ttl_does_not_store_terminal_snapshot():
-    mgr = _mgr(ttl=-5)
+def test_negative_ttl_does_not_store_terminal_snapshot(store_and_ledger):
+    mgr = _mgr(store_and_ledger, ttl=-5)
     sess = _FakeSession("s-1"); own("s-1"); mgr._sessions["s-1"] = sess
     mgr._free_slot("s-1")
     assert "s-1" not in mgr._sessions                       # slot freed
@@ -96,31 +126,31 @@ def test_negative_ttl_does_not_store_terminal_snapshot():
 
 # --- terminal_kind regression tests ---
 
-def test_terminal_kind_delivery_failed_plumbed_through_status():
-    mgr = _mgr()
-    sess = _FakeSession("s-df", state="working", terminal_kind="delivery_failed")
-    own("s-df"); mgr._sessions["s-df"] = sess
-    mgr._free_slot("s-df")
+def test_terminal_kind_delivery_failed_plumbed_through_status(store_and_ledger):
+    store, ledger = store_and_ledger
+    mgr = _mgr(store_and_ledger)
+    sid, _sess = _inject(store, ledger, mgr, "df", state="working", terminal_kind="delivery_failed")
+    mgr._free_slot(sid)
     rt = mgr.status(owner_id=OWNER)["recent_terminal"]
-    assert rt["s-df"]["terminal_kind"] == "delivery_failed"
+    assert rt[sid]["terminal_kind"] == "delivery_failed"
 
 
-def test_terminal_kind_done_plumbed_through_status():
-    mgr = _mgr()
-    sess = _FakeSession("s-ok", state="exited", terminal_kind="done")
-    own("s-ok"); mgr._sessions["s-ok"] = sess
-    mgr._free_slot("s-ok")
+def test_terminal_kind_done_plumbed_through_status(store_and_ledger):
+    store, ledger = store_and_ledger
+    mgr = _mgr(store_and_ledger)
+    sid, _sess = _inject(store, ledger, mgr, "ok", state="exited", terminal_kind="done")
+    mgr._free_slot(sid)
     rt = mgr.status(owner_id=OWNER)["recent_terminal"]
-    assert rt["s-ok"]["terminal_kind"] == "done"
+    assert rt[sid]["terminal_kind"] == "done"
 
 
-def test_terminal_kind_crashed_plumbed_through_status():
-    mgr = _mgr()
-    sess = _FakeSession("s-cr", state="crashed", terminal_kind="crashed")
-    own("s-cr"); mgr._sessions["s-cr"] = sess
-    mgr._free_slot("s-cr")
+def test_terminal_kind_crashed_plumbed_through_status(store_and_ledger):
+    store, ledger = store_and_ledger
+    mgr = _mgr(store_and_ledger)
+    sid, _sess = _inject(store, ledger, mgr, "cr", state="crashed", terminal_kind="crashed")
+    mgr._free_slot(sid)
     rt = mgr.status(owner_id=OWNER)["recent_terminal"]
-    assert rt["s-cr"]["terminal_kind"] == "crashed"
+    assert rt[sid]["terminal_kind"] == "crashed"
 
 
 def test_session_terminal_kind_set_by_fail_delivery(tmp_path, monkeypatch):

@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from conftest import EXECUTOR, OWNER, make_spec
+from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start
 from daemon.drivers import get_driver
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
@@ -48,20 +48,21 @@ class _CapturingLauncher:
     def stop(self, handle): handle.close()
 
 
-def _serve(monkeypatch, tmp_path, *, spec=None, driver_factory=None, port=8801):
+def _serve(monkeypatch, tmp_path, store_and_ledger, *, spec=None, driver_factory=None, port=8801):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    store, ledger = store_and_ledger
     captured = []
     buf = io.StringIO()
     mgr = SessionManager({EXECUTOR: spec or make_spec(command="claude", args=["--foo"],
                                                       driver="claude")},
-                         EventQueue(),
+                         EventQueue(), store,
                          launcher_factory=lambda name: _CapturingLauncher(captured),
                          driver_factory=driver_factory or get_driver,
                          concurrency_limit=3, logger=Logger(level="debug", stream=buf))
     srv = make_server(mgr, Transport.tcp("127.0.0.1", port, "t"),
                       logger=Logger(level="debug", stream=buf))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, mgr, captured, buf
+    return srv, mgr, captured, buf, ledger
 
 
 def _req(port, body):
@@ -79,11 +80,11 @@ def _req(port, body):
         return e.code, json.loads(e.read())
 
 
-def test_daemon_start_with_model_reflects_in_spawned_argv_and_log(monkeypatch, tmp_path):
-    srv, mgr, captured, buf = _serve(monkeypatch, tmp_path, port=8801)
+def test_daemon_start_with_model_reflects_in_spawned_argv_and_log(monkeypatch, tmp_path, store_and_ledger):
+    srv, mgr, captured, buf, ledger = _serve(monkeypatch, tmp_path, store_and_ledger, port=8801)
     try:
         st, b = _req(8801, {"executor": EXECUTOR, "task": "hi", "cwd": str(tmp_path),
-                            "model": "haiku"})
+                            "model": "haiku", "session_id": reserve_start(ledger)})
         assert st == 200 and b["session_id"]
         assert captured == [["claude", "--foo", "--model", "haiku"]]      # spawned argv reflects it
         spawned = [json.loads(l) for l in buf.getvalue().splitlines()
@@ -93,21 +94,22 @@ def test_daemon_start_with_model_reflects_in_spawned_argv_and_log(monkeypatch, t
         mgr.stop_all(); srv.shutdown()
 
 
-def test_daemon_start_without_model_argv_unchanged(monkeypatch, tmp_path):
-    srv, mgr, captured, buf = _serve(monkeypatch, tmp_path, port=8802)
+def test_daemon_start_without_model_argv_unchanged(monkeypatch, tmp_path, store_and_ledger):
+    srv, mgr, captured, buf, ledger = _serve(monkeypatch, tmp_path, store_and_ledger, port=8802)
     try:
-        st, b = _req(8802, {"executor": EXECUTOR, "task": "hi", "cwd": str(tmp_path)})
+        st, b = _req(8802, {"executor": EXECUTOR, "task": "hi", "cwd": str(tmp_path),
+                            "session_id": reserve_start(ledger)})
         assert st == 200
         assert captured == [["claude", "--foo"]]                          # no --model injected
     finally:
         mgr.stop_all(); srv.shutdown()
 
 
-def test_daemon_start_bad_shape_returns_400(monkeypatch, tmp_path):
-    srv, mgr, captured, buf = _serve(monkeypatch, tmp_path, port=8803)
+def test_daemon_start_bad_shape_returns_400(monkeypatch, tmp_path, store_and_ledger):
+    srv, mgr, captured, buf, ledger = _serve(monkeypatch, tmp_path, store_and_ledger, port=8803)
     try:
         st, b = _req(8803, {"executor": EXECUTOR, "task": "hi", "cwd": str(tmp_path),
-                            "model": "bad\nshape"})
+                            "model": "bad\nshape", "session_id": reserve_start(ledger)})
         assert st == 400 and "error" in b
         assert captured == []                                             # no spawn
     finally:
@@ -118,12 +120,12 @@ class _NoModelDriver:
     def observe(self, *a, **k): pass
 
 
-def test_daemon_start_unsupported_driver_returns_400(monkeypatch, tmp_path):
-    srv, mgr, captured, buf = _serve(monkeypatch, tmp_path, port=8804,
+def test_daemon_start_unsupported_driver_returns_400(monkeypatch, tmp_path, store_and_ledger):
+    srv, mgr, captured, buf, ledger = _serve(monkeypatch, tmp_path, store_and_ledger, port=8804,
                                      driver_factory=lambda name: _NoModelDriver())
     try:
         st, b = _req(8804, {"executor": EXECUTOR, "task": "hi", "cwd": str(tmp_path),
-                            "model": "haiku"})
+                            "model": "haiku", "session_id": reserve_start(ledger)})
         assert st == 400 and "error" in b
         assert captured == []
     finally:

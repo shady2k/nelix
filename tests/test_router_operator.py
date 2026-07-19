@@ -9,7 +9,7 @@ import pytest
 from router.registry import GenerationRegistry
 from router.operator import OperatorRoutes
 
-from _router_fakes import Backend, Supervisor
+from tests._router_fakes import Backend, Supervisor
 
 _EPOCH = "r-" + "0" * 32
 

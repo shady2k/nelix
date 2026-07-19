@@ -13,12 +13,12 @@ to one retryable GENERATION_UNAVAILABLE, never a bare 500 (these routes carry no
 to protect, unlike /start)."""
 import pytest
 
-from conftest import OWNER
+from tests.conftest import OWNER
 from nelix_contracts.errors import NelixError
 from router.registry import GenerationRegistry
 from router.session_forward import SessionForward
 
-from _router_fakes import Backend, Supervisor
+from tests._router_fakes import Backend, Supervisor
 
 OTHER_OWNER = "harness-y"
 SID = "s-" + "a" * 32
@@ -90,7 +90,7 @@ def test_stop_forwards(wired):
 
 def test_restart_forwards_force_flag(wired):
     forward, backend = wired
-    status, body = forward.restart(OWNER, SID, force=True)
+    status, body = forward.restart(OWNER, SID, new_session_id="s-" + "d" * 32, force=True)
     assert status == 200
     assert body["force"] is True
 
@@ -123,7 +123,7 @@ def test_wrong_owner_stop_rejection_is_relayed_faithfully(wired):
 
 def test_wrong_owner_restart_rejection_is_relayed_faithfully(wired):
     forward, backend = wired
-    status, body = forward.restart(OTHER_OWNER, SID)
+    status, body = forward.restart(OTHER_OWNER, SID, new_session_id="s-" + "d" * 32)
     assert status == 404
     assert body["status"] == "unknown_session"
 

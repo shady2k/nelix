@@ -23,7 +23,7 @@ from nelix_store.ledger import StartLedger
 from router.registry import GenerationRegistry
 from router.start import StartPath
 
-from conftest import EXECUTOR, OWNER
+from tests.conftest import EXECUTOR, OWNER
 
 _SID_RE = re.compile(r"^s-[0-9a-f]{32}$")
 

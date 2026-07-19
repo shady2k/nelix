@@ -24,7 +24,11 @@ sys.path.insert(0, str(ROOT))
 
 from daemon.capture import read_capture                 # noqa: E402
 from daemon.renderer.base import make_renderer          # noqa: E402
-from tests.golden.invariants import INVARIANTS          # noqa: E402
+# The golden invariants live under tests/golden/; import directly without needing
+# tests/ to be a Python package (pytest doesn't require tests/__init__.py).
+_golden_dir = ROOT / "tests" / "golden"
+sys.path.insert(0, str(_golden_dir))
+from invariants import INVARIANTS                       # noqa: E402
 
 # ── corpus location ───────────────────────────────────────────────────────────
 REGRESSION_DIR = ROOT / "tests/golden/claude/_regression"

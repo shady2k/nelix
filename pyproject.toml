@@ -25,9 +25,9 @@ requires-python = "==3.11.*"
 dependencies = ["wasmtime==45.0.0"]
 
 [project.optional-dependencies]
-# Not installed by the core. `pyyaml` is here because bin/nelix-doctor (a repo tool, not a shipped
-# one) imports it, and `nelix_store`/`nelix_contracts` are test-only today: nothing under daemon/,
-# bin/ or the top-level modules references either package (verified by grep, 2026-07-17).
+# Not installed by the core. pyyaml is here because bin/nelix-doctor (a repo tool, not a shipped
+# one) imports it. nelix_store and nelix_contracts are local packages that ship as separate
+# wheels alongside the core via the runtime installer (nelix-9a4.4).
 dev = ["pytest==8.3.4", "pyyaml==6.0.3"]
 
 # Only the two WORKER-facing CLIs ship. daemon/hook_settings.py hands their absolute paths to every

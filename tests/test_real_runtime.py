@@ -52,7 +52,7 @@ def _build_wheel(src: Path, out: Path, version: str) -> Path:
     pp.write_text(pp.read_text().replace('version = "0.1.0"', f'version = "{version}"', 1))
     r = _run(["uv", "build", "--wheel", "--out-dir", out, src], cwd=src.parent)
     assert r.returncode == 0, f"wheel build failed:\n{r.stdout}\n{r.stderr}"
-    wheels = [w for w in out.glob(f"*-{version}-*.whl")]
+    wheels = [w for w in out.glob(f"nelix_core-{version}-*.whl")]
     assert len(wheels) == 1, f"expected one {version} wheel, got {wheels}"
     return wheels[0]
 
@@ -73,8 +73,25 @@ def generations(tmp_path_factory):
     os.environ["NELIX_HOME"] = str(home)
     os.environ.pop("NELIX_RUNTIME", None)
     try:
-        build_a = runtime.install(_build_wheel(src, dist, "0.1.0"), lock=src / RUNTIME_LOCK_NAME)
-        build_b = runtime.install(_build_wheel(src, dist, "0.2.0"), lock=src / RUNTIME_LOCK_NAME)
+        # nelix-9a4.4: build + install local packages alongside the core wheel
+        _build_local = lambda pkg: _run(
+            ["uv", "build", "--wheel", "--out-dir", dist, src / "packages" / pkg],
+            cwd=tmp).returncode == 0
+        _find = lambda name: next(iter(dist.glob(f"{name}*.whl")))
+        extra = []
+        for pkg, name in [("nelix_contracts", "nelix_contracts"),
+                          ("nelix_store", "nelix_store")]:
+            assert _build_local(pkg), f"{name} wheel build failed"
+            extra.append(_find(name))
+        build_a = runtime.install(_build_wheel(src, dist, "0.1.0"), lock=src / RUNTIME_LOCK_NAME,
+                                   extra_wheels=extra)
+        # Rebuild for 0.2.0 (different version stamp)
+        extra2 = []
+        for pkg, name in [("nelix_contracts", "nelix_contracts"),
+                          ("nelix_store", "nelix_store")]:
+            extra2.append(_find(name))
+        build_b = runtime.install(_build_wheel(src, dist, "0.2.0"), lock=src / RUNTIME_LOCK_NAME,
+                                   extra_wheels=extra2)
         runtime.activate(build_b)                       # the upgrade lands; A is still live
         yield home, build_a, build_b
     finally:
@@ -315,10 +332,17 @@ def test_installing_the_same_inputs_twice_is_a_no_op(generations):
     """Content-addressed, so a re-install of unchanged code must not mint a second generation — nor
     rewrite the first, which is live."""
     home, build_a, _ = generations
-    wheel = next((home.parent / "dist").glob("*-0.1.0-*.whl"))
+    # Select the CORE wheel (not nelix_store/nelix_contracts)
+    wheel = next((home.parent / "dist").glob("nelix_core-0.1.0-*.whl"))
     manifest = paths.runtime_manifest(build_a)
     before = manifest.stat().st_mtime_ns
-    again = runtime.install(wheel, lock=REPO / RUNTIME_LOCK_NAME)
+    dist = home.parent / "dist"
+    extra = []
+    for pkg in ("nelix_contracts", "nelix_store"):
+        ew = next(dist.glob(f"{pkg}-0.1.0-*.whl"))
+        extra.append(ew)
+    again = runtime.install(wheel, lock=Path(__file__).resolve().parents[1] / RUNTIME_LOCK_NAME,
+                            extra_wheels=extra)
     assert again == build_a
     assert manifest.stat().st_mtime_ns == before, "a re-install rewrote a live generation"
     assert sorted(runtime.installed()) == sorted(set(runtime.installed()))

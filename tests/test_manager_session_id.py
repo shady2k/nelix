@@ -1,16 +1,18 @@
-"""nelix-9a4.6 deliverable A: the generation's start endpoint accepts a router-assigned session id
-(spec §3). SessionManager.start()/._spawn() thread an optional `session_id` through; omitted ->
-self-mint, byte-identical to pre-feature (the self-mint FORMAT is deliberately left `s-<8hex>` —
-see the brief — only the WIDE-id acceptance is new)."""
+"""nelix-9a4.6 + nelix-9a4.4: session ids are ALWAYS router-assigned (spec §3).
+
+SessionManager.start()/._spawn() REQUIRE a `session_id` — no default, no self-mint.
+restart() REQUIRES `new_session_id` — no daemon-side minting.
+"""
 import re
 
 import pytest
-from conftest import EXECUTOR, OWNER, make_spec
+from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start
 from daemon.events import EventQueue
 from daemon.manager import SessionIdInUse, SessionIdRejected, SessionManager
 
 
-def _mgr(limit=5):
+def _mgr(store_and_ledger, limit=5):
+    store, ledger = store_and_ledger
     specs = {EXECUTOR: make_spec()}
     q = EventQueue()
     captured = []
@@ -40,92 +42,89 @@ def _mgr(limit=5):
         captured.append(s)
         return s
 
-    m = SessionManager(specs, q, session_factory=session_factory, concurrency_limit=limit)
-    return m, captured
+    m = SessionManager(specs, q, store, session_factory=session_factory, concurrency_limit=limit)
+    return m, captured, ledger
 
 
-def test_start_without_session_id_self_mints_the_legacy_shape():
-    # Omitted (None, the default) -> today's exact self-mint format, unchanged.
-    m, _ = _mgr()
-    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)
-    assert re.match(r"^s-[0-9a-f]{8}$", out.session_id)
+def test_start_requires_a_session_id(store_and_ledger):
+    """session_id is REQUIRED — no default, no self-mint."""
+    m, _, ledger = _mgr(store_and_ledger)
+    with pytest.raises(TypeError):
+        m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)  # missing session_id
 
 
-def test_start_honors_a_router_assigned_legacy_shaped_id():
-    m, captured = _mgr()
-    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id="s-deadbeef")
-    assert out.session_id == "s-deadbeef"
-    assert captured[0].sid == "s-deadbeef"
+def test_start_honors_a_router_assigned_legacy_shaped_id(store_and_ledger):
+    m, captured, ledger = _mgr(store_and_ledger)
+    sid = reserve_start(ledger)
+    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id=sid)
+    assert out.session_id == sid
+    assert captured[0].sid == sid
 
 
-def test_start_honors_a_router_assigned_wide_uuid4_shaped_id():
-    # spec §3: "Widen the id ... Use a full UUID/ULID." The future router mints a full UUID4 hex
-    # (32 chars); the validator must accept it, not just the legacy 8-hex form.
-    m, _ = _mgr()
-    wide = "s-" + "a" * 32
-    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id=wide)
-    assert out.session_id == wide
+def test_start_honors_a_router_assigned_wide_uuid4_shaped_id(store_and_ledger):
+    m, _, ledger = _mgr(store_and_ledger)
+    # The router mints full UUID4 hex (32 chars); reserve_start gives us one
+    sid = reserve_start(ledger)
+    assert len(sid) == 34  # s- + 32 hex
+    out = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id=sid)
+    assert out.session_id == sid
 
 
 @pytest.mark.parametrize("bad", [
-    "",                       # empty
-    "s-",                     # empty hex part
-    "s-xyz12345",             # non-hex chars
-    "../../etc/passwd",       # path traversal
-    "s-abc/def",              # separator
-    "no-prefix12345678",      # missing the s- prefix
-    "s-" + "a" * 65,          # over the accepted length
-    "s-ABCDEF12",             # uppercase hex rejected (charset is lowercase-only)
-    "s-deadbeef\n",           # trailing newline: `re.match(r"...$")` would accept this (`$` matches
-                              # just before a final "\n") -- the id becomes a `sessions/<sid>/`
-                              # directory name AND is exported as NELIX_SESSION / interpolated into
-                              # hook curl URLs, so a smuggled newline breaks curl silently (review
-                              # finding #1). `.fullmatch()` (no `$`/`^`) has no such gap.
-    "s-deadbeef ",            # trailing space
-    "s-dead\nbeef",           # embedded newline
+    "",
+    "s-",
+    "s-xyz12345",
+    "../../etc/passwd",
+    "s-abc/def",
+    "no-prefix12345678",
+    "s-" + "a" * 65,
+    "s-ABCDEF12",
+    "s-deadbeef\n",
+    "s-deadbeef ",
+    "s-dead\nbeef",
 ])
-def test_start_rejects_bad_shaped_session_id(bad):
-    m, captured = _mgr()
+def test_start_rejects_bad_shaped_session_id(store_and_ledger, bad):
+    m, captured, ledger = _mgr(store_and_ledger)
     with pytest.raises(SessionIdRejected):
         m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id=bad)
-    assert captured == []          # no session created on a rejected id
+    assert captured == []
 
 
-def test_start_rejects_a_live_session_id_collision():
-    m, _ = _mgr(limit=5)
-    out0 = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id="s-11112222")
-    assert out0.session_id == "s-11112222"
+def test_start_rejects_a_live_session_id_collision(store_and_ledger):
+    m, _, ledger = _mgr(store_and_ledger, limit=5)
+    sid = reserve_start(ledger)
+    out0 = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id=sid)
+    assert out0.session_id == sid
     with pytest.raises(SessionIdInUse):
-        m.start(EXECUTOR, "t2", "/tmp", owner_id=OWNER, session_id="s-11112222")
+        m.start(EXECUTOR, "t2", "/tmp", owner_id=OWNER, session_id=sid)  # same id collides
 
 
-def test_start_rejects_an_on_disk_session_id_collision():
-    # A session that already exited leaves its directory on disk; a router-supplied id naming
-    # that directory must not be silently reused/clobbered (spec §3), even though it is no
-    # longer LIVE in the registry.
+def test_start_rejects_an_on_disk_session_id_collision(store_and_ledger):
     import paths
-    m, _ = _mgr()
+    m, _, ledger = _mgr(store_and_ledger)
     (paths.sessions_root() / "s-33334444").mkdir(parents=True)
     with pytest.raises(SessionIdInUse):
         m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id="s-33334444")
 
 
-def test_start_rejected_session_id_does_not_consume_a_slot():
-    m, captured = _mgr(limit=1)
+def test_start_rejected_session_id_does_not_consume_a_slot(store_and_ledger):
+    m, captured, ledger = _mgr(store_and_ledger, limit=1)
     with pytest.raises(SessionIdRejected):
         m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id="bad id")
-    # The slot is still free: a follow-up start (no explicit id) succeeds.
-    out = m.start(EXECUTOR, "t2", "/tmp", owner_id=OWNER)
-    assert out.session_id
+    # The slot is still free: a follow-up start with a valid id succeeds.
+    sid = reserve_start(ledger)
+    out = m.start(EXECUTOR, "t2", "/tmp", owner_id=OWNER, session_id=sid)
+    assert out.session_id == sid
     assert captured[0].started == "t2"
 
 
-def test_restart_still_self_mints_never_taking_an_explicit_id():
-    # restart() has no session_id parameter of its own — the OUT-OF-SCOPE list forbids any
-    # router-side start-ledger / generation_id persistence in the restart path, and restart()
-    # must keep self-minting exactly as before.
-    m, _ = _mgr(limit=2)
-    out0 = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER)
-    out = m.restart(out0.session_id, owner_id=OWNER, force=True)
-    assert re.match(r"^s-[0-9a-f]{8}$", out.session_id)
+def test_restart_requires_new_session_id(store_and_ledger):
+    """restart() requires new_session_id — always router-assigned."""
+    m, _, ledger = _mgr(store_and_ledger, limit=2)
+    sid = reserve_start(ledger)
+    out0 = m.start(EXECUTOR, "t", "/tmp", owner_id=OWNER, session_id=sid)
+    new_sid = reserve_start(ledger)
+    out = m.restart(out0.session_id, new_session_id=new_sid, owner_id=OWNER, force=True)
+    assert re.match(r"^s-[0-9a-f]{32}$", out.session_id)
+    assert out.session_id == new_sid
     assert out.session_id != out0.session_id

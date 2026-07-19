@@ -38,7 +38,7 @@ import pytest
 
 from daemon.clock import FakeClock                  # noqa: E402
 from daemon.config import ExecutorSpec               # noqa: E402
-from conftest import OWNER, own                    # noqa: E402
+from tests.conftest import OWNER, own, reserve_start                    # noqa: E402
 from daemon.dialog import Dialog                     # noqa: E402
 from daemon.drivers.claude import ClaudeDriver       # noqa: E402
 from daemon.events import EventQueue                 # noqa: E402
@@ -55,9 +55,6 @@ ROOT = Path(__file__).resolve().parents[1]
 QUESTION = ROOT / "bin" / "nelix-question"
 NOTE = ROOT / "bin" / "nelix-note"
 _FRAME = (Path(__file__).parent / "golden" / "claude" / "idle_prompt" / "bare-prompt.txt").read_text()
-
-_SID = "s-11111111"   # must be shape-valid (nelix-9a4.6 finding #3: /message, /hook, /wait etc.
-                      # now shape-check every caller-supplied session id at the RPC layer)
 
 
 class Spec:
@@ -138,47 +135,52 @@ def unix_sock(tmp_path):
 
 
 @pytest.fixture
-def stack(tmp_path, unix_sock):
+def stack(tmp_path, unix_sock, store_and_ledger):
     """The REAL daemon stack: EventQueue + SessionManager + Session (scripted PTY, hook-driven),
     registered into the manager exactly as Manager._spawn wires a live session (on_terminal +
     deliver_turn — see daemon/manager.py:168-172), served by a REAL make_server on a REAL unix
     socket in a background thread. Yields (sess, mgr, ev, sid, sock_path)."""
+    store, ledger = store_and_ledger
+    sid = reserve_start(ledger)
+    import time
     ev = EventQueue()
     clock = FakeClock(0.0)
     specs = {"demo": ExecutorSpec(command="demo", args=[], env={}, driver="claude")}
-    mgr = SessionManager(specs, ev, concurrency_limit=3, session_retain=0, session_max_age_days=0)
-    sess = Session(_SID, "demo", ClaudeDriver(), None, Spec(), ev, clock=clock)
+    mgr = SessionManager(specs, ev, store, concurrency_limit=3, session_retain=0, session_max_age_days=0)
+    store.create_session(sid, state="busy", executor="demo", task="do the work",
+                         cwd=str(tmp_path), model=None, created_at=time.time())
+    sess = Session(sid, "demo", ClaudeDriver(), None, Spec(), ev, clock=clock)
     sess._handle = HookFakeHandle(_FRAME, clock=clock)
-    sess._dialog = Dialog(tmp_path / _SID, tail_lines=Spec.tail_lines,
+    sess._dialog = Dialog(tmp_path / sid, tail_lines=Spec.tail_lines,
                           spool_max_bytes=Spec.spool_max_bytes)
     sess._handle._dialog = sess._dialog
     sess._task_delivery = "delivered"
     with mgr._lock:
-        own(_SID); mgr._sessions[_SID] = sess
+        own(sid); mgr._sessions[sid] = sess
     sess.on_terminal = mgr._free_slot
-    sess.deliver_turn = lambda text: mgr.send_turn(_SID, text)
+    sess.deliver_turn = lambda text: mgr.send_turn(sid, text)
 
     srv = make_server(mgr, Transport.unix(unix_sock))
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     try:
-        yield sess, mgr, ev, _SID, unix_sock
+        yield sess, mgr, ev, sid, unix_sock
     finally:
         srv.shutdown()
         srv.server_close()
 
 
 def _drive_busy(sess):
-    sess.on_hook(HookEvent(_SID, "UserPromptSubmit"))
+    sess.on_hook(HookEvent(sess._id, "UserPromptSubmit"))
     sess._loop_once()
 
 
 def _drive_idle(sess):
-    sess.on_hook(HookEvent(_SID, "Stop"))
+    sess.on_hook(HookEvent(sess._id, "Stop"))
     sess._loop_once()
 
 
-def _env(sock, secret, sid=_SID):
+def _env(sock, secret, sid):
     return {"PATH": "/usr/bin:/bin", "NELIX_HOOK_SOCK": sock,
             "NELIX_HOOK_SECRET": secret, "NELIX_SESSION": sid}
 

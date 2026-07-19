@@ -23,36 +23,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
 from daemon.events import EventQueue                         # noqa: E402
 from daemon.manager import SessionManager                    # noqa: E402
 from daemon.messages import ProgressNote                     # noqa: E402
-from test_async_question import _demo_specs, _make_session   # noqa: E402
-from test_rpc_server import _req, _serve                     # noqa: E402
-from conftest import OWNER, own
+from tests.test_async_question import _demo_specs, _make_session   # noqa: E402
+from tests.test_rpc_server import _req, _serve                     # noqa: E402
+from tests.conftest import OWNER, own
 
 
 # ---------------------------------------------------------------------------
 # Manager level: the actual merge/gate logic (real Session, real SessionManager)
 # ---------------------------------------------------------------------------
 
-def _manager_with_busy_session(tmp_path):
+def _manager_with_busy_session(tmp_path, store_and_ledger):
+    store, _ledger = store_and_ledger
     sess, ev = _make_session(tmp_path, ["compiling…", "compiling…"])
     sess._loop()
     assert sess._decision is None and sess._state == "busy"    # active-working, no wake point
-    mgr = SessionManager(_demo_specs(), ev, concurrency_limit=3,
+    mgr = SessionManager(_demo_specs(), ev, store, concurrency_limit=3,
                          session_retain=0, session_max_age_days=0)
     with mgr._lock:
         own(sess._id); mgr._sessions[sess._id] = sess
     return mgr, sess
 
 
-def test_manager_status_default_omits_progress_during_active_working(tmp_path):
-    mgr, sess = _manager_with_busy_session(tmp_path)
+def test_manager_status_default_omits_progress_during_active_working(tmp_path, store_and_ledger):
+    mgr, sess = _manager_with_busy_session(tmp_path, store_and_ledger)
     sess.append_progress_note(ProgressNote("step 1", None))
     snap = mgr.status(sess._id, owner_id=OWNER)                     # default: include_progress=False
     assert snap["control_state"] == "busy"
     assert "progress" not in snap and "progress_total" not in snap   # anti-poll unchanged
 
 
-def test_manager_status_include_progress_returns_notes_during_active_working(tmp_path):
-    mgr, sess = _manager_with_busy_session(tmp_path)
+def test_manager_status_include_progress_returns_notes_during_active_working(tmp_path, store_and_ledger):
+    mgr, sess = _manager_with_busy_session(tmp_path, store_and_ledger)
     sess.append_progress_note(ProgressNote("step 1", "detail"))
     snap = mgr.status(sess._id, include_progress=True, owner_id=OWNER)
     assert snap["control_state"] == "busy"           # still active-working -- NOT a wake point
@@ -60,9 +61,9 @@ def test_manager_status_include_progress_returns_notes_during_active_working(tmp
     assert snap["progress_total"] == 1 and snap["progress_retained"] == 1
 
 
-def test_manager_status_all_sessions_board_include_progress(tmp_path):
+def test_manager_status_all_sessions_board_include_progress(tmp_path, store_and_ledger):
     """The all-sessions board read (session_id=None) gets the same on/off toggle per-session."""
-    mgr, sess = _manager_with_busy_session(tmp_path)
+    mgr, sess = _manager_with_busy_session(tmp_path, store_and_ledger)
     sess.append_progress_note(ProgressNote("board view", None))
     board_default = mgr.status(owner_id=OWNER)
     assert "progress" not in board_default["sessions"][sess._id]

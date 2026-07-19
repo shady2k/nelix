@@ -1,7 +1,7 @@
 from daemon.events import EventQueue
 from daemon.manager import SessionManager
 from daemon.config import ExecutorSpec
-from conftest import OWNER
+from tests.conftest import OWNER, reserve_start
 
 
 class _FakeSession:
@@ -13,45 +13,49 @@ class _FakeSession:
     def snapshot(self): return {"session_id": self._id, "state": "working"}
 
 
-def _mgr(events):
+def _mgr(store_and_ledger, events):
+    store, ledger = store_and_ledger
     specs = {"claude": ExecutorSpec(command="c", args=[], env={}, driver="claude")}
-    return SessionManager(specs, events, concurrency_limit=5,
+    mgr = SessionManager(specs, events, store, concurrency_limit=5,
                           session_factory=lambda sid, ex, spec, ev: _FakeSession(sid),
                           session_retain=0, session_max_age_days=0)
+    return mgr, ledger
 
 
-def test_status_includes_cursor_equal_to_latest_seq():
+def test_status_includes_cursor_equal_to_latest_seq(store_and_ledger):
     events = EventQueue()
-    mgr = _mgr(events)
+    mgr, _ledger = _mgr(store_and_ledger, events)
     events.publish("s-x", "claude", "working", "", "working")
     events.publish("s-x", "claude", "working", "", "working")
     out = mgr.status(owner_id=OWNER)
     assert out["cursor"] == events.latest_seq() == 2
 
 
-def test_status_cursor_zero_when_no_events():
-    out = _mgr(EventQueue()).status(owner_id=OWNER)
+def test_status_cursor_zero_when_no_events(store_and_ledger):
+    out = _mgr(store_and_ledger, EventQueue())[0].status(owner_id=OWNER)
     assert out["cursor"] == 0
 
 
-def test_per_session_status_carries_session_cursor(tmp_path):
+def test_per_session_status_carries_session_cursor(tmp_path, store_and_ledger):
     events = EventQueue()
-    mgr = _mgr(events)
-    _out = mgr.start("claude", "t", str(tmp_path), owner_id=OWNER); sid = _out.session_id
+    mgr, ledger = _mgr(store_and_ledger, events)
+    _out = mgr.start("claude", "t", str(tmp_path), owner_id=OWNER,
+                     session_id=reserve_start(ledger)); sid = _out.session_id
     events.publish(sid, "claude", "waiting_for_user", "", "working")  # one event for this session
     out = mgr.status(sid, owner_id=OWNER)
     assert out["session_id"] == sid
     assert out["cursor"] == events.latest_seq(sid)        # session-scoped cursor present
 
 
-def test_per_session_status_unknown_session():
-    assert _mgr(EventQueue()).status("s-nope", owner_id=OWNER) == {"error": "unknown session"}
+def test_per_session_status_unknown_session(store_and_ledger):
+    assert _mgr(store_and_ledger, EventQueue())[0].status("s-nope", owner_id=OWNER) == {"error": "unknown session"}
 
 
-def test_all_sessions_status_carries_per_session_seq(tmp_path):
+def test_all_sessions_status_carries_per_session_seq(tmp_path, store_and_ledger):
     events = EventQueue()
-    mgr = _mgr(events)
-    _out = mgr.start("claude", "t", str(tmp_path), owner_id=OWNER); sid = _out.session_id
+    mgr, ledger = _mgr(store_and_ledger, events)
+    _out = mgr.start("claude", "t", str(tmp_path), owner_id=OWNER,
+                     session_id=reserve_start(ledger)); sid = _out.session_id
     events.publish(sid, "claude", "working", "", "working")
     out = mgr.status(owner_id=OWNER)
     assert out["cursor"] == events.latest_seq()           # top-level stays GLOBAL

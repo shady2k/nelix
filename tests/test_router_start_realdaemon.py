@@ -29,8 +29,8 @@ from router.server import make_router_server
 from router.start import StartPath
 from rpc_client import RpcClient
 
-from conftest import EXECUTOR, OWNER, make_spec
-from _router_fakes import Supervisor
+from tests.conftest import EXECUTOR, OWNER, make_spec
+from tests._router_fakes import Supervisor
 
 
 class _RealDaemon:
@@ -40,6 +40,8 @@ class _RealDaemon:
     manager actually built, keyed by the id the start was driven with."""
 
     def __init__(self, sock_path):
+        from nelix_store.store import Store
+        store = Store(paths.nelix_root())
         self.created = []
         daemon = self
 
@@ -61,7 +63,7 @@ class _RealDaemon:
         def factory(sid, executor, spec, events):
             return _Leaf(sid, executor)
 
-        self.manager = SessionManager({EXECUTOR: make_spec()}, EventQueue(),
+        self.manager = SessionManager({EXECUTOR: make_spec()}, EventQueue(), store,
                                       session_factory=factory, concurrency_limit=5)
         self.server = make_server(self.manager, Transport.unix(sock_path))
         threading.Thread(target=self.server.serve_forever, daemon=True).start()

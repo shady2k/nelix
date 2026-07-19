@@ -9,7 +9,7 @@ import os
 import pytest
 
 import daemon.launchers.local as local
-from conftest import make_spec
+from tests.conftest import make_spec
 from daemon.env_resolver import EnvResolveError
 
 

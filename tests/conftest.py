@@ -15,6 +15,13 @@ EXECUTOR = "demo"
 # satisfying the signature use their own two owners: see tests/test_owner_isolation.py.
 OWNER = "test-owner"
 
+# nelix-9a4.4: the store is MANDATORY for the SessionManager. Every test that constructs
+# a SessionManager needs a Store + StartLedger sharing the same database root, and every
+# session_id must be router-assigned (reserved through the ledger). These helpers and
+# fixtures provide the shared setup so individual tests don't repeat it.
+_OID = "o-" + "a" * 32
+_GID = "g-" + "b" * 32
+
 
 def own(session_id, owner_id=OWNER):
     """Write the durable owner record a real `manager.start()` would have written.
@@ -39,27 +46,38 @@ def make_spec(**overrides):
 
 @pytest.fixture(autouse=True)
 def isolate_nelix_home(tmp_path_factory, monkeypatch):
-    """Point $NELIX_HOME at a per-test scratch root for EVERY test.
-
-    Not hygiene theatre — it closes a live bug. MEASURED 2026-07-17, on `main` at 9b1a14e and
-    BEFORE this fixture existed: a bare `pytest -q` wrote real PTY dumps into the developer's
-    own home, leaving ~/.hermes/workspace/nelix/sessions/s1/{raw,capture,transcript.jsonl,
-    meta.json}. It is old — the `s1` directory there dates from Jun 29 — and it hid well: the
-    files are rewritten in place, and overwriting a file does not change its DIRECTORY's mtime,
-    so `ls -l` on the session dir shows a June date after a run that just wrote to it. Only
-    `find -newermt` sees it.
-
-    The cause is that a default root is a REAL directory: tests that build a Session without
-    naming a root (tests/test_session.py's Session("s1", ...) and friends) inherit it. The
-    default has to exist for the product's sake, so the suite must override it, and no single
-    test can be trusted to remember — hence autouse, at the root of the suite.
-
-    A test that sets its own NELIX_HOME still wins: monkeypatch.setenv in the test body runs
-    after this fixture. So does monkeypatch.delenv, which is how test_paths.py asserts what the
-    default IS.
-
-    tests/test_paths.py::test_the_isolation_fixture_is_in_force fails if this is deleted.
-    """
+    """Point $NELIX_HOME at a per-test scratch root for EVERY test."""
     root = tmp_path_factory.mktemp("nelix-home")
     monkeypatch.setenv("NELIX_HOME", str(root))
     return root
+
+
+@pytest.fixture
+def store_and_ledger(tmp_path):
+    """Create a Store + StartLedger sharing the same database root.
+
+    Returns a (store, ledger) tuple. The store is mandatory for SessionManager
+    (nelix-9a4.4); every test that builds a SessionManager must use this fixture
+    or construct its own.
+    """
+    from nelix_store.store import Store
+    from nelix_store.ledger import StartLedger
+    root = tmp_path / "nelix-db"
+    root.mkdir()
+    store = Store(root)
+    ledger = StartLedger(root)
+    return store, ledger
+
+
+def reserve_start(ledger, owner_id=OWNER, idempotency_key=None):
+    """Reserve a start + assign generation via the ledger, returning the session_id.
+
+    Every test MUST use router-assigned session_ids — the daemon-minted-id fallback
+    no longer exists (nelix-9a4.4).
+    """
+    import uuid
+    key = idempotency_key or f"k-{uuid.uuid4().hex[:8]}"
+    r = ledger.reserve(idempotency_key=key, owner_id=owner_id,
+                       orchestration_id=_OID, request_fingerprint="fp")
+    ledger.assign_generation(r.session_id, _GID)
+    return r.session_id

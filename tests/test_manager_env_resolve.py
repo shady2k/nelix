@@ -9,7 +9,10 @@ import json
 
 import pytest
 
-from conftest import EXECUTOR, OWNER, make_spec
+from nelix_store.store import Store
+from nelix_store.ledger import StartLedger
+
+from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start
 from daemon.env_resolver import EnvResolveError, resolve_env_cmds
 from daemon.events import EventQueue
 from daemon.launchers.local import LocalLauncher
@@ -28,18 +31,24 @@ def _records(buf):
 
 def _mgr(monkeypatch, tmp_path, spec, buf):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
-    return SessionManager({EXECUTOR: spec}, EventQueue(),
-                          launcher_factory=lambda name: LocalLauncher(),
-                          driver_factory=get_driver, concurrency_limit=3,
-                          logger=Logger(level="debug", stream=buf))
+    root = tmp_path / "nelix-db"
+    root.mkdir()
+    store = Store(root)
+    ledger = StartLedger(root)
+    mgr = SessionManager({EXECUTOR: spec}, EventQueue(), store,
+                         launcher_factory=lambda name: LocalLauncher(),
+                         driver_factory=get_driver, concurrency_limit=3,
+                         logger=Logger(level="debug", stream=buf))
+    return mgr, ledger
 
 
 def test_spawn_env_resolve_failure_raises_and_cleans_up(monkeypatch, tmp_path):
     buf = io.StringIO()
     spec = make_spec(command="claude", args=["--foo"], driver="claude", env_cmd=dict(_LEAK))
-    m = _mgr(monkeypatch, tmp_path, spec, buf)
+    m, ledger = _mgr(monkeypatch, tmp_path, spec, buf)
     with pytest.raises(EnvResolveError) as ei:
-        m.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER)
+        m.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER,
+                session_id=reserve_start(ledger))
     assert ei.value.var == "TOK" and ei.value.reason == "non_zero_exit"
     assert not m._sessions               # the registered-but-unstarted session is torn down (slot freed)
 
@@ -47,9 +56,10 @@ def test_spawn_env_resolve_failure_raises_and_cleans_up(monkeypatch, tmp_path):
 def test_spawn_env_resolve_failure_logs_var_reason_without_leak(monkeypatch, tmp_path):
     buf = io.StringIO()
     spec = make_spec(command="claude", args=["--foo"], driver="claude", env_cmd=dict(_LEAK))
-    m = _mgr(monkeypatch, tmp_path, spec, buf)
+    m, ledger = _mgr(monkeypatch, tmp_path, spec, buf)
     with pytest.raises(EnvResolveError):
-        m.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER)
+        m.start(EXECUTOR, "hi", str(tmp_path), owner_id=OWNER,
+                session_id=reserve_start(ledger))
     out = buf.getvalue()
     # Redacted: neither the command string, its stdout, nor its stderr reaches any log sink.
     assert "LEAKOUT" not in out and "LEAKERR" not in out
