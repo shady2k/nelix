@@ -141,6 +141,11 @@ class TerminalRecord:
         # published it cannot be aged by this package's policy, which is the whole point of
         # having it rather than reusing the caller's ended_at.
         timestamp(self.published_at, "published_at")
+        # terminal_seq must be a non-negative, non-boolean int. 0 is valid (unset/legacy).
+        if isinstance(self.terminal_seq, bool) or not isinstance(self.terminal_seq, int) \
+                or self.terminal_seq < 0:
+            raise NelixError(INVALID_REQUEST,
+                             f"terminal_seq must be a non-negative int: {self.terminal_seq!r}")
         timestamp(self.acknowledged_at, "acknowledged_at", optional=True)
         timestamp(self.expired_at, "expired_at", optional=True)
         if self.expire_reason is not None:

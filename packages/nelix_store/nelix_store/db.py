@@ -143,9 +143,12 @@ CREATE INDEX IF NOT EXISTS terminal_by_published ON terminal (published_at);
 -- next_terminal_seq and assigns it as the new terminal's terminal_seq within the SAME
 -- transaction, so concurrent put_terminal calls from different sessions of one generation
 -- never produce duplicate seqs. Seqs start at 1 (first terminal for a generation gets seq=1).
+-- confirmed_high_water is reserved for the router to update in the retirement-ordering slice;
+-- gm3 writes only next_terminal_seq.
 CREATE TABLE IF NOT EXISTS generation_progress (
-    generation_id   TEXT PRIMARY KEY,
-    next_terminal_seq INTEGER NOT NULL DEFAULT 1
+    generation_id        TEXT PRIMARY KEY,
+    next_terminal_seq    INTEGER NOT NULL DEFAULT 1,
+    confirmed_high_water INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -642,7 +645,34 @@ def _migrate_v2_to_v3(conn):
             raise
     conn.execute("CREATE TABLE IF NOT EXISTS generation_progress ("
                  "generation_id TEXT PRIMARY KEY, "
-                 "next_terminal_seq INTEGER NOT NULL DEFAULT 1)")
+                 "next_terminal_seq INTEGER NOT NULL DEFAULT 1, "
+                 "confirmed_high_water INTEGER NOT NULL DEFAULT 0)")
+    # Handle round-1 migration that created generation_progress without confirmed_high_water.
+    try:
+        conn.execute("ALTER TABLE generation_progress ADD COLUMN confirmed_high_water "
+                     "INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e):
+            raise
+    # [1] Bump row-level schema_version on existing rows so list_* can see them.
+    conn.execute("UPDATE sessions SET schema_version=? WHERE schema_version<?",
+                 (SCHEMA_VERSION, SCHEMA_VERSION))
+    conn.execute("UPDATE terminal SET schema_version=? WHERE schema_version<?",
+                 (SCHEMA_VERSION, SCHEMA_VERSION))
+    # [2] Backfill terminal_seq with per-generation monotonic ordinals ordered by rowid
+    # (insert/persist order), starting at 1.
+    conn.execute("UPDATE terminal SET terminal_seq = ("
+                 "SELECT seq FROM ("
+                 "  SELECT t2.session_id,"
+                 "    ROW_NUMBER() OVER (PARTITION BY st.generation_id ORDER BY t2.rowid) AS seq"
+                 "  FROM terminal t2 JOIN starts st ON st.session_id = t2.session_id"
+                 ") sub WHERE sub.session_id = terminal.session_id"
+                 ")")
+    # Set generation_progress.next_terminal_seq to MAX(terminal_seq)+1 per generation.
+    conn.execute("INSERT OR IGNORE INTO generation_progress (generation_id, next_terminal_seq) "
+                 "SELECT st.generation_id, MAX(t.terminal_seq) + 1 "
+                 "FROM terminal t JOIN starts st ON st.session_id = t.session_id "
+                 "GROUP BY st.generation_id")
     # Update the stamp so subsequent opens skip migration.
     conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
 
