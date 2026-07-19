@@ -86,14 +86,14 @@ def test_a_future_version_token_expires_even_when_its_body_changed_shape():
     # positions grew a field reported invalid_request (caller's fault) instead of
     # cursor_expired (refetch the board). A version bump that changes nothing is not a
     # version bump worth having.
-    token = _token({"v": 2, "re": EPOCH, "tr": 1, "p": {GEN_A: ["ea", 5, "extra"]}})
+    token = _token({"v": 3, "re": EPOCH, "tr": 1, "p": {GEN_A: ["ea", 5, "extra"]}})
     with pytest.raises(NelixError) as ei:
         decode(token, router_epoch=EPOCH, topology_revision=1)
     assert ei.value.code == errors.CURSOR_EXPIRED
 
 
 def test_a_future_version_token_missing_a_field_still_expires():
-    token = _token({"v": 2, "re": EPOCH, "tr": 1})
+    token = _token({"v": 3, "re": EPOCH, "tr": 1})
     with pytest.raises(NelixError) as ei:
         decode(token, router_epoch=EPOCH, topology_revision=1)
     assert ei.value.code == errors.CURSOR_EXPIRED
@@ -163,7 +163,7 @@ def test_a_directly_constructed_cursor_still_has_immutable_positions():
 
 
 def test_decode_does_not_coerce_a_fractional_topology_revision():
-    token = _token({"v": 1, "re": EPOCH, "tr": 1.9, "p": {}})
+    token = _token({"v": 2, "re": EPOCH, "tr": 1.9, "p": {}})
     with pytest.raises(NelixError) as ei:
         decode(token, router_epoch=EPOCH, topology_revision=1)
     assert ei.value.code == errors.INVALID_REQUEST

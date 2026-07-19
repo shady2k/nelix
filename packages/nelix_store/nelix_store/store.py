@@ -115,6 +115,51 @@ class Store:
     def close(self):
         self._conns.close()
 
+    # ---- board_seq helpers (S2a.1) -------------------------------------------
+    @staticmethod
+    def _bump_board_seq(conn, owner_id: str) -> None:
+        """Increment the owner's board_seq by 1, creating the row if absent.
+
+        Idempotent: called once per owner per transaction inside the same
+        BEGIN IMMEDIATE. The calling method must NOT call this for owners whose
+        rows did not actually change.
+        """
+        conn.execute(
+            "INSERT INTO owner_board_seq(owner_id, seq) VALUES (?, 1) "
+            "ON CONFLICT(owner_id) DO UPDATE SET seq = seq + 1",
+            (owner_id,))
+
+    @translates_sqlite
+    def get_owner_board_seq(self, owner_id: str) -> int:
+        """Return the owner's current board_seq (0 if never mutated)."""
+        if not isinstance(owner_id, str) or not owner_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"owner_id must be a non-empty string: {owner_id!r}")
+        row = self._conn.execute(
+            "SELECT seq FROM owner_board_seq WHERE owner_id=?", (owner_id,)).fetchone()
+        return row[0] if row else 0
+
+    @translates_sqlite
+    def read_board_snapshot(self, owner_id: str):
+        """Atomically return (board_seq, rows) in ONE explicit read transaction.
+
+        Connections are isolation_level=None so two bare SELECTs are NOT one
+        snapshot.  This method explicitly BEGINs, reads the owner's board_seq
+        (0 if no row), reads the owner's archived board (same shape as
+        list_terminal), and commits — giving the cursor-before-snapshot
+        invariant: any mutation before the commit's snapshot has a board_seq <=
+        the returned high-water, and any mutation after has a strictly larger
+        board_seq.
+        """
+        if not isinstance(owner_id, str) or not owner_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"owner_id must be a non-empty string: {owner_id!r}")
+        with self._conn:
+            self._conn.execute("BEGIN")
+            seq = self.get_owner_board_seq(owner_id)
+            rows = self.list_terminal(owner_id)
+        return seq, rows
+
     # ---- sessions -------------------------------------------------------------
     @translates_sqlite
     def create_session(self, session_id: str, *, state: str, executor: str, task: str,
@@ -284,6 +329,7 @@ class Store:
                 "VALUES (?,?,?,?,?,?,?,?)",
                 (session_id, terminal_kind, summary, ended_at, published_at, terminal_seq,
                  None, SCHEMA_VERSION))
+            self._bump_board_seq(self._conn, start["owner_id"])
 
     @translates_sqlite
     def get_terminal(self, session_id: str, *, owner_id: str) -> TerminalRecord:
@@ -373,6 +419,7 @@ class Store:
             self._conn.execute(
                 "UPDATE terminal SET acknowledged_at=? WHERE session_id=? "
                 "AND acknowledged_at IS NULL", (timestamp(self._clock(), "clock"), session_id))
+            self._bump_board_seq(self._conn, owner_id)
             return self.get_terminal(session_id, owner_id=owner_id)
 
     @translates_sqlite
@@ -426,8 +473,9 @@ class Store:
             # or retire ones still being shown.
             expired = self._conn.execute(
                 "UPDATE terminal AS t SET expired_at=?, expire_reason='age' "
-                f"WHERE {_ON_THE_BOARD} AND (? - t.published_at) > ?",
-                (now, now, max_age_seconds)).rowcount
+                f"WHERE {_ON_THE_BOARD} AND (? - t.published_at) > ? "
+                "RETURNING session_id",
+                (now, now, max_age_seconds)).fetchall()
             # Runs AFTER the age pass, and reads what that pass wrote: rows it just expired are
             # no longer on the board, so they neither survive the count bound nor get counted
             # twice into the return value.
@@ -440,8 +488,23 @@ class Store:
                 "    ) AS rn FROM terminal t "
                 "    JOIN starts st ON st.session_id = t.session_id "
                 f"    WHERE {_ON_THE_BOARD}"
-                "  ) WHERE rn > ?)", (now, max_count)).rowcount
-        return expired
+                "  ) WHERE rn > ?) RETURNING session_id",
+                (now, max_count)).fetchall()
+            # Bump board_seq for EVERY distinct owner whose rows actually changed
+            # in either pass, exactly once each. Collect session_ids from both
+            # RETURNING result sets (they contain only rows THIS call just changed).
+            all_ids = tuple(r["session_id"] for batch in (expired, ) for r in batch)
+            n_expired = len(all_ids)
+            if all_ids:
+                placeholders = ",".join("?" * len(all_ids))
+                affected = self._conn.execute(
+                    f"SELECT DISTINCT st.owner_id FROM terminal t "
+                    f"JOIN starts st ON st.session_id = t.session_id "
+                    f"WHERE t.session_id IN ({placeholders})",
+                    all_ids).fetchall()
+                for row in affected:
+                    self._bump_board_seq(self._conn, row["owner_id"])
+        return n_expired
 
     # ---- generations/epochs identity API (nelix-80e-s1a) ----
 

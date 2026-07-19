@@ -182,6 +182,14 @@ CREATE TABLE IF NOT EXISTS generations (
 PRAGMA foreign_keys=ON;
 CREATE UNIQUE INDEX IF NOT EXISTS epochs_one_serving
     ON epochs (generation_id) WHERE process_state = 'serving';
+
+-- S2a.1: per-owner board change-version counter (additive DDL — any schema-v4 DB
+-- gains this table on reopen, no migration needed). An absent row means board_seq=0.
+-- Incremented at most ONCE per affected owner per COMMITTED transaction, NOT per row.
+CREATE TABLE IF NOT EXISTS owner_board_seq (
+    owner_id TEXT PRIMARY KEY,
+    seq      INTEGER NOT NULL
+);
 """
 
 LOCK_FILENAME = ".db-init.lock"
