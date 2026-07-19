@@ -59,12 +59,49 @@ def main() -> None:
 
     # ONE StartLedger, ONE Store, and ONE registry, shared across every request thread
     # (all three are thread-safe; none must be opened per-request).
-    ledger = StartLedger(paths.nelix_root())
-    store = Store(paths.nelix_root())
-    registry = GenerationRegistry(store=store)
-    start_path = StartPath(ledger, registry)
-    server = make_router_server(handle.socket, handle.sock_path, start_path, registry, router_epoch)
-    _install_shutdown_handlers()
+    # High: construct StartLedger INSIDE the try so a failure doesn't leak the router handle.
+    store = None
+    ledger = None
+    registry = None
+    try:
+        ledger = StartLedger(paths.nelix_root())
+        store = Store(paths.nelix_root())
+        # Bootstrap: pin the active runtime's build_id so the registry NEVER
+        # spawns a daemon from checkout code (spec §7.9 / C8).
+        # C8: ONLY ImportError (no runtime module) means "dev checkout".
+        # Any OTHER exception during runtime discovery (broken runtime) must FAIL.
+        try:
+            from runtime import active
+        except ImportError:
+            active_runtime = None
+        else:
+            active_runtime = active()  # let RuntimeError propagate — fail closed
+        build_id = active_runtime if active_runtime else None
+
+        # Eager re-adoption runs IN the constructor (§7.6).
+        registry = GenerationRegistry(store=store, build_id=build_id)
+        start_path = StartPath(ledger, registry)
+        # Install shutdown handlers BEFORE creating the server, so SIGTERM that
+        # arrives between socket creation and serve_forever() is handled gracefully.
+        _install_shutdown_handlers()
+        server = make_router_server(handle.socket, handle.sock_path,
+                                     start_path, registry, router_epoch)
+    except Exception:
+        # H13: Clean up EVERYTHING, not just when registry is None.
+        # A StartPath/server-creation failure must also release the router
+        # lock and close stores.
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+        if ledger is not None:
+            try:
+                ledger.close()
+            except Exception:
+                pass
+        handle.close()
+        raise
     _log.info("nelix router serving on %s (epoch=%s)", handle.sock_path, router_epoch)
     try:
         server.serve_forever()
@@ -73,10 +110,11 @@ def main() -> None:
             store.close()
         except Exception:
             pass
-        try:
-            ledger.close()
-        except Exception:
-            pass
+        if ledger is not None:
+            try:
+                ledger.close()
+            except Exception:
+                pass
         handle.close()
         _log.info("nelix router: stopped")
 

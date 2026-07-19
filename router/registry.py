@@ -1,53 +1,27 @@
 """The router's generation registry — ONE generation today, structurally multi-generation.
 
-The registry owns the "active-generation pointer" (spec §1): new sessions route to the one
-generation it tracks. It is deliberately LIST-shaped (a registry of N, N=1 today) so 3c.2/Plan 4
-add generations without reshaping this — nothing hard-codes "one generation" in a way a later slice
-must tear out.
-
-Per generation it tracks:
-  * `generation_id` — a STABLE `g-<32hex>` id (`new_generation_id()`), minted ONCE by the
-    registry itself (analogous to how the router mints its own `router_epoch` once per process —
-    see `router/app.py`) and PERSISTED via `store.create_generation(...)`. It SURVIVES a daemon
-    restart (unlike `epoch` below): it identifies the registry's generation SLOT, not any one
-    incarnation of a daemon occupying it. This is the vector cursor's `generation_id` map KEY
-    (`nelix_contracts.cursor`, `router/board.py`) — a caller's prior cursor position for this slot
-    must not be orphaned by a daemon restart.
-  * `epoch` — a per-INCARNATION `generation_epoch` MINTED by the router (`new_generation_id()`, a
-    g-<32hex> id — the exact shape the StartLedger stores and validates). The epoch is what
-    assign_generation/commit bind a reservation to; keyed on the daemon's INCARNATION so a daemon
-    RESTART yields a NEW epoch. The daemon's own /health carries no incarnation id yet (that
-    addition is a later slice), so the incarnation is keyed on supervisor identity —
-    (pid, start_fingerprint). Carried as the vector cursor's per-generation VALUE (paired with the
-    seq), never its map key.
-  * `transport` — the live daemon Transport.
-  * `build_id` — the daemon's /health `generation_id` (may be None in dev — handled). Informational.
-
-If a generation cannot be made available, callers get GENERATION_UNAVAILABLE (retryable).
+S1c-2 (authority switch): production uses per-generation GenerationSupervisor, mint-before-spawn,
+single-flight, incarnation-guarded reap, eager re-adoption in constructor.
 """
 import json
+import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
 
-from nelix_contracts.errors import GENERATION_UNAVAILABLE, NelixError
+from nelix_contracts.errors import GENERATION_UNAVAILABLE, IDEMPOTENCY_CONFLICT, NelixError
 from nelix_contracts.ids import new_generation_id
 
-import supervisor as _supervisor_module
+from generation_supervisor import GenerationSupervisor
 
-# The owner the registry's /health probe constructs an RpcClient as. /health carries no owner on the
-# wire (spec §8/§10); this value only satisfies RpcClient's construction check — it owns nothing.
-# Mirrors supervisor._PROBE_OWNER's rationale.
 PROBE_OWNER = "nelix-router-probe"
+
+_log = logging.getLogger("nelix.registry")
 
 
 @dataclass(frozen=True)
 class GenerationHandle:
-    """A snapshot of one tracked generation. `generation_id` is the durable STABLE id — persisted
-    via store.create_generation(), survives a daemon restart, and is what the vector cursor keys
-    on. `epoch` is the router's per-incarnation id (the ledger key; fresh on every restart).
-    `transport` reaches the backend; `build_id` is the daemon's self-reported identity (or None);
-    `incarnation` is the supervisor identity the epoch is keyed on."""
     generation_id: str
     epoch: str
     transport: object
@@ -55,259 +29,622 @@ class GenerationHandle:
     incarnation: dict
 
 
-def _default_health_probe(transport) -> "str | None":
-    """Read a generation's build-id from GET /health, or None if it cannot be read (dev runtimes
-    report None, and an unreachable/odd backend must not make the whole registry fail here — the
-    build-id is informational; availability is decided by the transport, not by this probe).
-    Reads the ``build_id`` field (S1c-1: /health now returns explicit
-    ``{generation_id, generation_epoch, build_id}``).
-    """
-    try:
-        from rpc_client import RpcClient
-    except ImportError:                                    # package mode
-        from .rpc_client import RpcClient
-    try:
-        return RpcClient(transport, PROBE_OWNER).health().get("build_id")
-    except Exception:
-        return None
-
-
 def _incarnation_meta(inc: dict) -> str:
-    """Deterministic canonical JSON of the incarnation identity dict."""
     return json.dumps(inc, sort_keys=True)
 
 
 class GenerationRegistry:
-    """Thread-safe: the router shares ONE registry across its request threads. The epoch mint/refresh
-    runs under a lock so two concurrent starts observing a fresh incarnation mint exactly ONE epoch
-    (not two racing ids for the same generation); the slow steps (spawn, build-id probe) run outside
-    that lock so a stalled generation never serializes all /start + /health behind them."""
 
-    def __init__(self, *, store=None, supervisor=_supervisor_module,
-                 health_probe=_default_health_probe):
+    def __init__(self, *, store=None, build_id=None,
+                 supervisor=None, health_probe=None):
         self._store = store
-        self._sup = supervisor
-        self._probe = health_probe
         self._lock = threading.Lock()
-        # The registry's ONE slot's STABLE generation id, minted exactly once for the lifetime of
-        # this registry — it identifies the SLOT, never any one incarnation occupying it, so it
-        # survives every daemon restart this registry ever observes. Persisted via
-        # store.create_generation(...) on first observation.
-        self._generation_id = new_generation_id()
-        self._generation_created = False
-        # The active-generation pointer, N=1: {"incarnation", "epoch", "generation_id",
-        # "build_id", "transport"} or None before anything is observed.
+        self._gen_locks = {}
+        self._gen_locks_lock = threading.Lock()
+        self._build_id = build_id
+        self._sup = supervisor
+        self._generation_id = None
         self._active = None
-        # The vector cursor's topology component. N=1 today: the registry has exactly one slot and
-        # never adds/removes one, so this starts at a fixed 1 and never moves yet.
         self._topology_revision = 1
 
-    def active(self) -> GenerationHandle:
-        """Return the active generation, ensuring a backend is available. Raises
-        NelixError(GENERATION_UNAVAILABLE) if none can be made available.
+        # Eager re-adoption in constructor.
+        if self._store is not None and self._sup is None:
+            self._eager_reconcile()
 
-        The IDENTITY READ + epoch mint/install are ATOMIC under the lock. The slow work stays
-        OUTSIDE the lock: `_ensure_available()` (which may spawn a daemon and health-checks it)
-        and the informational build-id probe (up to the health timeout). Then, UNDER the lock, the
-        current `(transport, incarnation)` is read from the AUTHORITATIVE LIVE LOCK HOLDER
-        (`supervisor.held_generation()`) and the epoch is minted/installed together with it.
+    # ── eager re-adoption (§3, full case matrix) ──────────────────────────
 
-        Per S1b, the registry now persists the generation identity:
-          - First observation: store.create_generation() with the stable generation_id.
-          - Per incarnation: store.insert_epoch(starting) -> health -> cas_epoch_serving.
-          - On incarnation change: mark old epoch dead before inserting new starting epoch.
+    def _eager_reconcile(self):
+        """Run during construction: reconcile ALL durable generations.
+        DB-first: list_generations(), for each construct its GenerationSupervisor,
+        inspect the lock holder + strict /health, repair to a consistent state.
+
+        FAIL-CLOSED on store read errors — never mint a second active row.
         """
-        self._ensure_available()                            # spawn / health-check — OUTSIDE the lock
+        if self._store is None:
+            return
+
+        # C5: FAIL CLOSED — a store read error must abort, not silently mint.
+        try:
+            gens = self._store.list_generations()
+        except Exception:
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             "failed to read generation list during re-adoption; "
+                             "store may be corrupted")
+
+        # Multiple active rows → FAIL CLOSED
+        active_rows = [g for g in gens if g.lifecycle_state == "active"]
+        if len(active_rows) > 1:
+            raise NelixError(IDEMPOTENCY_CONFLICT,
+                             f"multiple ({len(active_rows)}) active generation rows found; "
+                             "store is corrupted")
+
+        if not active_rows:
+            return  # No active — first call to active() will mint one.
+
+        gen_rec = active_rows[0]
+        gid = gen_rec.generation_id
+        build_id = gen_rec.build_id
+
+        self._generation_id = gid
+
+        # H9: NEVER reject a pinned OLDER runtime — pinning IS the point.
+        # The runtime may not match ours, and that's fine; the generation
+        # runs its OWN pinned code. Only fail if build_id is None AND
+        # our runtime is also None (both checkout — in dev that's ok too).
+
+        sup = GenerationSupervisor(gid, build_id)
+        current_epoch = gen_rec.current_epoch
+
+        # C5: FAIL CLOSED — a store read error on epochs must abort.
+        try:
+            all_epochs = self._store.list_epochs_strict(gid)
+        except Exception:
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             "failed to read epoch list during re-adoption; "
+                             "store may be corrupted")
+
+        # C6: Reap dirs with no DB row.
+        # TODO(S1c-2 hardening bead): dir-only orphan reaping in empty/no-active case
+        try:
+            for d in sup.generation_dir().parent.iterdir():
+                if not d.is_dir():
+                    continue
+                dir_name = d.name
+                if dir_name not in {g.generation_id for g in gens}:
+                    _log.warning("registry: orphan generation dir %s (no DB row); reaping", dir_name)
+                    # Best-effort: reap the lock holder if any.
+                    try:
+                        os_sup = GenerationSupervisor(dir_name, None)
+                        holder = os_sup._live_lock_holder()
+                        if holder:
+                            inc = {"pid": holder["pid"],
+                                   "start_fingerprint": holder.get("start_fingerprint")}
+                            os_sup.reap_holder(inc)
+                    except Exception:
+                        pass
+        except OSError:
+            pass
+
+        # C6: current_epoch=NULL but epochs exist → repair to a consistent state.
+        if current_epoch is None:
+            serving = [e for e in all_epochs if e.process_state == "serving"]
+            starting = [e for e in all_epochs if e.process_state == "starting"]
+
+            # Try to adopt a serving epoch with a live matching holder.
+            # Repair the dangling current_epoch pointer rather than dead-reconciling.
+            for se in serving:
+                holder = sup._live_lock_holder()
+                if holder is None:
+                    continue
+                transport = sup._holder_transport(holder)
+                if transport is None:
+                    # TCP/unknown holder — try endpoint.
+                    ep = sup.endpoint(expected_epoch=se.generation_epoch)
+                    if ep is None:
+                        continue
+                    transport = ep
+                identity = sup._health_identity(transport)
+                if identity is None:
+                    continue
+                if (identity.get("generation_id") == gid
+                        and identity.get("generation_epoch") == se.generation_epoch
+                        and identity.get("build_id") == build_id):
+                    # C1: Re-read holder before installing.
+                    re_read = sup._live_lock_holder()
+                    if (not re_read
+                            or re_read.get("pid") != holder["pid"]
+                            or re_read.get("start_fingerprint") != holder.get("start_fingerprint")):
+                        _log.warning("registry: holder changed during NULL repair; aborting")
+                        return
+                    inc = {"pid": holder["pid"],
+                           "start_fingerprint": holder.get("start_fingerprint")}
+                    _log.info("registry: repairing NULL current_epoch -> %s (serving, live)",
+                              se.generation_epoch)
+                    # C4: DIRECT repair of the dangling pointer.
+                    try:
+                        self._store.set_current_epoch(gid, se.generation_epoch)
+                    except NelixError:
+                        pass
+                    self._active = {
+                        "incarnation": inc, "epoch": se.generation_epoch,
+                        "generation_id": gid, "transport": transport,
+                        "build_id": build_id,
+                    }
+                    # Don't return yet — also reconcile remaining starting epochs below.
+                    break
+
+            # If we installed _active from a serving epoch, still reconcile
+            # remaining starting epochs.
+            for se in starting:
+                holder = sup._live_lock_holder()
+                if holder is None:
+                    continue
+                transport = sup._holder_transport(holder)
+                if transport is None:
+                    # TCP/unknown holder — try endpoint.
+                    ep = sup.endpoint(expected_epoch=se.generation_epoch)
+                    if ep is None:
+                        continue
+                    transport = ep
+                identity = sup._health_identity(transport)
+                if identity is None:
+                    continue
+                if (identity.get("generation_id") == gid
+                        and identity.get("generation_epoch") == se.generation_epoch
+                        and identity.get("build_id") == build_id):
+                    inc = {"pid": holder["pid"],
+                           "start_fingerprint": holder.get("start_fingerprint")}
+                    _log.info("registry: repairing NULL current_epoch → promoting starting %s",
+                              se.generation_epoch)
+                    try:
+                        self._store.cas_epoch_serving(
+                            gid, se.generation_epoch,
+                            expected_current_epoch=None,
+                            incarnation_meta=_incarnation_meta(inc))
+                    except NelixError:
+                        self._store.reconcile_epoch_dead(gid, se.generation_epoch)
+                        continue
+                    self._active = {
+                        "incarnation": inc, "epoch": se.generation_epoch,
+                        "generation_id": gid, "transport": transport,
+                        "build_id": build_id,
+                    }
+                    break
+
+            # No live matching holder OR _active already set —
+            # reconcile all remaining starting/serving to dead.
+            if self._active is not None:
+                # We already adopted a serving/starting epoch above.
+                # Just clean up any remaining starting epochs.
+                for se in starting:
+                    try:
+                        self._store.reconcile_epoch_dead(gid, se.generation_epoch)
+                    except NelixError:
+                        pass
+                return
+            for se in serving + starting:
+                try:
+                    self._store.reconcile_epoch_dead(gid, se.generation_epoch)
+                except NelixError:
+                    pass
+            return
+
+        # Inspect the current_epoch's holder.
+        # TODO(S1c-2 hardening bead): bounded not-yet-healthy startup stabilization
+        holder = sup._live_lock_holder()
+        epoch_recs = {e.generation_epoch: e for e in all_epochs}
+        epoch_rec = epoch_recs.get(current_epoch)
+
+        if holder is not None:
+            transport = sup._holder_transport(holder)
+
+            if transport is not None:
+                # C3: STRICT health check (key presence, not .get()).
+                identity = sup._health_identity(transport) if sup._check_health(transport) else None
+                if identity is not None and all(k in identity for k in ("generation_id", "generation_epoch", "build_id")):
+                    full_match = (
+                        identity["generation_id"] == gid
+                        and identity["generation_epoch"] == current_epoch
+                        and identity["build_id"] == build_id
+                    )
+                    inc = {"pid": holder["pid"],
+                           "start_fingerprint": holder.get("start_fingerprint")}
+
+                    if full_match and epoch_rec and epoch_rec.process_state == "serving":
+                        # C1: Re-read holder before install — incarnation must not have changed.
+                        # If it changed, ABORT without reaping (the new holder may be legitimate).
+                        re_read = sup._live_lock_holder()
+                        if (not re_read
+                                or re_read.get("pid") != holder["pid"]
+                                or re_read.get("start_fingerprint") != holder.get("start_fingerprint")):
+                            _log.warning("registry: holder changed during eager health probe; "
+                                         "aborting adoption without reaping replacement")
+                            return
+                        _log.info("registry: re-adopting serving epoch %s", current_epoch)
+                        self._active = {
+                            "incarnation": inc, "epoch": current_epoch,
+                            "generation_id": gid, "transport": transport,
+                            "build_id": build_id,
+                        }
+                        return
+
+                    if full_match and epoch_rec and epoch_rec.process_state == "starting":
+                        # C1: Re-read holder BEFORE CAS — incarnation must not have changed.
+                        re_read = sup._live_lock_holder()
+                        if (not re_read
+                                or re_read.get("pid") != holder["pid"]
+                                or re_read.get("start_fingerprint") != holder.get("start_fingerprint")):
+                            _log.warning("registry: holder changed before eager CAS; "
+                                         "aborting promotion without reaping replacement")
+                            return
+                        _log.info("registry: promoting starting epoch %s", current_epoch)
+                        if self._store:
+                            try:
+                                self._store.cas_epoch_serving(gid, current_epoch,
+                                                              expected_current_epoch=current_epoch,
+                                                              incarnation_meta=_incarnation_meta(inc))
+                            except NelixError:
+                                self._store.reconcile_epoch_dead(gid, current_epoch)
+                                return
+                        # C1: Re-read holder after CAS — incarnation must not have changed.
+                        re_read2 = sup._live_lock_holder()
+                        if (not re_read2
+                                or re_read2.get("pid") != holder["pid"]
+                                or re_read2.get("start_fingerprint") != holder.get("start_fingerprint")):
+                            _log.warning("registry: holder changed during eager CAS; "
+                                         "aborting without reaping replacement")
+                            self._store.reconcile_epoch_dead(gid, current_epoch)
+                            return
+                        self._active = {
+                            "incarnation": inc, "epoch": current_epoch,
+                            "generation_id": gid, "transport": transport,
+                            "build_id": build_id,
+                        }
+                        return
+
+                # Identity mismatch — don't reap (holder may be a legitimate
+                # replacement); just reconcile the epoch dead.
+                # The reap+spawn cycle belongs to the active() mint path, not
+                # the eager reconcile constructor.
+
+            else:
+                # C2: TCP holder — route through endpoint() with expected_epoch
+                # verification, not inline health checks.
+                inc = {"pid": holder["pid"],
+                       "start_fingerprint": holder.get("start_fingerprint")}
+                ep = sup.endpoint(expected_epoch=current_epoch)
+                if ep is not None:
+                    # C1: Re-read holder before install — abort if changed, don't reap.
+                    re_read = sup._live_lock_holder()
+                    if (not re_read
+                            or re_read.get("pid") != holder["pid"]
+                            or re_read.get("start_fingerprint") != holder.get("start_fingerprint")):
+                        _log.warning("registry: TCP holder changed during eager health; "
+                                     "aborting adoption without reaping replacement")
+                        return
+                    self._active = {
+                        "incarnation": inc, "epoch": current_epoch,
+                        "generation_id": gid, "transport": ep,
+                        "build_id": build_id,
+                    }
+                    return
+                # Don't reap — the holder may be a legitimate replacement.
+                # Just reconcile the epoch dead below.
+
+        # C6: Handle ALL historical starting epochs.
+        # Reconcile the current_epoch (serving/starting with no match).
+        if current_epoch:
+            try:
+                self._store.reconcile_epoch_dead(gid, current_epoch)
+            except NelixError as e:
+                _log.warning("registry: reconcile_epoch_dead(%s, %s) failed: %s",
+                             gid, current_epoch, e)
+                # Surface the error — a swallowed reconcile may leave the DB in a state
+                # where a subsequent fresh-epoch CAS cannot succeed.
+                raise
+
+        # C6: Every OTHER starting epoch → dead.
+        # TODO(S1c-2 hardening bead): multiple historical starting epochs reconciliation
+        for e in all_epochs:
+            if e.generation_epoch == current_epoch:
+                continue
+            if e.process_state == "starting":
+                try:
+                    self._store.reconcile_epoch_dead(gid, e.generation_epoch)
+                except NelixError as e:
+                    _log.warning("registry: reconcile_epoch_dead(%s, %s) failed: %s",
+                                 gid, e.generation_epoch, e)
+                    raise
+
+    def _get_epoch(self, gid, epoch):
+        if self._store is None:
+            return None
+        try:
+            for ep in self._store.list_epochs(gid):
+                if ep.generation_epoch == epoch:
+                    return ep
+        except Exception:
+            pass
+        return None
+
+    # ── per-generation single-flight ──────────────────────────────────────
+
+    def _gen_lock(self, gid: str) -> threading.Lock:
+        with self._gen_locks_lock:
+            if gid not in self._gen_locks:
+                self._gen_locks[gid] = threading.Lock()
+            return self._gen_locks[gid]
+
+    # ── active() ──────────────────────────────────────────────────────────
+
+    def active(self) -> GenerationHandle:
+        if self._sup is not None:
+            return self._active_compat()
+
         with self._lock:
-            snap = self._sup.held_generation()              # authoritative identity+transport — no RPC
+            if self._active is not None:
+                return self._refresh_active_locked()
+            return self._find_or_create_locked()
+
+    def _refresh_active_locked(self) -> GenerationHandle:
+        """C1+C2: Re-verify full identity + serving state + durable pointer,
+        not just /status."""
+        a = self._active
+        gid = a["generation_id"]
+        epoch = a["epoch"]
+        build_id = a.get("build_id")
+        sup = GenerationSupervisor(gid, build_id)
+
+        holder = sup._live_lock_holder()
+        if holder is None:
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             f"generation {gid} has no live lock holder")
+
+        # #4: For TCP holders, _holder_transport returns None.  Use endpoint()
+        # (which reads the state file and constructs the tokened transport) instead.
+        transport = sup._holder_transport(holder)
+        if transport is None:
+            # TCP or otherwise unreachable via holder meta — try endpoint.
+            ep = sup.endpoint(expected_epoch=epoch)
+            if ep is None:
+                raise NelixError(GENERATION_UNAVAILABLE,
+                                 f"generation {gid} has unreachable holder")
+            transport = ep
+
+        # C2: Verify FULL identity triple via STRICT health check.
+        if not sup._check_health_strict(transport, epoch, gid, build_id):
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             f"generation {gid} identity mismatch on refresh")
+
+        # C1: Compare fingerprint, not just PID.
+        current = {"pid": holder["pid"],
+                   "start_fingerprint": holder.get("start_fingerprint")}
+        prev = a.get("incarnation", {})
+        if (current.get("pid") != prev.get("pid")
+                or current.get("start_fingerprint") != prev.get("start_fingerprint")):
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             f"generation {gid} incarnation changed on refresh")
+
+        if self._store:
+            gen_rec = self._store.get_generation(gid)
+            # C4: Do NOT silently accept a null durable current_epoch.
+            # When the pointer is NULL but we have a verified live serving daemon,
+            # repair the pointer. Otherwise fail — null pointer means inconsistency.
+            if gen_rec.current_epoch is None:
+                # Check the epoch row: it must be 'serving' for us to trust it.
+                epoch_list = self._store.list_epochs_strict(gid)
+                epoch_found = any(e.generation_epoch == epoch and e.process_state == "serving"
+                                  for e in epoch_list)
+                if epoch_found:
+                    # C4: DIRECT repair — set current_epoch to the serving epoch.
+                    # Do NOT use cas_epoch_serving (which requires 'starting' state).
+                    _log.warning("registry: repairing NULL current_epoch -> %s", epoch)
+                    try:
+                        self._store.set_current_epoch(gid, epoch)
+                    except NelixError:
+                        pass  # best effort; pointer will be fixed on next write
+                else:
+                    raise NelixError(GENERATION_UNAVAILABLE,
+                                     f"generation {gid} current_epoch is NULL and "
+                                     f"epoch {epoch} is not serving")
+            elif gen_rec.current_epoch != epoch:
+                # C4: Non-serving pointer — check if the pointed epoch is still serving.
+                # If it's dead/starting, reject.
+                epoch_list = self._store.list_epochs_strict(gid)
+                pointed = [e for e in epoch_list
+                           if e.generation_epoch == gen_rec.current_epoch]
+                if pointed and pointed[0].process_state != "serving":
+                    raise NelixError(GENERATION_UNAVAILABLE,
+                                     f"generation {gid} current_epoch "
+                                     f"{gen_rec.current_epoch!r} is not serving "
+                                     f"(actual: {pointed[0].process_state})")
+                raise NelixError(GENERATION_UNAVAILABLE,
+                                 f"generation {gid} current_epoch changed to "
+                                 f"{gen_rec.current_epoch!r}, expected {epoch!r}")
+
+        self._active["transport"] = transport
+        self._active["incarnation"] = current
+        return GenerationHandle(generation_id=gid, epoch=epoch,
+                                transport=transport, build_id=build_id,
+                                incarnation=current)
+
+    def _find_or_create_locked(self) -> GenerationHandle:
+        """C5: FAIL CLOSED on store read errors, never silently mint."""
+        gid = None
+        build_id = self._build_id
+
+        if self._store is not None:
+            try:
+                gens = self._store.list_generations()
+            except Exception:
+                raise NelixError(GENERATION_UNAVAILABLE,
+                                 "failed to read generation list; store may be corrupted")
+
+            active_rows = [g for g in gens if g.lifecycle_state == "active"]
+            if len(active_rows) > 1:
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 "multiple active generation rows found")
+            if active_rows:
+                gr = active_rows[0]
+                gid = gr.generation_id
+                build_id = gr.build_id  # H9: use the PINNED build, never override
+
+        if gid is None:
+            # C8: ONLY ImportError means "no runtime" (dev checkout).
+            # Any other exception during runtime discovery must propagate.
+            if build_id is None:
+                try:
+                    from runtime import active
+                except ImportError:
+                    pass
+                else:
+                    build_id = active()  # let RuntimeError propagate — fail closed
+            if build_id is None:
+                _log.warning("registry: bootstrapping with build_id=None (checkout code); "
+                             "provision a runtime for production")
+            gid = new_generation_id()
+
+        self._generation_id = gid
+        return self._single_flight_mint_and_install(gid, build_id)
+
+    def _single_flight_mint_and_install(self, gid: str,
+                                         build_id: "str | None") -> GenerationHandle:
+        gen_lock = self._gen_lock(gid)
+        with gen_lock:
+            return self._mint_install_unlocked(gid, build_id)
+
+    def _mint_install_unlocked(self, gid: str,
+                                build_id: "str | None") -> GenerationHandle:
+        clock = time.time()
+
+        if self._store is not None:
+            try:
+                self._store.create_generation(gid, build_id=build_id,
+                                              lifecycle_state="active",
+                                              capability_snapshot=None, created_at=clock)
+            except NelixError as e:
+                if e.code != "duplicate_start":
+                    raise NelixError(GENERATION_UNAVAILABLE,
+                                     f"failed to persist generation: {e}") from None
+
+        epoch = new_generation_id()
+        if self._store is not None:
+            try:
+                self._store.insert_epoch(epoch, gid, incarnation_meta=None, created_at=clock)
+            except NelixError as e:
+                raise NelixError(GENERATION_UNAVAILABLE,
+                                 f"failed to persist starting epoch: {e}") from None
+
+        sup = GenerationSupervisor(gid, build_id)
+        incarnation = None
+        transport = None
+        try:
+            incarnation, transport = sup.ensure_running(epoch)
+        except Exception as e:
+            if self._store is not None:
+                try:
+                    self._store.reconcile_epoch_dead(gid, epoch)
+                except Exception:
+                    pass
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             f"failed to spawn generation daemon: {e}") from None
+
+        # 4. STRICT /health check.
+        if not sup._check_health_strict(transport, epoch, gid, build_id):
+            if incarnation:
+                sup.reap_holder(incarnation)
+            if self._store:
+                try:
+                    self._store.reconcile_epoch_dead(gid, epoch)
+                except Exception:
+                    pass
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             "generation daemon health check failed (strict identity mismatch)")
+
+        # 5. C1: Re-read holder, compare FINGERPRINT, not just PID.
+        holder = sup._live_lock_holder()
+        if not holder:
+            if incarnation:
+                sup.reap_holder(incarnation)
+            if self._store:
+                try:
+                    self._store.reconcile_epoch_dead(gid, epoch)
+                except Exception:
+                    pass
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             "generation daemon vanished before installation")
+
+        # C1: Compare both pid AND fingerprint.
+        if (holder["pid"] != incarnation["pid"]
+                or holder.get("start_fingerprint") != incarnation.get("start_fingerprint")):
+            _log.warning("registry: holder replaced during health check gen_id=%s "
+                         "expected=(pid=%s fp=%s) actual=(pid=%s fp=%s)",
+                         gid, incarnation["pid"], incarnation.get("start_fingerprint"),
+                         holder["pid"], holder.get("start_fingerprint"))
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             "generation daemon holder replaced during health check")
+
+        current_incarnation = {"pid": holder["pid"],
+                               "start_fingerprint": holder.get("start_fingerprint")}
+
+        # 6. C7: Guarded CAS with incarnation recording.
+        if self._store is not None:
+            try:
+                self._store.cas_epoch_serving(gid, epoch, expected_current_epoch=None,
+                                              incarnation_meta=_incarnation_meta(current_incarnation))
+            except NelixError:
+                sup.reap_holder(current_incarnation)
+                try:
+                    self._store.reconcile_epoch_dead(gid, epoch)
+                except Exception:
+                    pass
+                raise NelixError(GENERATION_UNAVAILABLE,
+                                 "epoch promotion failed (CAS conflict)")
+
+        # 7. C1: Final validation — compare FINGERPRINT.
+        holder = sup._live_lock_holder()
+        if (not holder
+                or holder.get("pid") != current_incarnation["pid"]
+                or holder.get("start_fingerprint") != current_incarnation.get("start_fingerprint")):
+            if self._store:
+                try:
+                    self._store.reconcile_epoch_dead(gid, epoch)
+                except Exception:
+                    pass
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             "generation daemon replaced after promotion")
+
+        self._active = {
+            "incarnation": current_incarnation, "epoch": epoch,
+            "generation_id": gid, "transport": transport, "build_id": build_id,
+        }
+        return GenerationHandle(generation_id=gid, epoch=epoch, transport=transport,
+                                build_id=build_id, incarnation=current_incarnation)
+
+    # ── compat path (test mock) ───────────────────────────────────────────
+
+    def _active_compat(self) -> GenerationHandle:
+        self._ensure_available_compat()
+        with self._lock:
+            snap = self._sup.held_generation()
             if snap is None:
                 raise NelixError(GENERATION_UNAVAILABLE,
                                  "generation disappeared before it could be pinned")
             transport, inc = snap
-
             if self._active is None:
-                # First observation of ANY incarnation: persist the stable generation and
-                # the first epoch, then CAS to serving.
-                return self._first_observation(transport, inc)
-
+                return self._first_observation_compat(transport, inc)
             if self._active["incarnation"] != inc:
-                # Daemon respawn: new incarnation under the same generation_id.
-                return self._new_incarnation(transport, inc)
-
-            # Same incarnation: refresh the transport, re-use the existing epoch.
+                return self._new_incarnation_compat(transport, inc)
             self._active["transport"] = transport
             epoch = self._active["epoch"]
-            generation_id = self._active["generation_id"]
+            gid = self._active["generation_id"]
             build_id = self._active.get("build_id")
-            return GenerationHandle(generation_id=generation_id, epoch=epoch,
+            return GenerationHandle(generation_id=gid, epoch=epoch,
                                     transport=transport, build_id=build_id, incarnation=inc)
 
-    def _first_observation(self, transport, inc) -> GenerationHandle:
-        """First observation of any daemon incarnation. Create the generation row, insert the
-        first starting epoch, then CAS to serving. On any failure, mark the epoch dead."""
-        clock = time.time()
-        gid = self._generation_id
-
-        # Resolve build_id for the validated incarnation before create_generation.
-        build_id = self._probe(transport)
-        if self._store is not None:
-            try:
-                self._store.create_generation(gid, build_id=build_id, lifecycle_state="active",
-                                              capability_snapshot=None, created_at=clock)
-            except Exception:
-                raise NelixError(GENERATION_UNAVAILABLE,
-                                 "failed to persist the generation identity")
-
-        epoch = new_generation_id()
-        meta = _incarnation_meta(inc)
-        if self._store is not None:
-            try:
-                self._store.insert_epoch(epoch, gid, incarnation_meta=meta, created_at=clock)
-            except Exception:
-                raise NelixError(GENERATION_UNAVAILABLE,
-                                 "failed to persist the starting epoch")
-
-        if self._store is not None:
-            # Health-check already done by _ensure_available; CAS promote.
-            try:
-                self._store.cas_epoch_serving(gid, epoch, expected_current_epoch=None)
-            except Exception:
-                self._store.set_epoch_process_state(epoch, "dead")
-                raise NelixError(GENERATION_UNAVAILABLE,
-                                 "epoch promotion failed after health check")
-
-        self._active = {
-            "incarnation": inc, "epoch": epoch, "generation_id": gid,
-            "transport": transport, "build_id": build_id, "build_id_probed": True,
-        }
-        return GenerationHandle(generation_id=gid, epoch=epoch, transport=transport,
-                                build_id=build_id, incarnation=inc)
-
-    def _new_incarnation(self, transport, inc) -> GenerationHandle:
-        """Daemon respawn: mark the old epoch dead, insert a new starting epoch, then CAS to
-        serving. On any failure, mark the new epoch dead."""
-        gid = self._active["generation_id"]
-        old_epoch = self._active["epoch"]
-
-        if self._store is not None:
-            # Mark old epoch dead BEFORE inserting the new one (the partial-unique serving index
-            # forbids two serving epochs).
-            try:
-                self._store.set_epoch_process_state(old_epoch, "dead")
-            except Exception:
-                # Old epoch already dead or gone — continue; the new epoch must still be created.
-                pass
-
-        clock = time.time()
-        epoch = new_generation_id()
-        meta = _incarnation_meta(inc)
-        if self._store is not None:
-            try:
-                self._store.insert_epoch(epoch, gid, incarnation_meta=meta, created_at=clock)
-            except Exception:
-                raise NelixError(GENERATION_UNAVAILABLE,
-                                 "failed to persist the starting epoch for new incarnation")
-
-        if self._store is not None:
-            # Health-check already done by _ensure_available; CAS promote with expected=old_epoch.
-            try:
-                self._store.cas_epoch_serving(gid, epoch, expected_current_epoch=old_epoch)
-            except Exception:
-                self._store.set_epoch_process_state(epoch, "dead")
-                raise NelixError(GENERATION_UNAVAILABLE,
-                                 "epoch promotion failed for new incarnation")
-
-        self._active = {
-            "incarnation": inc, "epoch": epoch, "generation_id": gid,
-            "transport": transport, "build_id": None, "build_id_probed": False,
-        }
-        build_id = None
-        # Probe build_id for the new incarnation — informational, outside the lock.
-        try:
-            build_id = self._probe(transport)
-            if build_id is not None:
-                self._active["build_id"] = build_id
-                self._active["build_id_probed"] = True
-        except Exception:
-            pass
-        return GenerationHandle(generation_id=gid, epoch=epoch, transport=transport,
-                                build_id=build_id, incarnation=inc)
-
-    def topology_revision(self) -> int:
-        """The vector cursor's topology component (nelix_contracts.cursor.new_cursor): bumped only
-        when a generation is added to or removed from the registry (Plan 4). N=1 today, so this is
-        a fixed 1 — never a daemon-incarnation restart, which changes `epoch`, not the topology."""
-        with self._lock:
-            return self._topology_revision
-
-    def generations(self, *, discover=False) -> list:
-        """The registry as a LIST (N=1 today): the active-generation pointer, or []. List-shaped so
-        3c.2/Plan 4 can return N generations without reshaping this interface.
-
-        `discover=True` (used ONLY by the fan-out board read, `router/board.py`): if nothing has
-        been observed YET (`_active is None`), take one NON-SPAWNING discovery probe
-        (`_discover_locked`, under the same lock `active()` uses) before answering `[]`.
-        A router restart empties this registry but kills no daemon, so an unconditional `[]` would
-        report an honestly-empty BOARD while a daemon already holds the singleton lock and serves
-        live sessions the board must not hide. Only when that probe also finds nothing running is
-        the board genuinely empty.
-
-        The default (`discover=False` — /health, /capabilities, /generation_list, unchanged) never
-        takes this probe: those routes answer strictly from what this registry has already observed,
-        exactly as before this fix-pass; widening THEIR contract is not this fix."""
-        with self._lock:
-            if self._active is None and discover:
-                self._discover_locked()
-            return [] if self._active is None else [self._handle(self._active)]
-
-    def _discover_locked(self):
-        """Must be called with `self._lock` held, and only when `self._active is None`. A single
-        NON-SPAWNING probe of the CURRENT singleton-lock holder (`supervisor.held_generation()`).
-        If a daemon currently holds the lock, install it as the active generation — creating the
-        generation row and a starting epoch. Unlike `active()`, this does NOT run a separate health
-        check or CAS promote: the epoch is left `starting` and will be promoted by the next
-        `active()` call that observes the same incarnation. `_ensure_available` is NOT called, so
-        no daemon is spawned."""
-        snap = self._sup.held_generation()
-        if snap is None:
-            return
-        transport, inc = snap
-        gid = self._generation_id
-        clock = time.time()
-        # create_generation if not already done (best-effort).
-        if self._store is not None:
-            try:
-                self._store.create_generation(gid, build_id=None, lifecycle_state="active",
-                                              capability_snapshot=None, created_at=clock)
-            except Exception:
-                return  # leave _active as None — board genuinely empty / not our job to fix
-        epoch = new_generation_id()
-        meta = _incarnation_meta(inc)
-        if self._store is not None:
-            try:
-                self._store.insert_epoch(epoch, gid, incarnation_meta=meta, created_at=clock)
-            except Exception:
-                return
-        self._active = {
-            "incarnation": inc, "epoch": epoch, "generation_id": gid,
-            "transport": transport, "build_id": None, "build_id_probed": False,
-        }
-
-    def _handle(self, a) -> GenerationHandle:
-        return GenerationHandle(generation_id=a["generation_id"], epoch=a["epoch"],
-                                transport=a["transport"], build_id=a["build_id"],
-                                incarnation=a["incarnation"])
-
-    def _ensure_available(self):
-        """Make a HEALTHY generation available, OUTSIDE the lock (this is the slow work). Uses the
-        full `active_generation()` read (which does the /health RPC); if nothing healthy is recorded,
-        spawns one (ensure_running()) and re-checks. Returns nothing — the identity the caller pins
-        is read separately UNDER the lock via `held_generation()` (the authoritative lock holder),
-        so the epoch decision is atomic and never carries a stale outside-the-lock snapshot. Any
-        failure to make one available is GENERATION_UNAVAILABLE (retryable)."""
+    def _ensure_available_compat(self):
         try:
             if self._sup.active_generation() is None:
-                # Nothing healthy recorded — spawn one, then re-check it became healthy.
                 self._sup.ensure_running()
                 if self._sup.active_generation() is None:
                     raise NelixError(GENERATION_UNAVAILABLE, "no generation backend available")
@@ -316,3 +653,173 @@ class GenerationRegistry:
         except Exception as e:
             raise NelixError(GENERATION_UNAVAILABLE,
                              f"could not make a generation available: {e}") from None
+
+    def _first_observation_compat(self, transport, inc):
+        clock = time.time()
+        gid = self._generation_id or new_generation_id()
+        self._generation_id = gid
+        build_id = self._build_id
+        if self._store:
+            try:
+                self._store.create_generation(gid, build_id=build_id, lifecycle_state="active",
+                                              capability_snapshot=None, created_at=clock)
+            except Exception:
+                raise NelixError(GENERATION_UNAVAILABLE, "failed to persist the generation identity")
+        epoch = new_generation_id()
+        if self._store:
+            try:
+                self._store.insert_epoch(epoch, gid, incarnation_meta=_incarnation_meta(inc),
+                                         created_at=clock)
+                self._store.cas_epoch_serving(gid, epoch, expected_current_epoch=None,
+                                              incarnation_meta=_incarnation_meta(inc))
+            except Exception:
+                self._store.set_epoch_process_state(epoch, "dead")
+                raise NelixError(GENERATION_UNAVAILABLE, "epoch promotion failed")
+        self._active = {"incarnation": inc, "epoch": epoch, "generation_id": gid,
+                        "transport": transport, "build_id": build_id}
+        return GenerationHandle(generation_id=gid, epoch=epoch, transport=transport,
+                                build_id=build_id, incarnation=inc)
+
+    def _new_incarnation_compat(self, transport, inc):
+        gid = self._active["generation_id"]
+        old_epoch = self._active["epoch"]
+        if self._store:
+            try:
+                self._store.set_epoch_process_state(old_epoch, "dead")
+            except Exception:
+                pass
+        clock = time.time()
+        epoch = new_generation_id()
+        if self._store:
+            try:
+                self._store.insert_epoch(epoch, gid, incarnation_meta=_incarnation_meta(inc),
+                                         created_at=clock)
+                self._store.cas_epoch_serving(gid, epoch, expected_current_epoch=old_epoch,
+                                              incarnation_meta=_incarnation_meta(inc))
+            except Exception:
+                self._store.set_epoch_process_state(epoch, "dead")
+                raise NelixError(GENERATION_UNAVAILABLE, "epoch promotion failed")
+        build_id = self._build_id or self._active.get("build_id")
+        self._active = {"incarnation": inc, "epoch": epoch, "generation_id": gid,
+                        "transport": transport, "build_id": build_id}
+        return GenerationHandle(generation_id=gid, epoch=epoch, transport=transport,
+                                build_id=build_id, incarnation=inc)
+
+    # ── topology / generations / discovery ────────────────────────────────
+
+    def topology_revision(self) -> int:
+        with self._lock:
+            return self._topology_revision
+
+    def generations(self, *, discover=False) -> list:
+        with self._lock:
+            if self._active is None and discover:
+                self._discover_locked()
+            return [] if self._active is None else [self._handle(self._active)]
+
+    def _discover_locked(self):
+        """C4: Non-spawning probe. If a daemon holds the lock, create a starting
+        epoch AND attempt guarded promotion — never install _active without promotion."""
+        if self._active is not None:
+            return
+
+        if self._sup is not None:
+            snap = self._sup.held_generation()
+            if snap is None:
+                return
+            transport, inc = snap
+            gid = self._generation_id or new_generation_id()
+            self._generation_id = gid
+            clock = time.time()
+            if self._store:
+                try:
+                    self._store.create_generation(gid, build_id=None, lifecycle_state="active",
+                                                  capability_snapshot=None, created_at=clock)
+                except NelixError:
+                    return
+            epoch = new_generation_id()
+            if self._store:
+                try:
+                    self._store.insert_epoch(epoch, gid,
+                                             incarnation_meta=_incarnation_meta(inc),
+                                             created_at=clock)
+                    self._store.cas_epoch_serving(gid, epoch, expected_current_epoch=None,
+                                                  incarnation_meta=_incarnation_meta(inc))
+                except NelixError:
+                    return
+            self._active = {"incarnation": inc, "epoch": epoch, "generation_id": gid,
+                            "transport": transport, "build_id": None}
+            return
+
+        gid = self._generation_id
+        if gid is None:
+            if self._store:
+                try:
+                    gens = self._store.list_generations()
+                    active_rows = [g for g in gens if g.lifecycle_state == "active"]
+                    if active_rows:
+                        gid = active_rows[0].generation_id
+                        self._generation_id = gid
+                except Exception:
+                    pass
+        if gid is None:
+            return
+
+        sup = GenerationSupervisor(gid, self._build_id)
+        holder = sup._live_lock_holder()
+        if holder is None:
+            return
+        transport = sup._holder_transport(holder)
+        if transport is None:
+            return
+
+        # C2+C3: Strict identity — verify FULL triple with key presence.
+        identity = sup._health_identity(transport)
+        if identity is None:
+            return
+        # _health_identity already enforces key presence (C3).
+        if (identity["generation_id"] != gid
+                or identity["build_id"] != self._build_id):
+            return
+
+        incarnation = {"pid": holder["pid"],
+                       "start_fingerprint": holder.get("start_fingerprint")}
+        # C4: Adopt the daemon's REPORTED epoch, not invent a new one.
+        reported_epoch = identity.get("generation_epoch")
+        if not reported_epoch:
+            return  # daemon has no epoch — cannot adopt
+        clock = time.time()
+
+        if self._store:
+            try:
+                self._store.create_generation(gid, build_id=self._build_id,
+                                              lifecycle_state="active",
+                                              capability_snapshot=None, created_at=clock)
+            except NelixError:
+                pass
+            try:
+                self._store.insert_epoch(reported_epoch, gid,
+                                         incarnation_meta=_incarnation_meta(incarnation),
+                                         created_at=clock)
+            except NelixError:
+                return
+            # C4: Attempt guarded promotion using the REPORTED epoch.
+            try:
+                self._store.cas_epoch_serving(gid, reported_epoch, expected_current_epoch=None,
+                                              incarnation_meta=_incarnation_meta(incarnation))
+            except NelixError:
+                try:
+                    self._store.reconcile_epoch_dead(gid, reported_epoch)
+                except Exception:
+                    pass
+                return
+
+        self._active = {
+            "incarnation": incarnation, "epoch": reported_epoch,
+            "generation_id": gid, "transport": transport, "build_id": self._build_id,
+        }
+
+    def _handle(self, a) -> GenerationHandle:
+        return GenerationHandle(generation_id=a["generation_id"], epoch=a["epoch"],
+                                transport=a["transport"], build_id=a["build_id"],
+                                incarnation=a["incarnation"])

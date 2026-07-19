@@ -21,7 +21,7 @@ def test_reap_orphans_refuses_under_live_daemon(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     import paths; importlib.reload(paths)
     reap = _load_reap()
-    monkeypatch.setattr(reap.supervisor, "endpoint", lambda: Transport.tcp("127.0.0.1", 9999, "t"))   # live
+    monkeypatch.setattr(reap, "_any_per_gen_live", lambda: True)   # live
     out = reap.reap_orphans(inspector=None, killer=None, grace=5.0)
     assert out == {"refused": "daemon_alive"}
 
@@ -34,7 +34,7 @@ def test_reap_orphans_kills_when_daemon_dead(monkeypatch, tmp_path):
     reaper.record_child(sd, {"sid": "s-orphan9", "daemon_pid": 10, "daemon_fingerprint": "d",
                              "pid": 999, "child_fingerprint": "c", "pgid": 999, "argv": ["x"]})
     reap = _load_reap()
-    monkeypatch.setattr(reap.supervisor, "endpoint", lambda: None)                 # dead
+    monkeypatch.setattr(reap, "_any_per_gen_live", lambda: False)                 # dead
 
     class _Insp:
         def is_alive(self, pid): return pid == 999

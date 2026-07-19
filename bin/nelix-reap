@@ -9,13 +9,50 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import paths                                   # noqa: E402
-import supervisor                              # noqa: E402
+from generation_supervisor import GenerationSupervisor  # noqa: E402
 from daemon import owner, reaper               # noqa: E402
 from daemon.config import load_kill_grace_seconds  # noqa: E402
 
 
+def _any_per_gen_live():
+    """Check if ANY per-generation lock holder exists (including DB-unknown).
+    H12: Per-dir handling is isolated — one failure doesn't end the scan.
+    Must check the stored start_fingerprint, not just pid aliveness."""
+    import json
+    try:
+        for d in paths.generations_root().iterdir():
+            if not d.is_dir():
+                continue
+            try:
+                lock_path = d / "daemon.lock"
+                try:
+                    meta = json.loads(lock_path.read_text())
+                except Exception:
+                    continue
+                pid = meta.get("pid")
+                fp = meta.get("start_fingerprint")
+                if not pid:
+                    continue
+                # H12: Check that the pid is alive AND fingerprint matches.
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    continue  # pid not alive — skip this dir
+                if fp:
+                    insp = reaper.ProcessInspector()
+                    if insp.start_fingerprint(pid) != fp:
+                        continue  # fingerprint mismatch — skip
+                return True
+            except Exception:
+                # H12: Isolated per-dir — one bad dir must not abort the scan.
+                continue
+    except OSError:
+        pass
+    return False
+
+
 def reap_orphans(inspector, killer, grace):
-    if supervisor.endpoint():                   # never kill a live daemon's children
+    if _any_per_gen_live():                    # never kill a live daemon's children
         return {"refused": "daemon_alive"}
     inspector = inspector or reaper.ProcessInspector()
     killer = killer or reaper.ProcessKiller()
@@ -29,14 +66,32 @@ def reap_sid(sid):
     """Graceful stop of ONE live session, through the daemon.
 
     /stop is owner-gated, and the reaper has no owner of its own, so it reads the session's
-    DURABLE OWNER off disk and stops it AS that owner. That is not a bypass and the daemon grows
-    no wildcard for it: the reaper runs as the same uid as every other caller, so asserting an
-    owner is something it could always do — doing it from the recorded value just makes the
-    assertion honest and correct. No record (never started / already gc'd / torn) => fail closed
-    and refuse: `--orphans` is the path for a session the daemon can no longer speak for, and it
-    kills process groups directly rather than asking the daemon to.
+    DURABLE OWNER off disk and stops it AS that owner.
     """
-    transport = supervisor.endpoint()
+    # S1c-2: find a live per-generation daemon.
+    transport = None
+    try:
+        from nelix_store.store import Store
+        store = Store(paths.nelix_root())
+        try:
+            gen_rows = store.list_generations()
+        except Exception:
+            gen_rows = []
+        finally:
+            store.close()
+    except Exception:
+        gen_rows = []
+
+    for gr in gen_rows:
+        try:
+            sup = GenerationSupervisor(gr.generation_id, gr.build_id)
+            ep = sup.endpoint()
+            if ep is not None:
+                transport = ep
+                break
+        except Exception:
+            continue
+
     if not transport:
         return {"error": "no live daemon"}
     from rpc_client import RpcClient

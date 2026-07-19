@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""One-shot waiter: long-poll /wait, print a tiny DOORBELL for the first real event, exit.
+"""One-shot waiter: long-poll the router /wait, print a tiny DOORBELL for the first real event, exit.
 
 The wake rides the host's notify_on_complete stdout capture — a bounded, tail-truncating channel.
 So the wake carries ONLY small triage metadata (session_id, seq, kind, requires_response, hung):
 never the executor's screen_excerpt or its trust fence, which can be large enough to truncate the
 actionable fields away. Hermes pulls the authoritative state — and the decision_id it answers
-against — from nelix_status, an uncapped tool-result channel."""
-import argparse, http.client, json, os, sys
+against — from nelix_status, an uncapped tool-result channel.
+
+S1c-2 / H14: uses the ROUTER's orchestration /wait (owner_id + orchestration_id + vector cursor),
+not the daemon's state-file /wait.
+"""
+import argparse, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from daemon import owner
+import paths
 from daemon.transport import Transport
 from rpc_client import RpcClient
 
@@ -18,86 +22,74 @@ from rpc_client import RpcClient
 _DOORBELL_FIELDS = ("session_id", "seq", "kind", "requires_response", "hung")
 
 
-def _discover(state_file):
-    """Read the supervisor state file and return a Transport for the daemon endpoint."""
-    with open(state_file) as f:
-        return Transport.from_state(json.load(f))
+def _discover():
+    """Return a Transport for the router's public socket.
+    S1c-2: no state-file fallback — the router is the authority.
+    Supports NELIX_ROUTER_HOST/NELIX_ROUTER_PORT env override for testing."""
+    import os as _os
+    host = _os.environ.get("NELIX_ROUTER_HOST")
+    port = _os.environ.get("NELIX_ROUTER_PORT")
+    if host and port:
+        return Transport.tcp(host, int(port), "")
+    sock_path = str(paths.router_sock())
+    return Transport.unix(sock_path)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--state-file", dest="state_file", required=True,
-                    help="Path to the supervisor state file (written by nelix on start)")
-    ap.add_argument("--after", type=int, default=0)
-    ap.add_argument("--session-id", dest="session_id", required=True,
-                    help="Session to scope the wait to (REQUIRED: a session_id-less /wait is a "
-                         "global wait that would deliver another session's event to this waiter)")
     ap.add_argument("--owner-id", dest="owner_id", required=True,
-                    help="The owner this waiter speaks for (REQUIRED: /wait only arms on a "
-                         "session its owner asked about — a waiter armed on another harness's "
-                         "session is how one harness ends up answering another's decision)")
+                    help="The owner this waiter speaks for")
+    ap.add_argument("--orchestration-id", dest="orchestration_id", required=True,
+                    help="The orchestration to wait on")
+    ap.add_argument("--cursor", dest="cursor_token", default=None,
+                    help="Opaque vector cursor token (empty = start from now)")
     args = ap.parse_args()
-    if not args.session_id:
-        # required=True rejects an absent flag; also refuse an empty value so the executor's waiter
-        # can never fall back to a global (cross-session) wait. Mirrors the daemon's /wait guard.
-        ap.error("--session-id must be non-empty")
 
     try:
-        transport = _discover(args.state_file)
+        transport = _discover()
     except (OSError, ValueError, KeyError) as e:
-        # State file missing, unreadable, or contains no valid transport — daemon gone or
-        # not yet started. Exit cleanly so notify_on_complete wakes Hermes to reconcile.
         print(json.dumps({"kind": "none"}, ensure_ascii=False))
         return 0
 
+    client = RpcClient(transport, args.owner_id)
+
     try:
-        client = RpcClient(transport, args.owner_id)
-    except owner.OwnerRejected as e:
-        ap.error(str(e))
-    after = args.after
-    try:
-        while True:
-            # session_id is guaranteed present (required arg) — always scope the wait so a
-            # cross-session event never wakes this waiter. client.wait() builds the query,
-            # owner_id included: a hand-built URL here is how the owner param gets forgotten.
-            try:
-                body = client.wait(args.session_id, after_seq=after, timeout=40)
-            except (OSError, ConnectionError, http.client.HTTPException):
-                # Daemon gone/unreachable (e.g. torn down, restarting). Don't crash with a
-                # traceback — exit cleanly so notify_on_complete wakes Hermes to reconcile
-                # via nelix_status instead of surfacing a scary background failure.
-                print(json.dumps({"kind": "none"}, ensure_ascii=False))
-                return 0
-            if body.get("error"):
-                # The session is unknown, or belongs to another owner — indistinguishable, by
-                # design. Either way this wait can never wake, so EXIT; re-issuing would be an
-                # unthrottled hot loop against the daemon (the `continue` below is only correct
-                # for a poll that actually blocked). Same clean exit as an unreachable daemon:
-                # Hermes reconciles via nelix_status.
-                print(json.dumps({"kind": "none"}, ensure_ascii=False))
-                return 0
-            if body.get("cursor_expired"):
-                # The cursor fell off the back of the bounded ring: events we never saw were
-                # evicted, so this wait can never deliver them. Ring the doorbell anyway (a resync
-                # wake) so Hermes re-pulls the authoritative state via nelix_status instead of
-                # long-polling a doorbell that will never fire (nelix-9a4.5 deliverable 3).
-                out = {"schema": "nelix.wake.v1", "status_required": True,
-                       "cursor_expired": True, "session_id": args.session_id}
-                print(json.dumps(out, ensure_ascii=False))
-                return 0
-            evt = body.get("event")
-            if evt is None:
-                continue                     # timeout tick — re-issue
-            # Doorbell: tiny triage metadata only. status_required tells Hermes to pull the
-            # authoritative state via nelix_status (the wake is just "something happened on S").
-            out = {k: evt.get(k) for k in _DOORBELL_FIELDS}
-            out["schema"] = "nelix.wake.v1"
-            out["status_required"] = True
-            print(json.dumps(out, ensure_ascii=False))
-            return 0
-    except KeyboardInterrupt:
+        # H14: Use the router's orchestration /wait.
+        # Build params manually since RpcClient.wait() uses the daemon's shape.
+        import urllib.parse
+        params = {"owner_id": args.owner_id, "orchestration_id": args.orchestration_id}
+        if args.cursor_token:
+            params["cursor"] = args.cursor_token
+        path = "/wait?" + urllib.parse.urlencode(params)
+        _, body = client._call("GET", path, timeout=45)
+    except (OSError, ConnectionError):
         print(json.dumps({"kind": "none"}, ensure_ascii=False))
         return 0
+
+    if not isinstance(body, dict):
+        print(json.dumps({"kind": "none"}, ensure_ascii=False))
+        return 0
+
+    if body.get("cursor_expired") or body.get("board_changed"):
+        out = {"schema": "nelix.wake.v1", "status_required": True,
+               "cursor_expired": body.get("cursor_expired", False),
+               "board_changed": body.get("board_changed", False)}
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+
+    evt = body.get("event")
+    if evt is None:
+        print(json.dumps({"kind": "none"}, ensure_ascii=False))
+        return 0
+
+    # Doorbell: tiny triage metadata only.
+    out = {k: evt.get(k) for k in _DOORBELL_FIELDS}
+    out["schema"] = "nelix.wake.v1"
+    out["status_required"] = True
+    if body.get("cursor"):
+        out["cursor"] = body["cursor"]
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":

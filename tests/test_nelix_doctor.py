@@ -31,7 +31,8 @@ def test_doctor_collects_strays(monkeypatch, tmp_path):
         def start_fingerprint(self, pid): return "c" if pid == 999 else "?"
         def pgid(self, pid): return 999
         def ppid(self, pid): return 1
-    monkeypatch.setattr(doctor.supervisor, "endpoint", lambda: None)   # no live daemon
+    monkeypatch.setattr(doctor.GenerationSupervisor, "endpoint",
+                        lambda self: None)   # no live daemon
     out = doctor.collect(inspector=_Insp())
     assert any(s["sid"] == "s-stray1" for s in out["strays"])
     assert out["daemon"]["alive"] is False
@@ -131,9 +132,8 @@ def test_collect_adds_hermes_wiring_and_keeps_old_keys(monkeypatch, tmp_path):
     import paths
     importlib.reload(paths)
     doctor = _load_doctor()
-    monkeypatch.setattr(doctor.supervisor, "endpoint", lambda: None)
     out = doctor.collect()
-    for key in ("daemon", "lock_holder", "sessions", "strays"):
+    for key in ("daemon", "generations", "sessions", "strays"):
         assert key in out
     assert "profiles" in out["hermes_wiring"]
     # The core's own root is reported once, and is NOT inside the harness's home. (Asserting on

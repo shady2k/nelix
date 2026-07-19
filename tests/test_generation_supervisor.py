@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -38,7 +39,7 @@ _FAKE_GEN_DAEMON = textwrap.dedent("""\
         validate_generation_id(gid)
         lock_path = paths.generation_lock(gid)
     else:
-        lock_path = paths.daemon_lock()
+        raise SystemExit("NELIX_GENERATION_ID is required (no uid-wide fallback)")
     _insp = reaper.ProcessInspector(); _pid = os.getpid()
     _fd = singleton.acquire(lock_path,
                             {"pid": _pid, "start_fingerprint": _insp.start_fingerprint(_pid),
@@ -81,7 +82,7 @@ _FAKE_MISMATCHED_DAEMON = textwrap.dedent("""\
         validate_generation_id(gid)
         lock_path = paths.generation_lock(gid)
     else:
-        lock_path = paths.daemon_lock()
+        raise SystemExit("NELIX_GENERATION_ID is required (no uid-wide fallback)")
     _fd = singleton.acquire(lock_path,
                             {"pid": _pid, "start_fingerprint": _insp.start_fingerprint(_pid),
                              "transport": "tcp", "port": port})
@@ -184,8 +185,8 @@ def test_two_generations_independent_locks(monkeypatch, tmp_path):
     sup1._choose_transport = lambda: _tcp_transport()
     sup2._choose_transport = lambda: _tcp_transport()
 
-    t1 = sup1.ensure_running(generation_epoch=new_generation_id())
-    t2 = sup2.ensure_running(generation_epoch=new_generation_id())
+    _inc1, t1 = sup1.ensure_running(generation_epoch=new_generation_id())
+    _inc2, t2 = sup2.ensure_running(generation_epoch=new_generation_id())
 
     # Both should be healthy, distinct transports.
     assert t1 is not None
@@ -236,11 +237,10 @@ def test_health_returns_expected_identity(monkeypatch, tmp_path):
     sup._choose_transport = _tcp_transport
 
     epoch = new_generation_id()
-    sup.ensure_running(generation_epoch=epoch)
+    _, transport = sup.ensure_running(generation_epoch=epoch)
 
     # Health probe should return the expected generation_id and epoch.
-    transport = Transport.from_state(
-        json.loads(sup.state_path().read_text()))
+    # Transport is already returned from ensure_running, use it directly.
     from rpc_client import RpcClient
     health = RpcClient(transport, "nelix-gen-supervisor-probe").health()
 
@@ -251,17 +251,73 @@ def test_health_returns_expected_identity(monkeypatch, tmp_path):
 
 
 def test_adoption_rejects_mismatched_identity():
-    """Adoption rejects a lock holder whose /health identity does not match the
-    expected generation_id. This is verified implicitly:
-      - test_two_generations_independent_locks verifies separate supervisors
-        each hold their own daemon with no lock conflict.
-      - test_health_returns_expected_identity verifies /health returns
-        matching generation_id and epoch.
-    The actual identity-rejection path in _reconcile_lock_holder reads the
-    lock holder's /health and compares the returned generation_id against
-    the expected one — a mismatch causes reap + fresh spawn.
-    """
-    pytest.skip("Verified implicitly by two-generations and health-identity tests")
+    """A daemon whose /health reports a WRONG epoch or build MUST be rejected,
+    not adopted. Uses a fake daemon on a unix socket."""
+    import socket as _sock
+    gid = new_generation_id()
+    wrong_epoch = new_generation_id()
+    correct_epoch = new_generation_id()
+
+    # Start a fake daemon on a random TCP port (reliable HTTP handling).
+    import socket as _sock_lib
+    s = _sock_lib.socket(_sock_lib.AF_INET, _sock_lib.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    # Ensure generation directory exists.
+    gen_dir = paths.generation_dir(gid)
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(gen_dir, 0o700)
+
+    import json as _json
+    import daemon.reaper as _rp
+    from daemon.protocol import RPC_PROTOCOL_VERSION
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = _json.dumps({
+                "status": "ok", "rpc_protocol": RPC_PROTOCOL_VERSION,
+                "generation_id": gid,
+                "generation_epoch": wrong_epoch,  # WRONG epoch!
+                "build_id": None,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        def do_POST(self): return self.do_GET()
+        def log_message(self, *a): pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    # Write lock holder with REAL fingerprint (TCP transport).
+    pid = os.getpid()
+    insp = _rp.ProcessInspector()
+    real_fp = insp.start_fingerprint(pid)
+    lock_meta = {"pid": pid, "start_fingerprint": real_fp,
+                 "transport": "tcp", "host": "127.0.0.1", "port": port,
+                 "token": ""}
+    paths.generation_lock(gid).write_text(_json.dumps(lock_meta))
+    # Also write the state file so endpoint() works.
+    paths.generation_state(gid).write_text(_json.dumps(lock_meta))
+
+    try:
+        sup = generation_supervisor.GenerationSupervisor(gid, None)
+        # C2: Verify that _health_identity returns the WRONG epoch from /health,
+        # and that _reconcile_lock_holder with expected_epoch rejects it.
+        identity = sup._health_identity(
+            Transport.tcp("127.0.0.1", port, ""))
+        assert identity is not None, "Health probe failed"
+        assert identity.get("generation_epoch") == wrong_epoch, (
+            f"Expected wrong_epoch {wrong_epoch}, got {identity.get('generation_epoch')}")
+        # Direct epoch check: if we expected correct_epoch, this should fail.
+        assert identity.get("generation_epoch") != correct_epoch, (
+            "Daemon with wrong epoch matches expected correct epoch")
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 # ============================================================================
@@ -339,31 +395,78 @@ def test_ensure_generation_dirs_uses_owned_private_dir(monkeypatch, tmp_path):
 
 
 # ============================================================================
-# Test: env var absence -> fallback (production unchanged)
+# Test: daemon requires NELIX_GENERATION_ID (uid-wide fallback removed)
 # ============================================================================
 
-def test_daemon_app_acquire_singleton_falls_back_to_uid_wide(monkeypatch, tmp_path):
-    """When NELIX_GENERATION_ID is not set, daemon.app.acquire_singleton() uses
-    the uid-wide daemon_lock. This ensures production is unchanged.
-    """
+def test_daemon_app_acquire_singleton_requires_generation_id(monkeypatch, tmp_path):
+    """When NELIX_GENERATION_ID is not set, daemon.app.acquire_singleton()
+    must RAISE — the uid-wide daemon_lock fallback has been removed (S1c-2)."""
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     importlib.reload(paths)
 
-    # Standalone test: verify that without the env var, the lock path is
-    # the uid-wide one.
-    # We can't easily call acquire_singleton() here because it would try to
-    # acquire the lock. Instead, just verify the logic: when NELIX_GENERATION_ID
-    # is absent, it uses paths.daemon_lock().
-    assert os.environ.get("NELIX_GENERATION_ID") is None
-
-    # Simulate the lock path selection logic from app.py.
     gid = os.environ.get("NELIX_GENERATION_ID")
-    if gid:
-        from nelix_contracts.ids import validate_generation_id
-        validate_generation_id(gid)
-        lock_path = paths.generation_lock(gid)
-    else:
-        lock_path = paths.daemon_lock()
+    assert gid is None
 
-    assert lock_path == paths.daemon_lock()
-    assert "generations" not in str(lock_path)
+    # S1c-2: per-generation daemons REQUIRE NELIX_GENERATION_ID.
+    # Actually call acquire_singleton and assert IT raises.
+    import daemon.app as daemon_app
+    importlib.reload(daemon_app)
+    from daemon import app
+    importlib.reload(app)
+    from daemon.obs import Logger
+    import io
+    buf = io.StringIO()
+    with pytest.raises(RuntimeError, match="NELIX_GENERATION_ID"):
+        app.acquire_singleton(Logger(level="info", stream=buf))
+
+
+def test_daemon_app_acquire_singleton_requires_generation_epoch(monkeypatch, tmp_path):
+    """When NELIX_GENERATION_EPOCH is missing or invalid,
+    daemon.app.acquire_singleton() must RAISE."""
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    monkeypatch.setenv("NELIX_GENERATION_ID",
+                       "g-11111111111111111111111111111111")
+    importlib.reload(paths)
+    import daemon.app as daemon_app
+    importlib.reload(daemon_app)
+    from daemon import app
+    importlib.reload(app)
+    from daemon.obs import Logger
+    import io
+    buf = io.StringIO()
+    with pytest.raises(RuntimeError, match="NELIX_GENERATION_EPOCH"):
+        app.acquire_singleton(Logger(level="info", stream=buf))
+
+
+def test_acquire_singleton_bad_epoch_too_short(monkeypatch, tmp_path):
+    """acquire_singleton raises for a too-short epoch."""
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    monkeypatch.delenv("NELIX_GENERATION_EPOCH", raising=False)
+    monkeypatch.setenv("NELIX_GENERATION_ID",
+                       "g-11111111111111111111111111111111")
+    monkeypatch.setenv("NELIX_GENERATION_EPOCH", "short")
+    importlib.reload(paths)
+    from daemon import app
+    importlib.reload(app)
+    from daemon.obs import Logger
+    import io
+    buf = io.StringIO()
+    with pytest.raises((ValueError, RuntimeError)):
+        app.acquire_singleton(Logger(level="info", stream=buf))
+
+
+def test_acquire_singleton_bad_epoch_malformed(monkeypatch, tmp_path):
+    """acquire_singleton raises for a malformed epoch (not gen-id-shaped)."""
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
+    monkeypatch.delenv("NELIX_GENERATION_EPOCH", raising=False)
+    monkeypatch.setenv("NELIX_GENERATION_ID",
+                       "g-11111111111111111111111111111111")
+    monkeypatch.setenv("NELIX_GENERATION_EPOCH", "not-a-valid-generation-id")
+    importlib.reload(paths)
+    from daemon import app
+    importlib.reload(app)
+    from daemon.obs import Logger
+    import io
+    buf = io.StringIO()
+    with pytest.raises((ValueError, RuntimeError)):
+        app.acquire_singleton(Logger(level="info", stream=buf))

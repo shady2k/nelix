@@ -38,6 +38,7 @@ class _Wired:
         self.handle = rd.establish()
         self.ledger = StartLedger(paths.nelix_root())
         self.registry = GenerationRegistry(supervisor=Supervisor(self.backend.transport),
+                                           build_id=self.backend.build_id,
                                            health_probe=lambda t: self.backend.build_id)
         self.start_path = StartPath(self.ledger, self.registry)
         self.epoch = "r-" + "0" * 32

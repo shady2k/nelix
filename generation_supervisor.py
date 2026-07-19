@@ -272,21 +272,43 @@ class GenerationSupervisor:
         """A daemon answering /status with a COMPATIBLE protocol version."""
         return self._compatible(self._status_body())
 
-    def endpoint(self):
-        """Return the live daemon's Transport, or None if no healthy daemon is running."""
+    def endpoint(self, expected_epoch=None):
+        """Return the live daemon's Transport, or None if no healthy daemon is running.
+
+        C2: MUST prove the pid currently HOLDS the generation lock AND verify the full
+        identity triple (generation_id, generation_epoch, build_id) via /health — not
+        just trust .active.json + /status compatibility.
+
+        ``expected_epoch``, when provided, also verifies the daemon's reported epoch
+        matches — a mismatch returns None (stale daemon).
+        """
+        holder = self._live_lock_holder()
+        if not holder:
+            return None
         st = self._read_state()
         if not st:
             return None
         pid = st.get("pid")
-        if not pid or not self._pid_alive(pid):
+        if not pid:
             return None
-        if reaper.ProcessInspector().start_fingerprint(pid) != st.get("start_fingerprint"):
+        # C2: Prove lock ownership — the state file's pid MUST be the CURRENT lock holder.
+        if holder.get("pid") != pid:
             return None
         try:
             t = Transport.from_state(st)
         except ValueError:
             return None
-        return t if self._check_health(t) else None
+        # C2: Verify full identity triple through /health.
+        identity = self._health_identity(t)
+        if identity is None:
+            return None
+        if (identity.get("generation_id") != self._generation_id
+                or identity.get("build_id") != self._build_id):
+            return None
+        # C2: Verify expected epoch when provided.
+        if expected_epoch is not None and identity.get("generation_epoch") != expected_epoch:
+            return None
+        return t
 
     def _check_health(self, transport) -> bool:
         """Check a transport for compatibility. Same as _healthy() but takes
@@ -325,8 +347,13 @@ class GenerationSupervisor:
         return bool(holder) and holder.get("pid") == pid
 
     def _health_identity(self, transport) -> "dict | None":
-        """Read the daemon's /health and return ``{generation_id, generation_epoch}``
-        if reachable, or None. Used by strict adoption to reject a mismatched holder.
+        """Read the daemon's /health and return ``{generation_id, generation_epoch, build_id}``
+        if reachable AND all three keys are PRESENT, or None.
+
+        C3: Uses key PRESENCE checks (``in``), NOT ``.get()`` — a MISSING key is not
+        the same as an explicit ``None`` value. A daemon that omits ``build_id``
+        (missing key) is rejected; a daemon that reports ``build_id: null`` is
+        accepted when the expected build_id is also None (dev mode).
         """
         try:
             from .rpc_client import RpcClient
@@ -334,31 +361,127 @@ class GenerationSupervisor:
             from rpc_client import RpcClient
         try:
             health = RpcClient(transport, _PROBE_OWNER).health(timeout=2)
-            return {
-                "generation_id": health.get("generation_id"),
-                "generation_epoch": health.get("generation_epoch"),
-            }
         except Exception:
             return None
+        # C3: Key PRESENCE — all three keys must exist in the response.
+        for key in ("generation_id", "generation_epoch", "build_id"):
+            if key not in health:
+                return None
+        return {
+            "generation_id": health.get("generation_id"),
+            "generation_epoch": health.get("generation_epoch"),
+            "build_id": health.get("build_id"),
+        }
+
+    def _check_health_strict(self, transport, expected_epoch: str,
+                              expected_gid: str, expected_build: "str | None") -> bool:
+        """Verify /health returns an EXACT triple match including key presence.
+
+        ``None`` matches ``None`` (dev runs with no build pinned).
+        A MISSING key (not present in the dict) is a REJECTION — we use
+        direct dict containment checks (``in``), NOT ``.get()`` which
+        cannot distinguish absent from ``None``.
+        """
+        try:
+            from .rpc_client import RpcClient
+        except ImportError:
+            from rpc_client import RpcClient
+        try:
+            health = RpcClient(transport, _PROBE_OWNER).health(timeout=2)
+        except Exception:
+            return False
+
+        # Check key PRESENCE, not just value — missing key ≠ None.
+        for key in ("generation_id", "generation_epoch", "build_id"):
+            if key not in health:
+                return False
+        return (health["generation_id"] == expected_gid
+                and health["generation_epoch"] == expected_epoch
+                and health["build_id"] == expected_build)
+
+    def _capture_incarnation(self) -> "dict | None":
+        """Return ``{pid, start_fingerprint}`` of the CURRENT live lock holder."""
+        meta = self._live_lock_holder()
+        if not meta:
+            return None
+        return {"pid": meta["pid"], "start_fingerprint": meta.get("start_fingerprint")}
+
+    @staticmethod
+    def _capture_incarnation_from(pid: int) -> dict:
+        """Return ``{pid, start_fingerprint}`` for a specific pid."""
+        fp = reaper.ProcessInspector().start_fingerprint(pid)
+        return {"pid": pid, "start_fingerprint": fp}
+
+    def reap_holder(self, expected_incarnation: dict) -> None:
+        """Kill THIS generation's lock holder ONLY if it matches ``expected_incarnation``
+        exactly (both ``pid`` and ``start_fingerprint``). If the holder changed
+        (pid or fingerprint differs or is absent), do NOT kill anything.
+
+        This is incarnation-guarded: a replacement daemon that grabbed the lock
+        between our read and this call is left alone. Never kills a newer daemon.
+        """
+        if not expected_incarnation:
+            return
+        expected_pid = expected_incarnation.get("pid")
+        expected_fp = expected_incarnation.get("start_fingerprint")
+        if not expected_pid or not expected_fp:
+            return
+
+        holder = self._live_lock_holder()
+        if not holder:
+            return
+        if (holder.get("pid") != expected_pid
+                or holder.get("start_fingerprint") != expected_fp):
+            # Holder changed — do NOT reap the replacement.
+            _log.warning("generation daemon: holder replaced gen_id=%s "
+                         "expected=(pid=%s fp=%s) actual=(pid=%s fp=%s); not reaping",
+                         self._generation_id, expected_pid, expected_fp,
+                         holder.get("pid"), holder.get("start_fingerprint"))
+            return
+
+        self._reap_daemon(expected_pid, f"reap_holder gen_id={self._generation_id}")
 
     # ---- ensure running -----------------------------------------------------
 
-    def ensure_running(self, generation_epoch: "str | None" = None) -> Transport:
-        """Spawn or discover this generation's daemon. Returns a Transport
-        to a healthy per-generation daemon.
+    def ensure_running(self, generation_epoch: str):
+        """Spawn or discover this generation's daemon. Returns ``(incarnation, transport)``
+        where ``incarnation`` is ``{pid, start_fingerprint}``.
 
-        ``generation_epoch``, if provided, is passed to the child via
-        ``NELIX_GENERATION_EPOCH`` so the daemon publishes it on /health.
+        ``generation_epoch`` is MANDATORY and validated — non-empty string.
+        The epoch is passed to the child via ``NELIX_GENERATION_EPOCH``.
+
+        Calls ``ensure_generation_dirs()`` itself before spawning (the caller
+        no longer does).
         """
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise ValueError(
+                f"generation_epoch must be a non-empty string, got {generation_epoch!r}")
+
         existing = self.endpoint()
         if existing:
-            return existing
+            # C2: Epoch-aware identity check — the endpoint must report the
+            # expected epoch, not just be alive and matching generation_id.
+            identity = self._health_identity(existing)
+            if identity is not None and identity.get("generation_epoch") == generation_epoch:
+                return self._capture_incarnation(), existing
+            # Endpoint exists but epoch doesn't match — it's a stale daemon.
+            # Fall through to reap+spawn.
 
         # Reconcile a lock holder that .active.json did NOT surface.
-        adopted = self._reconcile_lock_holder()
+        adopted = self._reconcile_lock_holder(expected_epoch=generation_epoch)
         if adopted:
-            return adopted
+            return self._capture_incarnation(), adopted
 
+        # If there's still a live lock holder after reconciliation failed,
+        # we cannot spawn — the lock is held.  Fail fast.
+        lingering = self._live_lock_holder()
+        if lingering:
+            raise RuntimeError(
+                f"generation daemon gen_id={self._generation_id}: "
+                f"a live lock holder (pid={lingering.get('pid')}) exists but "
+                f"could not be reconciled or reaped; cannot spawn a new daemon")
+
+        self.ensure_generation_dirs()
         transport = self._choose_transport()
         log_path = self._open_daemon_log()
         log = open(log_path, "ab")
@@ -368,9 +491,8 @@ class GenerationSupervisor:
                                        "NELIX_CONFIG": str(paths.config_path()),
                                        "NELIX_HOME": str(paths.nelix_root()),
                                        "NELIX_GENERATION_ID": self._generation_id,
+                                       "NELIX_GENERATION_EPOCH": generation_epoch,
                                        })
-        if generation_epoch is not None:
-            env["NELIX_GENERATION_EPOCH"] = generation_epoch
         if transport.kind == "unix":
             env["NELIX_RPC_SOCK"] = transport.path
         else:
@@ -386,20 +508,21 @@ class GenerationSupervisor:
         finally:
             log.close()
 
+        incarnation = self._capture_incarnation_from(proc.pid)
         deadline = time.time() + _HEALTH_TIMEOUT
         while time.time() < deadline:
             # Require BOTH a compatible /status AND proof that OUR spawned pid
             # holds the per-generation lock.
             if self._check_health(transport) and self._owns_lock(proc.pid):
                 self._write_state(proc.pid, transport)
-                _log.info("generation daemon started gen_id=%s pid=%s transport=%s log=%s",
-                          self._generation_id, proc.pid, transport.kind, log_path)
-                return transport
+                _log.info("generation daemon started gen_id=%s epoch=%s pid=%s transport=%s log=%s",
+                          self._generation_id, generation_epoch, proc.pid, transport.kind, log_path)
+                return incarnation, transport
             if proc.poll() is not None:
                 existing = self.endpoint()
                 if existing:
                     _log.info("generation daemon: lost startup race pid=%s", proc.pid)
-                    return existing
+                    return self._capture_incarnation(), existing
                 raise RuntimeError(
                     f"generation daemon gen_id={self._generation_id} exited early "
                     f"(code {proc.returncode}); see {log_path}")
@@ -411,14 +534,14 @@ class GenerationSupervisor:
 
     # ---- reconciliation / adoption ------------------------------------------
 
-    def _reconcile_lock_holder(self):
+    def _reconcile_lock_holder(self, expected_epoch=None):
         """Reconcile a lock holder that .active.json did NOT surface as a usable
         endpoint. Returns a Transport to a holder we ADOPTED, or None.
 
-        Strict identity adoption: a lock holder whose /health identity does NOT
-        match ``{generation_id, generation_epoch}`` (the holder's own env) is
-        REAPED rather than adopted — it belongs to a different generation and
-        must not be confused with ours.
+        C1+C2: Strict identity adoption — a lock holder whose /health identity does NOT
+        match the FULL triple ``{generation_id, generation_epoch, build_id}`` is
+        REAPED via incarnation-guarded ``reap_holder()`` rather than adopted.
+        ``expected_epoch``, when provided, rejects a daemon with the wrong epoch.
         """
         meta = self._live_lock_holder()
         if not meta:
@@ -426,39 +549,73 @@ class GenerationSupervisor:
 
         transport = self._holder_transport(meta)
         if transport is None:
-            # tcp holder: no token in lock meta, cannot probe. Wait for it to
-            # publish a usable endpoint.
-            ep = self._await_endpoint(_HEALTH_TIMEOUT)
+            # C2: TCP holder — route through endpoint() with expected_epoch
+            # verification, not bypass identity checking.
+            ep = self.endpoint(expected_epoch=expected_epoch)
             if ep is not None:
-                return ep
-            self._reap_daemon(meta["pid"], "stale tcp lock holder (never published)")
+                # Verify identity through /health before adopting.
+                identity = self._health_identity(ep)
+                if identity is not None:
+                    actual_gid = identity.get("generation_id")
+                    actual_epoch = identity.get("generation_epoch")
+                    actual_build = identity.get("build_id")
+                    gid_match = (actual_gid == self._generation_id)
+                    build_match = (actual_build == self._build_id)
+                    epoch_match = (expected_epoch is None
+                                   or actual_epoch == expected_epoch)
+                    if gid_match and build_match and epoch_match:
+                        self._write_state(meta["pid"], ep)
+                        _log.info("generation daemon: adopted tcp lock holder gen_id=%s pid=%s",
+                                  self._generation_id, meta["pid"])
+                        return ep
+                    _log.warning("generation daemon: tcp lock holder identity mismatch "
+                                 "(expected gid=%s build=%s epoch=%s, got gid=%s build=%s epoch=%s)",
+                                 self._generation_id, self._build_id, expected_epoch,
+                                 actual_gid, actual_build, actual_epoch)
+            # C1: Incarnation-guarded reap — never kill a replacement.
+            inc = {"pid": meta["pid"],
+                   "start_fingerprint": meta.get("start_fingerprint")}
+            self.reap_holder(inc)
             return None
 
-        # unix holder: probe /health for identity match.
+        # unix holder: probe /health for FULL identity match.
         if self._check_health(transport):
             identity = self._health_identity(transport)
             if identity is not None:
                 actual_gid = identity.get("generation_id")
-                if actual_gid == self._generation_id:
+                actual_epoch = identity.get("generation_epoch")
+                actual_build = identity.get("build_id")
+                # C2: Full triple match — must match generation_id, build_id, AND
+                # expected_epoch (when provided).
+                gid_match = (actual_gid == self._generation_id)
+                build_match = (actual_build == self._build_id)
+                epoch_match = (expected_epoch is None
+                               or actual_epoch == expected_epoch)
+                if gid_match and build_match and epoch_match:
                     # Identity matches — adopt.
                     self._write_state(meta["pid"], transport)
                     _log.info("generation daemon: adopted lock holder gen_id=%s pid=%s",
                               self._generation_id, meta["pid"])
                     return transport
                 _log.warning("generation daemon: lock holder gen_id=%s pid=%s has "
-                             "mismatched identity (expected %s, got %s); reaping",
+                             "mismatched identity (expected gid=%s build=%s epoch=%s, "
+                             "got gid=%s build=%s epoch=%s); reaping",
                              self._generation_id, meta["pid"],
-                             self._generation_id, actual_gid)
+                             self._generation_id, self._build_id, expected_epoch,
+                             actual_gid, actual_build, actual_epoch)
             else:
                 # /health unreachable — treat as incompatible.
                 _log.warning("generation daemon: lock holder gen_id=%s pid=%s "
                              "unreachable; reaping",
                              self._generation_id, meta["pid"])
-            self._reap_daemon(meta["pid"],
-                              f"incompatible lock holder for gen_id={self._generation_id}")
+            # C1: Incarnation-guarded reap.
+            inc = {"pid": meta["pid"],
+                   "start_fingerprint": meta.get("start_fingerprint")}
+            self.reap_holder(inc)
         else:
-            self._reap_daemon(meta["pid"],
-                              f"unhealthy lock holder for gen_id={self._generation_id}")
+            inc = {"pid": meta["pid"],
+                   "start_fingerprint": meta.get("start_fingerprint")}
+            self.reap_holder(inc)
         return None
 
     def _holder_transport(self, meta):
