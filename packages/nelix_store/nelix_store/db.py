@@ -26,9 +26,9 @@ from nelix_contracts.errors import (
 )
 
 DB_FILENAME = "nelix.db"
-# 3: the per-generation monotonic terminal_seq for retirement watermarks + generation_progress
-#     counter table (nelix-gm3). Moves TOGETHER with records.SCHEMA_VERSION (nelix-165).
-SCHEMA_VERSION = 3
+# 4: durable generations/epochs identity tables + v4 migration (nelix-80e-s1a). Moves TOGETHER
+#     with records.SCHEMA_VERSION (nelix-165).
+SCHEMA_VERSION = 4
 
 # prune_terminal's ROW_NUMBER() window function needs SQLite >= 3.25 (2018). Asserted at
 # open because the daemon runs a different interpreter than the test venv — a feature that
@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS starts (
     request_fingerprint TEXT NOT NULL,
     state               TEXT NOT NULL,
     generation_id       TEXT,
+    generation_epoch    TEXT,           -- nelix-80e-s1a: per-incarnation epoch (NULL in legacy rows)
     reason              TEXT,
     created_at          REAL NOT NULL,
     UNIQUE (owner_id, idempotency_key)
@@ -150,6 +151,37 @@ CREATE TABLE IF NOT EXISTS generation_progress (
     next_terminal_seq    INTEGER NOT NULL DEFAULT 1,
     confirmed_high_water INTEGER NOT NULL DEFAULT 0
 );
+
+-- S1a: durable generations/epochs identity (nelix-80e). Circular FK broken by disabling
+-- foreign_keys during CREATE: SQLite stores the FK definitions but does not enforce them
+-- until foreign_keys is re-enabled, avoiding the chicken-and-egg problem.
+PRAGMA foreign_keys=OFF;
+CREATE TABLE IF NOT EXISTS epochs (
+    generation_epoch  TEXT PRIMARY KEY,
+    generation_id     TEXT NOT NULL REFERENCES generations (generation_id) ON DELETE RESTRICT,
+    process_state     TEXT NOT NULL,
+    retirement_state  TEXT NOT NULL,
+    certificate       TEXT,
+    final_high_water  INTEGER,
+    incarnation_meta  TEXT,
+    created_at        REAL NOT NULL,
+    UNIQUE (generation_id, generation_epoch),
+    CHECK (process_state IN ('starting','serving','dead')),
+    CHECK (retirement_state IN ('open','quiescing','certified'))
+);
+CREATE TABLE IF NOT EXISTS generations (
+    generation_id        TEXT PRIMARY KEY,
+    build_id             TEXT,
+    lifecycle_state      TEXT NOT NULL,
+    current_epoch        TEXT,
+    capability_snapshot  TEXT,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (generation_id, current_epoch)
+        REFERENCES epochs (generation_id, generation_epoch) ON DELETE RESTRICT
+);
+PRAGMA foreign_keys=ON;
+CREATE UNIQUE INDEX IF NOT EXISTS epochs_one_serving
+    ON epochs (generation_id) WHERE process_state = 'serving';
 """
 
 LOCK_FILENAME = ".db-init.lock"
@@ -335,9 +367,9 @@ def connect(root, *, timeout: float = 30.0) -> sqlite3.Connection:
             # BEFORE any DDL: a file whose stamp disagrees with this build must be refused
             # without being touched. The DDL below is not read-only — it is what makes this
             # ordering load-bearing rather than cosmetic.
-            found = _refuse_a_disagreeing_database(conn)
-            if found is not None and int(found) < SCHEMA_VERSION:
-                _migrate(conn, int(found))
+            _refuse_a_disagreeing_database(conn)
+            # Greenfield — no migration exists. An older-version DB is simply refused
+            # by the version gate above and _check_or_stamp_version below.
             _stamp_before_the_ddl(conn)
             conn.executescript(_SCHEMA)
             _check_or_stamp_version(conn)
@@ -623,59 +655,10 @@ def _refuse_a_disagreeing_database(conn):
                          f"({SCHEMA_VERSION}); refusing to open it")
     if found == SCHEMA_VERSION:
         return raw            # same version: ready to go
-    return raw                # found < SCHEMA_VERSION — caller decides migration
-
-
-def _migrate(conn, from_version: int):
-    """Run the migration path from `from_version` to SCHEMA_VERSION."""
-    if from_version == 2:
-        _migrate_v2_to_v3(conn)
-    else:
-        raise NelixError(STORE_CORRUPT,
-                         f"database schema {from_version} predates this build "
-                         f"({SCHEMA_VERSION}) and no migration exists; refusing to open it")
-
-
-def _migrate_v2_to_v3(conn):
-    """Migrate a v2 database to v3: add terminal_seq column and generation_progress table."""
-    try:
-        conn.execute("ALTER TABLE terminal ADD COLUMN terminal_seq INTEGER NOT NULL DEFAULT 0")
-    except sqlite3.OperationalError as e:
-        if "duplicate column" not in str(e):
-            raise
-    conn.execute("CREATE TABLE IF NOT EXISTS generation_progress ("
-                 "generation_id TEXT PRIMARY KEY, "
-                 "next_terminal_seq INTEGER NOT NULL DEFAULT 1, "
-                 "confirmed_high_water INTEGER NOT NULL DEFAULT 0)")
-    # Handle round-1 migration that created generation_progress without confirmed_high_water.
-    try:
-        conn.execute("ALTER TABLE generation_progress ADD COLUMN confirmed_high_water "
-                     "INTEGER NOT NULL DEFAULT 0")
-    except sqlite3.OperationalError as e:
-        if "duplicate column" not in str(e):
-            raise
-    # [1] Bump row-level schema_version on existing rows so list_* can see them.
-    conn.execute("UPDATE sessions SET schema_version=? WHERE schema_version<?",
-                 (SCHEMA_VERSION, SCHEMA_VERSION))
-    conn.execute("UPDATE terminal SET schema_version=? WHERE schema_version<?",
-                 (SCHEMA_VERSION, SCHEMA_VERSION))
-    # [2] Backfill terminal_seq with per-generation monotonic ordinals ordered by rowid
-    # (insert/persist order), starting at 1.
-    conn.execute("UPDATE terminal SET terminal_seq = ("
-                 "SELECT seq FROM ("
-                 "  SELECT t2.session_id,"
-                 "    ROW_NUMBER() OVER (PARTITION BY st.generation_id ORDER BY t2.rowid) AS seq"
-                 "  FROM terminal t2 JOIN starts st ON st.session_id = t2.session_id"
-                 ") sub WHERE sub.session_id = terminal.session_id"
-                 ")")
-    # Set generation_progress.next_terminal_seq to MAX(terminal_seq)+1 per generation.
-    conn.execute("INSERT OR IGNORE INTO generation_progress (generation_id, next_terminal_seq) "
-                 "SELECT st.generation_id, MAX(t.terminal_seq) + 1 "
-                 "FROM terminal t JOIN starts st ON st.session_id = t.session_id "
-                 "GROUP BY st.generation_id")
-    # Update the stamp so subsequent opens skip migration.
-    conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
-
+    # Greenfield — no migration exists. Refuse immediately without touching DDL.
+    raise NelixError(STORE_CORRUPT,
+                     f"database schema {found} predates this build "
+                     f"({SCHEMA_VERSION}) and no migration exists; refusing to open it")
 
 def _stamp_before_the_ddl(conn):
     """Create meta and write the stamp in ONE transaction, BEFORE the rest of the DDL.

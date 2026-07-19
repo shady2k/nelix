@@ -20,7 +20,8 @@ from nelix_contracts.errors import (
     STORE_CORRUPT, TERMINAL_EXPIRED, UNKNOWN_SESSION, NelixError,
 )
 from nelix_contracts.records import (
-    SCHEMA_VERSION, SessionRecord, TerminalRecord, timestamp,
+    SCHEMA_VERSION, GenerationRecord, EpochRecord, SessionRecord, TerminalRecord,
+    timestamp,
 )
 
 from .db import ThreadLocalConnections, translates_sqlite
@@ -431,3 +432,244 @@ class Store:
                 f"    WHERE {_ON_THE_BOARD}"
                 "  ) WHERE rn > ?)", (now, max_count)).rowcount
         return expired
+
+    # ---- generations/epochs identity API (nelix-80e-s1a) ----
+
+    @translates_sqlite
+    def create_generation(self, generation_id: str, *, build_id, lifecycle_state: str,
+                          capability_snapshot, created_at: float) -> None:
+        """Insert a generations row with current_epoch=NULL."""
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        if build_id is not None and (not isinstance(build_id, str) or not build_id):
+            raise NelixError(INVALID_REQUEST, f"build_id must be a non-empty string or None: {build_id!r}")
+        if not isinstance(lifecycle_state, str) or not lifecycle_state:
+            raise NelixError(INVALID_REQUEST,
+                             f"lifecycle_state must be a non-empty string: {lifecycle_state!r}")
+        if capability_snapshot is not None and (not isinstance(capability_snapshot, str)
+                                                or not capability_snapshot):
+            raise NelixError(INVALID_REQUEST,
+                             f"capability_snapshot must be a non-empty string or None: "
+                             f"{capability_snapshot!r}")
+        created_at = timestamp(created_at, "created_at")
+        GenerationRecord(generation_id=generation_id, build_id=build_id,
+                         lifecycle_state=lifecycle_state, current_epoch=None,
+                         capability_snapshot=capability_snapshot, created_at=created_at)
+        try:
+            self._conn.execute(
+                "INSERT INTO generations (generation_id, build_id, lifecycle_state, "
+                "current_epoch, capability_snapshot, created_at) VALUES (?,?,?,?,?,?)",
+                (generation_id, build_id, lifecycle_state, None,
+                 capability_snapshot, created_at))
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE" in str(e) or "PRIMARY KEY" in str(e):
+                raise NelixError(DUPLICATE_START,
+                                 f"generation already exists: {generation_id}") from None
+            raise
+
+    @translates_sqlite
+    def insert_epoch(self, generation_epoch: str, generation_id: str, *,
+                     incarnation_meta, created_at: float) -> None:
+        """Insert an epochs row with process_state='starting', retirement_state='open'."""
+        for name, val in [("generation_epoch", generation_epoch),
+                          ("generation_id", generation_id)]:
+            if not isinstance(val, str) or not val:
+                raise NelixError(INVALID_REQUEST,
+                                 f"{name} must be a non-empty string: {val!r}")
+        if incarnation_meta is not None and (not isinstance(incarnation_meta, str)
+                                             or not incarnation_meta):
+            raise NelixError(INVALID_REQUEST,
+                             f"incarnation_meta must be a non-empty string or None: "
+                             f"{incarnation_meta!r}")
+        created_at = timestamp(created_at, "created_at")
+        EpochRecord(generation_epoch=generation_epoch, generation_id=generation_id,
+                    process_state="starting", retirement_state="open",
+                    certificate=None, final_high_water=None,
+                    incarnation_meta=incarnation_meta, created_at=created_at)
+        try:
+            self._conn.execute(
+                "INSERT INTO epochs (generation_epoch, generation_id, process_state, "
+                "retirement_state, certificate, final_high_water, incarnation_meta, "
+                "created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (generation_epoch, generation_id, "starting", "open",
+                 None, None, incarnation_meta, created_at))
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE" in str(e) or "PRIMARY KEY" in str(e):
+                raise NelixError(DUPLICATE_START,
+                                 f"epoch already exists: {generation_epoch}") from None
+            if "FOREIGN KEY" in str(e) or "constraint failed" in str(e):
+                raise NelixError(UNKNOWN_SESSION,
+                                 f"generation not found: {generation_id}") from None
+            raise
+
+    @translates_sqlite
+    def cas_epoch_serving(self, generation_id: str, generation_epoch: str, *,
+                          expected_current_epoch) -> None:
+        """CAS generations.current_epoch AND set epoch process_state='serving'.
+
+        In ONE transaction: atomically promotes the epoch to serving and records
+        it as the generation's current_epoch. Fails if expected_current_epoch
+        does not match (IDEMPOTENCY_CONFLICT) or another serving epoch exists
+        (the partial unique index enforces the latter).
+        """
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            # Verify expected_current_epoch matches.
+            row = self._conn.execute(
+                "SELECT current_epoch FROM generations WHERE generation_id=?",
+                (generation_id,)).fetchone()
+            if row is None:
+                raise NelixError(UNKNOWN_SESSION,
+                                 f"no such generation: {generation_id}")
+            cur = row["current_epoch"]
+            if cur != expected_current_epoch:
+                raise NelixError(
+                    IDEMPOTENCY_CONFLICT,
+                    f"current_epoch {cur!r} does not match expected "
+                    f"{expected_current_epoch!r}")
+            # Set current_epoch on generation AND process_state='serving' on epoch.
+            self._conn.execute(
+                "UPDATE generations SET current_epoch=? WHERE generation_id=?",
+                (generation_epoch, generation_id))
+            self._conn.execute(
+                "UPDATE epochs SET process_state='serving' "
+                "WHERE generation_epoch=? AND generation_id=?",
+                (generation_epoch, generation_id))
+
+    @translates_sqlite
+    def set_epoch_process_state(self, generation_epoch: str, state: str) -> None:
+        """Update an epoch's process_state (guarded transition: starting|serving|dead)."""
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        if state not in ("starting", "serving", "dead"):
+            raise NelixError(INVALID_REQUEST,
+                             f"invalid process_state: {state!r}")
+        cur = self._conn.execute(
+            "UPDATE epochs SET process_state=? WHERE generation_epoch=?",
+            (state, generation_epoch))
+        if cur.rowcount == 0:
+            raise NelixError(UNKNOWN_SESSION,
+                             f"no such epoch: {generation_epoch}")
+
+    @translates_sqlite
+    def set_epoch_retirement(self, generation_epoch: str, *,
+                             retirement_state: str, certificate=None,
+                             final_high_water=None) -> None:
+        """Update an epoch's retirement_state (guarded: open|quiescing|certified).
+
+        When `certified`, also writes certificate and final_high_water.
+        """
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        if retirement_state not in ("open", "quiescing", "certified"):
+            raise NelixError(INVALID_REQUEST,
+                             f"invalid retirement_state: {retirement_state!r}")
+        if final_high_water is not None:
+            if isinstance(final_high_water, bool) or not isinstance(
+                    final_high_water, int) or final_high_water < 0:
+                raise NelixError(
+                    INVALID_REQUEST,
+                    f"final_high_water must be a non-negative int: {final_high_water!r}")
+        if retirement_state == "certified":
+            cur = self._conn.execute(
+                "UPDATE epochs SET retirement_state=?, certificate=?, "
+                "final_high_water=? WHERE generation_epoch=?",
+                (retirement_state, certificate, final_high_water, generation_epoch))
+        else:
+            cur = self._conn.execute(
+                "UPDATE epochs SET retirement_state=? WHERE generation_epoch=?",
+                (retirement_state, generation_epoch))
+        if cur.rowcount == 0:
+            raise NelixError(UNKNOWN_SESSION,
+                             f"no such epoch: {generation_epoch}")
+
+    @translates_sqlite
+    def list_epochs(self, generation_id: str) -> list:
+        """List epochs for a generation, ordered by created_at."""
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        rows = self._conn.execute(
+            "SELECT generation_epoch, generation_id, process_state, retirement_state, "
+            "certificate, final_high_water, incarnation_meta, created_at "
+            "FROM epochs WHERE generation_id=? ORDER BY created_at",
+            (generation_id,)).fetchall()
+        records, _skipped = _read_rows(rows, EpochRecord)
+        return records
+
+    @translates_sqlite
+    def get_generation(self, generation_id: str) -> GenerationRecord:
+        """Return a generation row or UNKNOWN_SESSION."""
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        row = self._conn.execute(
+            "SELECT generation_id, build_id, lifecycle_state, current_epoch, "
+            "capability_snapshot, created_at "
+            "FROM generations WHERE generation_id=?",
+            (generation_id,)).fetchone()
+        if row is None:
+            raise NelixError(UNKNOWN_SESSION,
+                             f"no such generation: {generation_id}")
+        return _decode_stored(GenerationRecord, row)
+
+    @translates_sqlite
+    def set_generation_lifecycle_state(self, generation_id: str, state: str) -> None:
+        """Update a generation's lifecycle_state."""
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        if not isinstance(state, str) or not state:
+            raise NelixError(INVALID_REQUEST,
+                             f"state must be a non-empty string: {state!r}")
+        cur = self._conn.execute(
+            "UPDATE generations SET lifecycle_state=? WHERE generation_id=?",
+            (state, generation_id))
+        if cur.rowcount == 0:
+            raise NelixError(UNKNOWN_SESSION,
+                             f"no such generation: {generation_id}")
+
+    @translates_sqlite
+    def clear_current_epoch(self, generation_id: str) -> None:
+        """Set generations.current_epoch to NULL."""
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        cur = self._conn.execute(
+            "UPDATE generations SET current_epoch=NULL WHERE generation_id=?",
+            (generation_id,))
+        if cur.rowcount == 0:
+            raise NelixError(UNKNOWN_SESSION,
+                             f"no such generation: {generation_id}")
+
+    @translates_sqlite
+    def set_generation_confirmed_high_water(self, generation_epoch: str, seq: int) -> None:
+        """Monotonic advance of generation_progress.confirmed_high_water for an epoch.
+
+        Never regress: only writes if seq > current confirmed_high_water.
+        The counter row is created on demand (INSERT OR IGNORE), mirroring
+        put_terminal's pattern.
+        """
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            raise NelixError(INVALID_REQUEST,
+                             f"seq must be a non-negative int: {seq!r}")
+        self._conn.execute(
+            "INSERT OR IGNORE INTO generation_progress "
+            "(generation_id, next_terminal_seq, confirmed_high_water) "
+            "VALUES (?, 1, 0)", (generation_epoch,))
+        self._conn.execute(
+            "UPDATE generation_progress SET confirmed_high_water = MAX("
+            "confirmed_high_water, ?) WHERE generation_id=?",
+            (seq, generation_epoch))
