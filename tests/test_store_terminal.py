@@ -771,7 +771,6 @@ def test_put_terminal_assigns_monotonic_terminal_seq_per_generation(store, ledge
     ledger.assign_generation(r_b.session_id, GID2)
     store.create_session(r_b.session_id, state="running", executor="coder", task="t",
                           cwd="/repo", model=None, created_at=100.0)
-    sid_b = r_b.session_id
 
     seqs_a = []
     for i in range(3):
