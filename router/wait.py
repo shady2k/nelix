@@ -123,13 +123,13 @@ class WaitForward:
         # ONLY that generation's component. N=1 collapses to one generation owning every session:
         gen_sessions = sessions
 
-        component = cursor.position_for(gen.slot_id)
+        component = cursor.position_for(gen.generation_id)
         if component is None:
             # No prior position for this generation (a fresh/board-less cursor) -> start from NOW:
             # its current int cursor, so only a NEW event wakes. Establish the component so the
             # returned token is coherent (and a timeout re-arm does not re-read "now" every call).
             after_seq = self._current_seq(gen, owner_id)
-            cursor = cursor.advance(gen.slot_id, gen.epoch, after_seq)
+            cursor = cursor.advance(gen.generation_id, gen.epoch, after_seq)
         else:
             epoch, after_seq = component
             if epoch != gen.epoch:
@@ -196,5 +196,5 @@ class WaitForward:
             raise NelixError(GENERATION_UNAVAILABLE,
                              "generation /wait event carried no usable seq")
         # An event -> advance ONLY this generation's component (spec §4) and return it + the token.
-        advanced = cursor.advance(gen.slot_id, gen.epoch, seq)
+        advanced = cursor.advance(gen.generation_id, gen.epoch, seq)
         return 200, {"event": evt, "cursor": encode(advanced)}

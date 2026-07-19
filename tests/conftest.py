@@ -21,6 +21,7 @@ OWNER = "test-owner"
 # fixtures provide the shared setup so individual tests don't repeat it.
 _OID = "o-" + "a" * 32
 _GID = "g-" + "b" * 32
+_GEPOCH = "g-" + "c" * 32
 
 
 def own(session_id, owner_id=OWNER):
@@ -88,5 +89,5 @@ def reserve_start(ledger, owner_id=OWNER, idempotency_key=None):
     key = idempotency_key or f"k-{uuid.uuid4().hex[:8]}"
     r = ledger.reserve(idempotency_key=key, owner_id=owner_id,
                        orchestration_id=_OID, request_fingerprint="fp")
-    ledger.assign_generation(r.session_id, _GID)
+    ledger.assign_generation(r.session_id, _GID, _GEPOCH)
     return r.session_id

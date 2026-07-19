@@ -83,6 +83,7 @@ class SessionRecord:
     owner_id: str
     orchestration_id: str
     generation_id: str
+    generation_epoch: str
     state: str
     executor: str
     task: str
@@ -94,6 +95,10 @@ class SessionRecord:
     def __post_init__(self):
         _version(self.schema_version)
         _ids(self.session_id, self.owner_id, self.orchestration_id, self.generation_id)
+        try:
+            validate_generation_id(self.generation_epoch)
+        except InvalidId as e:
+            raise NelixError(INVALID_REQUEST, str(e)) from None
         for name in ("state", "executor", "task", "cwd"):
             _text(getattr(self, name), name)
         if self.model is not None:
@@ -120,6 +125,7 @@ class TerminalRecord:
     owner_id: str
     orchestration_id: str
     generation_id: str
+    generation_epoch: str
     terminal_kind: str
     summary: str
     ended_at: float
@@ -133,6 +139,10 @@ class TerminalRecord:
     def __post_init__(self):
         _version(self.schema_version)
         _ids(self.session_id, self.owner_id, self.orchestration_id, self.generation_id)
+        try:
+            validate_generation_id(self.generation_epoch)
+        except InvalidId as e:
+            raise NelixError(INVALID_REQUEST, str(e)) from None
         _text(self.terminal_kind, "terminal_kind")
         _text(self.summary, "summary")
         timestamp(self.ended_at, "ended_at")

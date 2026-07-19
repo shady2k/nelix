@@ -80,6 +80,7 @@ def _setup_store_and_ledger(tmp_path, clock):
 
 _OID = "o-" + "a" * 32
 _GID = "g-" + "b" * 32
+_GEPOCH = "g-" + "c" * 32
 
 
 def _router_started_session(ledger, store, owner_id=OWNER, clock=None):
@@ -88,7 +89,7 @@ def _router_started_session(ledger, store, owner_id=OWNER, clock=None):
     carries when it reaches the daemon."""
     r = ledger.reserve(idempotency_key="k1", owner_id=owner_id,
                        orchestration_id=_OID, request_fingerprint="fp1")
-    ledger.assign_generation(r.session_id, _GID)
+    ledger.assign_generation(r.session_id, _GID, _GEPOCH)
     return r.session_id
 
 

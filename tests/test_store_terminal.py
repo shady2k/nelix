@@ -12,6 +12,8 @@ from nelix_store.store import Store
 OID = "o-" + "2" * 32
 GID = "g-" + "3" * 32
 GID2 = "g-" + "4" * 32
+GEPOCH = "g-" + "6" * 32
+GEPOCH2 = "g-" + "7" * 32
 
 
 class FakeClock:
@@ -45,7 +47,7 @@ def started_session(store, ledger, owner="hermes:local", key="k1", **over):
     """A session whose identity came from a real start — the only way to make one now."""
     r = ledger.reserve(idempotency_key=key, owner_id=owner, orchestration_id=OID,
                        request_fingerprint="fp")
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     fields = dict(state="starting", executor="coder", task="t", cwd="/repo",
                   model=None, created_at=100.0)
     fields.update(over)
@@ -768,7 +770,7 @@ def test_put_terminal_assigns_monotonic_terminal_seq_per_generation(store, ledge
     gap-free-enough ordinals per generation. Revert the seq assignment -> this test fails."""
     r_b = ledger.reserve(idempotency_key="k-seq-b", owner_id="hermes:local",
                           orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(r_b.session_id, GID2)
+    ledger.assign_generation(r_b.session_id, GID2, GEPOCH2)
     store.create_session(r_b.session_id, state="running", executor="coder", task="t",
                           cwd="/repo", model=None, created_at=100.0)
 
@@ -784,14 +786,14 @@ def test_put_terminal_assigns_monotonic_terminal_seq_per_generation(store, ledge
     clock.t = 1000.0
     r_b2 = ledger.reserve(idempotency_key="k-seq-b2", owner_id="hermes:local",
                            orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(r_b2.session_id, GID2)
+    ledger.assign_generation(r_b2.session_id, GID2, GEPOCH2)
     store.create_session(r_b2.session_id, state="running", executor="coder", task="t",
                           cwd="/repo", model=None, created_at=100.0)
     sid_b2 = r_b2.session_id
     store.put_terminal(sid_b2, terminal_kind="done", summary="gen2 first", ended_at=0.0)
     r_c = ledger.reserve(idempotency_key="k-seq-b3", owner_id="hermes:local",
                           orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(r_c.session_id, GID2)
+    ledger.assign_generation(r_c.session_id, GID2, GEPOCH2)
     store.create_session(r_c.session_id, state="running", executor="coder", task="t",
                           cwd="/repo", model=None, created_at=100.0)
     sid_b3 = r_c.session_id
@@ -805,26 +807,26 @@ def test_put_terminal_assigns_monotonic_terminal_seq_per_generation(store, ledge
 
 
 def test_get_generation_persisted_high_water(store, ledger, clock):
-    """Verify get_generation_persisted_high_water returns the correct max per generation."""
+    """Verify get_generation_persisted_high_water returns the correct max per epoch."""
     # No terminals yet -> 0
-    assert store.get_generation_persisted_high_water(GID) == 0
+    assert store.get_generation_persisted_high_water(GEPOCH) == 0
 
     # One terminal -> seq 1
     sid1 = started_session(store, ledger, key="k-hw-1", state="running")
     store.put_terminal(sid1, terminal_kind="done", summary="first", ended_at=1.0)
-    assert store.get_generation_persisted_high_water(GID) == 1
+    assert store.get_generation_persisted_high_water(GEPOCH) == 1
 
     # Another terminal -> seq 2
     sid2 = started_session(store, ledger, key="k-hw-2", state="running")
     store.put_terminal(sid2, terminal_kind="done", summary="second", ended_at=2.0)
-    assert store.get_generation_persisted_high_water(GID) == 2
+    assert store.get_generation_persisted_high_water(GEPOCH) == 2
 
-    # Second generation separate counter
+    # Second epoch separate counter
     r = ledger.reserve(idempotency_key="k-hw-gen2", owner_id="hermes:local",
                         orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(r.session_id, GID2)
+    ledger.assign_generation(r.session_id, GID2, GEPOCH2)
     store.create_session(r.session_id, state="running", executor="coder", task="t",
                           cwd="/repo", model=None, created_at=100.0)
     store.put_terminal(r.session_id, terminal_kind="done", summary="gen2 only", ended_at=3.0)
-    assert store.get_generation_persisted_high_water(GID2) == 1
-    assert store.get_generation_persisted_high_water(GID) == 2  # unchanged
+    assert store.get_generation_persisted_high_water(GEPOCH2) == 1
+    assert store.get_generation_persisted_high_water(GEPOCH) == 2  # unchanged

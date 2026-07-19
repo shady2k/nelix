@@ -160,7 +160,7 @@ def test_orchestration_wait_wakes_on_a_real_event_across_the_multi_session_primi
     # ONLY this generation's component advanced, to the real event's seq.
     new_cursor = decode(wb["cursor"], router_epoch=epoch,
                         topology_revision=registry.topology_revision())
-    slot_id = registry.generations()[0].slot_id
+    slot_id = registry.generations()[0].generation_id
     assert new_cursor.position_for(slot_id)[1] == evt.seq
     # sanity: s1 exists and is a distinct session in the same orchestration (the set had two).
     assert s1 != s2

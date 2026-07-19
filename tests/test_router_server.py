@@ -163,7 +163,8 @@ def test_start_routes_through_the_active_generation(wired):
     assert wired.backend.starts[0]["session_id"] == sid
     # /health now shows the active generation the start committed to.
     h = wired.client().health()
-    assert h["active_generation"]["epoch"] == body["generation_id"]
+    assert h["active_generation"]["generation_id"] == body["generation_id"]
+    assert h["active_generation"]["generation_epoch"] is not None
 
 
 def test_board_status_returns_the_started_session_and_a_decodable_cursor(wired):
@@ -181,8 +182,8 @@ def test_board_status_returns_the_started_session_and_a_decodable_cursor(wired):
     assert body["board_incomplete"] is False
     cursor = decode(body["cursor"], router_epoch=wired.epoch,
                     topology_revision=wired.registry.topology_revision())
-    gen_epoch = start_body["generation_id"]
-    slot_id = wired.registry.generations()[0].slot_id
+    slot_id = wired.registry.generations()[0].generation_id
+    gen_epoch = wired.registry.generations()[0].epoch
     assert cursor.position_for(slot_id) == (gen_epoch, 9)
 
 
@@ -239,7 +240,7 @@ def test_wait_orchestration_wakes_over_the_full_http_stack(wired):
     assert wb["event"]["session_id"] == sid and wb["event"]["seq"] == 4
     new_cursor = decode(wb["cursor"], router_epoch=wired.epoch,
                         topology_revision=wired.registry.topology_revision())
-    slot_id = wired.registry.generations()[0].slot_id
+    slot_id = wired.registry.generations()[0].generation_id
     assert new_cursor.position_for(slot_id)[1] == 4       # ONLY this component advanced, to the seq
 
 

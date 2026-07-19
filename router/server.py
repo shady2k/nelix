@@ -370,7 +370,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             active = None
             if gens:
                 g = gens[0]
-                active = {"epoch": g.epoch, "build_id": g.build_id,
+                active = {"generation_id": g.generation_id,
+                          "generation_epoch": g.epoch,
+                          "build_id": g.build_id,
                           "transport": getattr(g.transport, "kind", None)}
             self._send(200, {"status": "ok", "router_epoch": router_epoch,
                              "active_generation": active})

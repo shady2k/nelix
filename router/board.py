@@ -105,12 +105,12 @@ class BoardForward:
         for gen in gens:
             reply = self._forward_one(gen, owner_id)
             if reply is None:
-                unavailable.append(gen.slot_id)
+                unavailable.append(gen.generation_id)
                 continue
-            healthy.append((gen.slot_id, reply))
+            healthy.append((gen.generation_id, reply))
             # fix-pass finding #1: the cursor's map KEY is the STABLE slot_id (survives a daemon
             # restart); the per-incarnation epoch is carried as the VALUE, alongside the seq.
-            cursor = cursor.advance(gen.slot_id, gen.epoch, reply["cursor"])
+            cursor = cursor.advance(gen.generation_id, gen.epoch, reply["cursor"])
         merged = merge_boards(healthy)
         merged["cursor"] = encode(cursor)
         merged["board_incomplete"] = unavailable if unavailable else False
@@ -120,7 +120,7 @@ class BoardForward:
         """Forward the board-wide /status to ONE generation. Returns its decoded board dict, or
         None if it is UNAVAILABLE (a transport failure of either phase, via the shared `relay`
         mapping -- reused, never re-derived -- or a reply that does not even look like the daemon's
-        own board shape). None is the caller's signal to record `gen.slot_id` in `board_incomplete`
+        own board shape). None is the caller's signal to record `gen.generation_id` in `board_incomplete`
         rather than silently treating a down generation as having no sessions.
 
         fix-pass finding #2: a 200 reply is not trusted just because it is a dict with a "cursor"

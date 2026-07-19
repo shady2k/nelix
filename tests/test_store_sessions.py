@@ -7,6 +7,7 @@ from nelix_store.store import Store
 
 OID = "o-" + "2" * 32
 GID = "g-" + "3" * 32
+GEPOCH = "g-" + "6" * 32
 SID = "s-" + "1" * 32
 
 
@@ -28,7 +29,7 @@ def started_session(store, ledger, owner="hermes:local", key="k1", **over):
     """A session whose identity came from a real start — the only way to make one now."""
     r = ledger.reserve(idempotency_key=key, owner_id=owner, orchestration_id=OID,
                        request_fingerprint="fp")
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     fields = dict(state="starting", executor="coder", task="t", cwd="/repo",
                   model=None, created_at=100.0)
     fields.update(over)
@@ -61,13 +62,13 @@ def test_a_session_inherits_its_identity_from_its_start(store, ledger):
 
     r_a = ledger.reserve(idempotency_key="k-a", owner_id="hermes:local",
                          orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(r_a.session_id, GID)
+    ledger.assign_generation(r_a.session_id, GID, GEPOCH)
     store.create_session(r_a.session_id, state="starting", executor="coder", task="t",
                          cwd="/repo", model=None, created_at=100.0)
 
     r_b = ledger.reserve(idempotency_key="k-b", owner_id="claude-code:1",
                          orchestration_id=oid_b, request_fingerprint="fp")
-    ledger.assign_generation(r_b.session_id, gid_b)
+    ledger.assign_generation(r_b.session_id, gid_b, GEPOCH)
     store.create_session(r_b.session_id, state="starting", executor="coder", task="t",
                          cwd="/repo", model=None, created_at=100.0)
 
@@ -157,7 +158,7 @@ def test_one_future_schema_row_does_not_brick_an_owners_board(store, ledger):
     sid = started_session(store, ledger, key="k1")
     other = ledger.reserve(idempotency_key="k2", owner_id="hermes:local",
                            orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(other.session_id, GID)
+    ledger.assign_generation(other.session_id, GID, GEPOCH)
     store._conn.execute(
         "INSERT INTO sessions (session_id, state, executor, task, cwd, model, created_at,"
         " schema_version) VALUES (?,?,?,?,?,?,?,?)",
@@ -183,7 +184,7 @@ def test_a_non_duplicate_integrity_failure_is_not_reported_as_a_duplicate_start(
     # test can no longer trigger; nothing here still exercises it.
     r = ledger.reserve(idempotency_key="k1", owner_id="hermes:local",
                        orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     with pytest.raises(NelixError) as ei:
         store.create_session(r.session_id, state=None, executor="coder", task="t",
                              cwd="/repo", model=None, created_at=1.0)
@@ -197,7 +198,7 @@ def test_a_corrupt_row_does_not_blind_an_owner_to_their_healthy_rows(store, ledg
     sid = started_session(store, ledger, key="k1")
     other = ledger.reserve(idempotency_key="k2", owner_id="hermes:local",
                            orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(other.session_id, GID)
+    ledger.assign_generation(other.session_id, GID, GEPOCH)
     store._conn.execute(
         "INSERT INTO sessions (session_id, state, executor, task, cwd, model, created_at,"
         " schema_version) VALUES (?,?,?,?,?,?,?,?)",
@@ -220,7 +221,7 @@ def test_a_failed_start_cannot_acquire_a_session(store, ledger):
     # and dispatches a SECOND WORKER. That is the fatal case ledger.py's docstring names.
     r = ledger.reserve(idempotency_key="k1", owner_id="hermes:local",
                        orchestration_id=OID, request_fingerprint="fp")
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     ledger.fail(r.session_id, "forward timed out")
     with pytest.raises(NelixError) as ei:
         store.create_session(r.session_id, state="running", executor="coder", task="t",
@@ -252,7 +253,7 @@ def test_create_session_rejects_a_malformed_field(store, ledger, field, bad):
 def _assigned_start(ledger, owner="hermes:local", key="k9"):
     r = ledger.reserve(idempotency_key=key, owner_id=owner, orchestration_id=OID,
                        request_fingerprint="fp")
-    ledger.assign_generation(r.session_id, GID)
+    ledger.assign_generation(r.session_id, GID, GEPOCH)
     return r.session_id
 
 

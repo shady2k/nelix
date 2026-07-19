@@ -312,13 +312,13 @@ def test_slot_id_is_stable_across_a_restart_while_epoch_is_not():
     sup.inc = {"pid": 200, "start_fingerprint": "fp-2"}     # daemon restarted: new incarnation
     second = reg.active()
     assert first.epoch != second.epoch                     # epoch: per-incarnation, as before
-    assert first.slot_id == second.slot_id                  # slot_id: stable across the restart
-    assert _EPOCH_RE.match(first.slot_id)                   # same g-<32hex> shape as epoch
+    assert first.generation_id == second.generation_id                  # slot_id: stable across the restart
+    assert _EPOCH_RE.match(first.generation_id)                   # same g-<32hex> shape as epoch
 
 
 def test_slot_id_is_stable_across_repeated_observations_of_the_same_incarnation():
     reg = _reg(FakeSupervisor())
-    assert reg.active().slot_id == reg.active().slot_id
+    assert reg.active().generation_id == reg.active().generation_id
 
 
 def test_slot_id_is_never_the_nullable_build_id():
@@ -326,8 +326,8 @@ def test_slot_id_is_never_the_nullable_build_id():
     # in dev where the health probe reports None) as the cursor's stable key.
     gen = GenerationRegistry(supervisor=FakeSupervisor(), health_probe=lambda t: None).active()
     assert gen.build_id is None
-    assert gen.slot_id is not None
-    assert _EPOCH_RE.match(gen.slot_id)
+    assert gen.generation_id is not None
+    assert _EPOCH_RE.match(gen.generation_id)
 
 
 def test_generations_reports_the_same_slot_id_as_active():
@@ -335,7 +335,7 @@ def test_generations_reports_the_same_slot_id_as_active():
     reg = _reg(sup)
     pinned = reg.active()
     listed = reg.generations()[0]
-    assert listed.slot_id == pinned.slot_id
+    assert listed.generation_id == pinned.generation_id
 
 
 # ============================================ nelix-3rm 3c.3a fix-pass finding #3: discovery
@@ -360,7 +360,7 @@ def test_generations_discover_true_discovers_a_currently_held_incarnation_when_e
     assert g.incarnation == sup.inc
     assert g.transport == sup.transport
     assert _EPOCH_RE.match(g.epoch)
-    assert _EPOCH_RE.match(g.slot_id)
+    assert _EPOCH_RE.match(g.generation_id)
 
 
 def test_generations_discover_true_is_honestly_empty_when_no_daemon_is_held():
@@ -399,7 +399,7 @@ def test_generations_discover_true_installs_the_same_epoch_and_slot_id_active_th
     discovered = reg.generations(discover=True)[0]
     pinned = reg.active()
     assert discovered.epoch == pinned.epoch
-    assert discovered.slot_id == pinned.slot_id
+    assert discovered.generation_id == pinned.generation_id
     assert discovered.incarnation == pinned.incarnation
 
 
@@ -408,4 +408,4 @@ def test_generations_discover_true_is_idempotent_across_repeated_calls():
     reg = _reg(sup)
     first = reg.generations(discover=True)[0]
     second = reg.generations(discover=True)[0]
-    assert first.epoch == second.epoch and first.slot_id == second.slot_id
+    assert first.epoch == second.epoch and first.generation_id == second.generation_id

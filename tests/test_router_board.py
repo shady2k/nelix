@@ -113,7 +113,7 @@ def test_cursor_component_is_keyed_on_slot_id_with_value_epoch_and_the_daemons_i
     status, body = forward.status(OWNER)
     assert status == 200
     cursor = decode(body["cursor"], router_epoch=EPOCH, topology_revision=registry.topology_revision())
-    assert cursor.position_for(gen.slot_id) == (gen.epoch, 42)
+    assert cursor.position_for(gen.generation_id) == (gen.epoch, 42)
 
 
 def test_cursor_key_survives_a_daemon_restart_new_epoch_same_slot():
@@ -130,11 +130,11 @@ def test_cursor_key_survives_a_daemon_restart_new_epoch_same_slot():
         _, body_before = forward.status(OWNER)
         cursor_before = decode(body_before["cursor"], router_epoch=EPOCH,
                                topology_revision=registry.topology_revision())
-        assert cursor_before.position_for(gen_before.slot_id) == (gen_before.epoch, 5)
+        assert cursor_before.position_for(gen_before.generation_id) == (gen_before.epoch, 5)
 
         sup.inc = {"pid": 999, "start_fingerprint": "fp-restarted"}   # simulate a daemon restart
         gen_after = registry.active()
-        assert gen_after.slot_id == gen_before.slot_id          # same registry slot
+        assert gen_after.generation_id == gen_before.generation_id          # same registry slot
         assert gen_after.epoch != gen_before.epoch              # a fresh incarnation minted a fresh epoch
         backend.board_cursor = 1
         _, body_after = forward.status(OWNER)
@@ -143,7 +143,7 @@ def test_cursor_key_survives_a_daemon_restart_new_epoch_same_slot():
         # position_for(slot_id) resolves to the SAME component, key never orphaned by the restart --
         # exactly the shape 3c.3b's /wait needs to detect "same generation, new epoch" (CURSOR_EXPIRED
         # for that component) rather than seeing a whole new, unrelated map entry.
-        assert cursor_after.position_for(gen_after.slot_id) == (gen_after.epoch, 1)
+        assert cursor_after.position_for(gen_after.generation_id) == (gen_after.epoch, 1)
     finally:
         backend.close()
 
@@ -199,12 +199,12 @@ def test_board_incomplete_names_the_unavailable_generation_but_still_returns_200
     forward = BoardForward(registry, EPOCH)
     status, body = forward.status(OWNER)
     assert status == 200
-    assert body["board_incomplete"] == [gen.slot_id]
+    assert body["board_incomplete"] == [gen.generation_id]
     assert body["sessions"] == {}
     assert body["recent_terminal"] == {}
     # The token is still a real, decodable cursor -- an incomplete board is not a broken one.
     cursor = decode(body["cursor"], router_epoch=EPOCH, topology_revision=registry.topology_revision())
-    assert cursor.position_for(gen.slot_id) is None           # never advanced: it never answered
+    assert cursor.position_for(gen.generation_id) is None           # never advanced: it never answered
 
 
 def test_empty_registry_is_an_honestly_empty_board_not_incomplete():
@@ -313,12 +313,12 @@ def test_a_malformed_cursor_in_an_otherwise_200_reply_is_incomplete_not_merged_n
     backend.board_cursor = bad_cursor
     status, body = forward.status(OWNER)                 # must not raise -- never a hard error
     assert status == 200
-    assert body["board_incomplete"] == [gen.slot_id]      # unavailable, not silently merged empty
+    assert body["board_incomplete"] == [gen.generation_id]      # unavailable, not silently merged empty
     assert body["sessions"] == {}
     assert body["recent_terminal"] == {}
     # The cursor is still real and decodable; this generation's component never advanced.
     cursor = decode(body["cursor"], router_epoch=EPOCH, topology_revision=registry.topology_revision())
-    assert cursor.position_for(gen.slot_id) is None
+    assert cursor.position_for(gen.generation_id) is None
 
 
 def test_a_non_dict_sessions_field_in_an_otherwise_200_reply_is_incomplete_not_merged(wired):
@@ -327,7 +327,7 @@ def test_a_non_dict_sessions_field_in_an_otherwise_200_reply_is_incomplete_not_m
     backend.board_reply_override = {"cursor": 3, "sessions": "oops", "recent_terminal": {}}
     status, body = forward.status(OWNER)
     assert status == 200
-    assert body["board_incomplete"] == [gen.slot_id]
+    assert body["board_incomplete"] == [gen.generation_id]
     assert body["sessions"] == {}
 
 
@@ -337,7 +337,7 @@ def test_a_non_dict_recent_terminal_field_in_an_otherwise_200_reply_is_incomplet
     backend.board_reply_override = {"cursor": 3, "sessions": {}, "recent_terminal": ["oops"]}
     status, body = forward.status(OWNER)
     assert status == 200
-    assert body["board_incomplete"] == [gen.slot_id]
+    assert body["board_incomplete"] == [gen.generation_id]
 
 
 def test_a_200_reply_missing_sessions_and_recent_terminal_entirely_is_incomplete_not_merged_empty(
@@ -350,7 +350,7 @@ def test_a_200_reply_missing_sessions_and_recent_terminal_entirely_is_incomplete
     backend.board_reply_override = {"cursor": 12}
     status, body = forward.status(OWNER)
     assert status == 200
-    assert body["board_incomplete"] == [gen.slot_id]
+    assert body["board_incomplete"] == [gen.generation_id]
     assert body["sessions"] == {}
 
 

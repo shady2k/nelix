@@ -43,7 +43,7 @@ def test_generation_list_reports_the_one_active_generation(wired):
     assert body["router_epoch"] == _EPOCH
     assert len(body["generations"]) == 1
     g = body["generations"][0]
-    assert g["generation_id"] == registry.active().epoch
+    assert g["generation_id"] == registry.active().generation_id
     assert g["build_id"] == "b-real-1"
     assert g["transport_kind"] == "tcp"
 
@@ -54,7 +54,7 @@ def test_capabilities_forwards_the_generations_global_baseline(wired):
     status, body = ops.capabilities()
     assert status == 200
     assert body["router_epoch"] == _EPOCH
-    assert body["generation_id"] == registry.active().epoch
+    assert body["generation_id"] == registry.active().generation_id
     assert body["capabilities"]["executors"]["demo"]["hook_capable"] is True
 
 
