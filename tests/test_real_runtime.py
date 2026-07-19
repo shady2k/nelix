@@ -52,7 +52,7 @@ def _build_wheel(src: Path, out: Path, version: str) -> Path:
     pp.write_text(pp.read_text().replace('version = "0.1.0"', f'version = "{version}"', 1))
     r = _run(["uv", "build", "--wheel", "--out-dir", out, src], cwd=src.parent)
     assert r.returncode == 0, f"wheel build failed:\n{r.stdout}\n{r.stderr}"
-    wheels = [w for w in out.glob(f"*-{version}-*.whl")]
+    wheels = [w for w in out.glob(f"nelix_core-{version}-*.whl")]
     assert len(wheels) == 1, f"expected one {version} wheel, got {wheels}"
     return wheels[0]
 
@@ -332,10 +332,17 @@ def test_installing_the_same_inputs_twice_is_a_no_op(generations):
     """Content-addressed, so a re-install of unchanged code must not mint a second generation — nor
     rewrite the first, which is live."""
     home, build_a, _ = generations
-    wheel = next((home.parent / "dist").glob("*-0.1.0-*.whl"))
+    # Select the CORE wheel (not nelix_store/nelix_contracts)
+    wheel = next((home.parent / "dist").glob("nelix_core-0.1.0-*.whl"))
     manifest = paths.runtime_manifest(build_a)
     before = manifest.stat().st_mtime_ns
-    again = runtime.install(wheel, lock=REPO / RUNTIME_LOCK_NAME)
+    dist = home.parent / "dist"
+    extra = []
+    for pkg in ("nelix_contracts", "nelix_store"):
+        ew = next(dist.glob(f"{pkg}-0.1.0-*.whl"))
+        extra.append(ew)
+    again = runtime.install(wheel, lock=Path(__file__).resolve().parents[1] / RUNTIME_LOCK_NAME,
+                            extra_wheels=extra)
     assert again == build_a
     assert manifest.stat().st_mtime_ns == before, "a re-install rewrote a live generation"
     assert sorted(runtime.installed()) == sorted(set(runtime.installed()))

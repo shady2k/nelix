@@ -270,8 +270,17 @@ def _build_at(rt: Path, wheel: Path, lock: Path, base_python: Path,
             raise RuntimeInstallError(f"venv creation failed:\n{mk.stdout}\n{mk.stderr}")
 
         py = paths.runtime_python(build)
-        # --require-hashes covers the whole closure: the lock's pins by hash, and the wheel by the
-        # digest of the bytes we were handed. `uv pip install <wheel>` alone would preserve neither.
+        # Install local package wheels FIRST (no hash pinning — they ship with the core).
+        # Must be before the core wheel so its dependencies resolve (nelix-store depends on
+        # nelix-contracts). Install without --require-hashes since they're local.
+        for ew in extra_wheels:
+            ei = _run(["uv", "pip", "install", "--python", py, str(ew)],
+                      env={**env, "VIRTUAL_ENV": str(paths.runtime_dir(build) / "venv")})
+            if ei.returncode != 0:
+                raise RuntimeInstallError(f"extra wheel install failed ({ew}):\n{ei.stdout}\n{ei.stderr}")
+
+        # --require-hashes covers the whole third-party closure: the lock's pins by hash, and
+        # the wheel by the digest of the bytes we were handed.
         reqs = rt / "requirements.txt"
         reqs.write_text(f"{lock.read_text()}\n"
                         f"{wheel} --hash=sha256:{_file_sha256(wheel)}\n")
@@ -280,13 +289,6 @@ def _build_at(rt: Path, wheel: Path, lock: Path, base_python: Path,
         reqs.unlink()
         if inst.returncode != 0:
             raise RuntimeInstallError(f"runtime install failed:\n{inst.stdout}\n{inst.stderr}")
-
-        # Install local packages (no hash pinning — they ship with the core)
-        for ew in extra_wheels:
-            ei = _run(["uv", "pip", "install", "--python", py, str(ew)],
-                      env={**env, "VIRTUAL_ENV": str(paths.runtime_dir(build) / "venv")})
-            if ei.returncode != 0:
-                raise RuntimeInstallError(f"extra wheel install failed ({ew}):\n{ei.stdout}\n{ei.stderr}")
 
         _write_manifest(build, wheel, lock, base_python, python_version)
     except BaseException:

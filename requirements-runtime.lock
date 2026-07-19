@@ -13,10 +13,6 @@
 # The core wheel itself is NOT here: it is built, not resolved, so runtime.install() hashes the
 # wheel it was handed and folds that hash into the build id.
 #
-# nelix-9a4.4: nelix_store and nelix_contracts are LOCAL packages that ship as separate wheels
-# alongside the core. They are NOT third-party packages and cannot be hash-pinned — they are
-# built+installed together with the core wheel, not resolved from an index.
-#
 # Regenerate after changing pyproject.toml's dependencies:
 #   uv pip compile pyproject.toml --generate-hashes --no-header --python-version 3.11 \
 #     -o requirements-runtime.lock
