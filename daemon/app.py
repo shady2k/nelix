@@ -28,14 +28,19 @@ def build_reaper_ctx(grace):
 
 
 def transport_from_env():
+    """Return a Transport from env vars. NELIX_RPC_SOCK is REQUIRED for unix;
+    NELIX_RPC_HOST/NELIX_RPC_PORT/NELIX_RPC_TOKEN for TCP."""
     if os.environ.get("NELIX_RPC_TRANSPORT") == "tcp":
         return Transport.tcp(os.environ.get("NELIX_RPC_HOST", "127.0.0.1"),
                              int(os.environ["NELIX_RPC_PORT"]),
                              os.environ["NELIX_RPC_TOKEN"])
-    # `or`, not dict.get(k, default): get() evaluates its default EAGERLY, so the derived node
-    # would be built even when NELIX_RPC_SOCK names the socket explicitly. Harmless while
-    # rpc_sock() was total; a trap the moment anything about the derived path can fail.
-    return Transport.unix(os.environ.get("NELIX_RPC_SOCK") or str(paths.rpc_sock()))
+    # S1c-2: NELIX_RPC_SOCK is REQUIRED for per-generation daemons.
+    sock = os.environ.get("NELIX_RPC_SOCK")
+    if not sock:
+        raise RuntimeError(
+            "NELIX_RPC_SOCK is required for per-generation daemons; "
+            "the uid-wide rpc_sock fallback has been removed")
+    return Transport.unix(sock)
 
 
 def acquire_singleton(logger, transport=None):
@@ -51,14 +56,28 @@ def acquire_singleton(logger, transport=None):
         # adopts/probes the path the holder ACTUALLY bound rather than assuming the default.
         "path": transport.path if (transport is not None and transport.kind == "unix") else None,
     }
-    # When NELIX_GENERATION_ID is set, use the per-generation lock instead of the uid-wide one.
+    # S1c-2: NELIX_GENERATION_ID is REQUIRED for per-generation daemons.
     gid = os.environ.get("NELIX_GENERATION_ID")
-    if gid:
-        from nelix_contracts.ids import validate_generation_id
-        validate_generation_id(gid)
-        lock_path = paths.generation_lock(gid)
-    else:
-        lock_path = paths.daemon_lock()
+    if not gid:
+        raise RuntimeError(
+            "NELIX_GENERATION_ID is required for per-generation daemons; "
+            "the uid-wide daemon_lock fallback has been removed")
+    from nelix_contracts.ids import validate_generation_id
+    validate_generation_id(gid)
+    # S1c-2 / H10: NELIX_GENERATION_EPOCH is also REQUIRED and must be a valid
+    # generation-id-shaped string (same shape as generation_id).
+    epoch = os.environ.get("NELIX_GENERATION_EPOCH")
+    if not epoch:
+        raise RuntimeError(
+            "NELIX_GENERATION_EPOCH is required for per-generation daemons")
+    from nelix_contracts.ids import validate_generation_id as _validate_gid
+    try:
+        _validate_gid(epoch)
+    except Exception:
+        raise ValueError(
+            f"NELIX_GENERATION_EPOCH must be a valid generation-id-shaped string, "
+            f"got {epoch!r}") from None
+    lock_path = paths.generation_lock(gid)
     fd = singleton.acquire(lock_path, meta)
     if fd is None and logger is not None:
         holder = singleton.read_holder(lock_path)

@@ -22,6 +22,7 @@ def test_concurrency_limit_default_flows_config_to_app_to_manager(monkeypatch, t
     # Non-existent config → load_concurrency_limit returns the default 5
     monkeypatch.setenv("NELIX_CONFIG", str(tmp_path / "absent.toml"))
     monkeypatch.setenv("NELIX_RPC_TOKEN", "t")
+    monkeypatch.setenv("NELIX_RPC_SOCK", str(tmp_path / "gen.sock"))
 
     try:
         app.main()
@@ -54,6 +55,7 @@ def test_broker_set_before_server_built(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "acquire_singleton", lambda *a, **k: 7)   # fake lock fd
     monkeypatch.setattr(app.reaper, "reconcile_orphans", lambda *a, **k: [])
     monkeypatch.setenv("NELIX_RPC_TOKEN", "t")
+    monkeypatch.setenv("NELIX_RPC_SOCK", str(tmp_path / "gen.sock"))
 
     try:
         app.main()

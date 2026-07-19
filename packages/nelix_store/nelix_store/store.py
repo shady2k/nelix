@@ -515,13 +515,20 @@ class Store:
 
     @translates_sqlite
     def cas_epoch_serving(self, generation_id: str, generation_epoch: str, *,
-                          expected_current_epoch) -> None:
-        """CAS generations.current_epoch AND set epoch process_state='serving'.
+                          expected_current_epoch, incarnation_meta=None) -> None:
+        """Guarded CAS: promote epoch ``starting → serving`` + set ``generations.current_epoch``
+        + record ``incarnation_meta``.
 
-        In ONE transaction: atomically promotes the epoch to serving and records
-        it as the generation's current_epoch. Fails if expected_current_epoch
-        does not match (IDEMPOTENCY_CONFLICT) or another serving epoch exists
-        (the partial unique index enforces the latter).
+        ALL-OR-NOTHING in one transaction — verifies THREE things before writing:
+          1. The epoch BELONGS to the supplied generation (``generation_id`` matches).
+          2. The epoch's ``process_state`` is EXACTLY ``starting``.
+          3. The generation's ``current_epoch`` matches ``expected_current_epoch``.
+
+        Checks rowcounts on BOTH UPDATEs; rolls back on any miss. Fails if
+        any condition is violated (IDEMPOTENCY_CONFLICT) or generation/epoch not found.
+
+        ``incarnation_meta``, when provided, is written to epochs.incarnation_meta
+        in the SAME transaction (C7: records the observed incarnation on promotion).
         """
         if not isinstance(generation_id, str) or not generation_id:
             raise NelixError(INVALID_REQUEST,
@@ -529,9 +536,14 @@ class Store:
         if not isinstance(generation_epoch, str) or not generation_epoch:
             raise NelixError(INVALID_REQUEST,
                              f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        if incarnation_meta is not None and (not isinstance(incarnation_meta, str)
+                                             or not incarnation_meta):
+            raise NelixError(INVALID_REQUEST,
+                             f"incarnation_meta must be a non-empty string or None: "
+                             f"{incarnation_meta!r}")
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
-            # Verify expected_current_epoch matches.
+            # Verify 1: generation exists AND current_epoch matches expected.
             row = self._conn.execute(
                 "SELECT current_epoch FROM generations WHERE generation_id=?",
                 (generation_id,)).fetchone()
@@ -544,14 +556,38 @@ class Store:
                     IDEMPOTENCY_CONFLICT,
                     f"current_epoch {cur!r} does not match expected "
                     f"{expected_current_epoch!r}")
-            # Set current_epoch on generation AND process_state='serving' on epoch.
-            self._conn.execute(
-                "UPDATE generations SET current_epoch=? WHERE generation_id=?",
-                (generation_epoch, generation_id))
-            self._conn.execute(
-                "UPDATE epochs SET process_state='serving' "
+            # Verify 2: epoch belongs to this generation AND is exactly 'starting'.
+            ep_row = self._conn.execute(
+                "SELECT process_state FROM epochs "
                 "WHERE generation_epoch=? AND generation_id=?",
-                (generation_epoch, generation_id))
+                (generation_epoch, generation_id)).fetchone()
+            if ep_row is None:
+                raise NelixError(
+                    IDEMPOTENCY_CONFLICT,
+                    f"epoch {generation_epoch!r} does not belong to generation "
+                    f"{generation_id!r}")
+            if ep_row["process_state"] != "starting":
+                raise NelixError(
+                    IDEMPOTENCY_CONFLICT,
+                    f"epoch {generation_epoch!r} is not starting "
+                    f"(actual: {ep_row['process_state']!r})")
+            # Now: update BOTH (or THREE with incarnation_meta), check rowcounts.
+            rc1 = self._conn.execute(
+                "UPDATE generations SET current_epoch=? WHERE generation_id=?",
+                (generation_epoch, generation_id)).rowcount
+            if incarnation_meta is not None:
+                rc2 = self._conn.execute(
+                    "UPDATE epochs SET process_state='serving', incarnation_meta=? "
+                    "WHERE generation_epoch=? AND generation_id=?",
+                    (incarnation_meta, generation_epoch, generation_id)).rowcount
+            else:
+                rc2 = self._conn.execute(
+                    "UPDATE epochs SET process_state='serving' "
+                    "WHERE generation_epoch=? AND generation_id=?",
+                    (generation_epoch, generation_id)).rowcount
+            if rc1 != 1 or rc2 != 1:
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 "CAS: rowcount mismatch during promotion")
 
     @translates_sqlite
     def set_epoch_process_state(self, generation_epoch: str, state: str) -> None:
@@ -604,7 +640,8 @@ class Store:
 
     @translates_sqlite
     def list_epochs(self, generation_id: str) -> list:
-        """List epochs for a generation, ordered by created_at."""
+        """List epochs for a generation, ordered by created_at.
+        SKIPS malformed rows (board semantics: one bad row must not blind the caller)."""
         if not isinstance(generation_id, str) or not generation_id:
             raise NelixError(INVALID_REQUEST,
                              f"generation_id must be a non-empty string: {generation_id!r}")
@@ -615,6 +652,24 @@ class Store:
             (generation_id,)).fetchall()
         records, _skipped = _read_rows(rows, EpochRecord)
         return records
+
+    @translates_sqlite
+    def list_epochs_strict(self, generation_id: str) -> list:
+        """List epochs for a generation, ordered by created_at.
+        FAIL-CLOSED on any malformed row (authority semantics: reconciliation must not
+        skip a row that may hold critical state). Uses _decode_stored instead of _read_rows."""
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        rows = self._conn.execute(
+            "SELECT generation_epoch, generation_id, process_state, retirement_state, "
+            "certificate, final_high_water, incarnation_meta, created_at "
+            "FROM epochs WHERE generation_id=? ORDER BY created_at",
+            (generation_id,)).fetchall()
+        out = []
+        for row in rows:
+            out.append(_decode_stored(EpochRecord, row))
+        return out
 
     @translates_sqlite
     def get_generation(self, generation_id: str) -> GenerationRecord:
@@ -662,6 +717,26 @@ class Store:
                              f"no such generation: {generation_id}")
 
     @translates_sqlite
+    def set_current_epoch(self, generation_id: str, generation_epoch: str) -> None:
+        """DIRECT update of generations.current_epoch — used ONLY for repairing
+        a dangling NULL pointer to a live serving epoch.  This is NOT a CAS; it is
+        a targeted repair.  Callers must verify the epoch is serving first."""
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                "UPDATE generations SET current_epoch=? WHERE generation_id=?",
+                (generation_epoch, generation_id))
+        if cur.rowcount == 0:
+            raise NelixError(UNKNOWN_SESSION,
+                             f"no such generation: {generation_id}")
+
+    @translates_sqlite
     def set_generation_confirmed_high_water(self, generation_epoch: str, seq: int) -> None:
         """Monotonic advance of generation_progress.confirmed_high_water for an epoch.
 
@@ -683,3 +758,64 @@ class Store:
             "UPDATE generation_progress SET confirmed_high_water = MAX("
             "confirmed_high_water, ?) WHERE generation_id=?",
             (seq, generation_epoch))
+
+    @translates_sqlite
+    def list_generations(self) -> list:
+        """Return ALL generation rows, deterministic order. FAIL-CLOSED on
+        any malformed row — does NOT skip unreadable rows (unlike _read_rows
+        which is designed for list_sessions/list_terminal's board semantics)."""
+        rows = self._conn.execute(
+            "SELECT generation_id, build_id, lifecycle_state, current_epoch, "
+            "capability_snapshot, created_at "
+            "FROM generations ORDER BY created_at, generation_id"
+        ).fetchall()
+        out = []
+        for row in rows:
+            out.append(_decode_stored(GenerationRecord, row))
+        return out
+
+    @translates_sqlite
+    def reconcile_epoch_dead(self, generation_id: str,
+                              generation_epoch: str) -> None:
+        """One transaction: set this epoch ``dead`` AND clear ``current_epoch``
+        ONLY if it still points to this exact epoch.
+
+        Idempotent for an already-dead epoch (returns without error).
+        REJECTS a generation/epoch ownership mismatch (epoch belongs to a
+        different generation — raises IDEMPOTENCY_CONFLICT).
+
+        If the epoch is already dead but ``current_epoch`` still dangles,
+        still clears the dangling pointer (spec §7.7).
+        """
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            # Verify ownership: the epoch belongs to THIS generation.
+            ep_row = self._conn.execute(
+                "SELECT process_state FROM epochs "
+                "WHERE generation_epoch=? AND generation_id=?",
+                (generation_epoch, generation_id)).fetchone()
+            if ep_row is None:
+                raise NelixError(
+                    IDEMPOTENCY_CONFLICT,
+                    f"epoch {generation_epoch!r} does not belong to generation "
+                    f"{generation_id!r}")
+
+            if ep_row["process_state"] != "dead":
+                # Mark the epoch dead.
+                self._conn.execute(
+                    "UPDATE epochs SET process_state='dead' "
+                    "WHERE generation_epoch=? AND generation_id=?",
+                    (generation_epoch, generation_id))
+
+            # Clear current_epoch ONLY if it still points to this exact epoch.
+            # NEVER advance to another epoch; NEVER clear a newer epoch's pointer.
+            self._conn.execute(
+                "UPDATE generations SET current_epoch=NULL "
+                "WHERE generation_id=? AND current_epoch=?",
+                (generation_id, generation_epoch))

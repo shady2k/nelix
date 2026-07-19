@@ -47,29 +47,14 @@ def config_path() -> Path:
     return nelix_root() / "nelix.toml"
 
 
-def state_file() -> Path:
-    return nelix_root() / ".active.json"
-
-
-def rpc_sock() -> Path:
-    """AF_UNIX socket node for the local RPC transport. Lives in the 0700 nelix_root (so the node
-    inherits a private dir); the node itself is created 0600 by the daemon at bind time.
-
-    A pure accessor: it does NOT check sun_path. See sun_path_overflow() for why not, and for
-    who does.
-    """
-    return nelix_root() / "rpc.sock"
-
-
 def sun_path_overflow(path) -> str | None:
     """Why `path` cannot be an AF_UNIX node on this platform, or None if it fits.
 
-    Returns a reason instead of raising, and lives here rather than inside rpc_sock(), because
-    rpc_sock() is a path accessor and an accessor that throws breaks every caller that only
-    wants the string. That is measured, not hypothetical: pytest's own tmp_path on macOS is
-    ~125 bytes, so a checking rpc_sock() red-lights tests that never bind a thing. The BIND
-    site raises — that is where the limit is actually enforced, and it is the only place that
-    knows a bind is about to happen.
+    Returns a reason instead of raising. A path accessor that throws breaks every
+    caller that only wants the string. That is measured, not hypothetical: pytest's
+    own tmp_path on macOS is ~125 bytes, so a checking accessor red-lights tests
+    that never bind a thing. The BIND site raises — that is where the limit is
+    actually enforced, and it is the only place that knows a bind is about to happen.
 
     Worth guarding at all because $NELIX_HOME is operator-settable now: an unguarded bind fails
     with a bare OSError("AF_UNIX path too long") naming neither the path, the limit, nor the
@@ -270,25 +255,9 @@ def child_record(session_dir) -> Path:
     return Path(session_dir) / "child.json"
 
 
-def daemon_lock() -> Path:
-    """Advisory single-daemon lock for this nelix_root (one daemon per NELIX_HOME)."""
-    return nelix_root() / "daemon.lock"
-
-
 def logs_dir() -> Path:
     return nelix_root() / "logs"
 
-
-def daemon_log(stamp: str, pid: int) -> Path:
-    return logs_dir() / f"daemon-{stamp}-{pid}.log"
-
-
-def daemon_latest() -> Path:
-    return logs_dir() / "daemon-latest.log"
-
-
-# Per-spawn files only. Two wildcards ⇒ never matches single-dash daemon-latest.log.
-DAEMON_LOG_GLOB = "daemon-*-*.log"
 
 # Per-generation log glob (only daemon spawn logs, never latest-pointers or other files).
 GENERATION_LOG_GLOB = "gen-*-*-*.log"

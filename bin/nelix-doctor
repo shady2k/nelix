@@ -19,8 +19,8 @@ import yaml                                    # ships with the tooling venv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import paths                                   # noqa: E402
-import supervisor                              # noqa: E402
-from daemon import reaper, singleton           # noqa: E402
+from generation_supervisor import GenerationSupervisor  # noqa: E402
+from daemon import reaper           # noqa: E402
 
 
 def _scan_strays(inspector):
@@ -121,32 +121,77 @@ def _disk_sessions():
 
 def collect(inspector=None):
     inspector = inspector or reaper.ProcessInspector()
-    transport = supervisor.endpoint()
-    holder = singleton.read_holder(paths.daemon_lock())
-    # The session inventory comes from DISK, not from /status.
-    #
-    # /status is owner-filtered now (daemon/owner.py) and doctor has no owner: it diagnoses the
-    # HOST, it does not drive sessions. The alternatives were both worse than reading the disk —
-    # an operator/wildcard mode on /status would hand the whole board back to any caller that
-    # asked for it, which is the exact bug owners exist to close, and guessing an owner would
-    # report one harness's world as if it were the machine's.
-    #
-    # Reading the sessions root is strictly better for a diagnostic anyway: it is the same place
-    # _scan_strays already looks, and it still answers when the daemon is DEAD — which is when
-    # doctor is actually run. The meaning shifts from "sessions this daemon admits to" to
-    # "session state on this host", which is the question being asked.
+    # S1c-2: enumerate generations from durable store + per-generation lock holders.
+    generations = []
+    try:
+        from nelix_store.store import Store
+        store = Store(paths.nelix_root())
+        try:
+            gen_rows = store.list_generations()
+        except Exception:
+            gen_rows = []
+        finally:
+            store.close()
+    except Exception:
+        gen_rows = []
+
+    for gr in gen_rows:
+        try:
+            sup = GenerationSupervisor(gr.generation_id, gr.build_id)
+            holder = sup._live_lock_holder()
+            transport = sup.endpoint()
+            gen_info = {
+                "generation_id": gr.generation_id,
+                "build_id": gr.build_id,
+                "lifecycle_state": gr.lifecycle_state,
+                "current_epoch": gr.current_epoch,
+                "holder_alive": holder is not None,
+                "daemon_alive": transport is not None,
+                "lock_holder": holder,
+            }
+        except Exception:
+            gen_info = {
+                "generation_id": gr.generation_id,
+                "build_id": gr.build_id,
+                "lifecycle_state": gr.lifecycle_state,
+                "current_epoch": gr.current_epoch,
+                "error": "failed to inspect",
+            }
+        generations.append(gen_info)
+
+    # Dir-only orphans: directories under generations/ with no DB row.
+    dir_orphans = []
+    gen_ids_in_db = {g.generation_id for g in gen_rows}
+    try:
+        for d in paths.generations_root().iterdir():
+            if d.is_dir() and d.name not in gen_ids_in_db:
+                dir_orphans.append(str(d))
+    except OSError:
+        pass
+
+    transport = None
+    for g in generations:
+        if g.get("daemon_alive"):
+            if g.get("lock_holder") and g["lock_holder"].get("transport") == "unix":
+                transport = g["lock_holder"]
+                break
+
     sessions = _disk_sessions()
-    if transport is not None and transport.kind == "tcp":
-        base_url = f"http://{transport.host}:{transport.port}"
+    if transport is not None and isinstance(transport, dict):
+        base_url = transport.get("path")
     elif transport is not None:
-        base_url = str(transport.path)
+        base_url = None
     else:
         base_url = None
-    return {"daemon": {"alive": transport is not None, "base": base_url},
+
+    return {"daemon": {"alive": len([g for g in generations if g.get("daemon_alive")]) > 0,
+                       "base": base_url},
             "nelix_home": {"root": str(paths.nelix_root()),
                            "config": str(paths.config_path()),
                            "config_present": paths.config_path().is_file()},
-            "lock_holder": holder, "sessions": sessions,
+            "generations": generations,
+            "dir_orphans": dir_orphans,
+            "sessions": sessions,
             "strays": _scan_strays(inspector),
             "hermes_wiring": hermes_wiring()}
 

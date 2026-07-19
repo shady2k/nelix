@@ -33,6 +33,8 @@ class FakePty:
 def _run(monkeypatch, spec, **kw):
     for var in ("NELIX_SESSION", "NELIX_HOOK_SOCK", "NELIX_HOOK_SECRET"):
         monkeypatch.delenv(var, raising=False)
+    # S1c-2: NELIX_RPC_SOCK is required for per-generation daemon hooks.
+    monkeypatch.setenv("NELIX_RPC_SOCK", "/tmp/dummy-daemon.sock")
     captured = {}
     monkeypatch.setattr(local, "get_broker", lambda: FakeBroker(captured))
     monkeypatch.setattr(local, "PtySession", FakePty)

@@ -33,6 +33,8 @@ def _run(monkeypatch, spec, **kw):
     # "no injection" assertions (resolved_env() copies os.environ).
     for var in ("NELIX_SESSION", "NELIX_HOOK_SOCK", "NELIX_HOOK_SECRET"):
         monkeypatch.delenv(var, raising=False)
+    # S1c-2: NELIX_RPC_SOCK is required for per-generation daemon hooks.
+    monkeypatch.setenv("NELIX_RPC_SOCK", str(paths.router_sock()))
     captured = {}
     monkeypatch.setattr(local, "get_broker", lambda: FakeBroker(captured))
     monkeypatch.setattr(local, "PtySession", FakePty)
@@ -50,7 +52,7 @@ def test_local_launcher_injects_hooks_for_claude(monkeypatch):
     json.loads(cap["argv"][i + 1])               # the value is valid JSON
     assert cap["env"]["NELIX_SESSION"] == "s-1"
     assert cap["env"]["NELIX_HOOK_SECRET"] == "sek"
-    assert cap["env"]["NELIX_HOOK_SOCK"] == str(paths.rpc_sock())
+    assert cap["env"]["NELIX_HOOK_SOCK"] == str(paths.router_sock())
 
 
 def test_merges_user_supplied_settings_instead_of_clobbering(monkeypatch):

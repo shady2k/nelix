@@ -18,6 +18,7 @@ _EPOCH = "r-" + "0" * 32
 def wired():
     backend = Backend(build_id="b-real-1")
     registry = GenerationRegistry(supervisor=Supervisor(backend.transport),
+                                  build_id=backend.build_id,
                                   health_probe=lambda t: backend.build_id)
     ops = OperatorRoutes(registry, _EPOCH)
     yield ops, registry, backend

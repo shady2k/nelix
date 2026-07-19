@@ -17,7 +17,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import paths  # noqa: E402
 import runtime  # noqa: E402
-import supervisor  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -26,7 +25,6 @@ def _home(monkeypatch, tmp_path):
     monkeypatch.delenv("NELIX_RUNTIME", raising=False)
     importlib.reload(paths)
     importlib.reload(runtime)
-    importlib.reload(supervisor)
     yield
 
 
@@ -190,59 +188,3 @@ def test_a_current_pointing_at_a_partial_runtime_is_not_active():
     paths.ensure_private_dir(paths.runtimes_root())
     paths.runtime_current().symlink_to("0.1.0-partial")
     assert runtime.active() is None
-
-
-# ---------------------------------------------------------------- supervisor wiring
-
-def test_daemon_argv_uses_the_active_runtimes_interpreter():
-    """The pin point. This interpreter becomes the daemon's sys.executable, and broker_client.py
-    respawns the PTY broker with exactly that — so a generation re-enters its own frozen code."""
-    _fake_runtime("0.1.0-gen")
-    runtime.activate("0.1.0-gen")
-    assert supervisor._daemon_argv() == [str(paths.runtime_python("0.1.0-gen")), "-m", "daemon.app"]
-
-
-def test_daemon_argv_falls_back_to_sys_executable_in_a_checkout():
-    assert supervisor._daemon_argv() == [sys.executable, "-m", "daemon.app"]
-
-
-def test_a_runtime_daemon_does_not_get_the_checkout_on_its_path():
-    """PYTHONPATH PRECEDES site-packages, so injecting the checkout — which is how a checkout makes
-    `import daemon.app` work — would hand a pinned generation the WORKING TREE's code and undo the
-    entire version-addressed directory. Scrubbed, not merely un-injected: an inherited PYTHONPATH
-    leaks a repo in just as well as one we add."""
-    _fake_runtime("0.1.0-gen")
-    runtime.activate("0.1.0-gen")
-    env = supervisor._apply_code_source({"PYTHONPATH": "/somewhere/else", "PYTHONHOME": "/ph"})
-    assert "PYTHONPATH" not in env, "the runtime daemon can import code from outside its generation"
-    assert "PYTHONHOME" not in env
-    assert env["PYTHONNOUSERSITE"] == "1"
-
-
-def test_a_runtime_daemon_does_not_run_from_the_checkout_directory():
-    """cwd is a code source too (sys.path[0]); the runtime must not sit in the repo."""
-    _fake_runtime("0.1.0-gen")
-    runtime.activate("0.1.0-gen")
-    assert supervisor._daemon_cwd() != str(supervisor.PLUGIN_ROOT)
-
-
-def test_a_checkout_daemon_still_gets_the_checkout_injected():
-    """The dev loop: there, the checkout IS the install."""
-    env = supervisor._apply_code_source({})
-    assert env["PYTHONPATH"].split(os.pathsep)[0] == str(supervisor.PLUGIN_ROOT)
-    assert supervisor._daemon_cwd() == str(supervisor.PLUGIN_ROOT)
-
-
-def test_the_deps_hack_is_gone():
-    """It papered over an interpreter that could import daemon.app without having installed the
-    core. After nelix-9a4.1 there is no such interpreter — installing the core brings wasmtime with
-    it — and a generation gets both frozen in by runtime.install(). Reintroducing any of this would
-    mean a daemon mutating its own interpreter at spawn time, which an immutable runtime forbids;
-    the `hermes_cli` import also had a core module asking a harness for permission to install its
-    own dependencies."""
-    for gone in ("_ensure_deps", "_venv_pip_install", "_deps_present",
-                 "_lazy_installs_allowed", "_resolve_uv", "_DAEMON_DEPS",
-                 "_DAEMON_MODULES", "_DAEMON_LOCK"):
-        assert not hasattr(supervisor, gone), f"supervisor.{gone} is back"
-    assert "hermes_cli" not in Path(supervisor.__file__).read_text().split('"""', 2)[2], \
-        "supervisor imports a harness's config again"

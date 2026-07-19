@@ -97,7 +97,9 @@ def test_router_sock_path_length_is_independent_of_nelix_home_depth(monkeypatch,
     deep = tmp_path / ("d" * 200)
     monkeypatch.setenv("NELIX_HOME", str(deep))
     importlib.reload(paths)
-    assert paths.sun_path_overflow(paths.rpc_sock()) is not None      # the OLD location overflows
+    # A path under NELIX_HOME (like the old rpc_sock) overflows.
+    old_style = paths.nelix_root() / "rpc.sock"
+    assert paths.sun_path_overflow(old_style) is not None      # the OLD location overflows
     assert paths.sun_path_overflow(paths.router_sock()) is None      # the router's does not
 
 
