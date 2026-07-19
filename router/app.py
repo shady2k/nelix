@@ -68,11 +68,13 @@ def main() -> None:
         store = Store(paths.nelix_root())
         # Bootstrap: pin the active runtime's build_id so the registry NEVER
         # spawns a daemon from checkout code (spec §7.9 / C8).
-        # C8: ONLY ImportError (no runtime module) means "dev checkout".
-        # Any OTHER exception during runtime discovery (broken runtime) must FAIL.
+        # C8: ONLY ModuleNotFoundError(name='runtime') means "no runtime" (dev checkout).
+        # Any other ImportError (broken module, missing export) must PROPAGATE.
         try:
             from runtime import active
-        except ImportError:
+        except ModuleNotFoundError as e:
+            if e.name != "runtime":
+                raise
             active_runtime = None
         else:
             active_runtime = active()  # let RuntimeError propagate — fail closed

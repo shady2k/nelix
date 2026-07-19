@@ -5,7 +5,6 @@ single-flight, incarnation-guarded reap, eager re-adoption in constructor.
 """
 import json
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -161,10 +160,14 @@ class GenerationRegistry:
                     _log.info("registry: repairing NULL current_epoch -> %s (serving, live)",
                               se.generation_epoch)
                     # C4: DIRECT repair of the dangling pointer.
+                    # Must NOT swallow the failure — a NULL pointer with a live
+                    # daemon is an inconsistency; don't return an active handle.
                     try:
                         self._store.set_current_epoch(gid, se.generation_epoch)
                     except NelixError:
-                        pass
+                        _log.error("registry: failed to repair NULL current_epoch -> %s; "
+                                   "aborting adoption", se.generation_epoch)
+                        raise
                     self._active = {
                         "incarnation": inc, "epoch": se.generation_epoch,
                         "generation_id": gid, "transport": transport,
@@ -192,6 +195,14 @@ class GenerationRegistry:
                 if (identity.get("generation_id") == gid
                         and identity.get("generation_epoch") == se.generation_epoch
                         and identity.get("build_id") == build_id):
+                    # C1: Re-read holder BEFORE CAS — incarnation must not have changed.
+                    re_read = sup._live_lock_holder()
+                    if (not re_read
+                            or re_read.get("pid") != holder["pid"]
+                            or re_read.get("start_fingerprint") != holder.get("start_fingerprint")):
+                        _log.warning("registry: holder changed before NULL-starting eager CAS; "
+                                     "aborting promotion without reaping replacement")
+                        return
                     inc = {"pid": holder["pid"],
                            "start_fingerprint": holder.get("start_fingerprint")}
                     _log.info("registry: repairing NULL current_epoch → promoting starting %s",
@@ -215,8 +226,12 @@ class GenerationRegistry:
             # reconcile all remaining starting/serving to dead.
             if self._active is not None:
                 # We already adopted a serving/starting epoch above.
-                # Just clean up any remaining starting epochs.
+                # Just clean up any remaining starting epochs — EXCLUDE the
+                # one we just promoted (it's now serving, not dead).
+                adopted_epoch = self._active.get("epoch")
                 for se in starting:
+                    if adopted_epoch is not None and se.generation_epoch == adopted_epoch:
+                        continue
                     try:
                         self._store.reconcile_epoch_dead(gid, se.generation_epoch)
                     except NelixError:
@@ -438,11 +453,15 @@ class GenerationRegistry:
                 if epoch_found:
                     # C4: DIRECT repair — set current_epoch to the serving epoch.
                     # Do NOT use cas_epoch_serving (which requires 'starting' state).
+                    # Must NOT swallow the failure — don't return an active handle
+                    # while the durable pointer is still NULL.
                     _log.warning("registry: repairing NULL current_epoch -> %s", epoch)
                     try:
                         self._store.set_current_epoch(gid, epoch)
                     except NelixError:
-                        pass  # best effort; pointer will be fixed on next write
+                        _log.error("registry: failed to repair NULL current_epoch -> %s; "
+                                   "aborting", epoch)
+                        raise
                 else:
                     raise NelixError(GENERATION_UNAVAILABLE,
                                      f"generation {gid} current_epoch is NULL and "
@@ -461,6 +480,32 @@ class GenerationRegistry:
                 raise NelixError(GENERATION_UNAVAILABLE,
                                  f"generation {gid} current_epoch changed to "
                                  f"{gen_rec.current_epoch!r}, expected {epoch!r}")
+            else:
+                # C4: current_epoch == epoch — verify the epoch row is 'serving'.
+                # A dead/starting/missing row with a matching pointer must NOT
+                # be routed; the pointer is stale.
+                epoch_list = self._store.list_epochs_strict(gid)
+                matched = [e for e in epoch_list
+                           if e.generation_epoch == epoch]
+                if not matched:
+                    raise NelixError(GENERATION_UNAVAILABLE,
+                                     f"generation {gid} current_epoch {epoch!r} "
+                                     f"has no matching epoch row")
+                if matched[0].process_state != "serving":
+                    raise NelixError(GENERATION_UNAVAILABLE,
+                                     f"generation {gid} current_epoch {epoch!r} "
+                                     f"is not serving (actual: {matched[0].process_state})")
+
+        # TOCTOU: Re-read the holder after all health/store checks and
+        # before RETURNING the handle. If the holder changed (A→B), do not
+        # return A's identity with a transport now reaching B.
+        re_read = sup._live_lock_holder()
+        if (not re_read
+                or re_read.get("pid") != current.get("pid")
+                or re_read.get("start_fingerprint") != current.get("start_fingerprint")):
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             f"generation {gid} holder changed during refresh; "
+                             f"aborting without adopting replacement")
 
         self._active["transport"] = transport
         self._active["incarnation"] = current
@@ -490,13 +535,15 @@ class GenerationRegistry:
                 build_id = gr.build_id  # H9: use the PINNED build, never override
 
         if gid is None:
-            # C8: ONLY ImportError means "no runtime" (dev checkout).
-            # Any other exception during runtime discovery must propagate.
             if build_id is None:
+                # C8: ONLY ModuleNotFoundError(name='runtime') means "no runtime"
+                # (dev checkout). A broken module / missing 'active' export MUST
+                # PROPAGATE — fail closed, never silently use None.
                 try:
                     from runtime import active
-                except ImportError:
-                    pass
+                except ModuleNotFoundError as e:
+                    if e.name != "runtime":
+                        raise
                 else:
                     build_id = active()  # let RuntimeError propagate — fail closed
             if build_id is None:

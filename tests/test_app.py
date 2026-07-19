@@ -37,7 +37,7 @@ def test_acquire_singleton_second_call_conflicts(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     monkeypatch.setenv("NELIX_GENERATION_ID", "g-11111111111111111111111111111111")
     monkeypatch.setenv("NELIX_GENERATION_EPOCH", "g-22222222222222222222222222222222")
-    import importlib, io, paths
+    import importlib, io
     importlib.reload(paths)
     from daemon import app, singleton
     from daemon.obs import Logger
@@ -93,7 +93,7 @@ def test_transport_from_env_defaults_to_unix(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     monkeypatch.delenv("NELIX_RPC_TRANSPORT", raising=False)
     monkeypatch.setenv("NELIX_RPC_SOCK", str(tmp_path / "gen.sock"))
-    import importlib, paths
+    import importlib
     importlib.reload(paths)
     t = app.transport_from_env()
     assert t.kind == "unix" and t.path == str(tmp_path / "gen.sock")

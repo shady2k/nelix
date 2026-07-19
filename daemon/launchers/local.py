@@ -1,7 +1,6 @@
 import json
 import os
 
-import paths
 from daemon.broker_client import get_broker
 from daemon.drivers import DRIVERS
 from daemon.env_resolver import resolve_env_cmds

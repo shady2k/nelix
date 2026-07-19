@@ -253,7 +253,6 @@ def test_health_returns_expected_identity(monkeypatch, tmp_path):
 def test_adoption_rejects_mismatched_identity():
     """A daemon whose /health reports a WRONG epoch or build MUST be rejected,
     not adopted. Uses a fake daemon on a unix socket."""
-    import socket as _sock
     gid = new_generation_id()
     wrong_epoch = new_generation_id()
     correct_epoch = new_generation_id()
@@ -423,6 +422,7 @@ def test_daemon_app_acquire_singleton_requires_generation_id(monkeypatch, tmp_pa
 def test_daemon_app_acquire_singleton_requires_generation_epoch(monkeypatch, tmp_path):
     """When NELIX_GENERATION_EPOCH is missing or invalid,
     daemon.app.acquire_singleton() must RAISE."""
+    monkeypatch.delenv("NELIX_GENERATION_EPOCH", raising=False)
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     monkeypatch.setenv("NELIX_GENERATION_ID",
                        "g-11111111111111111111111111111111")

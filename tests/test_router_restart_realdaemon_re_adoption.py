@@ -20,7 +20,7 @@ import paths
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon import reaper
 from nelix_contracts.errors import (
-    GENERATION_UNAVAILABLE, IDEMPOTENCY_CONFLICT, NelixError,
+    GENERATION_UNAVAILABLE, NelixError,
 )
 from nelix_contracts.ids import new_generation_id
 from nelix_store.store import Store
@@ -165,6 +165,17 @@ def test_eager_readopt_wrong_epoch_rejected():
         gen = store.get_generation(gid)
         assert gen.current_epoch is None, (
             f"current_epoch should be NULL after reconcile, got {gen.current_epoch!r}")
+
+        # S1c-2 round-4: call active() — it must NOT return a handle bound to E2.
+        # Since E was reconciled dead and E2 is not in the DB, active() must raise
+        # GENERATION_UNAVAILABLE (cannot adopt an unknown epoch).
+        from unittest.mock import patch
+        from generation_supervisor import GenerationSupervisor
+        with patch.object(GenerationSupervisor, 'reap_holder', return_value=None):
+            with pytest.raises(NelixError) as exc:
+                reg.active()
+            assert exc.value.code == GENERATION_UNAVAILABLE, (
+                f"expected GENERATION_UNAVAILABLE, got {exc.value.code}")
     finally:
         _teardown(daemon_srv)
 
@@ -221,7 +232,7 @@ def test_null_current_epoch_repaired():
         # Build registry — eager reconcile runs in constructor.
         # It should find the serving epoch E, detect NULL current_epoch,
         # and repair the pointer via set_current_epoch.
-        reg = GenerationRegistry(store=Store(paths.nelix_root()), build_id=None)
+        _ = GenerationRegistry(store=Store(paths.nelix_root()), build_id=None)
 
         # The durable pointer must now be repaired to E.
         gen_rec_after = store.get_generation(gid)
@@ -234,36 +245,63 @@ def test_null_current_epoch_repaired():
 # ── S1-T4: non-serving current_epoch rejected ────────────────────────────────
 
 def test_refresh_rejects_nonserving_pointer():
-    """Seed current_epoch=NULL + serving epoch E + starting epoch S.
-    Eager reconcile must repair NULL → E (daemon reports E), not route to S."""
+    """Set up a serving daemon, then corrupt the DB so current_epoch
+    points at a dead (and separately a starting) epoch.  active() must
+    hit _refresh_active_locked's equal-pointer state check and REJECT."""
+    from unittest.mock import patch
+    from generation_supervisor import GenerationSupervisor
+
     gid = new_generation_id()
-    gepoch_serving = new_generation_id()
+    gepoch = new_generation_id()
     gepoch_starting = new_generation_id()
 
-    store, daemon_srv, _port, _token = _setup_gen_and_daemon(gid, gepoch_serving, None)
+    store, daemon_srv, _port, _token = _setup_gen_and_daemon(gid, gepoch, None)
     try:
         inc_meta = json.dumps({"pid": os.getpid(), "start_fingerprint": "fp"})
-        store.cas_epoch_serving(gid, gepoch_serving, expected_current_epoch=None,
+        store.cas_epoch_serving(gid, gepoch, expected_current_epoch=None,
                                 incarnation_meta=inc_meta)
 
-        # Clear current_epoch + insert a starting epoch.
-        store.clear_current_epoch(gid)
-        store.insert_epoch(gepoch_starting, gid, incarnation_meta=None, created_at=3000.0)
-
-        # Build registry — eager reconcile repairs NULL → gepoch_serving.
+        # Build registry — eager reconcile runs, adopts the serving epoch.
         reg = GenerationRegistry(store=Store(paths.nelix_root()), build_id=None)
 
-        # The durable pointer must be repaired to gepoch_serving (daemon reports it).
-        gen_after = store.get_generation(gid)
-        assert gen_after.current_epoch == gepoch_serving, (
-            f"current_epoch not repaired to serving epoch: {gen_after.current_epoch!r}")
+        # First active() call: should succeed (serving epoch matched).
+        gen_first = reg.active()
+        assert gen_first.epoch == gepoch
 
-        # gepoch_starting should have been reconciled dead (no matching holder).
+        # ── Dead case ──
+        # Corrupt the DB: set the epoch to 'dead' but keep current_epoch=E.
+        store.reconcile_epoch_dead(gid, gepoch)
+        store.set_current_epoch(gid, gepoch)
         epoch_list = store.list_epochs_strict(gid)
-        s_row = [e for e in epoch_list if e.generation_epoch == gepoch_starting]
-        assert s_row, "Starting epoch S not found"
-        assert s_row[0].process_state == "dead", (
-            f"Starting epoch S not reconciled dead: {s_row[0].process_state}")
+        dead_check = [e for e in epoch_list if e.generation_epoch == gepoch]
+        assert dead_check and dead_check[0].process_state == "dead"
+
+        # active() hits _refresh_active_locked → store says current_epoch==epoch
+        # but epoch is dead → must raise.
+        with patch.object(GenerationSupervisor, 'reap_holder', return_value=None):
+            with pytest.raises(NelixError) as exc:
+                reg.active()
+            assert exc.value.code == GENERATION_UNAVAILABLE
+
+        # ── Starting case ──
+        # Create a DIFFERENT starting epoch, set current_epoch to it, then
+        # swap _active's epoch so the refresh sees a matching pointer to a
+        # starting (non-serving) epoch.
+        store.insert_epoch(gepoch_starting, gid, incarnation_meta=None, created_at=600.0)
+        store.set_current_epoch(gid, gepoch_starting)
+        # Swap _active's epoch to match the starting pointer.
+        reg._active["epoch"] = gepoch_starting
+
+        epoch_list2 = store.list_epochs_strict(gid)
+        start_check = [e for e in epoch_list2 if e.generation_epoch == gepoch_starting]
+        assert start_check and start_check[0].process_state == "starting"
+
+        # active() hits _refresh_active_locked → matching pointer but epoch
+        # is not serving → must raise.
+        with patch.object(GenerationSupervisor, 'reap_holder', return_value=None):
+            with pytest.raises(NelixError) as exc2:
+                reg.active()
+            assert exc2.value.code == GENERATION_UNAVAILABLE
     finally:
         _teardown(daemon_srv)
 

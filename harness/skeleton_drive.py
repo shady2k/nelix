@@ -11,7 +11,6 @@ S1c-2 / H14: routes through the router, using the orchestration /wait
 (owner_id + orchestration_id + vector cursor).
 """
 
-import json
 import os
 import sys
 import time
@@ -40,7 +39,6 @@ def main():
     start = _client().start(executor, task, cwd)
     sid = start["session_id"]
     orchestration_id = start.get("orchestration_id", sid)
-    after = int(start.get("next_after_seq", 0))
     print(f"[harness] started {sid} as owner {OWNER_ID}: {task}")
 
     # H14: Use the router's orchestration /wait with owner_id + orchestration_id + cursor.

@@ -485,8 +485,6 @@ def test_guarded_cas_rejects_wrong_ownership():
     """cas_epoch_serving must REJECT an epoch that belongs to a DIFFERENT
     generation, and must reject promotion from 'dead' or 'serving' state."""
     from nelix_store.store import Store
-    from nelix_store.ledger import StartLedger
-    from nelix_contracts.errors import IDEMPOTENCY_CONFLICT
 
     store = Store(paths.nelix_root())
     gid_a = new_generation_id()
@@ -506,7 +504,6 @@ def test_guarded_cas_rejects_wrong_ownership():
         f"Expected IDEMPOTENCY_CONFLICT, got {exc.value.code}")
 
     # After setting epoch to dead, CAS must reject (can't promote from dead).
-    import json as _json
     store.reconcile_epoch_dead(gid_b, epoch_b)
     with pytest.raises(NelixError) as exc2:
         store.cas_epoch_serving(gid_b, epoch_b, expected_current_epoch=None)
@@ -517,7 +514,6 @@ def test_guarded_cas_rolls_back_on_rowcount_mismatch():
     """When rowcounts don't match, the CAS MUST roll back — neither
     the epoch state nor current_epoch should change."""
     from nelix_store.store import Store
-    from nelix_contracts.errors import IDEMPOTENCY_CONFLICT
 
     store = Store(paths.nelix_root())
     gid = new_generation_id()
@@ -536,14 +532,11 @@ def test_guarded_cas_rolls_back_on_rowcount_mismatch():
 
 
 # ── S1-T6: CAS rollback on wrong state ───────────────────────────────────────
-
 def test_cas_rollback_on_wrong_state():
     """cas_epoch_serving() on a dead/serving epoch, or with wrong
     expected_current_epoch, must RAISE and ROLL BACK — neither the epoch
     state nor current_epoch should change."""
     from nelix_store.store import Store
-    from nelix_contracts.errors import IDEMPOTENCY_CONFLICT
-
     store = Store(paths.nelix_root())
     gid = new_generation_id()
     epoch = new_generation_id()
@@ -562,25 +555,56 @@ def test_cas_rollback_on_wrong_state():
     gen_before = store.get_generation(gid)
     assert gen_before.current_epoch == epoch
 
+    # Read back process_state before failed CAS.
+    epoch_before = [e for e in store.list_epochs_strict(gid)
+                    if e.generation_epoch == epoch]
+    assert epoch_before and epoch_before[0].process_state == "serving", (
+        f"Precondition: epoch must be serving, got {epoch_before[0].process_state if epoch_before else 'missing'}")
+
     # CAS on already-serving epoch must RAISE.
     with pytest.raises(NelixError):
         store.cas_epoch_serving(gid, epoch, expected_current_epoch=epoch,
                                 incarnation_meta=inc)
 
-    # current_epoch must NOT have changed.
+    # S1c-2 round-4: READ BACK both current_epoch and process_state — NEITHER changed.
     gen_after = store.get_generation(gid)
     assert gen_after.current_epoch == epoch, (
-        "current_epoch changed after failed CAS")
+        "current_epoch changed after failed CAS on serving epoch")
 
-    # Now set to dead and try CAS — must raise.
+    epoch_after = [e for e in store.list_epochs_strict(gid)
+                   if e.generation_epoch == epoch]
+    assert epoch_after and epoch_after[0].process_state == "serving", (
+        f"epoch process_state changed after failed CAS: "
+        f"{epoch_after[0].process_state if epoch_after else 'missing'}")
+
+    # Now SET to dead and try CAS — use expected_current_epoch=None to
+    # ISOLATE dead-state rejection (not wrong-epoch rejection).
     store.reconcile_epoch_dead(gid, epoch)
+
+    gen_dead = store.get_generation(gid)
+    assert gen_dead.current_epoch is None, (
+        "Precondition: current_epoch must be NULL after reconcile dead")
+
+    epoch_dead_before = [e for e in store.list_epochs_strict(gid)
+                         if e.generation_epoch == epoch]
+    assert epoch_dead_before and epoch_dead_before[0].process_state == "dead", (
+        "Precondition: epoch must be dead")
+
+    # CAS on dead epoch with expected_current_epoch=None isolates dead-state rejection.
     with pytest.raises(NelixError):
-        store.cas_epoch_serving(gid, epoch, expected_current_epoch=epoch,
+        store.cas_epoch_serving(gid, epoch, expected_current_epoch=None,
                                 incarnation_meta=inc)
 
-    # current_epoch must now be NULL (reconciled dead clears it).
-    gen_dead = store.get_generation(gid)
-    assert gen_dead.current_epoch is None
+    # READ BACK to prove rollback: neither process_state nor current_epoch changed.
+    gen_dead_after = store.get_generation(gid)
+    assert gen_dead_after.current_epoch is None, (
+        "current_epoch changed after failed CAS on dead epoch")
+
+    epoch_dead_after = [e for e in store.list_epochs_strict(gid)
+                        if e.generation_epoch == epoch]
+    assert epoch_dead_after and epoch_dead_after[0].process_state == "dead", (
+        f"epoch process_state changed after failed dead CAS: "
+        f"{epoch_dead_after[0].process_state if epoch_dead_after else 'missing'}")
 
     # Wrong expected_current_epoch must raise.
     epoch2 = new_generation_id()
@@ -593,7 +617,6 @@ def test_cas_rollback_on_wrong_state():
 def test_cas_rollback_wrong_generation_ownership():
     """CAS with an epoch belonging to a DIFFERENT generation must raise."""
     from nelix_store.store import Store
-    from nelix_contracts.errors import IDEMPOTENCY_CONFLICT
 
     store = Store(paths.nelix_root())
     gid_a = new_generation_id()
@@ -616,9 +639,10 @@ def test_cas_rollback_wrong_generation_ownership():
 
 # ── S1-T7: bootstrap fail-closed on broken runtime ────────────────────────────
 
-def test_bootstrap_fails_closed_on_broken_runtime(monkeypatch):
+def test_bootstrap_fails_closed_on_broken_runtime(monkeypatch, tmp_path):
     """When runtime discovery raises RuntimeError (broken configured runtime),
-    bootstrap must FAIL — must NOT persist build_id=None."""
+    the ACTUAL router.app.main() bootstrap must FAIL — must NOT persist
+    build_id=None."""
     # Simulate a broken runtime: import succeeds but active() raises.
     import types
     fake_runtime = types.ModuleType("runtime")
@@ -627,28 +651,30 @@ def test_bootstrap_fails_closed_on_broken_runtime(monkeypatch):
     fake_runtime.active = _broken_active
 
     monkeypatch.setitem(sys.modules, "runtime", fake_runtime)
+    monkeypatch.setenv("NELIX_HOME", str(tmp_path))
 
-    # The registry should not silently use build_id=None.
-    # The router/app.py code should surface the error.
-    from router.app import main as _unused  # just verify imports resolve
-    # Direct test: _find_or_create_locked distinguishes ImportError from RuntimeError.
-    from router.registry import GenerationRegistry
+    import importlib
+    importlib.reload(paths)
+
+    # Mock establish() to avoid socket binding — we only care about the
+    # bootstrap path (lines 62–82 in app.py), not the HTTP server.
+    from unittest.mock import MagicMock, patch as mock_patch
+    fake_handle = MagicMock()
+    fake_handle.socket = MagicMock()
+    fake_handle.sock_path = str(tmp_path / "router.sock")
+
+    with mock_patch("router.app.establish", return_value=fake_handle):
+        # main() should raise because runtime.active() raises RuntimeError.
+        from router.app import main
+        with pytest.raises(RuntimeError, match="configured runtime is corrupt"):
+            main()
+
+    # Verify no generation with build_id=None was persisted.
     from nelix_store.store import Store
-    from nelix_contracts.errors import GENERATION_UNAVAILABLE
-
-    gid = new_generation_id()
-    gen_dir = paths.generation_dir(gid)
-    gen_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(gen_dir, 0o700)
-
     store = Store(paths.nelix_root())
-    # Don't pre-seed a generation — let the registry try to bootstrap.
-    # The registry will call active() → _find_or_create_locked → try to resolve
-    # runtime.  With our fake runtime, active() raises RuntimeError.
-    # C8: the registry must FAIL, not silently use None.
-    reg = GenerationRegistry(store=store, build_id=None)
-    # C8: active() should propagate the RuntimeError from broken runtime discovery.
-    # It must NOT silently fall back to build_id=None.
-    with pytest.raises(RuntimeError, match="configured runtime is corrupt"):
-        reg.active()
+    gens = store.list_generations()
+    none_build_gens = [g for g in gens if g.build_id is None]
+    assert len(none_build_gens) == 0, (
+        f"bootstrap failed closed but Store has {len(none_build_gens)} generation(s) "
+        f"with build_id=None")
 
