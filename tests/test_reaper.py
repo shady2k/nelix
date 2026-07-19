@@ -149,7 +149,7 @@ def test_reconcile_skips_live_owner(tmp_path):
 
 
 def test_reconcile_skips_reused_child_pid_fingerprint_mismatch(tmp_path):
-    sd = _seed_record(tmp_path, "s-00000003", pid=999, child_fingerprint="c1")
+    _seed_record(tmp_path, "s-00000003", pid=999, child_fingerprint="c1")
     insp = _FakeInspector({
         10:  {"alive": False},
         999: {"alive": True, "ppid": 1, "pgid": 999, "fp": "DIFFERENT"},  # reused pid

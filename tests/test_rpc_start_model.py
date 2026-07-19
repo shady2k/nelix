@@ -9,7 +9,6 @@ import io
 import json
 import threading
 
-import pytest
 
 from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start
 from daemon.drivers import get_driver

@@ -549,7 +549,7 @@ class FakeManagerRaisesValueError:
     def __init__(self):
         self._events = EventQueue()
     def start(self, executor, task, cwd, *, owner_id, model=None, session_id=None):
-        raise ValueError(f"launcher 'auto' is not implemented (post-MVP); use 'local'")
+        raise ValueError("launcher 'auto' is not implemented (post-MVP); use 'local'")
     def respond(self, *a): return None
     def status(self, session_id=None, *, owner_id, include_progress=False): return {}
     def stop(self, session_id, *, owner_id): return False

@@ -4,10 +4,9 @@ import socket
 import urllib.parse
 
 try:
-    from .daemon.transport import Transport     # package mode (hermes_plugins.nelix.rpc_client)
+    from .daemon.transport import Transport  # noqa: F401 — package-mode re-export (hermes_plugins.nelix.rpc_client)
     from .daemon import owner
 except ImportError:
-    from daemon.transport import Transport      # top-level module mode (tests)
     from daemon import owner
 
 

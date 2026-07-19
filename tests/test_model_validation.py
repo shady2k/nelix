@@ -1,5 +1,4 @@
 import pytest
-from dataclasses import replace
 from daemon.manager import SessionManager, ModelUnavailable
 from daemon.env_resolver import EnvResolveError
 

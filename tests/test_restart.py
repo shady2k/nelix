@@ -135,7 +135,6 @@ def test_restart_balances_reserved_counter(tmp_path, monkeypatch, store_and_ledg
     assert out.status == "restarted" and mgr._reserved == 0
     # Now a single free slot exists for the lineage; a fresh start at limit 1 must be rejected,
     # proving the restart did not leave the cap overcounted or undercounted.
-    import pytest
     with pytest.raises(RuntimeError, match="concurrency_limit=1 reached"):
         mgr.start("claude", "other", str(tmp_path), owner_id=OWNER,
                   session_id=reserve_start(ledger))

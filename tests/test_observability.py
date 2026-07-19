@@ -12,7 +12,7 @@ import json
 from daemon.obs import Logger
 from daemon.belief import BeliefEngine, Note
 from daemon.clock import FakeClock
-from daemon.observation import Observation, ObservationCtx, Heartbeat
+from daemon.observation import Observation
 from daemon.config import BeliefConfig
 
 from tests.test_session import (_session, respond_via_submit_monitor, _BOX, _WORKING, _echo,

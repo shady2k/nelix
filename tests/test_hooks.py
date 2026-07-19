@@ -1,4 +1,4 @@
-from daemon.hooks import HookEvent, HookObservation, normalize_claude_hook as N
+from daemon.hooks import HookEvent, normalize_claude_hook as N
 
 
 def E(event, **kw):

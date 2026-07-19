@@ -64,3 +64,10 @@ include = ["daemon*"]
 markers = [
     "slow: builds a wheel and a venv; seconds, not milliseconds (tests/test_real_wheel.py)",
 ]
+
+[tool.ruff.lint]
+# Real-bug rules ONLY, not style: F = pyflakes (undefined names, unused imports/vars, empty
+# f-strings), E9 = syntax/IO errors. These catch mistakes, not formatting opinions, so the
+# pre-commit gate (.githooks/pre-commit) can block on them without flooding an unformatted tree.
+# Widen deliberately, not by accident.
+select = ["F", "E9"]

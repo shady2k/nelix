@@ -140,10 +140,10 @@ def test_post_submit_echo_suppresses_waiting_for_user():
     # passes 0==0 while guarding nothing.
     # Observed in real replay: echo_frames=2, echo_free_text_frames=1.
     assert echo_frames > 0, (
-        f"delivery capture must have ≥1 frame with submitted_echo_present=True "
+        "delivery capture must have ≥1 frame with submitted_echo_present=True "
         "(echo detection may have regressed to always-False; saw echo_frames=0)")
     assert echo_free_text_frames > 0, (
-        f"delivery capture must have ≥1 echo-visible free_text frame "
+        "delivery capture must have ≥1 echo-visible free_text frame "
         "(the prompt phase where suppression must fire; saw echo_free_text_frames=0)")
     assert wakes_during_echo == 0, (
         f"{wakes_during_echo} waiting_for_user publish(es) fired while submitted echo was "

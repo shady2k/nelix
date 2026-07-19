@@ -125,7 +125,7 @@ def main():
             print(f"  SURVIVED  {name}\n            -> {line}")
             holes.append((name, line))
         else:
-            first = line.split(" - ")[0]
+            line.split(" - ")[0]
             print(f"  caught    {name}")
 
     print()

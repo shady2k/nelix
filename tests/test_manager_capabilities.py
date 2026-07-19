@@ -18,7 +18,7 @@ lifecycle), where more than one generation coexisting makes the cross-generation
 from nelix_store.store import Store
 from nelix_store.ledger import StartLedger
 
-from tests.conftest import EXECUTOR, OWNER, make_spec, own, reserve_start
+from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start
 from daemon.events import EventQueue
 from daemon.launchers.base import ExecutorCapabilities
 from daemon.manager import SessionManager

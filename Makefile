@@ -24,8 +24,16 @@ venv:  ## Create the Python 3.11 virtualenv if it is missing
 	@test -d $(VENV) || $(PYTHON) -m venv $(VENV)
 
 .PHONY: install
-install: venv  ## Create the venv and install dependencies
+install: venv hooks  ## Create the venv, install dependencies, and wire the git hooks
 	$(PIP) install -r requirements.txt
+
+.PHONY: lint
+lint:  ## Run the linter (real-bug rules: pyflakes F + syntax E9)
+	$(VENV)/bin/ruff check --select F,E9 .
+
+.PHONY: hooks
+hooks:  ## Point git at .githooks so the pre-commit gate (lint + full suite) runs on every commit
+	git config core.hooksPath .githooks
 
 .PHONY: check-python
 check-python:  ## Fail unless the venv is Python 3.11 (the daemon's floor)

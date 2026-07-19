@@ -177,7 +177,7 @@ def test_genuine_permission_request_without_askuserquestion_still_publishes_perm
 
 def test_duplicate_stop_idempotent():
     e = eng()
-    a1 = e.on_hook(H("idle", closes=True), 0.0)
+    e.on_hook(H("idle", closes=True), 0.0)
     a2 = e.on_hook(H("idle", closes=True), 0.1)
     assert a2 == []                                       # already idle at same epoch
 

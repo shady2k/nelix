@@ -4,7 +4,6 @@ Asserts on the exact env the launcher hands the broker (FakeBroker captures it) 
 resolver runs real commands, no mocking, no fabricated PTY frames. Ordering matters:
 env_cmd overrides static [env] but must NOT override the injected NELIX_* hook env.
 """
-import os
 
 import pytest
 

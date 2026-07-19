@@ -1,4 +1,3 @@
-import pytest
 from daemon.messages import parse_message_body, AsyncQuestion, ProgressNote
 
 

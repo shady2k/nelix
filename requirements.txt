@@ -11,4 +11,5 @@
 -e ./packages/nelix_contracts
 -e ./packages/nelix_store
 pytest==8.3.4
+ruff==0.15.22     # linter for the pre-commit gate (make hooks); dev-only, not a core runtime dep
 pyyaml==6.0.3      # bin/nelix-doctor only; not a daemon import, so not a core runtime dep

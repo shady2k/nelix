@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# nelix pre-commit gate — block a commit whose worktree fails the linter or the test suite.
+#
+# Runs in the CURRENT worktree (git sets cwd to its top-level) against THAT worktree's own
+# ./.venv, so every worktree / generation is gated identically. This is the guard that stops a
+# "green but broken" commit at the source instead of at merge time.
+#
+# Escape hatch: `git commit --no-verify` skips this. Use it only when you know exactly why —
+# it defeats the entire point.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+PY="./.venv/bin/python"
+if [ ! -x "$PY" ]; then
+  echo "pre-commit: no ./.venv in this worktree." >&2
+  echo "            run 'uv venv && uv pip install -r requirements.txt' (or 'make install') first." >&2
+  exit 1
+fi
+
+# 1) Linter — real-bug rules only (F = pyflakes: undefined names, unused imports/vars, bad
+#    f-strings; E9 = syntax/IO errors). Skipped gracefully if ruff isn't in this venv yet, so an
+#    older worktree still gets the test gate.
+RUFF="./.venv/bin/ruff"
+if [ -x "$RUFF" ]; then
+  echo "pre-commit: ruff check (F,E9) ..."
+  if ! "$RUFF" check --select F,E9 . ; then
+    echo "pre-commit: ruff found issues — commit BLOCKED (fix them, or 'ruff check --fix')." >&2
+    exit 1
+  fi
+fi
+
+# 2) Full test suite. The one KNOWN flaky test (nelix-s6q: test_nelix_wait_graceful_interrupt,
+#    ~1/3 OSError) is deselected so the gate does not coin-flip on unrelated commits — REMOVE this
+#    deselect once nelix-s6q is fixed. (nelix-45h is a warning, not a failure, so it does not gate.)
+echo "pre-commit: pytest (full suite; this takes a few minutes) ..."
+if ! "$PY" -m pytest -q \
+      --deselect tests/test_nelix_wait.py::test_nelix_wait_graceful_interrupt ; then
+  echo "pre-commit: tests failed — commit BLOCKED." >&2
+  exit 1
+fi
+
+echo "pre-commit: OK — linter clean, suite green."

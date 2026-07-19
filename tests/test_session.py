@@ -1298,7 +1298,7 @@ def test_reemit_install_after_claim_does_not_resurrect_answered_decision(monkeyp
     # The race Codex flagged: a re-emit is BUILT while the decision is pending, but its install hook
     # runs AFTER a concurrent respond() claimed/answered it. The hook must NOT resurrect the answered
     # decision, and must mark the now-obsolete re-emit event answered (so pending() stays clean).
-    box = "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
+    "Ready — what next?\n❯ \n⏵⏵ ask mode (shift+tab to cycle)"
     # logger=None ON PURPOSE: this test stubs ev.publish to RETURN None (the `defer` below) to capture
     # a re-emit without publishing it — a degenerate stub the real EventQueue.publish never does (it
     # always returns an Event). _publish then logs audit_decision(evt.event_id); with a real Logger that
@@ -1776,7 +1776,7 @@ def test_finish_kills_group_when_monitor_dies_with_child_alive(tmp_path, monkeyp
 
 
 def test_respond_after_terminal_is_rejected_without_writing(tmp_path):
-    from daemon.session import Session, RespondOutcome
+    from daemon.session import Session
     ev = EventQueue()
     h = FakeHandle(["x"])
     sess = Session("s-11112222", "demo", ClaudeDriver(), _NoopLauncher(h), Spec(), ev)

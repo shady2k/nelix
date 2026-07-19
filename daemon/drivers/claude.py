@@ -1,7 +1,7 @@
 import re
 
 from daemon.drivers import register
-from daemon.observation import Observation, ObservationCtx, Option, Heartbeat
+from daemon.observation import Observation, Option, Heartbeat
 from daemon.fingerprints import semantic_fp, region_fp
 
 WORKING_MARKERS = ("esc to interrupt",)

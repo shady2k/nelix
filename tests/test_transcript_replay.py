@@ -98,12 +98,11 @@ def test_replay_full_pagination_reproduces_text():
     """Paginating the whole log via next_offset reproduces the full flat text exactly."""
     d = _replay()
     full_text = "\n".join(t for (_, t) in d.records)
-    total_len = len(full_text)
+    len(full_text)
 
     # Use a real Dialog to get the flat-log pagination
-    import tempfile, os
+    import tempfile
     with tempfile.TemporaryDirectory() as td:
-        import paths
         dlg = Dialog(td + "/s", tail_lines=1000, spool_max_bytes=10_000_000)
         # Replay all records into the real Dialog
         for (kind, text) in d.records:

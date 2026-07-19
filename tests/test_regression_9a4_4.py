@@ -3,12 +3,10 @@
 Each test MUST fail if its corresponding fix is reverted. Tests use real objects
 where practical; stubs are used only for failure-injection points.
 """
-import json
 
 import pytest
 
 from nelix_contracts.errors import NelixError
-from nelix_contracts.ids import validate_session_id
 from nelix_store.store import Store
 
 from tests.conftest import EXECUTOR, OWNER, make_spec, own, reserve_start
@@ -318,7 +316,7 @@ def test_t5_durable_persist_with_zero_ttl(tmp_path):
     # A durable record must exist in the store despite ttl=0
     term = store.get_terminal(sid, owner_id=OWNER)
     assert term.terminal_kind == "done", (
-        f"T5 FAIL: no durable record found (terminal_snapshot_ttl=0 suppressed persist)"
+        "T5 FAIL: no durable record found (terminal_snapshot_ttl=0 suppressed persist)"
     )
 
 
@@ -328,9 +326,7 @@ def test_t6_force_distinguishes_restart_key(tmp_path):
     """T6: A non-forced restart that records budget-exhausted, followed by a
     force:true retry of the same old_sid, is a DISTINCT operation (does NOT replay
     the recorded failure). MUST FAIL if force is dropped from the idempotency key."""
-    from nelix_store.ledger import StartLedger
     from router.restart import _request_fingerprint
-    from router.restart import _derive_orchestration_id
     # Two fingerprints for the same (owner, old_sid) but different force
     # MUST produce DIFFERENT results
     fp_no_force = _request_fingerprint(OWNER, "s-old", False)

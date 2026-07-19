@@ -1,5 +1,4 @@
 import threading
-import pytest
 from daemon.model_cache import ModelCache
 
 LIST = [{"id": "glm-5.2", "display_name": "GLM-5.2"}]

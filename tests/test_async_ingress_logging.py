@@ -16,7 +16,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import pytest  # noqa: E402
 
 from daemon.clock import FakeClock              # noqa: E402
 from daemon.config import MAX_SUMMARY_LEN       # noqa: E402

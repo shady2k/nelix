@@ -27,7 +27,7 @@ from nelix_contracts.errors import (
     STORE_CORRUPT, STORE_UNAVAILABLE, STORE_UNSUPPORTED, NelixError,
 )
 from nelix_contracts.ids import (
-    InvalidId, new_orchestration_id, validate_orchestration_id, validate_owner_id,
+    InvalidId, validate_orchestration_id, validate_owner_id,
 )
 
 _HTTP_STATUS = {

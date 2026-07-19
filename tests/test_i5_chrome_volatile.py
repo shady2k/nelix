@@ -20,7 +20,6 @@ RED proof (recorded for commit body — DO NOT re-run, this is historical):
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from daemon.drivers.claude import ClaudeDriver  # noqa: E402

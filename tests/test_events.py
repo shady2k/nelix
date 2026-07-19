@@ -632,7 +632,7 @@ def test_publish_on_publish_runs_before_waiters_are_notified():
 
 def test_latest_seq_global_and_per_session():
     q = EventQueue()
-    a = q.publish("s-a", "ex", "working", "", "working")
+    q.publish("s-a", "ex", "working", "", "working")
     b = q.publish("s-b", "ex", "working", "", "working")
     c = q.publish("s-a", "ex", "waiting_for_user", "", "working")
     assert q.latest_seq() == c.seq          # global unchanged

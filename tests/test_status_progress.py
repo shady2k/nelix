@@ -14,7 +14,6 @@ Two layers are exercised here: the manager (the actual merge/gate logic) and the
 the plugin repo (shady2k/hermes-nelix, tests/test_plugin_status_progress.py) with the plugin
 itself; it is the only layer of this stack the core no longer owns.
 """
-import json
 import sys
 from pathlib import Path
 

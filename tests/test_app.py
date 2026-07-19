@@ -33,7 +33,7 @@ def test_install_stack_dump_handler_enables_faulthandler():
 
 def test_acquire_singleton_second_call_conflicts(monkeypatch, tmp_path):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
-    import importlib, io, json, paths
+    import importlib, io, paths
     importlib.reload(paths)
     from daemon import app, singleton
     from daemon.obs import Logger

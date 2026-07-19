@@ -15,7 +15,6 @@ import json
 import re
 import threading
 
-import pytest
 
 import paths
 from daemon.transport import Transport
