@@ -10,8 +10,7 @@ import uuid
 _HEX32 = "[0-9a-f]{32}"
 _SESSION_RE = re.compile(rf"^s-{_HEX32}$")
 _ORCH_RE = re.compile(rf"^o-{_HEX32}$")
-# Also accepts legacy synthetic ids g-legacy-<epoch> from v4 migration (nelix-80e-s1a).
-_GENERATION_RE = re.compile(rf"^(?:g-{_HEX32}|g-legacy-.+)$")
+_GENERATION_RE = re.compile(rf"^g-{_HEX32}$")
 # An owner is caller-supplied and DURABLE (a profile/installation identity, not a pid or a
 # conversation), so we constrain its charset rather than mint it. Leading char is alnum so a
 # value can never be mistaken for a flag.
