@@ -7,16 +7,20 @@ revision it was minted against.
 
 The token is OPAQUE to callers: they round-trip it, never parse it. It is base64url'd
 compact JSON so that WE can debug it — not so that callers can read it.
+
+S2a.1: added a DISTINCT typed archive component (archive_epoch, archive_seq) alongside the
+generation positions, and bumped _V to 2 so old tokens yield CURSOR_EXPIRED.
 """
 import base64
 import json
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
+from typing import Optional
 
 from .errors import BOARD_CHANGED, CURSOR_EXPIRED, INVALID_REQUEST, NelixError
 from .ids import InvalidId, validate_generation_id
 
-_V = 1
+_V = 2
 _MAX_TOKEN = 64 * 1024        # a cursor is small; anything larger is not one
 
 
@@ -29,6 +33,12 @@ class Cursor:
     router_epoch: str
     topology_revision: int
     positions: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
+    _archive: Optional[tuple] = field(default=None, repr=False)   # (archive_epoch, archive_seq) | None
+
+    @property
+    def archive_position(self):
+        """(archive_epoch, archive_seq) or None if no archive component has been set."""
+        return self._archive
 
     def __post_init__(self):
         if not isinstance(self.router_epoch, str) or not self.router_epoch:
@@ -55,6 +65,16 @@ class Cursor:
         # Freeze whatever we were handed, so a caller who passed a plain dict cannot mutate
         # the cursor afterwards. object.__setattr__ because the dataclass is frozen.
         object.__setattr__(self, "positions", MappingProxyType(dict(self.positions)))
+        # Validate archive component if present.
+        arch = self._archive
+        if arch is not None:
+            if (not isinstance(arch, tuple) or len(arch) != 2
+                    or isinstance(arch[1], bool)
+                    or not isinstance(arch[1], int) or arch[1] < 0
+                    or not isinstance(arch[0], int)):
+                raise NelixError(INVALID_REQUEST,
+                                 f"archive must be (int, non-negative int) or None: {arch!r}")
+            object.__setattr__(self, "_archive", (int(arch[0]), int(arch[1])))
 
     def position_for(self, generation_id):
         """The (generation_epoch, seq) consumed for `generation_id`, or None if this cursor
@@ -85,6 +105,20 @@ class Cursor:
         positions[generation_id] = (epoch, seq)
         return replace(self, positions=_freeze(positions))
 
+    def advance_archive(self, archive_epoch: int, seq: int) -> "Cursor":
+        """Advance ONLY the archive component. Leaves generation positions untouched.
+
+        Returns a new Cursor with the archive updated to (archive_epoch, seq).
+        Both values are validated exactly as generation positions are.
+        """
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            raise NelixError(INVALID_REQUEST,
+                             f"archive seq must be a non-negative int: {seq!r}")
+        if isinstance(archive_epoch, bool) or not isinstance(archive_epoch, int):
+            raise NelixError(INVALID_REQUEST,
+                             f"archive_epoch must be an int: {archive_epoch!r}")
+        return replace(self, _archive=(int(archive_epoch), int(seq)))
+
 
 def new_cursor(router_epoch: str, topology_revision: int) -> Cursor:
     return Cursor(router_epoch=str(router_epoch),
@@ -92,11 +126,11 @@ def new_cursor(router_epoch: str, topology_revision: int) -> Cursor:
 
 
 def encode(cursor: Cursor) -> str:
-    raw = json.dumps(
-        {"v": _V, "re": cursor.router_epoch, "tr": cursor.topology_revision,
-         "p": {g: [e, s] for g, (e, s) in cursor.positions.items()}},
-        separators=(",", ":"), sort_keys=True, allow_nan=False,
-    ).encode()
+    obj = {"v": _V, "re": cursor.router_epoch, "tr": cursor.topology_revision,
+           "p": {g: [e, s] for g, (e, s) in cursor.positions.items()}}
+    if cursor.archive_position is not None:
+        obj["a"] = list(cursor.archive_position)
+    raw = json.dumps(obj, separators=(",", ":"), sort_keys=True, allow_nan=False).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
@@ -145,9 +179,22 @@ def decode(token, *, router_epoch: str, topology_revision: int) -> Cursor:
         if (isinstance(decoded_topology_revision, bool)
                 or not isinstance(decoded_topology_revision, int)):
             raise ValueError("topology_revision must be an int")
+        # Decode archive component (optional — absent means None).
+        raw_archive = obj.get("a")
+        archive = None
+        if raw_archive is not None:
+            if not isinstance(raw_archive, list) or len(raw_archive) != 2:
+                raise ValueError("archive must be [epoch, seq]")
+            a_seq = raw_archive[1]
+            if isinstance(a_seq, bool) or not isinstance(a_seq, int) or a_seq < 0:
+                raise ValueError("archive seq must be a non-negative int")
+            if isinstance(raw_archive[0], bool) or not isinstance(raw_archive[0], int):
+                raise ValueError("archive epoch must be an int")
+            archive = (int(raw_archive[0]), int(a_seq))
         cursor = Cursor(router_epoch=str(obj["re"]),
                         topology_revision=decoded_topology_revision,
-                        positions=_freeze(positions))
+                        positions=_freeze(positions),
+                        _archive=archive)
     except Exception:
         raise NelixError(INVALID_REQUEST, "malformed cursor") from None
     if cursor.router_epoch != str(router_epoch):
