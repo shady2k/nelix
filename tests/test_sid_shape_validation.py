@@ -4,17 +4,13 @@ from urllib.parse import quote
 
 import pytest
 
-from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start
+from tests.conftest import EXECUTOR, OWNER, make_spec, reserve_start, serve
 from daemon import owner
 from daemon.events import EventQueue
 from daemon.launchers.base import ExecutorCapabilities
 from daemon.manager import SessionManager
-from daemon.rpc_server import make_server
 from daemon.session import RespondOutcome
-from daemon.transport import Transport
 from tests.test_rpc_server import _req
-
-_PORT = iter(range(9200, 9300))
 
 TRAVERSAL = "../../etc/passwd"
 
@@ -74,11 +70,10 @@ def daemon(store_and_ledger):
 
     mgr = SessionManager({EXECUTOR: make_spec()}, EventQueue(), store,
                          session_factory=session_factory, concurrency_limit=10)
-    port = next(_PORT)
-    srv = make_server(mgr, Transport.tcp("127.0.0.1", port, "t"))
+    srv, base = serve(mgr)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        yield f"http://127.0.0.1:{port}", mgr, made, ledger
+        yield base, mgr, made, ledger
     finally:
         srv.shutdown()
 

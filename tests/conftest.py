@@ -69,6 +69,15 @@ def store_and_ledger(tmp_path):
     return store, ledger
 
 
+def serve(manager, token="t"):
+    """Start a real HTTP server on an EPHEMERAL tcp port; return (srv, base_url). Race-free: the OS
+    assigns the port at bind time and we read it back, so parallel xdist workers never collide."""
+    from daemon.rpc_server import make_server
+    from daemon.transport import Transport
+    srv = make_server(manager, Transport.tcp("127.0.0.1", 0, token))
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
 def reserve_start(ledger, owner_id=OWNER, idempotency_key=None):
     """Reserve a start + assign generation via the ledger, returning the session_id.
 

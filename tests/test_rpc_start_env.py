@@ -2,8 +2,7 @@
 
 Drives the REAL path — a real SessionManager + Session + LocalLauncher run a real failing command,
 so the EnvResolveError propagates through manager._spawn to the /start handler exactly as at spawn.
-502 (not the generic 409): an upstream resolver/secret-backend failure, daemon healthy, relayable.
-"""
+502 (not the generic 409): an upstream resolver/secret-backend failure, daemon healthy, relayable."""
 import io
 import json
 import threading
@@ -18,7 +17,7 @@ from daemon.transport import Transport
 from daemon.drivers import get_driver
 
 
-def _serve(monkeypatch, tmp_path, store_and_ledger, spec, port):
+def _serve(monkeypatch, tmp_path, store_and_ledger, spec):
     monkeypatch.setenv("NELIX_HOME", str(tmp_path))
     store, ledger = store_and_ledger
     buf = io.StringIO()
@@ -26,10 +25,11 @@ def _serve(monkeypatch, tmp_path, store_and_ledger, spec, port):
                          launcher_factory=lambda name: LocalLauncher(),
                          driver_factory=get_driver, concurrency_limit=3,
                          logger=Logger(level="debug", stream=buf))
-    srv = make_server(mgr, Transport.tcp("127.0.0.1", port, "t"),
+    srv = make_server(mgr, Transport.tcp("127.0.0.1", 0, "t"),
                       logger=Logger(level="debug", stream=buf))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, mgr, buf, ledger
+    _, port = srv.server_address
+    return srv, mgr, buf, ledger, port
 
 
 def _req(port, body):
@@ -50,9 +50,9 @@ def _req(port, body):
 def test_env_cmd_failure_returns_502_redacted(monkeypatch, tmp_path, store_and_ledger):
     spec = make_spec(command="claude", args=["--foo"], driver="claude",
                      env_cmd={"TOK": "echo LEAKOUT; echo LEAKERR 1>&2; exit 5"})
-    srv, mgr, buf, ledger = _serve(monkeypatch, tmp_path, store_and_ledger, spec, port=8831)
+    srv, mgr, buf, ledger, port = _serve(monkeypatch, tmp_path, store_and_ledger, spec)
     try:
-        st, b = _req(8831, {"executor": EXECUTOR, "task": "hi", "cwd": str(tmp_path),
+        st, b = _req(port, {"executor": EXECUTOR, "task": "hi", "cwd": str(tmp_path),
                              "session_id": reserve_start(ledger)})
         assert st == 502                                   # distinct from the generic 409
         assert "error" in b
@@ -67,9 +67,9 @@ def test_env_cmd_failure_returns_502_redacted(monkeypatch, tmp_path, store_and_l
 def test_timeout_env_cmd_returns_502(monkeypatch, tmp_path, store_and_ledger):
     spec = make_spec(command="claude", args=["--foo"], driver="claude",
                      env_cmd={"SLOW": "sleep 5"}, env_cmd_timeout_seconds=0.2)
-    srv, mgr, buf, ledger = _serve(monkeypatch, tmp_path, store_and_ledger, spec, port=8832)
+    srv, mgr, buf, ledger, port = _serve(monkeypatch, tmp_path, store_and_ledger, spec)
     try:
-        st, b = _req(8832, {"executor": EXECUTOR, "task": "hi", "cwd": str(tmp_path),
+        st, b = _req(port, {"executor": EXECUTOR, "task": "hi", "cwd": str(tmp_path),
                              "session_id": reserve_start(ledger)})
         assert st == 502
         assert "SLOW" in b["error"]

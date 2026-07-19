@@ -61,6 +61,7 @@ include = ["daemon*"]
 "daemon.renderer" = ["shim.wasm"]
 
 [tool.pytest.ini_options]
+addopts = "-n auto"
 markers = [
     "slow: builds a wheel and a venv; seconds, not milliseconds (tests/test_real_wheel.py)",
 ]

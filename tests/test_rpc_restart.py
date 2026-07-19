@@ -1,10 +1,8 @@
 import threading
 from daemon.events import EventQueue
-from daemon.rpc_server import make_server
-from daemon.transport import Transport
 from daemon.manager import RestartOutcome
 from tests.test_rpc_server import _req            # reuse the existing request helper
-from tests.conftest import OWNER
+from tests.conftest import OWNER, serve
 
 
 class _RestartManager:
@@ -18,19 +16,14 @@ class _RestartManager:
         return self._outcome
 
 
-def _serve(manager, port):
-    srv = make_server(manager, Transport.tcp("127.0.0.1", port, "t"))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, f"http://127.0.0.1:{port}"
-
-
 def test_restart_route_returns_new_session():
     mgr = _RestartManager(RestartOutcome("restarted", session_id="s-00000000000000000000000000000001",
                                          lineage_id="s-old0000000000000000000000000000",
                                          restart_count=1, max_restarts=3,
                                          snapshot={"session_id": "s-00000000000000000000000000000001",
                                                    "control_state": "busy"}))
-    srv, base = _serve(mgr, 8771)
+    srv, base = serve(mgr)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", base + "/restart", body={"session_id": "s-0123456789abcdef0123456789abcdef",
                        "new_session_id": "s-00000000000000000000000000000001",
@@ -46,7 +39,8 @@ def test_restart_route_returns_new_session():
 
 def test_restart_route_budget_exhausted_is_409():
     mgr = _RestartManager(RestartOutcome("restart_budget_exhausted", restart_count=3, max_restarts=3))
-    srv, base = _serve(mgr, 8772)
+    srv, base = serve(mgr)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", base + "/restart", body={"session_id": "s-0123456789abcdef0123456789abcdef",
                        "new_session_id": "s-00000000000000000000000000000002",
@@ -58,7 +52,8 @@ def test_restart_route_budget_exhausted_is_409():
 
 def test_restart_route_unknown_is_404():
     mgr = _RestartManager(RestartOutcome("unknown_session"))
-    srv, base = _serve(mgr, 8773)
+    srv, base = serve(mgr)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", base + "/restart", body={"session_id": "s-dead0000000000000000000000000000",
                        "new_session_id": "s-00000000000000000000000000000003",
@@ -74,7 +69,8 @@ def test_restart_route_force_passed_through():
                                          restart_count=1, max_restarts=3,
                                          snapshot={"session_id": "s-00000000000000000000000000000001",
                                                    "control_state": "busy"}))
-    srv, base = _serve(mgr, 8774)
+    srv, base = serve(mgr)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         _req("POST", base + "/restart", body={"session_id": "s-0123456789abcdef0123456789abcdef",
                "force": True,
@@ -89,7 +85,8 @@ def test_restart_route_missing_session_id_is_400():
     mgr = _RestartManager(RestartOutcome("restarted", session_id="s-00000000000000000000000000000001",
                                          lineage_id="s-old0000000000000000000000000000",
                                          restart_count=1, max_restarts=3))
-    srv, base = _serve(mgr, 8776)
+    srv, base = serve(mgr)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         # owner + new_session_id supplied; session_id absent: keeps this test about the MISSING
         # session_id it is named for. (An owner-less body is refused first — that is covered by
@@ -103,7 +100,8 @@ def test_restart_route_missing_session_id_is_400():
 
 def test_restart_route_start_failed_is_409():
     mgr = _RestartManager(RestartOutcome("start_failed"))
-    srv, base = _serve(mgr, 8777)
+    srv, base = serve(mgr)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", base + "/restart", body={"session_id": "s-0123456789abcdef0123456789abcdef",
                        "new_session_id": "s-00000000000000000000000000000006",
@@ -121,7 +119,8 @@ def test_restart_route_includes_next_after_seq():
                                          restart_count=1, max_restarts=3, next_after_seq=42,
                                          snapshot={"session_id": "s-00000000000000000000000000000001",
                                                    "control_state": "busy"}))
-    srv, base = _serve(mgr, 8778)
+    srv, base = serve(mgr)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _req("POST", base + "/restart", body={"session_id": "s-0123456789abcdef0123456789abcdef",
                        "new_session_id": "s-00000000000000000000000000000007",
@@ -139,7 +138,8 @@ def test_rpc_client_restart_round_trip():
                                          restart_count=2, max_restarts=3,
                                          snapshot={"session_id": "s-00000000000000000000000000000001",
                                                    "control_state": "busy"}))
-    srv, base = _serve(mgr, 8775)
+    srv, base = serve(mgr)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, body = _req("POST", base + "/restart", body={"session_id": "s-0123456789abcdef0123456789abcdef",
                           "new_session_id": "s-00000000000000000000000000000008",

@@ -7,19 +7,12 @@ import urllib.request
 
 from daemon.events import EventQueue
 from daemon.protocol import RPC_PROTOCOL_VERSION
-from daemon.rpc_server import make_server
-from daemon.transport import Transport
+from tests.conftest import serve
 
 
 class _Manager:
     def __init__(self):
         self._events = EventQueue()
-
-
-def _serve(manager, port):
-    srv = make_server(manager, Transport.tcp("127.0.0.1", port, "t"))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, f"http://127.0.0.1:{port}"
 
 
 def _get(url):
@@ -32,7 +25,8 @@ def _get(url):
 
 
 def test_health_returns_ok_with_protocol_and_generation_id():
-    srv, base = _serve(_Manager(), 8910)
+    srv, base = serve(_Manager())
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + "/health")
         assert st == 200
@@ -45,7 +39,8 @@ def test_health_returns_ok_with_protocol_and_generation_id():
 
 def test_health_requires_no_owner_id_and_no_session_id():
     # Unlike /status, /screen, /dialog, /wait: a liveness probe must not need a caller identity.
-    srv, base = _serve(_Manager(), 8911)
+    srv, base = serve(_Manager())
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         st, b = _get(base + "/health")
         assert st == 200 and "error" not in b
@@ -56,7 +51,8 @@ def test_health_requires_no_owner_id_and_no_session_id():
 def test_health_still_requires_transport_auth():
     # The route is unauthenticated w.r.t. owner_id, but transport auth (token/peercred) still
     # applies — a health probe is not a hole in the auth boundary.
-    srv, base = _serve(_Manager(), 8912)
+    srv, base = serve(_Manager())
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         r = urllib.request.Request(base + "/health")   # no X-Nelix-Token
         try:
