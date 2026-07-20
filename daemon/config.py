@@ -307,6 +307,7 @@ class RetentionConfig:
     daemon_log_retain: int = 10
     session_retain: int = 20
     session_max_age_days: int = 7
+    replay_horizon_seconds: int = 86400  # 24h — max retry/idempotency window for start dedup
 
 
 def _cfg_int(data, key, default, floor):
@@ -327,6 +328,7 @@ def load_retention(path):
         daemon_log_retain=_cfg_int(data, "daemon_log_retain", 10, floor=1),
         session_retain=_cfg_int(data, "session_retain", 20, floor=0),
         session_max_age_days=_cfg_int(data, "session_max_age_days", 7, floor=0),
+        replay_horizon_seconds=_cfg_int(data, "replay_horizon_seconds", 86400, floor=0),
     )
 
 

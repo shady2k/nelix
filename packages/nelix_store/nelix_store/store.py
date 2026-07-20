@@ -23,6 +23,7 @@ from nelix_contracts.records import (
     SCHEMA_VERSION, GenerationRecord, EpochRecord, SessionRecord, TerminalRecord,
     timestamp,
 )
+from nelix_contracts.retirement import generation_retirement_oracle_blockers
 
 from .db import ThreadLocalConnections, translates_sqlite
 
@@ -505,6 +506,84 @@ class Store:
                 for row in affected:
                     self._bump_board_seq(self._conn, row["owner_id"])
         return n_expired
+
+    # ---- DURABLE-ROW + runtime-dir GC (nelix-80e §3.7) ----
+
+    @translates_sqlite
+    def gc_retired_generations(self, *, replay_horizon_seconds: float) -> dict:
+        """Reclaim durable rows of FULLY RETIRED generations, in FK order.
+
+        A `sessions` row is a DURABLE ARCHIVED record (holds task/cwd for restart,
+        board reads) and is DELETED ONLY BY THIS GC — NEVER at remove-live-session.
+        If future code deletes a sessions row at remove-live-session, the
+        ``terminal → sessions`` RESTRICT FK will correctly refuse.
+
+        For each generation that is lifecycle_state=retired AND has no oracle
+        blockers (every epoch certified, confirmed_high_water >= final_high_water)
+        AND has no unresolved board-visible terminal, this deletes:
+
+          1. terminal rows (permanent receipts — safe once resolved/acknowledged)
+          2. sessions rows (durable archive — FK order: terminal before sessions)
+          3. starts rows (idempotency key — ONLY if past the replay horizon)
+
+        Returns dict with keys:
+          ``generations_processed`` — generations examined for GC
+          ``terminals_deleted`` — terminal rows removed
+          ``sessions_deleted``  — session rows removed
+          ``starts_deleted``   — start rows deleted (past replay horizon)
+          ``starts_preserved`` — start rows too young (within replay horizon)
+
+        Idempotent: safe to call repeatedly. Never touches a live/draining/
+        retiring generation or an unresolved terminal.
+        """
+        if isinstance(replay_horizon_seconds, bool) or not isinstance(
+                replay_horizon_seconds, (int, float)) or replay_horizon_seconds < 0:
+            raise NelixError(INVALID_REQUEST,
+                             f"replay_horizon_seconds must be a non-negative number: "
+                             f"{replay_horizon_seconds!r}")
+        now = timestamp(self._clock(), "clock")
+        gens = self.list_generations()
+        stats = dict(generations_processed=0, terminals_deleted=0,
+                     sessions_deleted=0, starts_deleted=0, starts_preserved=0)
+
+        for gen in gens:
+            if gen.lifecycle_state != "retired":
+                continue
+            stats["generations_processed"] += 1
+            blockers = generation_retirement_oracle_blockers(
+                store=self, generation_id=gen.generation_id)
+            if blockers:
+                continue
+            unresolved = self._conn.execute(
+                "SELECT 1 FROM terminal t "
+                "JOIN starts st ON st.session_id = t.session_id "
+                "WHERE st.generation_id=? AND t.acknowledged_at IS NULL "
+                "AND t.expired_at IS NULL LIMIT 1",
+                (gen.generation_id,)).fetchone()
+            if unresolved is not None:
+                continue
+            session_rows = self._conn.execute(
+                "SELECT st.session_id, st.created_at FROM starts st "
+                "WHERE st.generation_id=?",
+                (gen.generation_id,)).fetchall()
+            for row in session_rows:
+                sid = row["session_id"]
+                with self._conn:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    rc = self._conn.execute(
+                        "DELETE FROM terminal WHERE session_id=?", (sid,)).rowcount
+                    stats["terminals_deleted"] += rc
+                    rc = self._conn.execute(
+                        "DELETE FROM sessions WHERE session_id=?", (sid,)).rowcount
+                    stats["sessions_deleted"] += rc
+                    past_horizon = (now - row["created_at"]) > replay_horizon_seconds
+                    if past_horizon:
+                        self._conn.execute(
+                            "DELETE FROM starts WHERE session_id=?", (sid,))
+                        stats["starts_deleted"] += 1
+                    else:
+                        stats["starts_preserved"] += 1
+        return stats
 
     # ---- generations/epochs identity API (nelix-80e-s1a) ----
 

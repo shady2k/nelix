@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""GC for durable rows and runtime dirs of FULLY RETIRED generations.
+
+Reclaims durable rows (terminal -> sessions -> starts) and runtime dirs
+(runtimes/<build-id>/) for generations that are fully retired (lifecycle_state=retired,
+every epoch certified, confirmed_high_water >= final_high_water, no unresolved
+board-visible terminals).
+
+Idempotent: safe to run repeatedly. Never touches a live/draining/retiring generation.
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import paths                                   # noqa: E402
+from daemon.config import load_retention        # noqa: E402
+from nelix_store.gc import gc_runtime_dirs      # noqa: E402
+from nelix_store.store import Store             # noqa: E402
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Reclaim durable rows and runtime dirs of retired generations.")
+    ap.add_argument("--replay-horizon", type=float, default=None,
+                    help="Override replay horizon in seconds (default: from config)")
+    args = ap.parse_args()
+
+    cfg_path = str(paths.config_path())
+    retention = load_retention(cfg_path)
+    horizon = args.replay_horizon if args.replay_horizon is not None else float(
+        retention.replay_horizon_seconds)
+
+    store = Store(paths.nelix_root())
+    try:
+        result = {"replay_horizon_seconds": horizon}
+        result["rows"] = store.gc_retired_generations(
+            replay_horizon_seconds=horizon)
+        result["runtime_dirs"] = gc_runtime_dirs(store)
+        print(json.dumps(result, indent=2))
+    finally:
+        store.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
