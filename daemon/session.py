@@ -544,11 +544,11 @@ class Session:
         self._fail_delivery("delivery_unconfirmed")
 
     def _fail_delivery(self, reason):
-        # Give up cleanly: do NOT press Enter, do NOT re-type. Mark failed so the run loop
-        # exits, and wake Hermes with a non-respondable advisory; the human stops + restarts.
         self._task_delivery = "failed"
         self._terminal_kind = "delivery_failed"
         self._handle.finalize()
+        excerpt = self._last_screen_excerpt
+        self._persist_terminal_before_publish("delivery_failed", excerpt)
         self._publish("delivery_failed", hint=reason, hung=False,
                       requires_response=False, task_delivery="failed")
         if self._log is not None:
@@ -568,8 +568,10 @@ class Session:
                  "nelix.toml.example")
         self._task_delivery = "failed"
         self._terminal_kind = "delivery_failed"
-        self._dialog.add_agent_line(cause)   # surface the human-readable cause in the decision text/tail
+        self._dialog.add_agent_line(cause)
         self._handle.finalize()
+        excerpt = self._last_screen_excerpt
+        self._persist_terminal_before_publish("delivery_failed", excerpt)
         self._publish("delivery_failed", hint="startup_no_output", hung=False,
                       requires_response=False, task_delivery="failed")
         if self._log is not None:

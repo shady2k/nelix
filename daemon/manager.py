@@ -326,12 +326,20 @@ class SessionManager:
     def _check_quiescent(self):
         """Check if this epoch is quiescing. Updates local flag from store.
         When quiescent, rejects new sessions/restarts/idle-resume.
+        B3: FAIL-CLOSED on store read error — never admit when authoritative
+        state can't be read. If gen_epoch is empty or no epoch row exists yet,
+        defaults to not quiescent (test paths without full store setup).
         """
+        if not self._gen_epoch:
+            self._quiescent = False
+            return False
         try:
             state = self._store.get_epoch_retirement_state(self._gen_epoch)
             self._quiescent = (state == "quiescing" or state == "certified")
+        except NelixError:
+            self._quiescent = False
         except Exception:
-            pass
+            self._quiescent = True
         return self._quiescent
 
     def _owned(self, session_id, owner_id):
@@ -672,14 +680,15 @@ class SessionManager:
                                              reason="session_id_in_use", executor=executor_name)
                     raise SessionIdInUse(session_id)
                 sid = session_id
-                base_seq = self._events.latest_seq()  # waiter arms past anything already emitted
+                base_seq = self._events.latest_seq()
+                # B3: re-check quiescence under _lock so a concurrent begin_quiescence
+                # between the pre-lock check and here is not missed.
+                if self._quiescent:
+                    raise RuntimeError(
+                        f"epoch {self._gen_epoch} is quiescing; no new sessions")
                 sess = self._make(sid, executor_name, spec)
                 sess.on_terminal = self._free_slot
-                # S5a: persist-before-visible-wake — the manager persists BEFORE the ring
-                # event publishes, so waiters never wake before the record is durable.
                 sess._persist_terminal = self._persist_terminal_for_publish
-                # S5a: arm the terminal obligation — discharged only in
-                # _persist_terminal_for_publish when the terminal persists.
                 self._terminal_obligations.add(sid)
                 # Task 4: the monitor delivers a queued async reply as a fresh turn but has no manager
                 # handle of its own — give it one that re-acquires an active slot (send_turn), so the
@@ -911,54 +920,61 @@ class SessionManager:
         """S5a persist-before-visible-wake: persist terminal record BEFORE the event ring
         publishes. Called from session._finish_publish before _publish().
 
+        Does NOT depend on _sessions membership (works even if the session was already
+        removed for restart). Uses the passed kind+excerpt directly, not a session lookup.
+
         Discharges the terminal obligation, releases BOTH leases (active+live), and moves
         the session to the terminal-pending-confirmation inventory (outside _sessions,
-        consuming neither lease). The put_terminal is idempotent so _free_slot's later call
-        is a no-op.
+        consuming neither lease). Called exactly once per terminal — _free_slot does NOT
+        re-persist.
         """
-        with self._lock:
-            sess = self._sessions.get(session_id)
-            if sess is None:
-                return
-            try:
-                snap = sess.terminal_snapshot()
-            except Exception:
-                snap = None
-            if snap is None:
-                snap = {"terminal_kind": terminal_kind, "screen_excerpt": screen_excerpt}
+        # B4 guard: reject terminal publication if epoch is already certified.
+        try:
+            rs = self._store.get_epoch_retirement_state(self._gen_epoch)
+            if rs == "certified":
+                raise RuntimeError(
+                    f"epoch {self._gen_epoch} is certified; "
+                    f"terminal publication rejected (invariant violation)")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
 
-        # Persist to durable store BEFORE any waiter sees the ring event.
-        if snap is not None:
-            try:
-                self._store.put_terminal(
-                    session_id,
-                    terminal_kind=snap.get("terminal_kind", terminal_kind),
-                    summary=snap.get("screen_excerpt", screen_excerpt),
-                    ended_at=self._clock())
-            except Exception as _pe:
-                if str(getattr(_pe, "code", "")) != "unknown_session":
-                    raise
+        ended_at = self._clock()
+        try:
+            self._store.put_terminal(
+                session_id,
+                terminal_kind=terminal_kind,
+                summary=screen_excerpt,
+                ended_at=ended_at)
+        except Exception as _pe:
+            if str(getattr(_pe, "code", "")) != "unknown_session":
+                raise
 
         with self._lock:
-            # Discharge the terminal obligation: this session's terminal is now persisted.
             self._terminal_obligations.discard(session_id)
-            # Release leases at persist time (NEVER at _free_slot for this session).
             active_tid = self._active_lease_tokens.pop(session_id, None)
             live_tid = self._live_lease_tokens.pop(session_id, None)
-            # Move to terminal-pending inventory (outside _sessions, consumes no leases).
+            # C2: record pending entry with the terminal_seq read right after persist.
             pending_seq = None
+            owner_id = ""
             try:
-                tr = self._store.get_terminal(session_id, owner_id="")  # no owner check for seq
-                pending_seq = tr.terminal_seq
+                row = self._store._conn.execute(
+                    "SELECT t.terminal_seq, st.owner_id FROM terminal t "
+                    "JOIN starts st ON st.session_id = t.session_id "
+                    "WHERE t.session_id=?", (session_id,)).fetchone()
+                if row:
+                    pending_seq = row["terminal_seq"]
+                    owner_id = row["owner_id"]
             except Exception:
                 pass
             self._terminal_pending[session_id] = {
                 "terminal_kind": terminal_kind,
                 "terminal_seq": pending_seq,
+                "owner_id": owner_id,
                 "epoch": self._gen_epoch,
             }
 
-        # Release leases outside the lock.
         if active_tid is not None or live_tid is not None:
             self._release_terminal_leases(active_tid, live_tid)
 
@@ -993,10 +1009,11 @@ class SessionManager:
                 live_tid = None
             if snap is not None and snap.get("terminal_kind") == "done":
                 self._lineages.pop(snap.get("lineage_id"), None)
-            # S5a: persist was already done in _persist_terminal_for_publish BEFORE the
-            # ring event. _free_slot's old put_terminal call is now a no-op (idempotent).
-            # Still call it for safety (tests / paths without the S5 callback).
-            if snap is not None:
+            # A3: persist was ALREADY done in _persist_terminal_for_publish BEFORE the
+            # ring event. Only fall back to re-persist if the callback never ran
+            # (session not in _terminal_pending, e.g. test-only path without the S5
+            # callback). Use the SAME clock value so idempotency works.
+            if snap is not None and session_id not in self._terminal_pending:
                 try:
                     self._store.put_terminal(
                         session_id,
@@ -1233,10 +1250,19 @@ class SessionManager:
         # (lockless) PTY write so a concurrent start cannot claim the same slot mid-resume.
         if self._lease_client is not None:
             return self._lease_send_turn(session_id, text)
+        # B3: non-lease send_turn MUST check quiescence too.
+        if self._check_quiescent():
+            return RespondOutcome("no_pending")
         with self._lock:
             sess = self._sessions.get(session_id)
             if sess is None:
                 return RespondOutcome("unknown_session")
+            # B3: re-check under lock.
+            if self._quiescent:
+                if self._logger is not None:
+                    self._logger.warning("manager", "send_turn_rejected",
+                                         reason="quiescing", session_id=session_id)
+                return RespondOutcome("no_pending")
             if self._active_count() + self._reserved >= self._limit:
                 if self._logger is not None:
                     self._logger.warning("manager", "send_turn_rejected",
@@ -1543,16 +1569,35 @@ class SessionManager:
             self._logger.info("manager", "quiescence_started",
                               epoch=self._gen_epoch)
 
+    def _drop_confirmed_pending(self):
+        """Drop terminal-pending entries whose terminal_seq <= confirmed_high_water
+        for their epoch (the router has confirmed board-visibility)."""
+        expired = []
+        for sid, info in self._terminal_pending.items():
+            tseq = info.get("terminal_seq")
+            epoch = info.get("epoch")
+            if tseq is None or not epoch:
+                expired.append(sid)
+                continue
+            try:
+                chw = self._store.get_generation_confirmed_high_water(epoch)
+                if chw >= tseq:
+                    expired.append(sid)
+            except Exception:
+                pass
+        for sid in expired:
+            self._terminal_pending.pop(sid, None)
+
     def quiescence_status(self):
         """Return a snapshot of quiescence-relevant counters:
         {
-            live_sessions: int,       # _sessions count
-            outstanding_obligations: int,  # _terminal_obligations count
-            terminal_pending: int,    # _terminal_pending count
+            live_sessions: int,
+            outstanding_obligations: int,
+            terminal_pending: int,
             quiescent: bool,
         }
-        The operator uses this to decide when to certify.
         """
+        self._drop_confirmed_pending()
         with self._lock:
             return {
                 "live_sessions": len(self._sessions),

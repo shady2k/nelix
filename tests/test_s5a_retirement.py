@@ -681,10 +681,14 @@ class TestRetireEndToEnd:
 # ============================================================
 
 class _FakeClock:
+    """Advancing clock: each call returns t += 0.1 so double-persist with
+    differing ended_at would trigger the idempotency guard."""
     def __init__(self, t=1000.0):
         self.t = t
     def __call__(self):
-        return self.t
+        v = self.t
+        self.t += 0.1
+        return v
 
 
 class _TrackingEventQueue:

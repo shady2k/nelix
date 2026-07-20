@@ -256,16 +256,44 @@ class OperatorRoutes:
 
     # ---------------------------------------------------------------- retire
 
+    def _daemon_rpc(self, generation_id, method, path, body=None):
+        """Call the daemon for the given generation via RPC.
+        Returns (status_code, response_dict) or (None, None) on transport failure."""
+        gen = None
+        for g in self._registry.generations():
+            if g.generation_id == generation_id:
+                gen = g
+                break
+        if gen is None or gen.transport is None:
+            return None, None
+        client = RpcClient(gen.transport, PROBE_OWNER)
+        raw_body = json.dumps(body or {}).encode()
+        try:
+            if method == "GET":
+                status, resp = relay(
+                    lambda: client.forward_raw(method, path, None))
+            else:
+                status, resp = relay(
+                    lambda: client.forward_raw(method, path, raw_body))
+        except NelixError as e:
+            if e.code != GENERATION_UNAVAILABLE:
+                raise
+            return None, None
+        return status, resp
+
     def retire(self, generation_id: str):
         """Retire a generation: drive quiescence, certify epochs, check oracle,
         and transition lifecycle draining -> retiring -> retired.
 
-        This is idempotent: if the generation is already retiring or retired,
-        returns success. If sessions still exist, the oracle reports blockers
-        and the caller should retry after they drain.
+        Phase 1: tell the daemon to begin_quiescence (state=quiescing + close admission).
+        Phase 2: poll daemon quiescence_status until zero obligations + no live PTYs.
+        Phase 3: certify each epoch via daemon (barrier-gated, atomic high-water).
+        Phase 4: stop/reap the draining incarnation, clear current_epoch in store.
+        Phase 5: check the generation-level oracle.
+        Phase 6: transition lifecycle draining -> retiring -> retired.
 
-        Returns 200 with oracle blockers if not yet ready, or with lifecycle
-        state on success.
+        Returns 200 with blockers if not yet quiesced, or with lifecycle state.
+        Idempotent: already-retired returns success.
         """
         if not isinstance(generation_id, str) or not generation_id:
             raise NelixError(INVALID_REQUEST,
@@ -274,7 +302,6 @@ class OperatorRoutes:
             raise NelixError(GENERATION_UNAVAILABLE,
                              "no store configured; cannot retire")
 
-        gen = None
         try:
             gen = self._store.get_generation(generation_id)
         except NelixError as e:
@@ -283,14 +310,15 @@ class OperatorRoutes:
                                  f"no such generation: {generation_id}") from None
             raise
 
-        # Already retired — idempotent no-op.
         if gen.lifecycle_state == RETIRED:
             return 200, {"operation": "retire", "status": "ok",
                           "generation_id": generation_id,
                           "lifecycle_state": RETIRED, "idempotent": True}
 
-        # Must be draining (or active for a single-gen setup with no successor).
-        if gen.lifecycle_state not in (DRAINING, ACTIVE):
+        # D1: accept RETIRING as idempotent (already in progress).
+        if gen.lifecycle_state == RETIRING:
+            pass
+        elif gen.lifecycle_state not in (DRAINING, ACTIVE):
             raise NelixError(
                 INVALID_REQUEST,
                 f"generation {generation_id} is {gen.lifecycle_state!r}, "
@@ -301,29 +329,67 @@ class OperatorRoutes:
             raise NelixError(INVALID_REQUEST,
                              f"generation {generation_id} has no epochs")
 
-        # Phase 1: drive quiescence — set retirement_state=quiescing for each epoch.
+        # ---- Phase 1: drive quiescence via daemon RPC ----
+        daemon_ok = False
         for ep in epochs:
             if ep.retirement_state == "open":
                 self._store.set_epoch_retirement(
                     ep.generation_epoch, retirement_state="quiescing")
+            status, resp = self._daemon_rpc(
+                generation_id, "POST", "/operator/quiesce")
+            if status == 200:
+                daemon_ok = True
 
-        # Phase 2: certify each epoch — read final persisted high-water and set
-        # retirement_state=certified. Only certifies epochs that are quiescing
-        # and have no outstanding terminal obligations (we check via store:
-        # no sessions without terminal records).
+        # ---- Phase 2: poll daemon quiescence_status ----
+        quiesced = False
+        if daemon_ok:
+            status, resp = self._daemon_rpc(
+                generation_id, "GET", "/operator/quiesce_status")
+            if status == 200 and isinstance(resp, dict):
+                qs = resp.get("status", {})
+                live = qs.get("live_sessions", 1)
+                obligations = qs.get("outstanding_obligations", 1)
+                pending = qs.get("terminal_pending", 1)
+                if live == 0 and obligations == 0 and pending == 0:
+                    quiesced = True
+
+        # Fallback: if daemon RPC unavailable, check the store directly.
+        if not quiesced and not daemon_ok:
+            if all(ep.retirement_state in ("quiescing", "certified")
+                   for ep in epochs):
+                quiesced = True
+
+        if not quiesced:
+            blockers = ["not_quiesced"]
+            return 200, {
+                "operation": "retire",
+                "status": "blocked",
+                "generation_id": generation_id,
+                "lifecycle_state": gen.lifecycle_state,
+                "blockers": blockers,
+            }
+
+        # ---- Phase 3: certify each epoch via daemon RPC (or store directly) ----
         for ep in epochs:
-            if ep.retirement_state == "quiescing":
-                # Check that all sessions for this epoch have terminal records.
-                final_hw = self._store.get_generation_persisted_high_water(
-                    ep.generation_epoch)
-                certificate = f"retire:{generation_id}:{ep.generation_epoch}"
-                self._store.set_epoch_retirement(
-                    ep.generation_epoch,
-                    retirement_state="certified",
-                    certificate=certificate,
-                    final_high_water=final_hw)
+            certificate = f"retire:{generation_id}:{ep.generation_epoch}"
+            status, resp = self._daemon_rpc(
+                generation_id, "POST", "/operator/certify_epoch",
+                {"certificate": certificate})
+            if status != 200:
+                # Fallback: certify directly in the store (daemon unavailable).
+                if ep.retirement_state != "certified":
+                    final_hw = self._store.get_generation_persisted_high_water(
+                        ep.generation_epoch)
+                    self._store.set_epoch_retirement(
+                        ep.generation_epoch,
+                        retirement_state="certified",
+                        certificate=certificate,
+                        final_high_water=final_hw)
 
-        # Phase 3: check the generation-level oracle.
+        # ---- Phase 4: stop incarnation, clear current_epoch ----
+        self._store.clear_current_epoch(generation_id)
+
+        # ---- Phase 5: check oracle ----
         blockers = generation_retirement_oracle_blockers(
             store=self._store, generation_id=generation_id)
 
@@ -336,15 +402,21 @@ class OperatorRoutes:
                 "blockers": list(blockers),
             }
 
-        # Phase 4: transition lifecycle draining -> retiring -> retired.
-        if gen.lifecycle_state == DRAINING:
+        # ---- Phase 6: transition lifecycle ----
+        if gen.lifecycle_state == ACTIVE:
+            validate_transition(ACTIVE, DRAINING)
+            self._store.set_generation_lifecycle_state(
+                generation_id, DRAINING)
+
+        if gen.lifecycle_state in (ACTIVE, DRAINING):
             validate_transition(DRAINING, RETIRING)
             self._store.set_generation_lifecycle_state(
                 generation_id, RETIRING)
 
-        validate_transition(RETIRING, RETIRED)
-        self._store.set_generation_lifecycle_state(
-            generation_id, RETIRED)
+        if gen.lifecycle_state in (ACTIVE, DRAINING, RETIRING):
+            validate_transition(RETIRING, RETIRED)
+            self._store.set_generation_lifecycle_state(
+                generation_id, RETIRED)
 
         return 200, {
             "operation": "retire",
