@@ -307,8 +307,10 @@ def test_terminal_inventory_is_owner_filtered(two_harnesses):
     st, b = _req("GET", base + f"/status?owner_id={Y}")
     assert b["recent_terminal"] == {}, "Y saw X's terminal session in the inventory"
     assert "X SECRET TASK" not in json.dumps(b)
+    # S2a.2: daemon no longer surfaces persisted terminals in recent_terminal
+    # (advertised=False — the router's archive read owns that).
     st, b = _req("GET", base + f"/status?owner_id={X}")
-    assert list(b["recent_terminal"]) == [sx]            # its own owner still gets it
+    assert b["recent_terminal"] == {}, "S2a.2: daemon hides persisted terminals from live board"
 
 
 # ============================================================ /wait — the waiter

@@ -174,9 +174,11 @@ def test_durable_record_survives_ttl_expiry(tmp_path):
     mgr.stop(sid, owner_id=OWNER)
 
     # Verify terminal is in volatile dict (TTL window)
-    status0 = mgr.status(owner_id=OWNER)
-    assert sid in status0["recent_terminal"], \
-        "terminal should be in recent_terminal while TTL is fresh"
+    # S2a.2: daemon no longer surfaces persisted terminals in recent_terminal.
+    # The volatile dict holds the entry (for ring retention), but it is
+    # advertised=False so status() does not include it.
+    assert sid in mgr._terminal, \
+        "terminal should be in volatile dict while TTL is fresh"
 
     # Advance clock past the TTL (300s)
     clock.t = 2000.0
@@ -188,23 +190,23 @@ def test_durable_record_survives_ttl_expiry(tmp_path):
     assert sid not in mgr._terminal, \
         "volatile terminal should be swept after TTL expiry"
 
-    # BUT the store-backed result is STILL board-visible
-    # After TTL expiry, status() MUST supplement recent_terminal from the store
-    assert sid in status1["recent_terminal"], (
-        f"BUG REGRESSION: harness away {clock.t - 1000.0}s past the TTL — "
-        f"terminal result is GONE from the board. The store has it "
-        f"(list_terminal={[t.session_id for t in store.list_terminal(OWNER)]}) "
-        f"but status() did not surface it."
+    # S2a.2: the daemon no longer supplements recent_terminal from the store.
+    # The router's archive read (BoardForward) surfaces persisted terminals.
+    # After TTL expiry, the daemon's live board does NOT show this terminal.
+    assert sid not in status1["recent_terminal"], (
+        "S2a.2: daemon no longer surfaces persisted terminals — "
+        "the router's archive read owns that responsibility."
     )
 
-    # Verify the store still has the record
+    # Verify the store still has the record (router can still surface it)
     term = store.get_terminal(sid, owner_id=OWNER)
     assert term.terminal_kind == "done"
 
 
-def test_status_merges_store_and_volatile_without_duplicates(tmp_path):
-    """When a terminal is both in the volatile dict (fresh) AND the store,
-    status() must not return duplicate entries."""
+def test_persisted_terminal_hidden_from_daemon_live_board(tmp_path):
+    """S2a.2: once a terminal is persisted (advertised=False), the daemon's
+    status() does NOT surface it in recent_terminal. The router's archive read
+    owns that responsibility."""
     clock = FakeClock(1000.0)
     store, ledger = _setup_store_and_ledger(tmp_path, clock)
     sid = _router_started_session(ledger, store)
@@ -217,8 +219,12 @@ def test_status_merges_store_and_volatile_without_duplicates(tmp_path):
     own(sid, OWNER)
     mgr.stop(sid, owner_id=OWNER)
 
-    # Fresh: volatile dict has it, store has it — status must deduplicate
+    # Fresh: volatile dict has it (advertised=False) — daemon status must NOT surface it
     status = mgr.status(owner_id=OWNER)
-    assert sid in status["recent_terminal"]
-    # No double-counting
-    assert len([k for k in status["recent_terminal"] if k == sid]) == 1
+    assert sid not in status["recent_terminal"], (
+        "S2a.2: daemon must not surface a persisted terminal (advertised=False) — "
+        "the router's archive read is the single source."
+    )
+    # Verify the store still has the record (the router will surface it)
+    term = store.get_terminal(sid, owner_id=OWNER)
+    assert term.terminal_kind == "done"

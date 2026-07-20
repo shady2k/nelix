@@ -50,9 +50,13 @@ def test_free_slot_captures_terminal_snapshot_and_frees_slot(store_and_ledger):
     sess.on_terminal = mgr._free_slot
     mgr._free_slot(sid)
     assert sid not in mgr._sessions                       # slot freed
+    # S2a.2: daemon surfaces persisted terminals only via router archive read,
+    # not in its live board recent_terminal (advertised=False).
     out = mgr.status(owner_id=OWNER)
-    assert out["recent_terminal"][sid]["state"] == "crashed"
-    assert out["recent_terminal"][sid]["screen_excerpt"] == "boom"
+    assert sid not in out["recent_terminal"]
+    # The store has the record (router will surface it).
+    term = store.get_terminal(sid, owner_id=OWNER)
+    assert term.terminal_kind == "crashed"
 
 
 def test_terminal_snapshot_pruned_after_ttl(store_and_ledger):
@@ -62,13 +66,18 @@ def test_terminal_snapshot_pruned_after_ttl(store_and_ledger):
     sid, sess = _inject(store, ledger, mgr, "t2")
     mgr._free_slot(sid)
     assert sid in mgr._terminal
-    assert sid in mgr.status(owner_id=OWNER)["recent_terminal"]
+    # S2a.2: daemon does not surface persisted terminals (advertised=False).
+    assert sid not in mgr.status(owner_id=OWNER)["recent_terminal"]
     t["now"] = 1011.0                                       # past ttl
-    # In-memory TTL pruning: volatile entry removed, but store-backed
-    # record still surfaces via status()'s list_terminal supplement.
+    # In-memory TTL pruning: volatile entry removed.
+    # S2a.2: daemon no longer supplements from the store — the router's
+    # archive read surfaces persisted terminals.
     mgr.status(owner_id=OWNER)                             # triggers sweep
     assert sid not in mgr._terminal                         # volatile pruned
-    assert sid in mgr.status(owner_id=OWNER).get("recent_terminal", {})  # store-backed
+    assert sid not in mgr.status(owner_id=OWNER).get("recent_terminal", {})
+    # The store still has the record (router archive read will surface it).
+    term = store.get_terminal(sid, owner_id=OWNER)
+    assert term.terminal_kind == "crashed"
 
 
 def test_terminal_expiry_forgets_session_from_event_ring(store_and_ledger):
@@ -111,9 +120,10 @@ def test_multiple_terminal_snapshots_coexist_and_prune_independently(store_and_l
     # In-memory TTL: sid1 pruned from volatile, sid2 remains.
     assert sid1 not in mgr._terminal
     assert sid2 in mgr._terminal
-    # Board: both still surfaced via the store supplement.
+    # S2a.2: daemon no longer surfaces persisted terminals (advertised=False).
+    # The store still has both records (router archive read surfaces them).
     rt = mgr.status(owner_id=OWNER)["recent_terminal"]
-    assert sid1 in rt and sid2 in rt
+    assert sid1 not in rt and sid2 not in rt
 
 
 def test_negative_ttl_does_not_store_terminal_snapshot(store_and_ledger):
@@ -126,31 +136,32 @@ def test_negative_ttl_does_not_store_terminal_snapshot(store_and_ledger):
 
 # --- terminal_kind regression tests ---
 
-def test_terminal_kind_delivery_failed_plumbed_through_status(store_and_ledger):
+def test_terminal_kind_delivery_failed_stored_correctly(store_and_ledger):
     store, ledger = store_and_ledger
     mgr = _mgr(store_and_ledger)
     sid, _sess = _inject(store, ledger, mgr, "df", state="working", terminal_kind="delivery_failed")
     mgr._free_slot(sid)
-    rt = mgr.status(owner_id=OWNER)["recent_terminal"]
-    assert rt[sid]["terminal_kind"] == "delivery_failed"
+    # S2a.2: daemon no longer surfaces persisted terminals. Verify the store instead.
+    term = store.get_terminal(sid, owner_id=OWNER)
+    assert term.terminal_kind == "delivery_failed"
 
 
-def test_terminal_kind_done_plumbed_through_status(store_and_ledger):
+def test_terminal_kind_done_stored_correctly(store_and_ledger):
     store, ledger = store_and_ledger
     mgr = _mgr(store_and_ledger)
     sid, _sess = _inject(store, ledger, mgr, "ok", state="exited", terminal_kind="done")
     mgr._free_slot(sid)
-    rt = mgr.status(owner_id=OWNER)["recent_terminal"]
-    assert rt[sid]["terminal_kind"] == "done"
+    term = store.get_terminal(sid, owner_id=OWNER)
+    assert term.terminal_kind == "done"
 
 
-def test_terminal_kind_crashed_plumbed_through_status(store_and_ledger):
+def test_terminal_kind_crashed_stored_correctly(store_and_ledger):
     store, ledger = store_and_ledger
     mgr = _mgr(store_and_ledger)
     sid, _sess = _inject(store, ledger, mgr, "cr", state="crashed", terminal_kind="crashed")
     mgr._free_slot(sid)
-    rt = mgr.status(owner_id=OWNER)["recent_terminal"]
-    assert rt[sid]["terminal_kind"] == "crashed"
+    term = store.get_terminal(sid, owner_id=OWNER)
+    assert term.terminal_kind == "crashed"
 
 
 def test_session_terminal_kind_set_by_fail_delivery(tmp_path, monkeypatch):

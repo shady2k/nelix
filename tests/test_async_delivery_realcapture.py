@@ -238,10 +238,14 @@ def test_terminal_snapshot_carries_progress_trail(tmp_path, store_and_ledger):
     sess._stop.set()
     sess._finish()                                        # real terminal funnel -> _free_slot runs
     assert mgr.get(sid) is None                          # deregistered: the slot was freed
-    board = mgr.status(owner_id=OWNER)
-    snap = board["recent_terminal"][sid]
-    assert snap["progress_total"] == 2
-    summaries = [n["summary"] for n in snap["progress"]]
+    # S2a.2: daemon no longer surfaces persisted terminals in recent_terminal.
+    # The progress trail is captured in the volatile snapshot (for ring retention)
+    # and in the store record (summary only). Verify the volatile dict.
+    snap = mgr._terminal.get(sid)
+    assert snap is not None, "volatile terminal snapshot should exist after _free_slot"
+    snap_data = snap[0]                                   # (snapshot_dict, expires_at, advertised)
+    assert snap_data["progress_total"] == 2
+    summaries = [n["summary"] for n in snap_data["progress"]]
     assert summaries == ["did step 1", "did step 2"]
 
 

@@ -106,14 +106,18 @@ class _PreboundUnixHTTPServer(ThreadingHTTPServer):
         self.server_activate()               # listen() on the adopted socket
 
 
-def make_router_server(bound_socket, sock_path, start_path, registry, router_epoch):
+def make_router_server(bound_socket, sock_path, start_path, registry, router_epoch,
+                       store=None, archive_epoch=None):
     # Constructed here (not threaded through the signature) so every existing caller of
     # make_router_server keeps working unchanged — both take only `registry` (+ router_epoch),
     # already parameters of this function.
     session_forward = SessionForward(registry)
     restart_path = RestartPath(start_path.ledger, registry)
     operator_routes = OperatorRoutes(registry, router_epoch)
-    board_forward = BoardForward(registry, router_epoch)
+    # S2a.2: the router owns the archive board read. store is threaded from app.py so BoardForward
+    # can call store.read_board_snapshot(owner_id) directly. archive_epoch is the per-process
+    # epoch for the archive cursor component, minted like router_epoch.
+    board_forward = BoardForward(registry, router_epoch, store=store, archive_epoch=archive_epoch)
     # The orchestration /wait waiter (3c.3b). Wired off the SAME shared StartLedger as the start
     # path (start_path.ledger) — one instance, never per-request (nelix-91y).
     wait_forward = WaitForward(start_path.ledger, registry, router_epoch)

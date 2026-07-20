@@ -31,6 +31,12 @@ def _new_router_epoch() -> str:
     return "r-" + uuid.uuid4().hex
 
 
+def _new_archive_epoch() -> int:
+    """A fresh per-process archive epoch (spec §3.2a: minted like router_epoch, so an old cursor's
+    archive component expires on router restart). An int, opaque to callers."""
+    return int.from_bytes(uuid.uuid4().bytes[:4], 'big')
+
+
 def _install_shutdown_handlers() -> None:
     """SIGTERM/SIGINT -> orderly serve_forever() exit. Mirrors daemon/app.py's working shutdown: the
     handler RAISES SystemExit to unwind serve_forever() from the SERVING (main) thread, then main()'s
@@ -50,6 +56,7 @@ def _install_shutdown_handlers() -> None:
 
 def main() -> None:
     router_epoch = _new_router_epoch()
+    archive_epoch = _new_archive_epoch()
     try:
         handle = establish()
     except RouterLockHeld as e:
@@ -87,7 +94,8 @@ def main() -> None:
         # arrives between socket creation and serve_forever() is handled gracefully.
         _install_shutdown_handlers()
         server = make_router_server(handle.socket, handle.sock_path,
-                                     start_path, registry, router_epoch)
+                                     start_path, registry, router_epoch,
+                                     store=store, archive_epoch=archive_epoch)
     except Exception:
         # H13: Clean up EVERYTHING, not just when registry is None.
         # A StartPath/server-creation failure must also release the router
