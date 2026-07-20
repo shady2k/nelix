@@ -778,14 +778,25 @@ class SessionManager:
                 sess.stop()                       # tear down any partially-spawned PTY / open dialog
             except Exception:
                 pass
-            # Roll back durable state: transition the store's session row to "failed"
-            # so the router's ledger.fail() does not conflict with a live sessions row.
+            # FIX 1+2: clean up so no outstanding trace remains. Delete the sessions
+            # row (and any terminal stop() may have created) so list_starts_for_epoch
+            # excludes it. Release+clear lease tokens.
             try:
-                self._store.transition_session(sid, owner_id=owner_id, state="failed")
+                self._store._conn.execute(
+                    "DELETE FROM terminal WHERE session_id=?", (sid,))
             except Exception:
                 pass
-            with self._lock:                      # don't leak a registered-but-unstarted session
-                self._sessions.pop(sid, None)     # reservation already consumed: slot frees cleanly
+            try:
+                self._store._conn.execute(
+                    "DELETE FROM sessions WHERE session_id=?", (sid,))
+            except Exception:
+                pass
+            with self._lock:
+                self._sessions.pop(sid, None)
+                active_tid = self._active_lease_tokens.pop(sid, None)
+                live_tid = self._live_lease_tokens.pop(sid, None)
+            if active_tid is not None or live_tid is not None:
+                self._release_terminal_leases(active_tid, live_tid)
             self._log_spawn_failure("session_start_failed", sid, e)
             raise
         return StartOutcome(session_id=sid, base_seq=base_seq, snapshot=sess.snapshot())

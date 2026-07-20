@@ -973,23 +973,6 @@ class Store:
 
     @translates_sqlite
     @translates_sqlite
-    def list_all_starts_for_epoch(self, generation_epoch: str) -> list:
-        """Return ALL start rows for an epoch (regardless of terminal status).
-        Used by crash reconciliation to enumerate every admitted session for
-        child-group completeness proof (FIX 1 — child.json derivation)."""
-        if not isinstance(generation_epoch, str) or not generation_epoch:
-            raise NelixError(INVALID_REQUEST,
-                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
-        rows = self._conn.execute(
-            "SELECT st.session_id, st.owner_id, st.orchestration_id, "
-            "st.state, st.generation_id, st.generation_epoch, st.created_at "
-            "FROM starts st "
-            "JOIN sessions s ON s.session_id = st.session_id "
-            "WHERE st.generation_epoch=?",
-            (generation_epoch,)).fetchall()
-        return [dict(r) for r in rows]
-
-    @translates_sqlite
     def list_starts_for_epoch(self, generation_epoch: str) -> list:
         """Return start rows for an epoch that have a sessions row but no terminal
         (outstanding obligations). These are admitted sessions that never received a

@@ -1,6 +1,7 @@
 """Orphan reaping across daemon restart. All process inspection/killing goes through the
 ProcessInspector/ProcessKiller boundary so unit tests inject a fake process table instead
 of faking /proc, ps, PID reuse, or ppid==1."""
+import errno
 import json
 import os
 import signal as _signal
@@ -101,25 +102,26 @@ def record_child(session_dir, record: dict) -> None:
     fsync file and dir). Must be called AFTER spawn returns a pid/pgid and BEFORE the
     monitor thread does any work.
 
-    FIX 1: propagates errors (ENOSPC/EIO/etc) instead of swallowing — a session that
-    cannot persist its reap record must not start, because crash reconciliation needs
-    a recorded child group for every outstanding session.
+    FIX 3: detects short writes, propagates all fsync errors — a successful return
+    means the record is durably on disk.
     """
     paths.ensure_private_dir(session_dir)
     final = paths.child_record(session_dir)
     tmp = final.with_suffix(".json.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, json.dumps(record).encode())
+        data = json.dumps(record).encode()
+        written = os.write(fd, data)
+        if written != len(data):
+            raise OSError(
+                errno.EIO, f"short write: {written} of {len(data)} bytes")
         os.fsync(fd)
     finally:
         os.close(fd)
     os.replace(tmp, final)
     dfd = os.open(session_dir, os.O_RDONLY)
     try:
-        os.fsync(dfd)                  # persist the rename's directory entry
-    except OSError:
-        pass
+        os.fsync(dfd)
     finally:
         os.close(dfd)
 
