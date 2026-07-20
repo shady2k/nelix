@@ -905,3 +905,52 @@ def store(request):
     s = Store(paths.nelix_root(), clock=lambda: 1000.0)
     request.addfinalizer(lambda: s.close())
     return s
+
+
+# ============================================================
+# 7. EPERM regression test — PermissionError means alive
+# ============================================================
+
+class TestEPERMAlive:
+    """Verify that EPERM (PermissionError) from os.kill is treated as ALIVE,
+    never as dead. Only ESRCH (ProcessLookupError) means dead."""
+
+    def test_pid_alive_eperm_means_alive(self):
+        from generation_supervisor import _pid_alive
+        import os
+        # Mock os.kill to raise PermissionError for pid 42
+        original_kill = os.kill
+        call_log = []
+        def _mock_kill(pid, sig, **kw):
+            call_log.append((pid, sig))
+            if pid == 42:
+                raise PermissionError("EPERM mock")
+            return original_kill(pid, sig, **kw)
+        os.kill = _mock_kill
+        try:
+            assert _pid_alive(42) is True, "EPERM must mean alive"
+            assert _pid_alive(999999999) is False, "ESRCH must mean dead"
+        finally:
+            os.kill = original_kill
+
+    def test_reap_holder_eperm_returns_false(self):
+        """reap_holder with a live PID that raises PermissionError must return
+        False (cannot confirm death), so retire blocks."""
+        import os
+        from generation_supervisor import GenerationSupervisor
+        # Create a minimal supervisor where the holder is absent but PID is alive
+        # (PermissionError from os.kill means PID exists but can't be signalled).
+        original_kill = os.kill
+        def _eperm_kill(pid, sig, **kw):
+            if pid == 9999:
+                raise PermissionError("EPERM mock — process exists")
+            return original_kill(pid, sig, **kw)
+        os.kill = _eperm_kill
+        try:
+            from nelix_contracts.ids import new_generation_id
+            result = GenerationSupervisor(new_generation_id(), "b-1").reap_holder(
+                {"pid": 9999, "start_fingerprint": "fp"})
+            assert result is False, \
+                "EPERM on expected PID -> cannot confirm death -> False"
+        finally:
+            os.kill = original_kill

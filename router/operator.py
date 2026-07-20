@@ -486,13 +486,21 @@ class OperatorRoutes:
                 }
 
             # ---- Phase 6: re-resolve + confirm confirmed>=final (FIX 3) ----
+            # RE-READ the epoch record AFTER certification to get the fresh
+            # final_high_water=N set by the daemon. target_epoch was loaded
+            # before certify and has stale final_high_water=None.
             resolve2_ok = self._resolve_confirmed(generation_id,
                                                    target_epoch.generation_epoch)
             if resolve2_ok:
+                fresh_epochs = self._store.list_epochs(generation_id)
+                fresh_fhw = 0
+                for ep in fresh_epochs:
+                    if ep.generation_epoch == target_epoch.generation_epoch:
+                        fresh_fhw = ep.final_high_water or 0
+                        break
                 chw = self._store.get_generation_confirmed_high_water(
                     target_epoch.generation_epoch)
-                fhw = target_epoch.final_high_water or 0
-                if chw < fhw:
+                if chw < fresh_fhw:
                     resolve2_ok = False
             if not resolve2_ok:
                 return 200, {
