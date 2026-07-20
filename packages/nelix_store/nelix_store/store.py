@@ -823,6 +823,52 @@ class Store:
             (seq, generation_epoch))
 
     @translates_sqlite
+    def set_generation_lifecycle_state_atomic(self, old_id: str, new_id: str,
+                                               new_state_old: str,
+                                               expected_old_state: str,
+                                               expected_new_state: str) -> None:
+        """Atomically transition old generation -> new_state_old AND new generation ->
+        active in ONE transaction (both or neither). Raises IDEMPOTENCY_CONFLICT if
+        either generation does not exist or is not in the expected state."""
+        for gid in (old_id, new_id):
+            if not isinstance(gid, str) or not gid:
+                raise NelixError(INVALID_REQUEST,
+                                 f"generation_id must be a non-empty string: {gid!r}")
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            old_row = self._conn.execute(
+                "SELECT lifecycle_state FROM generations WHERE generation_id=?",
+                (old_id,)).fetchone()
+            if old_row is None:
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 f"no such generation: {old_id}")
+            if old_row["lifecycle_state"] != expected_old_state:
+                raise NelixError(
+                    IDEMPOTENCY_CONFLICT,
+                    f"generation {old_id} expected {expected_old_state!r}, "
+                    f"actual {old_row['lifecycle_state']!r}")
+            new_row = self._conn.execute(
+                "SELECT lifecycle_state FROM generations WHERE generation_id=?",
+                (new_id,)).fetchone()
+            if new_row is None:
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 f"no such generation: {new_id}")
+            if new_row["lifecycle_state"] != expected_new_state:
+                raise NelixError(
+                    IDEMPOTENCY_CONFLICT,
+                    f"generation {new_id} expected {expected_new_state!r}, "
+                    f"actual {new_row['lifecycle_state']!r}")
+            rc1 = self._conn.execute(
+                "UPDATE generations SET lifecycle_state=? WHERE generation_id=?",
+                (new_state_old, old_id)).rowcount
+            rc2 = self._conn.execute(
+                "UPDATE generations SET lifecycle_state=? WHERE generation_id=?",
+                ("active", new_id)).rowcount
+            if rc1 != 1 or rc2 != 1:
+                raise NelixError(IDEMPOTENCY_CONFLICT,
+                                 "atomic flip: rowcount mismatch")
+
+    @translates_sqlite
     def list_generations(self) -> list:
         """Return ALL generation rows, deterministic order. FAIL-CLOSED on
         any malformed row — does NOT skip unreadable rows (unlike _read_rows
