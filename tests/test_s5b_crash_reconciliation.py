@@ -108,6 +108,12 @@ class TestCrashReconciliationEndToEnd:
         sid3 = _router_started_session(ledger, store, gid=gid, epoch=epoch)
         mgr.start(EXECUTOR, "task-3", "/tmp", owner_id=OWNER, session_id=sid3)
 
+        # Record child-group records for sid2 and sid3 (daemon would do this at spawn)
+        store.record_epoch_child_group(epoch, session_id=sid2, child_pid=99998, child_pgid=99998,
+                                        leader_fingerprint="fp-child-2")
+        store.record_epoch_child_group(epoch, session_id=sid3, child_pid=99997, child_pgid=99997,
+                                        leader_fingerprint="fp-child-3")
+
         # Simulate daemon crash: set epoch dead
         store.set_epoch_process_state(epoch, "dead")
 
@@ -201,7 +207,8 @@ class TestChildGroupReapGate:
         store.set_epoch_process_state(epoch, "dead")
 
         # Record a child group with pid 42
-        store.record_epoch_child_group(epoch, child_pid=42, child_pgid=42)
+        store.record_epoch_child_group(epoch, session_id="s-test-alive", child_pid=42,
+                                        child_pgid=42, leader_fingerprint="fp-alive")
 
         operator = OperatorRoutes(None, "r-test", store=store)
 
@@ -248,7 +255,8 @@ class TestChildGroupReapGate:
         store.set_epoch_process_state(epoch, "dead")
 
         # Record a child with a non-existent pid (will be ESRCH)
-        store.record_epoch_child_group(epoch, child_pid=99998, child_pgid=99998)
+        store.record_epoch_child_group(epoch, session_id="s-test-dead", child_pid=99998,
+                                        child_pgid=99998, leader_fingerprint="fp-dead")
 
         operator = OperatorRoutes(None, "r-test", store=store)
 

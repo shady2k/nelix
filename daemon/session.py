@@ -327,10 +327,10 @@ class Session:
                 self._log.warning("session", "child_record_failed", session_id=self._id)
         # S5b: also record in the store so the router can reap this child group
         # during crash reconciliation if the daemon crashes.
-        # FIX 3: pass leader_fingerprint (child_fingerprint) for PID-reuse protection;
-        # do NOT swallow exceptions (fail-closed).
+        # FIX 3: pass session_id + leader_fingerprint (child_fingerprint) for
+        # completeness proof and PID-reuse protection; do NOT swallow exceptions.
         if self._record_child_store is not None:
-            self._record_child_store(pid, pgid, leader_fingerprint=record["child_fingerprint"])
+            self._record_child_store(self._id, pid, pgid, record["child_fingerprint"])
 
     # ---- low-level PTY ops (split from the old blind _submit) ----
     def _type_text(self, text, timeout=None, drain_output=False):

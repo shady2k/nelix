@@ -195,11 +195,14 @@ CREATE TABLE IF NOT EXISTS owner_board_seq (
 -- crashes. Each row records one child process (pid + pgid + start fingerprint)
 -- spawned by the epoch's daemon. The router reads this during crash reconciliation
 -- to kill survivors and verify the child group is gone before certifying.
+-- session_id links the record to the session for completeness proofs (FIX 3).
+-- leader_fingerprint is NOT NULL to prevent PID-reuse hazards.
 CREATE TABLE IF NOT EXISTS epoch_child_groups (
     generation_epoch   TEXT NOT NULL,
+    session_id         TEXT NOT NULL,
     child_pid          INTEGER NOT NULL,
     child_pgid         INTEGER,
-    leader_fingerprint TEXT,
+    leader_fingerprint TEXT NOT NULL,
     recorded_at        REAL NOT NULL,
     FOREIGN KEY (generation_epoch) REFERENCES epochs (generation_epoch) ON DELETE RESTRICT
 );

@@ -972,19 +972,28 @@ class Store:
                 (generation_id, generation_epoch))
 
     def record_epoch_child_group(self, generation_epoch: str, *,
-                                  child_pid: int, child_pgid: int | None = None,
-                                  leader_fingerprint: str | None = None) -> None:
+                                  session_id: str, child_pid: int,
+                                  child_pgid: int | None = None,
+                                  leader_fingerprint: str = "") -> None:
         if not isinstance(generation_epoch, str) or not generation_epoch:
             raise NelixError(INVALID_REQUEST,
                              f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        if not isinstance(session_id, str) or not session_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"session_id must be a non-empty string: {session_id!r}")
         if isinstance(child_pid, bool) or not isinstance(child_pid, int) or child_pid < 0:
             raise NelixError(INVALID_REQUEST,
                              f"child_pid must be a non-negative int: {child_pid!r}")
+        if not isinstance(leader_fingerprint, str) or not leader_fingerprint:
+            raise NelixError(INVALID_REQUEST,
+                             "leader_fingerprint must be a non-empty string")
         self._conn.execute(
             "INSERT INTO epoch_child_groups "
-            "(generation_epoch, child_pid, child_pgid, leader_fingerprint, recorded_at) "
-            "VALUES (?,?,?,?,?)",
-            (generation_epoch, child_pid, child_pgid, leader_fingerprint, self._clock()))
+            "(generation_epoch, session_id, child_pid, child_pgid, "
+            "leader_fingerprint, recorded_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (generation_epoch, session_id, child_pid, child_pgid,
+             leader_fingerprint, self._clock()))
 
     @translates_sqlite
     def list_epoch_child_groups(self, generation_epoch: str) -> list:
@@ -992,7 +1001,7 @@ class Store:
             raise NelixError(INVALID_REQUEST,
                              f"generation_epoch must be a non-empty string: {generation_epoch!r}")
         rows = self._conn.execute(
-            "SELECT child_pid, child_pgid, leader_fingerprint, recorded_at "
+            "SELECT session_id, child_pid, child_pgid, leader_fingerprint, recorded_at "
             "FROM epoch_child_groups WHERE generation_epoch=?",
             (generation_epoch,)).fetchall()
         return [dict(r) for r in rows]

@@ -350,8 +350,8 @@ class SessionManager:
                 "SELECT process_state, retirement_state FROM epochs "
                 "WHERE generation_epoch=?", (self._gen_epoch,)).fetchone()
             if ep is None:
-                self._quiescent = False
-                return False
+                self._quiescent = True
+                return True
             if ep["process_state"] == "dead":
                 self._quiescent = True
                 return True
@@ -707,9 +707,10 @@ class SessionManager:
                 base_seq = self._events.latest_seq()
                 # B3: re-check quiescence under _lock so a concurrent begin_quiescence
                 # between the pre-lock check and here is not missed.
-                if self._quiescent:
+                # FIX 5: re-read AUTHORITATIVE state (not cached _quiescent) at commit.
+                if self._check_quiescent():
                     raise RuntimeError(
-                        f"epoch {self._gen_epoch} is quiescing; no new sessions")
+                        f"epoch {self._gen_epoch} is quiescing or dead; no new sessions")
                 sess = self._make(sid, executor_name, spec)
                 sess.on_terminal = self._free_slot
                 sess._persist_terminal = self._persist_terminal_for_publish
@@ -941,14 +942,15 @@ class SessionManager:
         return sum(1 for s in self._sessions.values()
                    if s.snapshot().get("control_state") == "idle")
 
-    def _record_child_group_store(self, child_pid, child_pgid, leader_fingerprint=None):
+    def _record_child_group_store(self, session_id, child_pid, child_pgid, leader_fingerprint):
         """Record the child process group in the store for router-side crash reconciliation.
-        FIX 3: includes leader_fingerprint (PID-reuse protection); exceptions propagate
-        (fail-closed — a missing record must not be silently lost)."""
+        FIX 3: includes session_id (completeness proof) + leader_fingerprint (PID-reuse
+        protection); exceptions propagate (fail-closed)."""
         if not self._gen_epoch:
             return
         self._store.record_epoch_child_group(
-            self._gen_epoch, child_pid=child_pid, child_pgid=child_pgid,
+            self._gen_epoch, session_id=session_id,
+            child_pid=child_pid, child_pgid=child_pgid,
             leader_fingerprint=leader_fingerprint)
 
     def _persist_terminal_for_publish(self, session_id, terminal_kind, screen_excerpt):
@@ -1407,8 +1409,14 @@ class SessionManager:
             # UNKNOWN_SESSION (epoch not in store) is NOT fail-closed — test paths.
             if self._gen_epoch:
                 try:
-                    state = self._store.get_epoch_retirement_state(self._gen_epoch)
-                    if state in ("quiescing", "certified"):
+                    ep_row = self._store._conn.execute(
+                        "SELECT process_state, retirement_state FROM epochs "
+                        "WHERE generation_epoch=?", (self._gen_epoch,)).fetchone()
+                    if ep_row is None:
+                        self._quiescent = True
+                    elif ep_row["process_state"] == "dead":
+                        self._quiescent = True
+                    elif ep_row["retirement_state"] in ("quiescing", "certified"):
                         self._quiescent = True
                 except NelixError as e:
                     if e.code != UNKNOWN_SESSION:
