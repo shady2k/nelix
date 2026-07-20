@@ -795,6 +795,39 @@ class GenerationRegistry:
 
     # ── topology / generations / discovery ────────────────────────────────
 
+    def adopt_generation(self, generation_id: str, epoch: str, transport,
+                          build_id: "str | None" = None,
+                          incarnation: "dict | None" = None) -> GenerationHandle:
+        """Adopt a newly-activated generation into the registry's in-memory state.
+
+        Called by the operator path AFTER the atomic store flip has committed
+        (old->draining + new->active). Sets _active, bumps topology_revision, and
+        returns a GenerationHandle. Only call this AFTER the store transaction
+        has committed — never on health-check failure.
+
+        When incarnation is None, reads it from the live lock holder (the normal
+        operator path). Tests may provide it directly.
+        """
+        if incarnation is None:
+            sup = GenerationSupervisor(generation_id, build_id)
+            holder = sup._live_lock_holder()
+            if not holder:
+                raise NelixError(GENERATION_UNAVAILABLE,
+                                 f"generation {generation_id} has no live lock holder")
+            incarnation = {"pid": holder["pid"],
+                           "start_fingerprint": holder.get("start_fingerprint")}
+        with self._lock:
+            self._generation_id = generation_id
+            self._active = {
+                "incarnation": incarnation, "epoch": epoch,
+                "generation_id": generation_id, "transport": transport,
+                "build_id": build_id,
+            }
+            self._bump_topology_locked()
+        return GenerationHandle(generation_id=generation_id, epoch=epoch,
+                                transport=transport, build_id=build_id,
+                                incarnation=incarnation)
+
     def topology_revision(self) -> int:
         with self._lock:
             return self._topology_revision

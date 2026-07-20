@@ -116,7 +116,7 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
     # already parameters of this function.
     session_forward = SessionForward(registry, ledger=start_path.ledger, store=store)
     restart_path = RestartPath(start_path.ledger, registry)
-    operator_routes = OperatorRoutes(registry, router_epoch)
+    operator_routes = OperatorRoutes(registry, router_epoch, store=store)
     # S2a.2: the router owns the archive board read. store is threaded from app.py so BoardForward
     # can call store.read_board_snapshot(owner_id) directly. archive_epoch is the per-process
     # epoch for the archive cursor component, minted like router_epoch.
@@ -233,6 +233,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             if path in ("/respond", "/stop"):
                 self._handle_session_post(path, raw)
                 return
+            if path.startswith("/operator/"):
+                self._handle_operator_post(path, raw)
+                return
             self._dispatch_unimplemented("POST", path)
 
         def do_GET(self):
@@ -264,6 +267,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                 return
             if path == "/wait":
                 self._handle_wait()
+                return
+            if path == "/operator/list":
+                self._handle_operator_list()
                 return
             self._dispatch_unimplemented("GET", path)
 
@@ -504,6 +510,41 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
 
         def _handle_generation_list(self):
             status, resp = operator_routes.generation_list()
+            self._send(status, resp)
+
+        def _handle_operator_post(self, path, raw):
+            try:
+                body = json.loads(raw or b"{}")
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                raise NelixError(INVALID_REQUEST,
+                                 "operator body must be a JSON object")
+            if path == "/operator/install":
+                wheel = body.get("wheel")
+                if not isinstance(wheel, str) or not wheel:
+                    raise NelixError(INVALID_REQUEST,
+                                     "install requires a 'wheel' path")
+                status, resp = operator_routes.install(wheel)
+            elif path == "/operator/activate":
+                build_id = body.get("build_id")
+                if not isinstance(build_id, str) or not build_id:
+                    raise NelixError(INVALID_REQUEST,
+                                     "activate requires a 'build_id'")
+                status, resp = operator_routes.activate(build_id)
+            elif path == "/operator/retire":
+                gen_id = body.get("generation_id")
+                if not isinstance(gen_id, str) or not gen_id:
+                    raise NelixError(INVALID_REQUEST,
+                                     "retire requires a 'generation_id'")
+                status, resp = operator_routes.retire(gen_id)
+            else:
+                self._dispatch_unimplemented("POST", path)
+                return
+            self._send(status, resp)
+
+        def _handle_operator_list(self):
+            status, resp = operator_routes.list()
             self._send(status, resp)
 
         def _handle_router_health(self):

@@ -236,6 +236,15 @@ def runtime_install_lock() -> Path:
     return runtimes_root() / ".install.lock"
 
 
+def generations_install_lock() -> Path:
+    """Serializes concurrent operator activate/install operations on generations.
+
+    Analogous to runtime_install_lock: a global lock held for the duration of an
+    operator mutation (activate/install) so concurrent operations serialize cleanly.
+    """
+    return nelix_root() / ".generations.lock"
+
+
 def session_meta(session_dir) -> Path:
     """Per-session metadata sidecar (cols/rows/executor/driver). Single source of the filename so
     the daemon (writer) and the nelix-capture tool (reader) agree."""

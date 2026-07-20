@@ -39,8 +39,9 @@ module must never reinterpret it.
 import urllib.parse
 
 from nelix_contracts.errors import (
-    INVALID_REQUEST, UNSUPPORTED_BY_GENERATION, NelixError,
+    INVALID_REQUEST, GENERATION_UNAVAILABLE, UNSUPPORTED_BY_GENERATION, NelixError,
 )
+from nelix_contracts.lifecycle import DRAINING
 from nelix_contracts.ids import InvalidId, validate_owner_id, validate_session_id
 
 from router.forwarding import relay
@@ -82,11 +83,18 @@ def _resolve_and_forward(forward, owner_id, sid, params_fn, method, path_tpl,
         except NelixError:
             proc_state = None
             handle = None
-        if proc_state is not None and handle is not None:
-            path, body = params_fn(sid, owner_id)
-            return forward._forward_handle(handle, owner_id, method, path, body)
-        if proc_state is not None and proc_state != "serving":
-            return forward._route_archived(sid, owner_id, method, path_tpl, body_fn)
+        if proc_state is not None:
+            # S4: a serving-but-draining generation rejects generation-local restart.
+            if path_tpl == "restart" and lc_state == DRAINING and proc_state == "serving":
+                raise NelixError(
+                    GENERATION_UNAVAILABLE,
+                    "draining generation rejects restart; "
+                    "use POST /restart to spawn on the active generation")
+            if proc_state != "serving":
+                return forward._route_archived(sid, owner_id, method, path_tpl, body_fn)
+            if handle is not None:
+                path, body = params_fn(sid, owner_id)
+                return forward._forward_handle(handle, owner_id, method, path, body)
     gen = forward._registry.active()
     path, body = params_fn(sid, owner_id)
     return forward._forward_handle(gen, owner_id, method, path, body)
@@ -137,7 +145,10 @@ class SessionForward:
             except Exception:
                 pass
         elif path_tpl == "restart":
-            pass  # TODO(S4): spawn on active generation
+            # Restart-on-active (S4): archived/terminal sessions are restarted via POST /restart
+            # (RestartPath), not the old session-keyed restart path.
+            # TODO(S3e): implement LIVE-source atomic restart transfer.
+            pass
         self._unsupported()
 
     # -------------------------------------------------------------- owner-scoped routes
