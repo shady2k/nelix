@@ -323,12 +323,23 @@ class SessionManager:
             self._make = lambda sid, ex, spec: _default_session_factory(
                 sid, ex, spec, events, launcher_factory, driver_factory, logger)
 
+    def _store_epoch_is_certified(self):
+        """Check the store directly if the epoch is certified.
+        Fail-closed on error: treat unreadable as certified (reject).
+        """
+        if not self._gen_epoch:
+            return False
+        try:
+            state = self._store.get_epoch_retirement_state(self._gen_epoch)
+            return state == "certified"
+        except Exception:
+            return True
+
     def _check_quiescent(self):
         """Check if this epoch is quiescing. Updates local flag from store.
-        When quiescent, rejects new sessions/restarts/idle-resume.
-        B3: FAIL-CLOSED on store read error — never admit when authoritative
-        state can't be read. If gen_epoch is empty or no epoch row exists yet,
-        defaults to not quiescent (test paths without full store setup).
+        D3: FAIL-CLOSED on store connectivity/availability errors → reject.
+        UNKNOWN_SESSION (epoch not found) is NOT fail-closed — it means the
+        store simply has no row for this epoch yet, common in tests.
         """
         if not self._gen_epoch:
             self._quiescent = False
@@ -928,17 +939,20 @@ class SessionManager:
         consuming neither lease). Called exactly once per terminal — _free_slot does NOT
         re-persist.
         """
-        # B4 guard: reject terminal publication if epoch is already certified.
-        try:
-            rs = self._store.get_epoch_retirement_state(self._gen_epoch)
+        # B4/E: reject terminal publication if epoch is already certified.
+        # Fail-closed on store read error: treat unreadable as certified → reject.
+        # Skip check if gen_epoch is empty (test-only paths without real generation).
+        if self._gen_epoch:
+            try:
+                rs = self._store.get_epoch_retirement_state(self._gen_epoch)
+            except Exception:
+                raise RuntimeError(
+                    f"epoch {self._gen_epoch} store read failed; "
+                    f"terminal publication rejected (fail-closed)")
             if rs == "certified":
                 raise RuntimeError(
                     f"epoch {self._gen_epoch} is certified; "
                     f"terminal publication rejected (invariant violation)")
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
 
         ended_at = self._clock()
         try:
@@ -1013,16 +1027,18 @@ class SessionManager:
             # ring event. Only fall back to re-persist if the callback never ran
             # (session not in _terminal_pending, e.g. test-only path without the S5
             # callback). Use the SAME clock value so idempotency works.
+            # E: never persist after certified — would invalidate final_high_water.
             if snap is not None and session_id not in self._terminal_pending:
-                try:
-                    self._store.put_terminal(
-                        session_id,
-                        terminal_kind=snap.get("terminal_kind", "unknown"),
-                        summary=snap.get("screen_excerpt", ""),
-                        ended_at=self._clock())
-                except Exception as _pe:
-                    if str(getattr(_pe, "code", "")) != "unknown_session":
-                        raise
+                if not self._quiescent or not self._store_epoch_is_certified():
+                    try:
+                        self._store.put_terminal(
+                            session_id,
+                            terminal_kind=snap.get("terminal_kind", "unknown"),
+                            summary=snap.get("screen_excerpt", ""),
+                            ended_at=self._clock())
+                    except Exception as _pe:
+                        if str(getattr(_pe, "code", "")) != "unknown_session":
+                            raise
             if self._terminal_ttl > 0:
                 expires_at = self._clock() + self._terminal_ttl
                 if snap is not None:
@@ -1347,6 +1363,8 @@ class SessionManager:
         # Revalidate under the lock. Keep pending_acquire set until after send_turn
         # completes so a racing thread cannot also acquire a lease for this session.
         # FIX D: stage tokens under lock, release RPCs outside lock.
+        # D2: recheck _quiescent under _lock AFTER acquisition — if quiescing now,
+        # release the acquired lease and reject.
         revalidate_ok = False
         active_tid = None
         active_info = tokens.get("active") or {}
@@ -1354,6 +1372,10 @@ class SessionManager:
         stale_tokens = []    # tokens to release outside the lock
         release_tokens = []  # tokens from rollback to release outside the lock
         with self._lock:
+            if self._quiescent:
+                self._pending_acquire.discard(session_id)
+                if is_fresh:
+                    release_tokens = [active_info.get("token_id")] if active_info else []
             sess = self._sessions.get(session_id)
             if sess is None:
                 self._pending_acquire.discard(session_id)
@@ -1560,64 +1582,99 @@ class SessionManager:
     # ── S5a: quiescence / retirement support ────────────────────────────────
 
     def begin_quiescence(self):
-        """Begin quiescence for this epoch. Sets retirement_state=quiescing in
-        the store and sets the local flag so admission is rejected."""
-        self._store.set_epoch_retirement(
-            self._gen_epoch, retirement_state="quiescing")
-        self._quiescent = True
+        """Begin quiescence for this epoch.
+        D1: sets local _quiescent flag UNDER _lock ATOMICALLY with the store write,
+        so a _spawn already holding _lock cannot observe False and admit."""
+        with self._lock:
+            self._store.set_epoch_retirement(
+                self._gen_epoch, retirement_state="quiescing")
+            self._quiescent = True
         if self._logger is not None:
             self._logger.info("manager", "quiescence_started",
                               epoch=self._gen_epoch)
 
     def _drop_confirmed_pending(self):
         """Drop terminal-pending entries whose terminal_seq <= confirmed_high_water
-        for their epoch (the router has confirmed board-visibility)."""
-        expired = []
-        for sid, info in self._terminal_pending.items():
-            tseq = info.get("terminal_seq")
-            epoch = info.get("epoch")
-            if tseq is None or not epoch:
-                expired.append(sid)
-                continue
-            try:
-                chw = self._store.get_generation_confirmed_high_water(epoch)
-                if chw >= tseq:
+        for their epoch (the router has confirmed board-visibility).
+        F6: iterate _terminal_pending UNDER _lock. A pending entry whose terminal_seq
+        is None STAYS pending (never silently dropped — seq not yet resolved)."""
+        with self._lock:
+            expired = []
+            for sid, info in self._terminal_pending.items():
+                tseq = info.get("terminal_seq")
+                epoch = info.get("epoch")
+                if tseq is None:
+                    continue
+                if not epoch:
                     expired.append(sid)
-            except Exception:
-                pass
-        for sid in expired:
-            self._terminal_pending.pop(sid, None)
+                    continue
+                try:
+                    chw = self._store.get_generation_confirmed_high_water(epoch)
+                    if chw >= tseq:
+                        expired.append(sid)
+                except Exception:
+                    pass
+            for sid in expired:
+                self._terminal_pending.pop(sid, None)
 
     def quiescence_status(self):
-        """Return a snapshot of quiescence-relevant counters:
-        {
-            live_sessions: int,
-            outstanding_obligations: int,
-            terminal_pending: int,
-            quiescent: bool,
-        }
-        """
+        """Return a snapshot of quiescence-relevant counters.
+        D4: reports NOT-quiesced while _pending_acquire non-empty or _reserved > 0."""
         self._drop_confirmed_pending()
         with self._lock:
+            pending = len(self._pending_acquire)
+            reserved = self._reserved
+            in_flight = pending > 0 or reserved > 0
             return {
                 "live_sessions": len(self._sessions),
                 "outstanding_obligations": len(self._terminal_obligations),
                 "terminal_pending": len(self._terminal_pending),
-                "quiescent": self._quiescent,
+                "in_flight_admissions": pending + reserved,
+                "_pending_acquire": pending,
+                "_reserved": reserved,
+                "quiescent": self._quiescent and not in_flight,
             }
 
-    def certify_epoch(self, certificate):
+    def certify_epoch(self, expected_epoch, certificate):
         """Certify this epoch after quiescence completes.
-        Reads the final persisted high-water and sets retirement_state=certified
-        in the store. Returns the final_high_water and certificate.
+        A1: takes EXPECTED generation_epoch, verifies equals manager._gen_epoch
+        (rejects a different epoch). Under ONE synchronized boundary (manager._lock):
+          (a) checks the FULL barrier — zero obligations, no live PTYs,
+              _pending_acquire empty, _reserved==0, all staged writes committed;
+          (b) reads final persisted high-water;
+          (c) sets retirement_state=certified + final_high_water.
+        If the barrier is not met → raises RuntimeError (caller reports blocked).
+        Returns the final_high_water and certificate on success.
         """
-        final_hw = self._store.get_generation_persisted_high_water(
-            self._gen_epoch)
-        self._store.set_epoch_retirement(
-            self._gen_epoch,
-            retirement_state="certified",
-            certificate=certificate,
-            final_high_water=final_hw)
+        if expected_epoch != self._gen_epoch:
+            raise RuntimeError(
+                f"expected epoch {expected_epoch!r} does not match "
+                f"manager epoch {self._gen_epoch!r}")
+
+        with self._lock:
+            if self._terminal_obligations:
+                raise RuntimeError(
+                    f"cannot certify: {len(self._terminal_obligations)} "
+                    f"outstanding terminal obligations")
+            if self._sessions:
+                raise RuntimeError(
+                    f"cannot certify: {len(self._sessions)} live sessions")
+            if self._pending_acquire:
+                raise RuntimeError(
+                    f"cannot certify: {len(self._pending_acquire)} "
+                    f"in-flight pending acquires")
+            if self._reserved:
+                raise RuntimeError(
+                    f"cannot certify: {self._reserved} reserved slots")
+            final_hw = self._store.get_generation_persisted_high_water(
+                self._gen_epoch)
+            self._store.set_epoch_retirement(
+                self._gen_epoch,
+                retirement_state="certified",
+                certificate=certificate,
+                final_high_water=final_hw)
+            self._quiescent = True
+
         if self._logger is not None:
             self._logger.info("manager", "epoch_certified",
                               epoch=self._gen_epoch,

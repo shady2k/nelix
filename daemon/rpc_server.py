@@ -673,11 +673,18 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 return
             elif p.path == "/operator/certify_epoch":
                 certificate = body.get("certificate") if isinstance(body, dict) else None
-                if not certificate:
-                    self._send(400, {"error": "certificate is required"})
+                epoch = body.get("generation_epoch") if isinstance(body, dict) else None
+                if not certificate or not epoch:
+                    self._send(400, {"error": "certificate and generation_epoch are required"})
                     return
-                result = manager.certify_epoch(certificate)
-                self._send(200, {"operation": "certify_epoch", "status": "ok", **result})
+                try:
+                    result = manager.certify_epoch(epoch, certificate)
+                except RuntimeError as e:
+                    self._send(409, {"operation": "certify_epoch", "status": "blocked",
+                                      "error": str(e)})
+                    return
+                self._send(200, {"operation": "certify_epoch", "status": "ok",
+                                  "generation_epoch": epoch, **result})
                 return
             elif p.path == "/stop":
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)

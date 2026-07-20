@@ -813,6 +813,24 @@ class Store:
                              f"no such generation: {generation_id}")
 
     @translates_sqlite
+    def list_terminal_for_epoch(self, generation_epoch: str) -> list:
+        """Owner-agnostic per-epoch terminal enumeration INCLUDING acked/expired.
+        Returns list of TerminalRecords sorted by terminal_seq.
+        Used by confirmed_high_water resolution (FIX F): resolves EVERY terminal ≤ H
+        — board-visible, owner-acked, and validly-expired.
+        """
+        rows = self._conn.execute(
+            "SELECT t.session_id, st.owner_id, st.orchestration_id, "
+            "st.generation_id, st.generation_epoch, "
+            "t.terminal_kind, t.summary, t.ended_at, t.published_at, t.terminal_seq, "
+            "t.acknowledged_at, t.expired_at, t.expire_reason, t.schema_version "
+            "FROM terminal t JOIN starts st ON st.session_id = t.session_id "
+            "WHERE st.generation_epoch=? ORDER BY t.terminal_seq",
+            (generation_epoch,)).fetchall()
+        records, _skipped = _read_rows(rows, TerminalRecord)
+        return records
+
+    @translates_sqlite
     def set_generation_confirmed_high_water(self, generation_epoch: str, seq: int) -> None:
         """Monotonic advance of generation_progress.confirmed_high_water for an epoch.
 

@@ -57,6 +57,8 @@ class Backend:
             "live_sessions": 0,
             "outstanding_obligations": 0,
             "terminal_pending": 0,
+            "in_flight_admissions": 0,
+            "quiescent": True,
         }
         self.certify_calls = []
         backend = self

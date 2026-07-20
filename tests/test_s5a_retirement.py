@@ -639,7 +639,7 @@ class TestRetireEndToEnd:
         assert len(body.get("blockers", [])) > 0
 
     def test_retire_success_after_certified(self, setup):
-        store, registry, operator, _ = setup
+        store, registry, operator, backend = setup
         gid = new_generation_id()
         store.create_generation(gid, build_id="b-1", lifecycle_state=DRAINING,
                                 capability_snapshot=None, created_at=1000.0)
@@ -647,16 +647,25 @@ class TestRetireEndToEnd:
         store.insert_epoch(epoch, gid, incarnation_meta=None, created_at=1000.0)
         store.cas_epoch_serving(gid, epoch, expected_current_epoch=None)
 
-        # Manually certify and confirm high water
+        # Pre-certify and confirm high water — do NOT clear current_epoch yet
+        # (the operator clears it after reaping).
         store.set_epoch_retirement(epoch, retirement_state="certified",
                                    certificate="test-cert",
                                    final_high_water=0)
         store.set_generation_confirmed_high_water(epoch, 0)
-        store.clear_current_epoch(gid)
+
+        # Register generation in the registry so daemon RPC works
+        from daemon.transport import Transport
+        registry.adopt_generation(gid, epoch,
+                                  Transport.tcp("127.0.0.1", backend.port, "t"),
+                                  "b-1", incarnation={"pid": 1, "start_fingerprint": "fp"})
 
         status, body = operator.retire(gid)
         assert status == 200
-        assert body["status"] == "ok"
+        # With daemon reachable and quiesced, and epoch certified, retire should succeed
+        if body["status"] != "ok":
+            # If blocked, report blockers for debugging
+            pytest.fail(f"retire blocked: {body.get('blockers')}")
         assert body["lifecycle_state"] == RETIRED
 
     def test_retire_idempotent_when_already_retired(self, setup):
