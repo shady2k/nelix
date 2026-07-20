@@ -47,11 +47,12 @@ The cursor gains an archive component (archive_epoch, archive_seq) populated fro
 `/wait` (cursor DECODE + long-poll + CURSOR_EXPIRED/BOARD_CHANGED + advance) is 3c.3b, not this
 slice -- this module only CONSTRUCTS and ENCODES the cursor.
 """
+import sqlite3
 import urllib.parse
 
 from nelix_contracts.cursor import encode, new_cursor
 from nelix_contracts.errors import (
-    GENERATION_UNAVAILABLE, INVALID_REQUEST, NelixError,
+    GENERATION_UNAVAILABLE, INVALID_REQUEST, STORE_UNAVAILABLE, NelixError,
 )
 from nelix_contracts.ids import InvalidId, validate_owner_id
 
@@ -127,6 +128,10 @@ class BoardForward:
     """
 
     def __init__(self, registry, router_epoch, store=None, archive_epoch=None):
+        if (store is None) != (archive_epoch is None):
+            raise ValueError(
+                "store and archive_epoch must be both set or both None; "
+                f"got store={store!r}, archive_epoch={archive_epoch!r}")
         self._registry = registry
         self._router_epoch = router_epoch
         self._store = store
@@ -158,13 +163,16 @@ class BoardForward:
         if self._store is not None:
             try:
                 archive_seq, records = self._store.read_board_snapshot(owner_id)
+            except (sqlite3.Error, OSError):
+                archive_incomplete = True
+            except NelixError as e:
+                if e.code == STORE_UNAVAILABLE:
+                    archive_incomplete = True
+                else:
+                    raise
+            else:
                 merged = merge_archive_into(merged, records)
                 cursor = cursor.advance_archive(self._archive_epoch, archive_seq)
-            except Exception:
-                # A store read failure yields archive_incomplete, while still returning
-                # healthy live results. Never emit board_incomplete:false to mean an
-                # archive failure (SPEC §3).
-                archive_incomplete = True
         merged["cursor"] = encode(cursor)
         merged["board_incomplete"] = unavailable if unavailable else False
         if archive_incomplete:

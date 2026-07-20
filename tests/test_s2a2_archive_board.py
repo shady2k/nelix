@@ -9,7 +9,8 @@ Three invariants this file exists to prove:
       live results still returned.
 """
 import pytest
-from tests.conftest import OWNER
+from tests.conftest import EXECUTOR, OWNER, make_spec, own
+from daemon.events import EventQueue
 from daemon.transport import Transport
 from nelix_contracts.cursor import decode
 from nelix_contracts.errors import NelixError
@@ -283,3 +284,260 @@ def test_archive_incomplete_live_results_still_returned(wired):
     assert SID_1 in body["sessions"]
     # board_incomplete is NOT set for the archive failure
     assert body["board_incomplete"] is False
+
+
+# ============================================================ FIX 1: programming error propagates
+
+def test_archive_read_programming_error_propagates_not_archive_incomplete(wired):
+    """A programming-type error from the store (e.g. AttributeError, malformed)
+    must PROPAGATE — it must NOT become a masked archive_incomplete."""
+    backend, registry = wired
+    registry.active()
+
+    class _BoomStore:
+        def read_board_snapshot(self, owner_id):
+            raise AttributeError("fake programming bug in store")
+
+    forward = BoardForward(registry, EPOCH, store=_BoomStore(), archive_epoch=AE_EPOCH)
+    with pytest.raises(AttributeError, match="fake programming bug"):
+        forward.status(OWNER)
+
+
+def test_archive_read_internal_error_propagates_not_archive_incomplete(wired):
+    """A NelixError(INTERNAL_ERROR, ...) from the store must PROPAGATE —
+    it must NOT become archive_incomplete."""
+    backend, registry = wired
+    registry.active()
+
+    class _InternalErrorStore:
+        def read_board_snapshot(self, owner_id):
+            from nelix_contracts.errors import INTERNAL_ERROR
+            raise NelixError(INTERNAL_ERROR, "wrong-thread use of connection")
+
+    forward = BoardForward(registry, EPOCH, store=_InternalErrorStore(), archive_epoch=AE_EPOCH)
+    with pytest.raises(NelixError) as ei:
+        forward.status(OWNER)
+    assert ei.value.code == "internal_error"
+
+
+def test_archive_read_corrupt_error_propagates_not_archive_incomplete(wired):
+    """A NelixError(STORE_CORRUPT, ...) from the store propagates —
+    corruption is not transient unavailability."""
+    backend, registry = wired
+    registry.active()
+
+    class _CorruptStore:
+        def read_board_snapshot(self, owner_id):
+            from nelix_contracts.errors import STORE_CORRUPT
+            raise NelixError(STORE_CORRUPT, "stored record is unreadable")
+
+    forward = BoardForward(registry, EPOCH, store=_CorruptStore(), archive_epoch=AE_EPOCH)
+    with pytest.raises(NelixError) as ei:
+        forward.status(OWNER)
+    assert ei.value.code == "store_corrupt"
+
+
+# ============================================================ FIX 2: XOR validation
+
+def test_board_forward_rejects_store_without_archive_epoch():
+    """Constructing BoardForward with store but no archive_epoch raises ValueError."""
+    store = object()  # any non-None value
+    with pytest.raises(ValueError, match="store and archive_epoch must be both set or both None"):
+        BoardForward(None, EPOCH, store=store, archive_epoch=None)
+
+
+def test_board_forward_rejects_archive_epoch_without_store():
+    """Constructing BoardForward with archive_epoch but no store raises ValueError."""
+    with pytest.raises(ValueError, match="store and archive_epoch must be both set or both None"):
+        BoardForward(None, EPOCH, store=None, archive_epoch=AE_EPOCH)
+
+
+def test_board_forward_both_none_is_valid():
+    """BoardForward with store=None and archive_epoch=None is valid."""
+    forward = BoardForward(None, EPOCH, store=None, archive_epoch=None)
+    assert forward._store is None
+    assert forward._archive_epoch is None
+
+
+def test_board_forward_both_set_is_valid():
+    """BoardForward with both store and archive_epoch set is valid."""
+    store = object()
+    forward = BoardForward(None, EPOCH, store=store, archive_epoch=AE_EPOCH)
+    assert forward._store is store
+    assert forward._archive_epoch == AE_EPOCH
+
+
+# ============================================================ FIX 3: real end-to-end resurrection
+
+def _real_resurrection_setup(tmp_path):
+    """Shared setup for end-to-end resurrection tests: real Store, real SessionManager,
+    start+stop a session so its terminal is persisted and daemon-hidden.
+
+    Returns (store, session_id).
+    """
+    from nelix_store.ledger import StartLedger
+    from nelix_store.store import Store
+
+    clock = FakeClock(1000.0)
+    store = Store(tmp_path / "nelix-db", clock=clock)
+    ledger = StartLedger(tmp_path / "nelix-db", clock=clock)
+    sid = _router_started_session(ledger, store)
+    events = EventQueue()
+    mgr, _captured = _mgr_with_store(tmp_path, clock, store, events)
+    mgr.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER, session_id=sid)
+    own(sid, OWNER)
+    mgr.stop(sid, owner_id=OWNER)
+    daemon_board = mgr.status(owner_id=OWNER)
+    assert sid not in daemon_board["recent_terminal"], (
+        "daemon must hide persisted terminal from live board"
+    )
+    return store, sid
+
+
+class FakeClock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class TerminatingSession:
+    def __init__(self, sid, executor, events):
+        self.sid = sid
+        self.executor = executor
+        self._events = events
+        self.on_terminal = None
+        self.reaper_ctx = None
+        self.lineage_id = None
+        self.restarted_from = None
+        self.restart_count = 0
+        self._terminal_kind = "done"
+        self.task = "test-task"
+        self.cwd = "/tmp"
+
+    def start(self, task, cwd):
+        self.task = task
+        self.cwd = cwd
+
+    def snapshot(self):
+        return {"session_id": self.sid, "executor": self.executor,
+                "control_state": "busy", "task_delivery": "pending"}
+
+    def terminal_snapshot(self):
+        return {
+            "session_id": self.sid, "executor": self.executor,
+            "task": self.task, "cwd": self.cwd,
+            "control_state": "terminal", "terminal_kind": self._terminal_kind,
+            "task_delivery": "terminal", "screen_excerpt": "all done",
+            "pending": False, "lineage_id": self.lineage_id,
+            "restarted_from": self.restarted_from,
+            "restart_count": self.restart_count, "terminal": True,
+        }
+
+    def stop(self):
+        self._events.publish(self.sid, self.executor, self._terminal_kind,
+                             "all done", self._terminal_kind)
+        if self.on_terminal is not None:
+            self.on_terminal(self.sid)
+
+
+_OID = "o-" + "a" * 32
+_GID = "g-" + "b" * 32
+_GEPOCH = "g-" + "c" * 32
+
+
+def _router_started_session(ledger, store, owner_id=OWNER, clock=None):
+    r = ledger.reserve(idempotency_key="k_rr", owner_id=owner_id,
+                       orchestration_id=_OID, request_fingerprint="fp1")
+    ledger.assign_generation(r.session_id, _GID, _GEPOCH)
+    return r.session_id
+
+
+def _mgr_with_store(tmp_path, clock, store, events=None):
+    from daemon.manager import SessionManager
+    if events is None:
+        events = EventQueue()
+    specs = {EXECUTOR: make_spec()}
+    captured = []
+
+    def session_factory(sid, executor, spec, ev):
+        s = TerminatingSession(sid, executor, ev)
+        captured.append(s)
+        return s
+
+    mgr = SessionManager(specs, events, store, session_factory=session_factory,
+                         concurrency_limit=5, terminal_snapshot_ttl=300.0)
+    return mgr, captured
+
+
+def test_archive_surfaces_persisted_terminal_exactly_once_via_real_store(tmp_path):
+    """Real end-to-end: a persisted terminal is surfaced EXACTLY ONCE by
+    BoardForward (in recent_terminal, never in sessions)."""
+    from router.registry import GenerationRegistry
+
+    store, sid = _real_resurrection_setup(tmp_path)
+    registry = GenerationRegistry(store=store)  # no daemon needed for archive-only read
+    archive_epoch = 42
+    forward = BoardForward(registry, EPOCH, store=store, archive_epoch=archive_epoch)
+    status, body = forward.status(OWNER)
+    assert status == 200
+    # The terminal appears exactly once — in recent_terminal, never in sessions
+    assert sid not in body["sessions"]
+    assert sid in body["recent_terminal"]
+    assert len([k for k in body["recent_terminal"] if k == sid]) == 1
+    assert body["recent_terminal"][sid]["terminal_kind"] == "done"
+
+
+def test_archive_terminal_does_not_resurrect_after_ack(tmp_path):
+    """Real end-to-end: acked terminal is NOT resurrected by BoardForward.
+    After ack, the store no longer returns it, so it disappears from the merged
+    board entirely."""
+    from router.registry import GenerationRegistry
+
+    store, sid = _real_resurrection_setup(tmp_path)
+    # Ack the terminal
+    store.ack_terminal(sid, owner_id=OWNER)
+    registry = GenerationRegistry(store=store)
+    archive_epoch = 42
+    forward = BoardForward(registry, EPOCH, store=store, archive_epoch=archive_epoch)
+    status, body = forward.status(OWNER)
+    assert status == 200
+    # After ack, the terminal should NOT be in recent_terminal or sessions
+    assert sid not in body["sessions"]
+    assert sid not in body["recent_terminal"], (
+        "acked terminal must NOT resurrect as a live board entry"
+    )
+
+
+def test_archive_terminal_does_not_resurrect_after_prune(tmp_path):
+    """Real end-to-end: pruned (expired) terminal is NOT resurrected by BoardForward.
+    After prune_terminal, the store no longer returns it, so it disappears."""
+    from nelix_store.store import Store
+    from nelix_store.ledger import StartLedger
+    from router.registry import GenerationRegistry
+
+    # Use an advanceable clock so we can time-travel past the TTL for prune
+    clock = FakeClock(1000.0)
+    store = Store(tmp_path / "nelix-db-prune", clock=clock)
+    ledger = StartLedger(tmp_path / "nelix-db-prune", clock=clock)
+    sid = _router_started_session(ledger, store)
+    events = EventQueue()
+    mgr, _captured = _mgr_with_store(tmp_path, clock, store, events)
+    mgr.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER, session_id=sid)
+    own(sid, OWNER)
+    mgr.stop(sid, owner_id=OWNER)
+    # Terminal is persisted at clock=1000.0
+    # Prune (expire by age) — advance clock first so now > ended_at
+    clock.t = 2000.0
+    pruned = store.prune_terminal(max_age_seconds=0, max_count=100)
+    assert pruned >= 1, "prune_terminal should have expired the terminal"
+    registry = GenerationRegistry(store=store)
+    archive_epoch = 42
+    forward = BoardForward(registry, EPOCH, store=store, archive_epoch=archive_epoch)
+    status, body = forward.status(OWNER)
+    assert status == 200
+    assert sid not in body["sessions"]
+    assert sid not in body["recent_terminal"], (
+        "expired terminal must NOT resurrect as a live board entry"
+    )
