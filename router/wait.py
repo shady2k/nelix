@@ -6,47 +6,57 @@ hand-rolls a second cursor or a second error mapping.
 
 The shape, and why each piece is where it is:
 
-  1. DERIVE THE SESSIONS from the OWNER-SCOPED StartLedger (`sessions_for_orchestration`). This is
-     the router's isolation seam: owner Y querying owner Z's orchestration_id gets NONE of Z's
-     sessions (the ledger filters on owner_id too), so a foreign orchestration collapses to an
-     EMPTY set here, before any generation is touched. An empty set is a wait that can NEVER wake ->
-     an EXPLICIT `empty_orchestration` marker, never a silent 25s null spin the caller re-issues
-     forever (the same anti-spin reasoning the daemon's un-armable single /wait 404 embodies).
+   1. DERIVE THE SESSIONS from the OWNER-SCOPED StartLedger (`sessions_for_orchestration`). This is
+      the router's isolation seam: owner Y querying owner Z's orchestration_id gets NONE of Z's
+      sessions (the ledger filters on owner_id too), so a foreign orchestration collapses to an
+      EMPTY set here, before any generation is touched. An empty set is a wait that can NEVER wake ->
+      an EXPLICIT `empty_orchestration` marker, never a silent 25s null spin the caller re-issues
+      forever (the same anti-spin reasoning the daemon's un-armable single /wait 404 embodies).
 
-  2. DECODE THE VECTOR CURSOR against the CURRENT router state (nelix_contracts.cursor.decode). A
-     router restart changed router_epoch -> CURSOR_EXPIRED; the topology moved (a generation
-     appeared/retired) -> BOARD_CHANGED. Both mean "refetch the board and re-arm", so both are
-     surfaced as EXPLICIT 200 markers ({cursor_expired:true} / {board_changed:true}) -- the SAME
-     resync-marker shape the daemon's own /wait uses for a fallen-off ring cursor, so a caller has
-     ONE uniform place to detect "resync" rather than a mix of body flags and error envelopes. A
-     MISSING cursor = "start from now": read the generation's current int cursor and arm from there,
-     so only a NEW event wakes (never re-delivering old history).
+   2. DECODE THE VECTOR CURSOR against the CURRENT router state (nelix_contracts.cursor.decode). A
+      router restart changed router_epoch -> CURSOR_EXPIRED; the topology moved (a generation
+      appeared/retired) -> BOARD_CHANGED. Both mean "refetch the board and re-arm", so both are
+      surfaced as EXPLICIT 200 markers ({cursor_expired:true} / {board_changed:true}) -- the SAME
+      resync-marker shape the daemon's own /wait uses for a fallen-off ring cursor, so a caller has
+      ONE uniform place to detect "resync" rather than a mix of body flags and error envelopes. A
+      MISSING cursor = "start from now": read the generation's current int cursor and arm from there,
+      so only a NEW event wakes (never re-delivering old history).
 
-  3. FOR THE GENERATION(S) (N=1 today, LIST-shaped for Plan 4): take the cursor's component for the
-     generation's STABLE `slot_id` (`Cursor.position_for`). If the component's EPOCH != the
-     generation's CURRENT epoch, the daemon restarted (a fresh incarnation minted a fresh epoch, so
-     seqs reset) -> CURSOR_EXPIRED, never a wait on a stale epoch's seq. Else forward the daemon's
-     MULTI-SESSION wait (`/wait` with repeated `session_id=`) for (the orchestration's sessions on
-     this generation, after_seq = the component's seq), OWNER PASSED THROUGH -- the daemon (not the
-     router) owner-gates each sid, exactly as the session-keyed forwards relay ownership to the one
-     real gate. On an event -> ADVANCE ONLY that component (spec §4: "return when ANY backend
-     produces an event -> advance ONLY that component") and return {event, cursor}. On timeout ->
-     the UNCHANGED cursor. On the generation's cursor_expired -> the marker. On an all-unowned set
-     the daemon 404s -> an explicit `unownable` signal.
+   3. FOR THE GENERATION(S) (N=1 today, LIST-shaped for Plan 4): take the cursor's component for the
+      generation's STABLE `slot_id` (`Cursor.position_for`). If the component's EPOCH != the
+      generation's CURRENT epoch, the daemon restarted (a fresh incarnation minted a fresh epoch, so
+      seqs reset) -> CURSOR_EXPIRED, never a wait on a stale epoch's seq. Else forward the daemon's
+      MULTI-SESSION wait (`/wait` with repeated `session_id=`) for (the orchestration's sessions on
+      this generation, after_seq = the component's seq), OWNER PASSED THROUGH -- the daemon (not the
+      router) owner-gates each sid, exactly as the session-keyed forwards relay ownership to the one
+      real gate. On an event -> ADVANCE ONLY that component (spec §4: "return when ANY backend
+      produces an event -> advance ONLY that component") and return {event, cursor}. On timeout ->
+      the UNCHANGED cursor. On the generation's cursor_expired -> the marker. On an all-unowned set
+      the daemon 404s -> an explicit `unownable` signal.
 
-  N=1 collapses the generation loop to a single forward; the structure (a per-generation subset +
-  after_seq, racing, returning on the FIRST event) is exactly what Plan 4 needs when a session's
-  ledger `generation_id` resolves it to one of several slots. `registry.active()` -- the SAME
-  authoritative current-generation read the session-keyed forwards use -- gives the current
-  (transport, epoch); a wait is a session/orchestration operation, not the pure fan-out READ the
-  board is, so it resolves the live generation like respond/stop/restart, not the non-spawning
-  board-discovery probe.
+   N=1 collapses the generation loop to a single forward; the structure (a per-generation subset +
+   after_seq, racing, returning on the FIRST event) is exactly what Plan 4 needs when a session's
+   ledger `generation_id` resolves it to one of several slots. `registry.active()` -- the SAME
+   authoritative current-generation read the session-keyed forwards use -- gives the current
+   (transport, epoch); a wait is a session/orchestration operation, not the pure fan-out READ the
+   board is, so it resolves the live generation like respond/stop/restart, not the non-spawning
+   board-discovery probe.
+
+S2a.3 (this slice): the archive wake arm (bounded cross-process poll on board_seq). The
+WaitForward now also polls the store for archived mutations (ack, expiry, prune) which produce
+NO daemon ring event. The generation /wait is multiplexed with a SHORT bounded timeout so the
+router can poll board_seq and wake on archived mutations within the same ~25s window — no
+orphaned 25s requests. Archive read failures degrade gracefully (narrow catch), never a false
+GENERATION_UNAVAILABLE.
 """
+import sqlite3
+import time
 import urllib.parse
 
 from nelix_contracts.cursor import decode, encode, new_cursor
 from nelix_contracts.errors import (
-    BOARD_CHANGED, CURSOR_EXPIRED, GENERATION_UNAVAILABLE, INVALID_REQUEST, NelixError,
+    BOARD_CHANGED, CURSOR_EXPIRED, GENERATION_UNAVAILABLE, INVALID_REQUEST, STORE_UNAVAILABLE,
+    NelixError,
 )
 from nelix_contracts.ids import InvalidId, validate_orchestration_id, validate_owner_id
 
@@ -80,10 +90,21 @@ def _healthy_int_cursor(value) -> bool:
 class WaitForward:
     """Router GET /wait -- the orchestration-scoped long-poll."""
 
-    def __init__(self, ledger, registry, router_epoch):
+    # S2a.3: the archive multiplex window and bounded poll interval (seconds). Made
+    # class-level so tests can override for fast execution without real blocking.
+    _WAIT_WINDOW = 25.0
+    _POLL_INTERVAL = 1.0
+
+    def __init__(self, ledger, registry, router_epoch, store=None, archive_epoch=None):
+        if (store is None) != (archive_epoch is None):
+            raise ValueError(
+                "store and archive_epoch must be both set or both None; "
+                f"got store={store!r}, archive_epoch={archive_epoch!r}")
         self._ledger = ledger
         self._registry = registry
         self._router_epoch = router_epoch
+        self._store = store
+        self._archive_epoch = archive_epoch
 
     def wait(self, owner_id, orchestration_id, cursor_token) -> "tuple[int, dict]":
         """Long-poll the orchestration. The effective long-poll window is always the generation's
@@ -117,9 +138,6 @@ class WaitForward:
         # 3. The generation(s). N=1 today; active() = the authoritative current generation (the same
         #    read the session-keyed forwards use), raising GENERATION_UNAVAILABLE (retryable) if none
         #    can be made available.
-        # TODO(S2a.3): archive wake arm (bounded cross-process poll on board_seq). Check the
-        # cursor's archive component against the current board_seq; if stale, poll/notify
-        # the store rather than only forwarding to the generation ring.
         gen = self._registry.active()
         # Plan 4: partition `sessions` by their ledger generation_id -> slot, derive (subset,
         # after_seq) PER generation, forward each wait, and return on the FIRST event -> advancing
@@ -153,7 +171,82 @@ class WaitForward:
         # router can detect the mismatch on THIS call and return cursor_expired immediately instead of
         # burning the window -- is filed as nelix-1hy, not this slice (3c.4 proves the ROUTER-restart
         # story: the daemon here never restarts at all).
-        return self._wait_on_generation(gen, owner_id, gen_sessions, after_seq, cursor)
+
+        # S2a.3: Archive arm setup. Determine the archive component from the decoded cursor.
+        archive_seq = None
+        if self._store is not None:
+            arch_pos = cursor.archive_position
+            if arch_pos is not None:
+                arch_epoch, arch_seq_val = arch_pos
+                if arch_epoch != self._archive_epoch:
+                    # Router restarted: a fresh archive_epoch means the old archive_seq is
+                    # meaningless. Resync like the generation epoch mismatch.
+                    return 200, {"event": None, "cursor_expired": True}
+                archive_seq = arch_seq_val
+            else:
+                # Fresh cursor (no archive component): "start from now" -- read current board_seq
+                # so only a NEW mutation wakes. Never deliver backlog.
+                try:
+                    board_seq = self._store.get_owner_board_seq(owner_id)
+                except (sqlite3.Error, OSError):
+                    pass
+                except NelixError as e:
+                    if e.code != STORE_UNAVAILABLE:
+                        raise
+                else:
+                    cursor = cursor.advance_archive(self._archive_epoch, board_seq)
+                    archive_seq = board_seq
+
+        # S2a.3: Bounded multiplex -- poll archive board_seq + short-generation forward loop.
+        # When both store and archive_seq are available, poll the store between short generation
+        # waits so an archived mutation (ack, expiry, prune) can wake the wait mid-window.
+        # The effective wait window stays ~25s (matching today's single forward), but each daemon
+        # forward uses a short bounded timeout so we can interleave archive polling. No orphaned
+        # 25s request.
+        if self._store is not None and archive_seq is not None:
+            start_time = time.time()
+
+            while True:
+                # Archive poll: check if board_seq advanced past the cursor's archive position.
+                try:
+                    current_seq = self._store.get_owner_board_seq(owner_id)
+                except (sqlite3.Error, OSError):
+                    pass
+                except NelixError as e:
+                    if e.code != STORE_UNAVAILABLE:
+                        raise
+                else:
+                    if current_seq > archive_seq:
+                        advanced = cursor.advance_archive(self._archive_epoch, current_seq)
+                        return 200, {"event": {"kind": "archive"}, "cursor": encode(advanced)}
+
+                elapsed = time.time() - start_time
+                remaining = self._WAIT_WINDOW - elapsed
+                if remaining <= 0:
+                    return 200, {"event": None, "cursor": encode(cursor)}
+
+                bounded = self._POLL_INTERVAL if self._POLL_INTERVAL < remaining else remaining
+                try:
+                    status, resp = self._wait_on_generation(
+                        gen, owner_id, gen_sessions, after_seq, cursor, timeout=bounded)
+                except NelixError as e:
+                    if e.code != GENERATION_UNAVAILABLE:
+                        raise
+                    # Transient generation failure: continue polling archive
+                    continue
+
+                if resp.get("empty_orchestration") or resp.get("unownable") or resp.get("cursor_expired"):
+                    return status, resp
+
+                if resp.get("event") is not None:
+                    return status, resp
+
+                # Brief yield so a rapid fake-Backend loop does not overwhelm the server.
+                time.sleep(0)
+        else:
+            # No archive arm: single generation forward with no bounded timeout,
+            # byte-for-byte identical to the pre-S2a.3 behavior.
+            return self._wait_on_generation(gen, owner_id, gen_sessions, after_seq, cursor)
 
     def _current_seq(self, gen, owner_id) -> int:
         """The generation's CURRENT int cursor (its board-wide latest_seq), for a "start from now"
@@ -167,13 +260,19 @@ class WaitForward:
         raise NelixError(GENERATION_UNAVAILABLE,
                          "could not read the generation's current cursor to start the wait")
 
-    def _wait_on_generation(self, gen, owner_id, sessions, after_seq, cursor) -> "tuple[int, dict]":
+    def _wait_on_generation(self, gen, owner_id, sessions, after_seq, cursor,
+                           timeout=None) -> "tuple[int, dict]":
         """Forward the daemon's MULTI-SESSION /wait for this generation's session subset, then map
         its reply back onto the vector cursor. The daemon owner-gates each sid (owner passed
-        through), so the router never re-implements ownership."""
+        through), so the router never re-implements ownership.
+
+        `timeout` is an optional bounded timeout (seconds) forwarded as a query param to the
+        daemon's /wait, enabling the S2a.3 bounded multiplex."""
         client = RpcClient(gen.transport, owner_id)
         # Repeated session_id= params -> the daemon's multi-session wait. doseq=True encodes the list.
         params = [("owner_id", owner_id), ("after_seq", after_seq)]
+        if timeout is not None:
+            params.append(("timeout", str(timeout)))
         params += [("session_id", s) for s in sessions]
         path = "/wait?" + urllib.parse.urlencode(params)
         status, body = relay(lambda: client.forward_raw("GET", path, None))
