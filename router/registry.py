@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from nelix_contracts.errors import GENERATION_UNAVAILABLE, IDEMPOTENCY_CONFLICT, UNKNOWN_SESSION, NelixError
 from nelix_contracts.ids import new_generation_id
 
+import paths
+
 from generation_supervisor import GenerationSupervisor
 
 PROBE_OWNER = "nelix-router-probe"
@@ -35,7 +37,8 @@ def _incarnation_meta(inc: dict) -> str:
 class GenerationRegistry:
 
     def __init__(self, *, store=None, build_id=None,
-                 supervisor=None, health_probe=None):
+                 supervisor=None, health_probe=None,
+                 health_retries=0, health_retry_delay=0.0):
         self._store = store
         self._lock = threading.Lock()
         self._gen_locks = {}
@@ -45,6 +48,9 @@ class GenerationRegistry:
         self._generation_id = None
         self._active = None
         self._topology_revision = 1
+        self._health_retries = health_retries
+        self._health_retry_delay = health_retry_delay
+        self._sleep = time.sleep
 
         # Eager re-adoption in constructor.
         if self._store is not None and self._sup is None:
@@ -77,6 +83,29 @@ class GenerationRegistry:
                              f"multiple ({len(active_rows)}) active generation rows found; "
                              "store is corrupted")
 
+        # C6: Reap dirs with no DB row — run even when there is no active generation
+        # so dir-only orphans (dirs not matching any DB row) are always cleaned up.
+        # Proven: test_orphan_dir_reaped_no_active in test_router_restart_realdaemon_re_adoption.py
+        try:
+            known_ids = {g.generation_id for g in gens}
+            for d in paths.generations_root().iterdir():
+                if not d.is_dir():
+                    continue
+                dir_name = d.name
+                if dir_name not in known_ids:
+                    _log.warning("registry: orphan generation dir %s (no DB row); reaping", dir_name)
+                    try:
+                        os_sup = GenerationSupervisor(dir_name, None)
+                        holder = os_sup._live_lock_holder()
+                        if holder:
+                            inc = {"pid": holder["pid"],
+                                   "start_fingerprint": holder.get("start_fingerprint")}
+                            os_sup.reap_holder(inc)
+                    except Exception:
+                        pass
+        except OSError:
+            pass
+
         if not active_rows:
             return  # No active — first call to active() will mint one.
 
@@ -101,28 +130,6 @@ class GenerationRegistry:
             raise NelixError(GENERATION_UNAVAILABLE,
                              "failed to read epoch list during re-adoption; "
                              "store may be corrupted")
-
-        # C6: Reap dirs with no DB row.
-        # TODO(S1c-2 hardening bead): dir-only orphan reaping in empty/no-active case
-        try:
-            for d in sup.generation_dir().parent.iterdir():
-                if not d.is_dir():
-                    continue
-                dir_name = d.name
-                if dir_name not in {g.generation_id for g in gens}:
-                    _log.warning("registry: orphan generation dir %s (no DB row); reaping", dir_name)
-                    # Best-effort: reap the lock holder if any.
-                    try:
-                        os_sup = GenerationSupervisor(dir_name, None)
-                        holder = os_sup._live_lock_holder()
-                        if holder:
-                            inc = {"pid": holder["pid"],
-                                   "start_fingerprint": holder.get("start_fingerprint")}
-                            os_sup.reap_holder(inc)
-                    except Exception:
-                        pass
-        except OSError:
-            pass
 
         # C6: current_epoch=NULL but epochs exist → repair to a consistent state.
         if current_epoch is None:
@@ -245,7 +252,6 @@ class GenerationRegistry:
             return
 
         # Inspect the current_epoch's holder.
-        # TODO(S1c-2 hardening bead): bounded not-yet-healthy startup stabilization
         holder = sup._live_lock_holder()
         epoch_recs = {e.generation_epoch: e for e in all_epochs}
         epoch_rec = epoch_recs.get(current_epoch)
@@ -255,7 +261,25 @@ class GenerationRegistry:
 
             if transport is not None:
                 # C3: STRICT health check (key presence, not .get()).
-                identity = sup._health_identity(transport) if sup._check_health(transport) else None
+                # B1: Bounded retry (health_retries parameter, default 0) for
+                # starting epochs — tolerate a daemon that is alive but not yet
+                # passing /health (still booting). health_retries=0 preserves
+                # the original reconcile-dead behavior. Tests inject retries
+                # and clock via the constructor. Proven:
+                # test_starting_epoch_retry_health and
+                # test_starting_epoch_no_retry_reconciles_dead in
+                # test_router_restart_realdaemon_re_adoption.py
+                identity = None
+                max_attempts = 1
+                if epoch_rec and epoch_rec.process_state == "starting" and self._health_retries > 0:
+                    max_attempts = 1 + self._health_retries
+                for attempt in range(max_attempts):
+                    if sup._check_health(transport):
+                        identity = sup._health_identity(transport)
+                        if identity is not None:
+                            break
+                    if attempt < max_attempts - 1:
+                        self._sleep(self._health_retry_delay)
                 if identity is not None and all(k in identity for k in ("generation_id", "generation_epoch", "build_id")):
                     full_match = (
                         identity["generation_id"] == gid
@@ -328,7 +352,10 @@ class GenerationRegistry:
                 inc = {"pid": holder["pid"],
                        "start_fingerprint": holder.get("start_fingerprint")}
                 ep = sup.endpoint(expected_epoch=current_epoch)
-                if ep is not None:
+                # D1: Must gate on process_state — do NOT adopt an epoch whose
+                # DB row is dead/unknown just because a TCP endpoint answers.
+                # Proven: test_tcp_holder_rejects_nonserving_epoch
+                if ep is not None and epoch_rec and epoch_rec.process_state == "serving":
                     # C1: Re-read holder before install — abort if changed, don't reap.
                     re_read = sup._live_lock_holder()
                     if (not re_read
@@ -359,16 +386,17 @@ class GenerationRegistry:
                 raise
 
         # C6: Every OTHER starting epoch → dead.
-        # TODO(S1c-2 hardening bead): multiple historical starting epochs reconciliation
+        # Proven: test_historical_starting_epochs_reconciled covers N>1 case;
+        # test_reconcile_starting_epoch_error_propagates covers error propagation.
         for e in all_epochs:
             if e.generation_epoch == current_epoch:
                 continue
             if e.process_state == "starting":
                 try:
                     self._store.reconcile_epoch_dead(gid, e.generation_epoch)
-                except NelixError as e:
+                except NelixError as err:
                     _log.warning("registry: reconcile_epoch_dead(%s, %s) failed: %s",
-                                 gid, e.generation_epoch, e)
+                                 gid, e.generation_epoch, err)
                     raise
 
     def _get_epoch(self, gid, epoch):
