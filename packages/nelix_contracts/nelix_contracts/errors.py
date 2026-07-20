@@ -28,6 +28,17 @@ STORE_UNSUPPORTED = "store_unsupported"
 # the same call can fix a defect in the code making it.
 INTERNAL_ERROR = "internal_error"
 
+# The router's lease service is unreachable or not yet ready to serve (S3b: rebuilding
+# state). Distinct from concurrency_limit so callers can distinguish "no capacity" from
+# "cannot even ask about capacity". Retryable: the same call may succeed once the router
+# is reachable or done rebuilding.
+ADMISSION_UNAVAILABLE = "admission_unavailable"
+
+# The router lease service is in the middle of rebuilding its in-memory state from the
+# durable store after a restart (S3b). A generation cannot know whether a slot is free
+# until rebuild completes. Retryable: re-queue and try again after a backoff.
+REBUILDING = "rebuilding"
+
 # The terminal result existed and the store retired it from the board before the owner
 # acknowledged it. Distinct from unknown_session ON PURPOSE: deleting the row made "you were too
 # late" and "that session id was never real" the same answer, and they call for opposite
@@ -42,6 +53,8 @@ _RETRYABLE = {
     ARCHIVE_INCOMPLETE: True,
     GENERATION_UNAVAILABLE: True,
     CONCURRENCY_LIMIT: True,
+    ADMISSION_UNAVAILABLE: True,
+    REBUILDING: True,
     OWNER_MISMATCH: False,
     UNKNOWN_SESSION: False,
     CURSOR_EXPIRED: False,

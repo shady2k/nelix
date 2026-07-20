@@ -39,6 +39,12 @@ launcher = "local"       # MVP: only "local" is implemented ("auto"/"docker" are
 #                                 # terminal-fails the session with a logged escalation (0 = off)
 # max_restarts            = 3     # consecutive auto-restarts (no progress) before Hermes escalates
 
+# Router lease service bounds (S3a). The router enforces ONE active counter across ALL
+# generations; live_pty_limit is a SEPARATE bound for idle-but-alive sessions that still
+# hold a PTY/process. Both default to 5.
+concurrency_limit = 5          # active-slot cap (router lease service)
+live_pty_limit = 5             # live-PTY cap (separate from active)
+
 # Retention (optional; defaults shown). Applied by the daemon/supervisor.
 daemon_log_retain    = 10    # how many daemon-<ts>-<pid>.log files to keep (min 1)
 session_retain       = 20    # how many session dirs to keep by count (0 = disable this rake)

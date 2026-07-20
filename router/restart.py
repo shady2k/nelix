@@ -18,8 +18,8 @@ Flow for POST /restart:
 import hashlib
 
 from nelix_contracts.errors import (
-    GENERATION_UNAVAILABLE, IDEMPOTENCY_CONFLICT, INTERNAL_ERROR, INVALID_REQUEST,
-    NelixError,
+    ADMISSION_UNAVAILABLE, CONCURRENCY_LIMIT, GENERATION_UNAVAILABLE, IDEMPOTENCY_CONFLICT,
+    INTERNAL_ERROR, INVALID_REQUEST, REBUILDING, NelixError,
 )
 from nelix_contracts.ids import (
     InvalidId, validate_owner_id, validate_session_id,
@@ -29,6 +29,9 @@ from nelix_contracts.ids import (
 _HTTP_STATUS = {
     INVALID_REQUEST: 400,
     IDEMPOTENCY_CONFLICT: 409,
+    CONCURRENCY_LIMIT: 429,
+    ADMISSION_UNAVAILABLE: 503,
+    REBUILDING: 503,
     GENERATION_UNAVAILABLE: 503,
     INTERNAL_ERROR: 500,
 }

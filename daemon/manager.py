@@ -12,9 +12,13 @@ from daemon.drivers import get_driver
 from daemon.env_resolver import EnvResolveError, resolve_env_cmds
 from daemon.events import EXTERNAL_OUTPUT_POLICY
 from daemon.launchers import get_launcher
+from daemon.lease_client import LeaseClient
 from daemon.model_cache import ModelCache
 from daemon.model_discovery import discover, auth_of, DiscoveryError
 from daemon.session import RespondOutcome, Session
+from nelix_contracts.errors import (
+    ADMISSION_UNAVAILABLE, CONCURRENCY_LIMIT, REBUILDING, NelixError,
+)
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
 
@@ -233,12 +237,19 @@ def _default_session_factory(sid, executor, spec, events, launcher_factory,
 
 
 class SessionManager:
-    """Registry of sessions. Holds <= concurrency_limit (config-driven, default 5)."""
+    """Registry of sessions. Holds <= concurrency_limit (config-driven, default 5).
+
+    When ``lease_client`` is provided, admission is managed through the ROUTER-OWNED lease
+    service with local choreography (§3.3b): acquire leases outside ``_lock``, validate
+    under ``_lock``, commit or release. Without ``lease_client``, the old local cap check
+    is used (backward compat for tests not wired to a router).
+    """
 
     def __init__(self, specs, events, store, launcher_factory=None, driver_factory=None,
                  concurrency_limit=5, idle_retained_limit=None, logger=None, session_factory=None,
                  session_retain=20, session_max_age_days=7, reaper_ctx=None,
-                 terminal_snapshot_ttl=300.0, clock=time.time):
+                 terminal_snapshot_ttl=300.0, clock=time.time,
+                 lease_client=None, generation_id=None, generation_epoch=None):
         self._specs = specs
         self._events = events
         self._limit = concurrency_limit
@@ -276,6 +287,16 @@ class SessionManager:
         # and passes it through to .models(), so the cache never assumes which strategy runs.
         self._model_cache = ModelCache(discover_fn=discover)
         self._lock = threading.Lock()
+        # S3a: router lease client for admission. When None, fall back to local cap check.
+        self._lease_client = lease_client
+        self._gen_id = generation_id or os.environ.get("NELIX_GENERATION_ID", "")
+        self._gen_epoch = generation_epoch or os.environ.get("NELIX_GENERATION_EPOCH", "")
+        # Local choreography state
+        self._pending_acquire = set()           # sids with an in-flight lease acquire
+        # sid -> active-token (set by start/send_turn; cleared by idle/terminal release)
+        self._active_lease_tokens = {}
+        # sid -> live-token (set by start; cleared by terminal release)
+        self._live_lease_tokens = {}
         if session_factory is not None:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
         else:
@@ -304,8 +325,102 @@ class SessionManager:
         return {sid for sid in session_ids if owner.owns_session(sid, owner_id)}
 
     def start(self, executor_name, task, cwd, *, owner_id, session_id, model=None):
+        if self._lease_client is not None:
+            return self._lease_start(executor_name, task, cwd, owner_id=owner_id,
+                                     session_id=session_id, model=model)
         return self._spawn(executor_name, task, cwd, lineage_id=None, restarted_from=None,
                            owner_id=owner_id, model=model, session_id=session_id)
+
+    def _lease_start(self, executor_name, task, cwd, *, owner_id, session_id, model=None):
+        """Start path with router lease choreography (§3.3b).
+
+        Pre-lock validation, acquire {active, live} atomically from the router, then
+        re-take lock for final validation + session creation.
+        """
+        owner.validate(owner_id)
+        spec = self._specs.get(executor_name)
+        if spec is None:
+            raise RuntimeError(f"unknown executor: {executor_name!r}")
+        cwd = os.path.abspath(os.path.expanduser(cwd))
+        if not os.path.isdir(cwd):
+            raise ValueError(f"cwd does not exist or is not a directory: {cwd!r}")
+        try:
+            validate_session_id_shape(session_id)
+        except SessionIdRejected:
+            raise
+        if self._session_id_exists(session_id):
+            raise SessionIdInUse(session_id)
+        applied_model = None
+        if model is not None:
+            spec, applied_model = self._apply_model_override(spec, executor_name, model)
+            self._check_model_available(spec, executor_name, applied_model)
+
+        # Under lock: install pending-acquire marker so racing send_turns etc. see it.
+        with self._lock:
+            if session_id in self._pending_acquire:
+                raise RuntimeError(f"concurrent start in progress for {session_id}")
+            self._pending_acquire.add(session_id)
+
+        tokens = None
+        try:
+            tokens = self._lease_client.acquire(
+                self._gen_id, self._gen_epoch, session_id, 0, {"active", "live"})
+        except (NelixError, LeaseClient.RouterUnavailable) as e:
+            with self._lock:
+                self._pending_acquire.discard(session_id)
+            if isinstance(e, NelixError) and e.code == CONCURRENCY_LIMIT:
+                raise RuntimeError(
+                    "concurrency_limit reached (lease service: active cap)")
+            if isinstance(e, NelixError) and e.code in (ADMISSION_UNAVAILABLE, REBUILDING):
+                raise RuntimeError(
+                    f"lease service unavailable: {e.code}")
+            raise RuntimeError(f"lease acquire failed: {e}") from e
+        except Exception as e:
+            with self._lock:
+                self._pending_acquire.discard(session_id)
+            raise RuntimeError(f"lease acquire failed: {e}") from e
+
+        try:
+            return self._spawn(
+                executor_name, task, cwd, lineage_id=None, restarted_from=None,
+                owner_id=owner_id, model=model, session_id=session_id,
+                lease_tokens=tokens)
+        except Exception:
+            self._release_lease_tokens(tokens)
+            raise
+        finally:
+            with self._lock:
+                self._pending_acquire.discard(session_id)
+
+    def _release_lease_tokens(self, tokens):
+        """Best-effort release of lease tokens (active + live). Called on rollback paths."""
+        if self._lease_client is None or not tokens:
+            return
+        for tid in tokens.values():
+            try:
+                self._lease_client.release(tid)
+            except Exception:
+                if self._logger is not None:
+                    self._logger.warning("manager", "lease_release_error",
+                                         token_id=tid, exc_info=True)
+
+    def _make_on_idle(self, sid):
+        """Return a callback for ``Session.on_idle`` that releases the active lease and
+        increments the activation counter for the next lease acquire."""
+        def _on_idle(_sid):
+            with self._lock:
+                token = self._active_lease_tokens.pop(_sid, None)
+                sess = self._sessions.get(_sid)
+                if sess is not None:
+                    sess._activation_counter = getattr(sess, "_activation_counter", 0) + 1
+            if token is not None and self._lease_client is not None:
+                try:
+                    self._lease_client.release(token)
+                except Exception:
+                    if self._logger is not None:
+                        self._logger.warning("manager", "lease_release_error",
+                                             session_id=_sid, exc_info=True)
+        return _on_idle
 
     def _session_id_exists(self, sid):
         """True if `sid` already names a session — live in the registry, or a directory
@@ -390,11 +505,14 @@ class SessionManager:
             self._logger.error("manager", event, session_id=session_id, exc_info=True)
 
     def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, owner_id,
-               session_id, reserve=False, model=None):
+               session_id, reserve=False, model=None, lease_tokens=None):
         # reserve=True: a slot reservation was made for us by restart() (old session popped +
         # self._reserved bumped under the lock). We OWN that reservation and must release it exactly
         # once: consume it ATOMICALLY with inserting the new session (so len(_sessions)+_reserved
         # never overcounts), or release it in `finally` if we raise before inserting.
+        # lease_tokens: dict of kind->token from a router lease acquire. When provided, the local
+        # cap check is skipped (the lease already verified capacity). Stored on the session for
+        # eventual release on idle/terminal.
         consumed = not reserve
         try:
             # Shape-check the owner FIRST, before the lock and the cap checks (same reasoning as
@@ -444,13 +562,15 @@ class SessionManager:
                 # active slot (everything except `idle`) + in-flight restart reservations; a retained
                 # `idle` session frees its active slot but is bounded by idle_retained_limit. A restart
                 # (reserve=True) reuses its own net-zero slot and skips both caps.
-                if not reserve and self._active_count() + self._reserved >= self._limit:
-                    if self._logger is not None:
-                        self._logger.warning("manager", "session_start_rejected",
-                                             reason="concurrency_limit", executor=executor_name)
-                    raise RuntimeError(
-                        f"concurrency_limit={self._limit} reached "
-                        f"(active: {sorted(self._sessions)})")
+                # When lease_tokens is provided, the router lease service already checked capacity.
+                if not reserve and lease_tokens is None:
+                    if self._active_count() + self._reserved >= self._limit:
+                        if self._logger is not None:
+                            self._logger.warning("manager", "session_start_rejected",
+                                                 reason="concurrency_limit", executor=executor_name)
+                        raise RuntimeError(
+                            f"concurrency_limit={self._limit} reached "
+                            f"(active: {sorted(self._sessions)})")
                 if not reserve and self._idle_count() >= self._idle_limit:
                     if self._logger is not None:
                         self._logger.warning("manager", "session_start_rejected",
@@ -476,6 +596,19 @@ class SessionManager:
                 sess.restarted_from = restarted_from
                 sess.restart_count = self._lineages.get(sess.lineage_id, 0)
                 sess.model = applied_model                   # validated override (or None): survives restart
+                # S3a: store lease tokens on the session for release on idle/terminal.
+                sess._activation_counter = 0
+                if lease_tokens is not None:
+                    active_tid = lease_tokens.get("active")
+                    live_tid = lease_tokens.get("live")
+                    if active_tid:
+                        self._active_lease_tokens[sid] = active_tid
+                    if live_tid:
+                        self._live_lease_tokens[sid] = live_tid
+                    # Set idle callback to release the active lease when the session goes idle.
+                    sess.on_idle = self._make_on_idle(sid)
+                else:
+                    sess._activation_counter = 0
                 self._sessions[sid] = sess
                 if reserve:
                     self._reserved -= 1                      # consume atomically with the insert
@@ -604,6 +737,26 @@ class SessionManager:
                 if self._logger is not None:
                     self._logger.warning("manager", "restart_stop_error",
                                          session_id=session_id, exc_info=True)
+        # S3a: acquire new leases for the restarted session. _free_slot (called from the old
+        # session's stop path) releases the old leases.
+        lease_tokens = None
+        if self._lease_client is not None and still_active:
+            try:
+                lease_tokens = self._lease_client.acquire(
+                    self._gen_id, self._gen_epoch, new_session_id, 0, {"active", "live"})
+            except (NelixError, LeaseClient.RouterUnavailable) as e:
+                if isinstance(e, NelixError) and e.code == CONCURRENCY_LIMIT:
+                    if self._logger is not None:
+                        self._logger.warning("manager", "restart_rejected",
+                                             reason="concurrency_limit",
+                                             session_id=session_id)
+                    return RestartOutcome("start_failed", lineage_id=lineage_id,
+                                          restart_count=count, max_restarts=max_restarts)
+                if self._logger is not None:
+                    self._logger.warning("manager", "restart_rejected",
+                                         reason=str(e), session_id=session_id)
+                return RestartOutcome("start_failed", lineage_id=lineage_id,
+                                      restart_count=count, max_restarts=max_restarts)
         # _spawn OWNS the reservation (reserve=reserve): it consumes it atomically with the insert,
         # or releases it in its own finally if it raises before inserting. restart() must NOT also
         # touch self._reserved here (that would double-decrement).
@@ -613,7 +766,8 @@ class SessionManager:
             started = self._spawn(executor, task, cwd, lineage_id=lineage_id,
                                   restarted_from=session_id, reserve=reserve, model=model,
                                   owner_id=stored_owner,
-                                  session_id=new_session_id)   # INHERITED from disk, never the request
+                                  session_id=new_session_id,
+                                  lease_tokens=lease_tokens)
             new_sid, base_seq = started.session_id, started.base_seq
         except Exception as e:
             self._log_spawn_failure("restart_spawn_failed", session_id, e)
@@ -665,6 +819,10 @@ class SessionManager:
                         sess.resolve_async_question(qid, None)
                     except Exception:
                         pass
+            # S3a: collect lease tokens BEFORE popping the session so we can release them
+            # outside the lock (never RPC under manager._lock). TODO(S3d/S5): staged release.
+            active_tid = self._active_lease_tokens.pop(session_id, None)
+            live_tid = self._live_lease_tokens.pop(session_id, None)
             # a CLEAN terminal (terminal_kind="done") ends the lineage; a crash/stop keeps it for a
             # possible restart. Keyed on terminal_kind, not a state string (NIT-16).
             if snap is not None and snap.get("terminal_kind") == "done":
@@ -705,8 +863,31 @@ class SessionManager:
             # non-default corners that never reach that seam (ttl<=0, a None terminal snapshot, or a
             # publish racing after slot-free) is DEFERRED to the retirement work (see forget_session's
             # docstring); the events themselves stay bounded by the normal ring regardless.
+        # S3a: release lease tokens OUTSIDE the lock (never RPC under manager._lock).
+        # TODO(S3d/S5): staged release — simple release for now.
+        if active_tid is not None or live_tid is not None:
+            self._release_terminal_leases(active_tid, live_tid)
         if existed and self._logger is not None:
             self._logger.info("manager", "slot_freed", session_id=session_id)
+
+    def _release_terminal_leases(self, active_tid, live_tid):
+        """Release active + live lease tokens on terminal. Best-effort."""
+        if self._lease_client is None:
+            return
+        if active_tid is not None:
+            try:
+                self._lease_client.release(active_tid)
+            except Exception:
+                if self._logger is not None:
+                    self._logger.warning("manager", "lease_release_error",
+                                         token_id=active_tid, exc_info=True)
+        if live_tid is not None:
+            try:
+                self._lease_client.release(live_tid)
+            except Exception:
+                if self._logger is not None:
+                    self._logger.warning("manager", "lease_release_error",
+                                         token_id=live_tid, exc_info=True)
 
     def get(self, session_id):
         with self._lock:
@@ -784,7 +965,7 @@ class SessionManager:
                 # be lost and an orchestrator retry would deliver a BARE answer. Re-queue it (nothing
                 # typed here) so the monitor re-delivers the full frame at the next idle — symmetric
                 # with drain_async_reply's re-queue.
-                if out.status in ("at_capacity", "no_pending"):
+                if out.status in ("at_capacity", "no_pending", "admission_unavailable"):
                     sess.requeue_async_reply(text)
                 return out
             if disposition == "queued_busy":
@@ -815,6 +996,8 @@ class SessionManager:
         # active slot, so resuming it must not push active+reserved past concurrency_limit; a capacity
         # refusal types nothing (mirrors start's honest cap). The reservation is held across the
         # (lockless) PTY write so a concurrent start cannot claim the same slot mid-resume.
+        if self._lease_client is not None:
+            return self._lease_send_turn(session_id, text)
         with self._lock:
             sess = self._sessions.get(session_id)
             if sess is None:
@@ -830,6 +1013,114 @@ class SessionManager:
         finally:
             with self._lock:
                 self._reserved -= 1
+
+    def _lease_send_turn(self, session_id, text):
+        """send_turn with router lease choreography (§3.3b).
+
+        1. Under _lock: install pending-acquire marker.
+        2. Drop lock, acquire active lease from router.
+        3. Re-take lock: revalidate session state.
+        4. Commit or release.
+        """
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                return RespondOutcome("unknown_session")
+            if session_id in self._pending_acquire:
+                # Another thread is mid-acquire for this session — refuse this one.
+                if self._logger is not None:
+                    self._logger.warning("manager", "send_turn_rejected",
+                                         reason="concurrent_acquire",
+                                         session_id=session_id)
+                return RespondOutcome("at_capacity")
+            # Check session is idle (only idle sessions can receive a follow-up turn).
+            cstate = sess.snapshot().get("control_state")
+            if cstate != "idle":
+                if self._logger is not None:
+                    self._logger.warning("manager", "send_turn_rejected",
+                                         reason="not_idle", session_id=session_id,
+                                         state=cstate)
+                return RespondOutcome("no_pending")
+            self._pending_acquire.add(session_id)
+
+        activation_id = getattr(sess, "_activation_counter", 0)
+        try:
+            tokens = self._lease_client.acquire(
+                self._gen_id, self._gen_epoch, session_id, activation_id, {"active"})
+        except LeaseClient.RouterUnavailable:
+            with self._lock:
+                self._pending_acquire.discard(session_id)
+            if self._logger is not None:
+                self._logger.warning("manager", "send_turn_rejected",
+                                     reason="admission_unavailable",
+                                     session_id=session_id)
+            return RespondOutcome("admission_unavailable")
+        except NelixError as e:
+            with self._lock:
+                self._pending_acquire.discard(session_id)
+            if e.code in (ADMISSION_UNAVAILABLE, REBUILDING):
+                return RespondOutcome("admission_unavailable")
+            if e.code == CONCURRENCY_LIMIT:
+                if self._logger is not None:
+                    self._logger.warning("manager", "send_turn_rejected",
+                                         reason="concurrency_limit",
+                                         session_id=session_id)
+                return RespondOutcome("at_capacity")
+            if self._logger is not None:
+                self._logger.warning("manager", "send_turn_rejected",
+                                     reason=e.code, session_id=session_id)
+            return RespondOutcome("admission_unavailable")
+
+        # Revalidate under the lock. Keep pending_acquire set until after send_turn
+        # completes so a racing thread cannot also acquire a lease for this session.
+        revalidate_ok = False
+        active_tid = None
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                self._pending_acquire.discard(session_id)
+                self._release_lease_tokens(tokens)
+                return RespondOutcome("unknown_session")
+            cstate = sess.snapshot().get("control_state")
+            if cstate != "idle":
+                self._pending_acquire.discard(session_id)
+                self._release_lease_tokens(tokens)
+                if self._logger is not None:
+                    self._logger.warning("manager", "send_turn_rejected",
+                                         reason="not_idle_revalidate",
+                                         session_id=session_id)
+                return RespondOutcome("no_pending")
+            # Commit: store the new active token (replacing any stale one).
+            active_tid = tokens.get("active")
+            if active_tid:
+                old = self._active_lease_tokens.pop(session_id, None)
+                if old is not None:
+                    try:
+                        self._lease_client.release(old)
+                    except Exception:
+                        if self._logger is not None:
+                            self._logger.warning("manager", "lease_release_error",
+                                                 session_id=session_id, exc_info=True)
+                self._active_lease_tokens[session_id] = active_tid
+            revalidate_ok = True
+
+        if not revalidate_ok:
+            return RespondOutcome("no_pending")
+
+        try:
+            return sess.send_turn(text)
+        except Exception:
+            if active_tid:
+                try:
+                    self._lease_client.release(active_tid)
+                except Exception:
+                    pass
+                with self._lock:
+                    self._active_lease_tokens.pop(session_id, None)
+            raise
+        finally:
+            with self._lock:
+                self._pending_acquire.discard(session_id)
 
     def status(self, session_id=None, *, owner_id, include_progress=False):
         """`include_progress` (Task 8): the explicit on-demand detail surface — merge
