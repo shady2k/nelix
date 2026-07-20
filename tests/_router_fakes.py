@@ -220,6 +220,18 @@ class Backend:
                     backend.quiesce_status["terminal_pending"] = 0
                     backend.quiesce_status["in_flight_admissions"] = 0
                     backend.quiesce_status["quiescent"] = True
+                    # Write certification to the store if available (mirrors daemon behavior)
+                    if backend._store is not None and body and "certificate" in body:
+                        gen_epoch = body.get("generation_epoch")
+                        certificate = body.get("certificate")
+                        if gen_epoch and certificate:
+                            try:
+                                final_hw = backend._store.get_generation_persisted_high_water(gen_epoch)
+                                backend._store.set_epoch_retirement(
+                                    gen_epoch, retirement_state="certified",
+                                    certificate=certificate, final_high_water=final_hw)
+                            except Exception:
+                                pass
                     self._send(200, {"operation": "certify_epoch", "status": "ok"})
                 else:
                     self._send(404, {"error": "not found"})

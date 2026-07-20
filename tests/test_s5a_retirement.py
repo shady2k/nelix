@@ -615,6 +615,7 @@ class TestRetireEndToEnd:
     def setup(self, tmp_path):
         store = Store(paths.nelix_root(), clock=lambda: 1000.0)
         backend = Backend(build_id="b-1")
+        backend._store = store
         registry = GenerationRegistry(supervisor=Supervisor(backend.transport),
                                       store=store,
                                       build_id="b-1",
@@ -774,7 +775,11 @@ class TestRetireEndToEnd:
             "terminal_pending should be empty after confirmed resolve"
 
         # ADD: test reap refusal blocks retirement
-        operator2 = OperatorRoutes(registry, "r-test", store=store)
+        # Create a separate Backend for the second generation
+        backend2 = Backend(build_id="b-1")
+        backend2._store = store
+        registry2 = GenerationRegistry(supervisor=Supervisor(backend2.transport))
+        operator2 = OperatorRoutes(registry2, "r-test", store=store)
         refused = []
         def _refuse_reap(gen_id, ep):
             refused.append((gen_id, ep))
@@ -789,16 +794,8 @@ class TestRetireEndToEnd:
         store.insert_epoch(epoch2, gid2, incarnation_meta=None, created_at=1000.0)
         store.cas_epoch_serving(gid2, epoch2, expected_current_epoch=None,
                                 incarnation_meta='{"pid": 99999, "start_fingerprint": "fp"}')
-        # Register and drive — should block on reap
-        registry2 = GenerationRegistry(supervisor=Supervisor(daemon_transport))
-        registry2.adopt_generation(gid2, epoch2, daemon_transport,
+        registry2.adopt_generation(gid2, epoch2, backend2.transport,
                                    "b-1", incarnation={"pid": 99999, "start_fingerprint": "fp"})
-        operator2._registry = registry2  # ensure registry has the gen
-
-        # Pre-certify so we get past the certify phase
-        store.set_epoch_retirement(epoch2, retirement_state="certified",
-                                   certificate="test-cert", final_high_water=0)
-        store.set_generation_confirmed_high_water(epoch2, 0)
 
         status2, body2 = operator2.retire(gid2)
         assert status2 == 200

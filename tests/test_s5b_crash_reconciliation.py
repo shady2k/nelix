@@ -205,22 +205,30 @@ class TestChildGroupReapGate:
 
         operator = OperatorRoutes(None, "r-test", store=store)
 
-        # Mock os.kill so pid 42 returns PermissionError (alive)
+        # Mock os.kill AND os.killpg so pid 42/pgid 42 returns PermissionError (alive)
         original_kill = os.kill
+        original_killpg = os.killpg
         call_log = []
         def _mock_kill(pid, sig, **kw):
-            call_log.append((pid, sig))
+            call_log.append(("kill", pid, sig))
             if pid == 42:
                 raise PermissionError("EPERM mock — child is alive")
             return original_kill(pid, sig, **kw)
+        def _mock_killpg(pgid, sig):
+            call_log.append(("killpg", pgid, sig))
+            if pgid == 42:
+                raise PermissionError("EPERM mock — child group is alive")
+            return original_killpg(pgid, sig)
 
         os.kill = _mock_kill
+        os.killpg = _mock_killpg
         try:
             success, blocker = operator._crash_reconcile_epoch(gid, epoch)
             assert not success, "must block when child is alive"
-            assert blocker == "child_still_alive", f"got blocker={blocker!r}"
+            assert blocker == "child_group_still_alive", f"got blocker={blocker!r}"
         finally:
             os.kill = original_kill
+            os.killpg = original_killpg
 
         # Verify epoch is NOT certified
         ep = store.get_epoch_retirement_state(epoch)

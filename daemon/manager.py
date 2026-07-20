@@ -340,12 +340,22 @@ class SessionManager:
         D2: FAIL-CLOSED on any NelixError EXCEPT UNKNOWN_SESSION (epoch genuinely
         absent — treat as not quiescing). STORE_UNAVAILABLE and any other error
         MUST reject admission.
+        FIX 5: also rejects ``process_state=dead`` — a dead epoch must not admit.
         """
         if not self._gen_epoch:
             self._quiescent = False
             return False
         try:
-            state = self._store.get_epoch_retirement_state(self._gen_epoch)
+            ep = self._store._conn.execute(
+                "SELECT process_state, retirement_state FROM epochs "
+                "WHERE generation_epoch=?", (self._gen_epoch,)).fetchone()
+            if ep is None:
+                self._quiescent = False
+                return False
+            if ep["process_state"] == "dead":
+                self._quiescent = True
+                return True
+            state = ep["retirement_state"]
             self._quiescent = (state == "quiescing" or state == "certified")
         except NelixError as e:
             if e.code == UNKNOWN_SESSION:
@@ -931,17 +941,15 @@ class SessionManager:
         return sum(1 for s in self._sessions.values()
                    if s.snapshot().get("control_state") == "idle")
 
-    def _record_child_group_store(self, child_pid, child_pgid):
-        """Record the child process group in the store for router-side crash reconciliation."""
+    def _record_child_group_store(self, child_pid, child_pgid, leader_fingerprint=None):
+        """Record the child process group in the store for router-side crash reconciliation.
+        FIX 3: includes leader_fingerprint (PID-reuse protection); exceptions propagate
+        (fail-closed — a missing record must not be silently lost)."""
         if not self._gen_epoch:
             return
-        try:
-            self._store.record_epoch_child_group(
-                self._gen_epoch, child_pid=child_pid, child_pgid=child_pgid)
-        except Exception:
-            if self._logger is not None:
-                self._logger.warning("manager", "child_group_record_failed",
-                                     epoch=self._gen_epoch, child_pid=child_pid)
+        self._store.record_epoch_child_group(
+            self._gen_epoch, child_pid=child_pid, child_pgid=child_pgid,
+            leader_fingerprint=leader_fingerprint)
 
     def _persist_terminal_for_publish(self, session_id, terminal_kind, screen_excerpt):
         """S5a persist-before-visible-wake: persist terminal record BEFORE the event ring

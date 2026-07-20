@@ -116,7 +116,7 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
     # already parameters of this function.
     session_forward = SessionForward(registry, ledger=start_path.ledger, store=store)
     restart_path = RestartPath(start_path.ledger, registry)
-    operator_routes = OperatorRoutes(registry, router_epoch, store=store)
+    operator_routes = OperatorRoutes(registry, router_epoch, store=store, lease_service=lease_service)
     # S2a.2: the router owns the archive board read. store is threaded from app.py so BoardForward
     # can call store.read_board_snapshot(owner_id) directly. archive_epoch is the per-process
     # epoch for the archive cursor component, minted like router_epoch.
