@@ -417,33 +417,33 @@ class OperatorRoutes:
     def _reap_child_groups(self, epoch, generation_id):
         """Derive child groups from per-session child.json on disk (FIX 1).
 
-        For EVERY admitted session (from starts + sessions rows), read child.json
-        from ``paths.sessions_root()/sid/child.json``. Any missing/unreadable/
-        incomplete record => BLOCKED. Never treat absence as ``proven gone``.
+        Enumerates only OUTSTANDING sessions (no persisted terminal) — completed
+        sessions whose ``child.json`` was legitimately deleted by ``_finish_cleanup``
+        are skipped. For each outstanding session reads ``child.json`` via
+        ``read_child_raw`` (FIX 5: non-mutating, does not consume evidence).
 
-        For each valid record: validate pgid>0, killpg(SIGTERM → SIGKILL),
-        prove WHOLE GROUP gone via killpg(pgid,0)→ESRCH. A leader-fingerprint
-        mismatch => pid reused => blocked (conservative). Never swallow killpg
-        errors. Do not delete evidence (retry re-derives, no deadlock).
+        Validates: record is a dict (FIX 4); ``sid`` matches (FIX 6); child
+        pid/pgid are int, not bool, >0 (FIX 3); leader_fingerprint present.
+        Kills the group (SIGTERM → SIGKILL), proves WHOLE GROUP gone via
+        ``killpg(pgid,0)``→ESRCH.
 
         Returns ``(ok: bool, blocker: str|None)``.
         """
         import paths
-        from daemon.reaper import ProcessInspector, read_child
+        from daemon.reaper import ProcessInspector, read_child_raw
         import signal
         import time as _time
 
         inspector = ProcessInspector()
 
-        # Enumerate ALL admitted sessions for the epoch
         try:
-            all_starts = self._store.list_all_starts_for_epoch(epoch)
+            outstanding = self._store.list_starts_for_epoch(epoch)
         except Exception as e:
             return False, f"list_starts_failed:{e}"
 
-        for srow in all_starts:
+        for srow in outstanding:
             sid = srow["session_id"]
-            record = read_child(paths.sessions_root() / sid)
+            record = read_child_raw(paths.sessions_root() / sid)
 
             if record is None:
                 if _log is not None:
@@ -451,6 +451,13 @@ class OperatorRoutes:
                                  "gen=%s epoch=%s sid=%s",
                                  generation_id, epoch, sid)
                 return False, f"child_record_missing:{sid}"
+
+            if record == "MALFORMED":
+                return False, f"child_record_malformed:{sid}"
+
+            # FIX 6: verify record belongs to this session
+            if record.get("sid") != sid:
+                return False, f"child_sid_mismatch:{sid}"
 
             child_pid = record.get("pid")
             child_pgid = record.get("pgid")
@@ -463,9 +470,10 @@ class OperatorRoutes:
             if not leader_fp:
                 return False, f"child_null_fingerprint:{sid}"
 
-            if not isinstance(child_pid, int) or child_pid <= 0:
+            # FIX 3: reject bool (True is int in Python)
+            if isinstance(child_pid, bool) or not isinstance(child_pid, int) or child_pid <= 0:
                 return False, f"invalid_child_pid:{sid}"
-            if not isinstance(child_pgid, int) or child_pgid <= 0:
+            if isinstance(child_pgid, bool) or not isinstance(child_pgid, int) or child_pgid <= 0:
                 return False, f"invalid_child_pgid:{sid}"
 
             # Reject stale PID/PGID via leader_fingerprint
@@ -474,7 +482,6 @@ class OperatorRoutes:
             except Exception:
                 actual_fp = None
             if actual_fp is not None and actual_fp != leader_fp:
-                # PID reused — treat this record as unresolvable: block
                 return False, f"child_fingerprint_mismatch:{sid}"
 
             # Kill the group — SIGTERM then SIGKILL
@@ -679,11 +686,7 @@ class OperatorRoutes:
                         "blockers": ["reap_refused_or_failed"],
                     }
 
-            # 2b. Clear current_epoch BEFORE oracle (reap above proved death)
-            if self._store.get_generation(generation_id).current_epoch is not None:
-                self._store.clear_current_epoch(generation_id)
-
-            # 2c. Release leases for every epoch (FIX 4 — must succeed)
+            # 2b. Release leases for every epoch (FIX 4 — must succeed)
             if self._lease_service is not None:
                 for ep in self._store.list_epochs(generation_id):
                     try:
@@ -717,20 +720,27 @@ class OperatorRoutes:
             for ep in self._store.list_epochs(generation_id):
                 self._resolve_confirmed(generation_id, ep.generation_epoch)
 
-            # 2d. Aggregate oracle check
+            # 2d. Aggregate oracle check (FIX 2: clear only AFTER non-current_epoch
+            # conditions pass; reap already proved death so has_current_epoch is safe to
+            # resolve by clearing here, before lease/oracle).
             blockers = generation_retirement_oracle_blockers(
                 store=self._store, generation_id=generation_id)
             if blockers:
-                return 200, {
-                    "operation": "retire",
-                    "status": "blocked",
-                    "generation_id": generation_id,
-                    "lifecycle_state": gen.lifecycle_state,
-                    "blockers": list(blockers),
-                }
+                has_ce = any("has_current_epoch" in b for b in blockers)
+                other = [b for b in blockers if "has_current_epoch" not in b]
+                if has_ce and not other:
+                    pass
+                else:
+                    return 200, {
+                        "operation": "retire",
+                        "status": "blocked",
+                        "generation_id": generation_id,
+                        "lifecycle_state": gen.lifecycle_state,
+                        "blockers": list(blockers),
+                    }
 
             # ================================================================
-            # PHASE 3 — FINALIZE (FIX 3: clear + FSM only after all gates pass)
+            # PHASE 3 — FINALIZE (FIX 2: clear + FSM only after all gates pass)
             # ================================================================
             if self._store.get_generation(generation_id).current_epoch is not None:
                 self._store.clear_current_epoch(generation_id)

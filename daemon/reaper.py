@@ -99,7 +99,12 @@ class ProcessKiller:
 def record_child(session_dir, record: dict) -> None:
     """Durably publish the reaping record inside the session dir (atomic temp+rename;
     fsync file and dir). Must be called AFTER spawn returns a pid/pgid and BEFORE the
-    monitor thread does any work."""
+    monitor thread does any work.
+
+    FIX 1: propagates errors (ENOSPC/EIO/etc) instead of swallowing — a session that
+    cannot persist its reap record must not start, because crash reconciliation needs
+    a recorded child group for every outstanding session.
+    """
     paths.ensure_private_dir(session_dir)
     final = paths.child_record(session_dir)
     tmp = final.with_suffix(".json.tmp")
@@ -136,6 +141,29 @@ def read_child(session_dir):
         except OSError:
             pass
         return None
+
+
+def read_child_raw(session_dir):
+    """Non-mutating read for crash reconciliation (FIX 5).
+
+    Returns the parsed record, or None if absent/unreadable, or the string
+    ``"MALFORMED"`` if the file exists but is not valid JSON / not a dict.
+    Unlike ``read_child``, this does NOT rename/mutate evidence on disk.
+    """
+    path = paths.child_record(session_dir)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    try:
+        val = json.loads(text)
+    except ValueError:
+        return "MALFORMED"
+    if not isinstance(val, dict):
+        return "MALFORMED"
+    return val
 
 
 def forget_child(session_dir) -> None:
