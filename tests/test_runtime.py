@@ -105,6 +105,75 @@ def test_build_id_carries_the_readable_core_version(tmp_path):
     assert runtime.build_id(_wheel(tmp_path, version="2.5.0"), "i").startswith("2.5.0-")
 
 
+def test_build_id_changes_when_a_first_party_wheel_changes(tmp_path):
+    """nelix-m78: the build id must cover nelix_store / nelix_contracts, not just the core wheel.
+    Same core wheel + interpreter + lock; a different first-party (extra) wheel -> different id."""
+    w = _wheel(tmp_path)
+    (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir()
+    store_a = _wheel(tmp_path / "a", payload=b"store-a")
+    store_b = _wheel(tmp_path / "b", payload=b"store-b")
+    assert runtime.build_id(w, "i", extra_wheels=[store_a]) != \
+           runtime.build_id(w, "i", extra_wheels=[store_b])
+
+
+def test_build_id_over_first_party_wheels_is_idempotent_and_order_independent(tmp_path):
+    """Identical first-party content -> identical id (so reinstalling identical inputs is a no-op),
+    and the ORDER the wheels are passed in must not change the id."""
+    w = _wheel(tmp_path)
+    (tmp_path / "s").mkdir(); (tmp_path / "c").mkdir()
+    s = _wheel(tmp_path / "s", payload=b"store")
+    c = _wheel(tmp_path / "c", payload=b"contracts")
+    assert runtime.build_id(w, "i", extra_wheels=[s, c]) == \
+           runtime.build_id(w, "i", extra_wheels=[c, s])
+
+
+def test_build_id_without_extra_wheels_is_unchanged(tmp_path):
+    """Backward-compat: the empty-extra-wheels path must equal the bare call, so existing callers
+    and prior runtimes' identities are preserved."""
+    w = _wheel(tmp_path)
+    assert runtime.build_id(w, "i", extra_wheels=[]) == runtime.build_id(w, "i")
+
+
+def test_manifest_records_first_party_digests(tmp_path, monkeypatch):
+    """nelix-m78: the committed manifest must be self-describing — it records the digest of every
+    first-party wheel, so a store/contracts change is visible without recomputing the build."""
+    monkeypatch.setattr(runtime, "interpreter_id", lambda python: "cpython-3.11.15-x-y")
+    build = "0.1.0-deadbeef0000"
+    paths.runtime_dir(build).mkdir(parents=True, exist_ok=True)
+    wheel = _wheel(tmp_path, payload=b"core")
+    (tmp_path / "s").mkdir(); (tmp_path / "c").mkdir()
+    store = _wheel(tmp_path / "s", payload=b"store")
+    contracts = _wheel(tmp_path / "c", payload=b"contracts")
+    runtime._write_manifest(build, wheel, runtime.RUNTIME_LOCK, Path("/base/python"),
+                            "3.11.15", extra_wheels=[store, contracts])
+    manifest = json.loads(paths.runtime_manifest(build).read_text())
+    assert manifest["first_party_digests"] == {
+        store.name: runtime.wheel_digest(store),
+        contracts.name: runtime.wheel_digest(contracts),
+    }
+
+
+def test_install_folds_first_party_wheels_into_the_build_id(tmp_path, monkeypatch):
+    """nelix-m78 at the install layer: install() must compute the SAME id build_id() does WITH
+    extra_wheels — otherwise a changed store wheel is silently served the old runtime. Heavy steps
+    (interpreter provisioning + the real build) are stubbed; only the identity wiring is under test.
+    """
+    monkeypatch.setattr(runtime, "provision_interpreter", lambda version=None: Path("/fake/python"))
+    monkeypatch.setattr(runtime, "interpreter_id", lambda python: "i")
+    monkeypatch.setattr(runtime, "_build_at", lambda *a, **k: None)
+
+    w = _wheel(tmp_path, payload=b"core")
+    (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir()
+    store_a = _wheel(tmp_path / "a", payload=b"store-a")
+    store_b = _wheel(tmp_path / "b", payload=b"store-b")
+
+    id_a = runtime.install(w, extra_wheels=[store_a])
+    id_b = runtime.install(w, extra_wheels=[store_b])
+
+    assert id_a != id_b
+    assert id_a == runtime.build_id(w.resolve(), "i", extra_wheels=[store_a])
+
+
 # ---------------------------------------------------------------- commit semantics
 
 def test_a_runtime_without_a_manifest_is_not_installed():

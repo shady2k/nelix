@@ -137,17 +137,23 @@ def _core_version(wheel) -> str:
     return Path(wheel).name.split("-")[1]
 
 
-def build_id(wheel, interp_id: str, lock=RUNTIME_LOCK) -> str:
+def build_id(wheel, interp_id: str, lock=RUNTIME_LOCK, *, extra_wheels=()) -> str:
     """The identity of everything that determines what code a generation runs: the core's payload,
-    its pinned third-party closure, and the interpreter. Change any one and you have a different
-    runtime that must live in a different directory — that is the whole mechanism.
+    the FIRST-PARTY wheels shipped alongside it (nelix_store, nelix_contracts — nelix-m78), its
+    pinned third-party closure, and the interpreter. Change any one and you have a different runtime
+    that must live in a different directory — that is the whole mechanism.
 
     Content-addressed rather than sequential so `install()` is idempotent: installing the same
-    inputs twice is a no-op on the second call rather than a second 78MB copy.
+    inputs twice is a no-op on the second call rather than a second 78MB copy. The first-party wheels
+    are folded in by their sorted `wheel_digest`, so the id does not depend on the order they were
+    passed and an empty `extra_wheels` reproduces the pre-nelix-m78 id exactly.
     """
     h = hashlib.sha256()
     for part in (wheel_digest(wheel), Path(lock).read_bytes().decode(), interp_id):
         h.update(part.encode() if isinstance(part, str) else part)
+        h.update(b"\0")
+    for d in sorted(wheel_digest(ew) for ew in extra_wheels):
+        h.update(d.encode())
         h.update(b"\0")
     return f"{_core_version(wheel)}-{h.hexdigest()[:_BUILD_ID_HASH_LEN]}"
 
@@ -232,7 +238,7 @@ def install(wheel, *, python_version: str = RUNTIME_PYTHON, lock=RUNTIME_LOCK,
     wheel = Path(wheel).resolve()
     lock = Path(lock).resolve()
     base_python = provision_interpreter(python_version)
-    build = build_id(wheel, interpreter_id(base_python), lock)
+    build = build_id(wheel, interpreter_id(base_python), lock, extra_wheels=extra_wheels)
     if is_installed(build):
         return build
 
@@ -289,7 +295,7 @@ def _build_at(rt: Path, wheel: Path, lock: Path, base_python: Path,
         if inst.returncode != 0:
             raise RuntimeInstallError(f"runtime install failed:\n{inst.stdout}\n{inst.stderr}")
 
-        _write_manifest(build, wheel, lock, base_python, python_version)
+        _write_manifest(build, wheel, lock, base_python, python_version, extra_wheels)
     except BaseException:
         shutil.rmtree(rt, ignore_errors=True)      # never leave a half-built runtime behind
         raise
@@ -303,15 +309,17 @@ def _file_sha256(path) -> str:
     return h.hexdigest()
 
 
-def _write_manifest(build, wheel, lock, base_python, python_version) -> None:
+def _write_manifest(build, wheel, lock, base_python, python_version, extra_wheels=()) -> None:
     """The commit. Written via tmp+replace so a runtime is never PARTLY committed: the manifest
-    either exists whole or not at all."""
+    either exists whole or not at all. It records the FULL first-party closure's digests (nelix-m78)
+    so the committed runtime is self-describing and a store/contracts change is visible."""
     m = paths.runtime_manifest(build)
     tmp = m.with_suffix(".json.tmp")
     body = json.dumps({
         "build_id": build,
         "core_version": _core_version(wheel),
         "wheel_digest": wheel_digest(wheel),
+        "first_party_digests": {Path(ew).name: wheel_digest(ew) for ew in extra_wheels},
         "python_version": python_version,
         "interpreter_id": interpreter_id(paths.runtime_python(build)),
         "provisioned_from": str(base_python),
