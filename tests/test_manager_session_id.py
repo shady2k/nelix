@@ -37,6 +37,11 @@ def _mgr(store_and_ledger, limit=5):
         def stop(self):
             pass
 
+        def observe(self): pass
+        def last_observed(self): return 0.0
+        def orphan_marked_ts(self): return None
+        def mark_orphaned(self, grace): pass
+
     def session_factory(sid, executor, spec, events):
         s = FakeSession(sid, executor)
         captured.append(s)

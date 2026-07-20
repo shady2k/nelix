@@ -24,6 +24,10 @@ class _FakeSession:
     def start(self, task, cwd):
         self._task = task; self._cwd = cwd; self.started = True
     def stop(self): self.stopped = True
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
     def snapshot(self): return {"session_id": self._id}
     def terminal_snapshot(self):
         return {"session_id": self._id, "terminal": True, "state": "crashed"}

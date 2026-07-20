@@ -100,6 +100,10 @@ class TestCrashReconciliationEndToEnd:
                 if self.on_terminal is not None:
                     self.on_terminal(self.sid)
                 self._stopped = True
+            def observe(self): pass
+            def last_observed(self): return 0.0
+            def orphan_marked_ts(self): return None
+            def mark_orphaned(self, grace): pass
             def pending_async_id(self): return None
 
         def session_factory(sid, ex, spec, ev):

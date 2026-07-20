@@ -17,6 +17,10 @@ class FakeSession:
     def snapshot(self): return {"session_id": self.sid, "executor": self.executor,
                                 "control_state": "busy", "task_delivery": "pending"}
     def stop(self): self.stopped = True
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 def _mgr(store_and_ledger, limit=1):
@@ -143,6 +147,10 @@ def test_operator_stop_publishes_single_stopped_event(tmp_path, store_and_ledger
             events.publish(self.sid, self.executor, "stopped", "", "stopped")
             if self.on_terminal is not None:
                 self.on_terminal(self.sid)
+        def observe(self): pass
+        def last_observed(self): return 0.0
+        def orphan_marked_ts(self): return None
+        def mark_orphaned(self, grace): pass
 
     specs = {EXECUTOR: make_spec()}
     mgr = SessionManager(specs, events, store, concurrency_limit=2,
@@ -337,6 +345,10 @@ class _StoppedSession:
         self.stopped = True
         if self.on_terminal is not None:
             self.on_terminal(self.sid)
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 def test_stop_confirmed_terminal_outcome(store_and_ledger):

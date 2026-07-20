@@ -87,6 +87,10 @@ class TestPersistBeforeWake:
                     call_order.append("publish")
                     if self.on_terminal is not None:
                         self.on_terminal(self.sid)
+                def observe(self): pass
+                def last_observed(self): return 0.0
+                def orphan_marked_ts(self): return None
+                def mark_orphaned(self, grace): pass
                 def pending_async_id(self): return None
 
             def session_factory(sid, ex, spec, ev):
@@ -160,6 +164,10 @@ class TestPersistBeforeWake:
                         self.sid, self.executor, kind, excerpt, kind)
                     if self.on_terminal is not None:
                         self.on_terminal(self.sid)
+                def observe(self): pass
+                def last_observed(self): return 0.0
+                def orphan_marked_ts(self): return None
+                def mark_orphaned(self, grace): pass
                 def pending_async_id(self): return None
 
             def session_factory(sid, ex, spec, ev):
@@ -224,6 +232,10 @@ class TestObligationBarrier:
                             "control_state": "busy", "task_delivery": "pending",
                             "terminal": False}
                 def stop(self): pass
+                def observe(self): pass
+                def last_observed(self): return 0.0
+                def orphan_marked_ts(self): return None
+                def mark_orphaned(self, grace): pass
                 def terminal_snapshot(self): return None
                 def pending_async_id(self): return None
 
@@ -299,6 +311,10 @@ class TestObligationBarrier:
                     return {"session_id": self.sid, "terminal_kind": self._terminal_kind,
                             "screen_excerpt": self._last_screen_excerpt,
                             "lineage_id": self.lineage_id}
+                def observe(self): pass
+                def last_observed(self): return 0.0
+                def orphan_marked_ts(self): return None
+                def mark_orphaned(self, grace): pass
                 def stop(self):
                     kind = self._terminal_kind
                     excerpt = self._last_screen_excerpt
@@ -363,6 +379,10 @@ class TestQuiescenceRejects:
                     return {"session_id": self.sid, "control_state": "busy",
                             "task_delivery": "pending", "terminal": False}
                 def stop(self): self._stop = True
+                def observe(self): pass
+                def last_observed(self): return 0.0
+                def orphan_marked_ts(self): return None
+                def mark_orphaned(self, grace): pass
                 def terminal_snapshot(self): return None
                 def pending_async_id(self): return None
 
@@ -419,6 +439,10 @@ class TestQuiescenceRejects:
                 def snapshot(self):
                     return {"control_state": "busy", "task_delivery": "pending"}
                 def stop(self): pass
+                def observe(self): pass
+                def last_observed(self): return 0.0
+                def orphan_marked_ts(self): return None
+                def mark_orphaned(self, grace): pass
                 def terminal_snapshot(self): return None
                 def pending_async_id(self): return None
 
@@ -488,6 +512,10 @@ class TestTerminalPending:
                     return {"session_id": self.sid, "terminal_kind": self._terminal_kind,
                             "screen_excerpt": self._last_screen_excerpt,
                             "lineage_id": self.lineage_id}
+                def observe(self): pass
+                def last_observed(self): return 0.0
+                def orphan_marked_ts(self): return None
+                def mark_orphaned(self, grace): pass
                 def stop(self):
                     kind = self._terminal_kind
                     excerpt = self._last_screen_excerpt
@@ -695,6 +723,10 @@ class TestRetireEndToEnd:
                 return {"session_id": self.sid, "terminal_kind": self._terminal_kind,
                         "screen_excerpt": self._last_screen_excerpt,
                         "lineage_id": self.lineage_id}
+            def observe(self): pass
+            def last_observed(self): return 0.0
+            def orphan_marked_ts(self): return None
+            def mark_orphaned(self, grace): pass
             def stop(self):
                 kind = self._terminal_kind
                 excerpt = self._last_screen_excerpt

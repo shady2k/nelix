@@ -53,6 +53,11 @@ class FakeSession:
     def stop(self):
         pass
 
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
+
     def respond(self, answer, decision_id=None):
         return RespondOutcome("resumed", seq=1, decision_id=decision_id,
                               answered_decision_id=decision_id, snapshot=self.snapshot())

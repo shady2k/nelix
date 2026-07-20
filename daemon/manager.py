@@ -1,3 +1,4 @@
+import collections
 import json
 import os
 import re
@@ -232,9 +233,10 @@ def _session_capabilities(session_id, sess):
 
 
 def _default_session_factory(sid, executor, spec, events, launcher_factory,
-                             driver_factory, logger):
+                             driver_factory, logger, clock=time.time):
     return Session(sid, executor, driver_factory(spec.driver),
-                   launcher_factory(spec.launcher), spec, events, logger=logger)
+                   launcher_factory(spec.launcher), spec, events, logger=logger,
+                   obs_clock=clock)
 
 
 class SessionManager:
@@ -283,9 +285,12 @@ class SessionManager:
         self._quiescent = False
         self._terminal_ttl = terminal_snapshot_ttl
         # S6 — orphan detection state.
-        self._active_waiter_sids = set()     # session_ids with an outstanding /wait in flight
+        # FIX 3: per-SID refcount (two concurrent waiters on one SID keep it observed until BOTH
+        # unregister). Dict[sid, int]; active while value > 0.
+        self._active_waiter_sids = collections.Counter()
         self._orphan_stop = threading.Event()
         self._orphan_thread = None
+        self._reap_queue = []                # SIDs collected for reaping, processed outside _lock
         self._clock = clock
         # nelix-9a4.4: the durable store for terminal records (generation-neutral). MANDATORY:
         # a generation daemon is always router-fronted, and the router owns the start ledger —
@@ -325,7 +330,8 @@ class SessionManager:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
         else:
             self._make = lambda sid, ex, spec: _default_session_factory(
-                sid, ex, spec, events, launcher_factory, driver_factory, logger)
+                sid, ex, spec, events, launcher_factory, driver_factory, logger,
+                clock=self._clock)
         self._start_orphan_checker()
 
     def _store_epoch_is_certified(self):
@@ -1763,14 +1769,23 @@ class SessionManager:
             self._orphan_stop.wait(15.0)
 
     def register_waiter(self, session_id):
-        """Mark session as having an outstanding /wait. Thread-safe."""
+        """Mark session as having an outstanding /wait. Thread-safe.
+        FIX 3: refcount — two concurrent waiters on one SID keep it observed until BOTH unregister.
+        FIX 1: refreshes sess.observe() so a new waiter immediately counts as observed."""
         with self._lock:
-            self._active_waiter_sids.add(session_id)
+            self._active_waiter_sids[session_id] += 1
+        # Immediately count as observed (closes the mark-time window).
+        self.observe_session(session_id)
 
     def unregister_waiter(self, session_id):
-        """Clear the outstanding /wait marker. Thread-safe."""
+        """Clear one outstanding /wait marker. Thread-safe.
+        FIX 3: decrements refcount; session still observed while count > 0."""
         with self._lock:
-            self._active_waiter_sids.discard(session_id)
+            c = self._active_waiter_sids.get(session_id, 0)
+            if c <= 1:
+                self._active_waiter_sids.pop(session_id, None)
+            else:
+                self._active_waiter_sids[session_id] = c - 1
 
     def observe_session(self, session_id):
         """Record an observation (heartbeat) on a session. Thread-safe."""
@@ -1781,70 +1796,113 @@ class SessionManager:
 
     def _check_orphans(self):
         """Orphan detection + reap loop: check every live session for observation lapse.
+        FIX 1: the check-and-mark/reap decision is ATOMIC under manager._lock — no interleaving
+        between reading waiter set + timestamps and the decision. Reaps are collected into a list
+        and executed outside the lock; each SID is re-validated inside _reap_orphan.
         Three-stage: (1) active waiter -> observed, skip; (2) past grace -> mark orphaned;
-        (3) marked + past grace -> reap (persist orphan_reaped terminal, expire session).
+        (3) marked + past grace -> schedule reap.
         """
         now = self._clock()
-        sids = []
+        to_reap = []
         with self._lock:
-            sids = list(self._sessions.keys())
-        for sid in sids:
-            with self._lock:
+            for sid in list(self._sessions.keys()):
                 sess = self._sessions.get(sid)
                 if sess is None:
                     continue
-                # Active waiter always counts as observed — reset clock.
-                if sid in self._active_waiter_sids:
+                # FIX 1 + FIX 3: refcount-based waiter check, atomic with decision.
+                if self._active_waiter_sids.get(sid, 0) > 0:
                     sess.observe()
                     continue
                 last_obs = sess.last_observed()
                 orphan_marked = sess.orphan_marked_ts()
-            if last_obs is None:
-                continue
-            age = now - last_obs
-            spec = self._specs.get(getattr(sess, 'executor', None))
-            grace = spec.observation_grace_seconds if (spec is not None and spec.observation_grace_seconds > 0) else 0
-            if grace == 0:
-                continue  # orphaning disabled
-            if orphan_marked is not None:
-                # Already marked: reap if grace has elapsed since marking.
-                if now - orphan_marked >= grace:
-                    self._reap_orphan(sid)
-            else:
-                # Not yet marked: mark if unobserved past grace.
-                if age >= grace:
-                    sess.mark_orphaned(grace)
+                if last_obs is None:
+                    continue
+                age = now - last_obs
+                spec = self._specs.get(getattr(sess, 'executor', None))
+                grace = spec.observation_grace_seconds if (spec is not None and spec.observation_grace_seconds > 0) else 0
+                if grace == 0:
+                    continue  # orphaning disabled
+                if orphan_marked is not None:
+                    # Already marked: reap if grace has elapsed since marking.
+                    if now - orphan_marked >= grace:
+                        to_reap.append(sid)
+                else:
+                    # Not yet marked: mark if unobserved past grace.
+                    if age >= grace:
+                        sess.mark_orphaned(grace)
+        # FIX 1: process reaps outside the lock — each re-validates under the lock.
+        for sid in to_reap:
+            try:
+                self._reap_orphan(sid)
+            except Exception:
+                if self._logger is not None:
+                    self._logger.warning("manager", "orphan_reap_error",
+                                         session_id=sid, exc_info=True)
 
     def _reap_orphan(self, session_id):
-        """Reap an orphaned session: persist orphan_reaped terminal via S5 path,
-        kill the process, clean up. Does NOT call _free_slot (bypasses Session finish).
-        Strategy: set _finalized first (under each session's own lock) to prevent the
-        monitor thread from running _finish, then stop the process, persist the terminal,
-        and clean up manager state.
-        """
-        sess = None
-        excerpt = ""
+        """Reap an orphaned session with FULL re-validation (FIX 1) and persist-first
+        ordering (FIX 4). Mirrors S5: persist -> discharge -> kill -> publish -> remove.
+        Aborts if re-validation fails (waiter arrived, observe unmarked, session gone).
+        Aborts if persist returns idempotency_conflict (real terminal already won).
+        Never strands the session on persist failure.
+        Returns True if reaped, False if aborted."""
+        # ── 1. Re-validate under manager._lock ──────────────────────────────
         with self._lock:
             sess = self._sessions.get(session_id)
             if sess is None:
-                return
+                return False
+            # FIX 1: re-check waiter (may have arrived since the checker snapshot).
+            if self._active_waiter_sids.get(session_id, 0) > 0:
+                return False
+            # FIX 1: re-check orphan mark (observe() may have cleared it).
+            orphan_marked = sess.orphan_marked_ts()
+            if orphan_marked is None:
+                return False
+            last_obs = sess.last_observed()
+            now = self._clock()
+            spec = self._specs.get(getattr(sess, 'executor', None))
+            grace = spec.observation_grace_seconds if (spec is not None and spec.observation_grace_seconds > 0) else 0
+            if grace == 0:
+                return False
+            # FIX 2: both ages are in the SAME clock domain (manager._clock).
+            if now - orphan_marked < grace:
+                return False  # observed between mark and reap -> abort
+            if now - last_obs < grace:
+                return False  # observation renewed -> abort
             snap = sess.snapshot()
             excerpt = snap.get("screen_excerpt", snap.get("text", ""))
+            executor_name = getattr(sess, "executor", "")
             if self._logger is not None:
                 self._logger.info("manager", "orphan_reaping",
                                   session_id=session_id,
                                   control_state=snap.get("control_state"),
                                   excerpt_len=len(excerpt))
-        if sess is None:
-            return
-        # Finalize the session under its own lock so the monitor thread's _finish
-        # sees _finalized=True and returns immediately.
-        # Acquire session lock then manager lock (consistent ordering: session -> manager).
+
+        # ── 2. Persist orphan_reaped terminal (S5 path, FIX 4 ordering) ─────
+        # This discharges the obligation and releases leases first, so if the session
+        # already terminaled (idempotency_conflict) we abort cleanly WITHOUT killing
+        # the process or publishing a conflicting orphan_reaped event.
+        try:
+            self._persist_terminal_for_publish(session_id, "orphan_reaped", excerpt)
+        except NelixError as e:
+            if e.code == "idempotency_conflict":
+                # Real terminal already won — abort, do NOT publish orphan_reaped.
+                if self._logger is not None:
+                    self._logger.warning("manager", "orphan_reap_idempotent",
+                                         session_id=session_id)
+                return False
+            # Other NelixError: propagate (will be logged by _check_orphans).
+            raise
+        except Exception:
+            # Non-Nelix persist error: propagate. Session is NOT stranded — it stays in
+            # _sessions with obligations intact (no discharge happened).
+            raise
+
+        # ── 3. Finalize the session (now that persist succeeded, FIX 4) ──────
         with sess._lock:
             sess._finalized = True
             sess._closing = True
             sess._stop.set()
-        # Kill the process group (best-effort) — outside both locks.
         try:
             sess._launcher.stop()
         except Exception:
@@ -1854,34 +1912,14 @@ class SessionManager:
                 sess._handle.close()
         except Exception:
             pass
-        # Join the monitor thread (it will see _stop and exit; _finish sees _finalized).
         if sess._thread is not None:
             sess._thread.join(timeout=10)
 
-        # Persist orphan_reaped terminal via the S5 path.
-        try:
-            self._persist_terminal_for_publish(session_id, "orphan_reaped", excerpt)
-        except NelixError as e:
-            if e.code == "idempotency_conflict":
-                if self._logger is not None:
-                    self._logger.warning("manager", "orphan_reap_idempotent",
-                                         session_id=session_id)
-            else:
-                if self._logger is not None:
-                    self._logger.error("manager", "orphan_reap_persist_failed",
-                                       session_id=session_id, error=str(e))
-                return
-        except Exception as e:
-            if self._logger is not None:
-                self._logger.error("manager", "orphan_reap_persist_failed",
-                                   session_id=session_id, error=str(e))
-            return
-
-        # Publish an event so any blocking /wait wakes up (the session is terminal).
+        # ── 4. Publish event (wakes any /wait) ──────────────────────────────
         try:
             self._events.publish(
                 session_id,
-                getattr(sess, "executor", ""),
+                executor_name,
                 "orphan_reaped",
                 excerpt[:200],
                 "crashed",
@@ -1894,19 +1932,13 @@ class SessionManager:
                 self._logger.warning("manager", "orphan_reap_publish_failed",
                                      session_id=session_id, exc_info=True)
 
-        # Remove from _sessions and final cleanup.
+        # ── 5. Remove from _sessions (leases already released by persist) ────
         with self._lock:
             self._sessions.pop(session_id, None)
-            self._terminal_obligations.discard(session_id)
-            active_tid = self._active_lease_tokens.pop(session_id, None)
-            live_tid = self._live_lease_tokens.pop(session_id, None)
-            self._active_token_activation.pop(session_id, None)
-            self._live_token_activation.pop(session_id, None)
-        if active_tid is not None or live_tid is not None:
-            self._release_terminal_leases(active_tid, live_tid)
         if self._logger is not None:
             self._logger.info("manager", "orphan_reaped",
                               session_id=session_id)
+        return True
 
     def stop_all(self, reason="shutdown"):
         self._stop_orphan_checker()

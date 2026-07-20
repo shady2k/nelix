@@ -657,6 +657,10 @@ class _FakeDialog:
 
 class _FakeSession:
     dialog = _FakeDialog()
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 class FakeManagerWithDialog:
@@ -780,6 +784,10 @@ class _CapturingDialog:
 
 class _CapturingSession:
     dialog = _CapturingDialog()
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 class _CapturingManager:

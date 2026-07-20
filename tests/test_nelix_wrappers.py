@@ -33,6 +33,11 @@ class FakeSession:
     def on_hook(self, ev):
         self.hooks.append(ev)
 
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
+
 
 class FakeManager:
     """Minimal stand-in for SessionManager exercising only what /message needs: `get` (auth),
