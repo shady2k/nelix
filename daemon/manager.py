@@ -340,12 +340,22 @@ class SessionManager:
         D2: FAIL-CLOSED on any NelixError EXCEPT UNKNOWN_SESSION (epoch genuinely
         absent — treat as not quiescing). STORE_UNAVAILABLE and any other error
         MUST reject admission.
+        FIX 5: also rejects ``process_state=dead`` — a dead epoch must not admit.
         """
         if not self._gen_epoch:
             self._quiescent = False
             return False
         try:
-            state = self._store.get_epoch_retirement_state(self._gen_epoch)
+            ep = self._store._conn.execute(
+                "SELECT process_state, retirement_state FROM epochs "
+                "WHERE generation_epoch=?", (self._gen_epoch,)).fetchone()
+            if ep is None:
+                self._quiescent = True
+                return True
+            if ep["process_state"] == "dead":
+                self._quiescent = True
+                return True
+            state = ep["retirement_state"]
             self._quiescent = (state == "quiescing" or state == "certified")
         except NelixError as e:
             if e.code == UNKNOWN_SESSION:
@@ -697,9 +707,10 @@ class SessionManager:
                 base_seq = self._events.latest_seq()
                 # B3: re-check quiescence under _lock so a concurrent begin_quiescence
                 # between the pre-lock check and here is not missed.
-                if self._quiescent:
+                # FIX 5: re-read AUTHORITATIVE state (not cached _quiescent) at commit.
+                if self._check_quiescent():
                     raise RuntimeError(
-                        f"epoch {self._gen_epoch} is quiescing; no new sessions")
+                        f"epoch {self._gen_epoch} is quiescing or dead; no new sessions")
                 sess = self._make(sid, executor_name, spec)
                 sess.on_terminal = self._free_slot
                 sess._persist_terminal = self._persist_terminal_for_publish
@@ -767,14 +778,28 @@ class SessionManager:
                 sess.stop()                       # tear down any partially-spawned PTY / open dialog
             except Exception:
                 pass
-            # Roll back durable state: transition the store's session row to "failed"
-            # so the router's ledger.fail() does not conflict with a live sessions row.
+            # FIX 1+2: clean up so no outstanding trace remains. Delete the sessions
+            # rows (terminal + sessions) in ONE transaction. Propagate errors so the
+            # start genuinely fails and router+daemon agree.
+            self._store._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._store.transition_session(sid, owner_id=owner_id, state="failed")
+                self._store._conn.execute(
+                    "DELETE FROM terminal WHERE session_id=?", (sid,))
+                self._store._conn.execute(
+                    "DELETE FROM sessions WHERE session_id=?", (sid,))
+                self._store._conn.execute("COMMIT")
             except Exception:
-                pass
-            with self._lock:                      # don't leak a registered-but-unstarted session
-                self._sessions.pop(sid, None)     # reservation already consumed: slot frees cleanly
+                self._store._conn.execute("ROLLBACK")
+                raise
+            with self._lock:
+                self._sessions.pop(sid, None)
+                self._terminal_obligations.discard(sid)
+                active_tid = self._active_lease_tokens.pop(sid, None)
+                live_tid = self._live_lease_tokens.pop(sid, None)
+                self._active_token_activation.pop(sid, None)
+                self._live_token_activation.pop(sid, None)
+            if active_tid is not None or live_tid is not None:
+                self._release_terminal_leases(active_tid, live_tid)
             self._log_spawn_failure("session_start_failed", sid, e)
             raise
         return StartOutcome(session_id=sid, base_seq=base_seq, snapshot=sess.snapshot())
@@ -1386,8 +1411,14 @@ class SessionManager:
             # UNKNOWN_SESSION (epoch not in store) is NOT fail-closed — test paths.
             if self._gen_epoch:
                 try:
-                    state = self._store.get_epoch_retirement_state(self._gen_epoch)
-                    if state in ("quiescing", "certified"):
+                    ep_row = self._store._conn.execute(
+                        "SELECT process_state, retirement_state FROM epochs "
+                        "WHERE generation_epoch=?", (self._gen_epoch,)).fetchone()
+                    if ep_row is None:
+                        self._quiescent = True
+                    elif ep_row["process_state"] == "dead":
+                        self._quiescent = True
+                    elif ep_row["retirement_state"] in ("quiescing", "certified"):
                         self._quiescent = True
                 except NelixError as e:
                     if e.code != UNKNOWN_SESSION:

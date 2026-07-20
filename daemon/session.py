@@ -316,14 +316,11 @@ class Session:
                   "daemon_fingerprint": ctx.daemon_fingerprint, "pid": pid,
                   "child_fingerprint": ctx.inspector.start_fingerprint(pid),
                   "pgid": pgid, "argv": lifecycle_log.redact_argv(self._spec.argv())}
-        try:
-            reaper.record_child(self._sessions_dir / self._id, record)
-            if self._log is not None:
-                self._log.info("session", "child_recorded", session_id=self._id,
-                               pid=pid, pgid=pgid)
-        except OSError:
-            if self._log is not None:
-                self._log.warning("session", "child_record_failed", session_id=self._id)
+        reaper.record_child(self._sessions_dir / self._id, record)
+        if self._log is not None:
+            self._log.info("session", "child_recorded", session_id=self._id,
+                           pid=pid, pgid=pgid)
+
 
     # ---- low-level PTY ops (split from the old blind _submit) ----
     def _type_text(self, text, timeout=None, drain_output=False):

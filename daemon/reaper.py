@@ -1,6 +1,7 @@
 """Orphan reaping across daemon restart. All process inspection/killing goes through the
 ProcessInspector/ProcessKiller boundary so unit tests inject a fake process table instead
 of faking /proc, ps, PID reuse, or ppid==1."""
+import errno
 import json
 import os
 import signal as _signal
@@ -99,22 +100,28 @@ class ProcessKiller:
 def record_child(session_dir, record: dict) -> None:
     """Durably publish the reaping record inside the session dir (atomic temp+rename;
     fsync file and dir). Must be called AFTER spawn returns a pid/pgid and BEFORE the
-    monitor thread does any work."""
+    monitor thread does any work.
+
+    FIX 3: detects short writes, propagates all fsync errors — a successful return
+    means the record is durably on disk.
+    """
     paths.ensure_private_dir(session_dir)
     final = paths.child_record(session_dir)
     tmp = final.with_suffix(".json.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, json.dumps(record).encode())
+        data = json.dumps(record).encode()
+        written = os.write(fd, data)
+        if written != len(data):
+            raise OSError(
+                errno.EIO, f"short write: {written} of {len(data)} bytes")
         os.fsync(fd)
     finally:
         os.close(fd)
     os.replace(tmp, final)
     dfd = os.open(session_dir, os.O_RDONLY)
     try:
-        os.fsync(dfd)                  # persist the rename's directory entry
-    except OSError:
-        pass
+        os.fsync(dfd)
     finally:
         os.close(dfd)
 
@@ -136,6 +143,29 @@ def read_child(session_dir):
         except OSError:
             pass
         return None
+
+
+def read_child_raw(session_dir):
+    """Non-mutating read for crash reconciliation (FIX 5).
+
+    Returns the parsed record, or None if absent/unreadable, or the string
+    ``"MALFORMED"`` if the file exists but is not valid JSON / not a dict.
+    Unlike ``read_child``, this does NOT rename/mutate evidence on disk.
+    """
+    path = paths.child_record(session_dir)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    try:
+        val = json.loads(text)
+    except ValueError:
+        return "MALFORMED"
+    if not isinstance(val, dict):
+        return "MALFORMED"
+    return val
 
 
 def forget_child(session_dir) -> None:

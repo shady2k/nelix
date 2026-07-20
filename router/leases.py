@@ -182,6 +182,27 @@ class LeaseService:
 
             return True
 
+    def release_epoch(self, gen_id, gen_epoch):
+        """Release ALL tokens held by an epoch. Used by crash reconciliation
+        (the daemon is dead and cannot release its own tokens)."""
+        with self._lock:
+            ep_key = (gen_id, gen_epoch)
+            es = self._epochs.get(ep_key)
+            if es is None:
+                return
+            for token_id, entry in list(es.tokens.items()):
+                es.tokens.pop(token_id, None)
+                es.by_kind_key.pop(entry.get("key"), None)
+                if entry.get("kind") == "active":
+                    es.active_count -= 1
+                    self._global_active_count -= 1
+                elif entry.get("kind") == "live":
+                    es.live_pty_count -= 1
+                    self._global_live_pty_count -= 1
+            # Clear epoch state
+            es.tokens.clear()
+            es.by_kind_key.clear()
+
     # ── 6-step handshake: register snapshot ────────────────────────────────
 
     def register_snapshot(self, gen_id, gen_epoch, reconciliation_id,

@@ -269,6 +269,11 @@ class _LeasedFakeSession(FakeSession):
 
 def _lease_mgr(store_and_ledger, active_limit=2, live_pty_limit=2):
     store, ledger = store_and_ledger
+    # Ensure the epoch row exists in the store so the admission gate can read it.
+    store.create_generation("g-leased", build_id="b-1", lifecycle_state="active",
+                            capability_snapshot=None, created_at=1000.0)
+    store.insert_epoch("e-leased", "g-leased", incarnation_meta=None, created_at=1000.0)
+    store.cas_epoch_serving("g-leased", "e-leased", expected_current_epoch=None)
     specs = {EXECUTOR: make_spec()}
     q = EventQueue()
     lease_client = _MockLeaseClient(active_limit=active_limit,
@@ -364,6 +369,10 @@ class TestLeaseAdmission:
     def test_router_unavailable_start(self, store_and_ledger):
         bad_client = LeaseClient("/nonexistent/router.sock", timeout=0.1)
         store, ledger = store_and_ledger
+        store.create_generation("g-1", build_id="b-1", lifecycle_state="active",
+                                capability_snapshot=None, created_at=1000.0)
+        store.insert_epoch("e-1", "g-1", incarnation_meta=None, created_at=1000.0)
+        store.cas_epoch_serving("g-1", "e-1", expected_current_epoch=None)
         specs = {EXECUTOR: make_spec()}
         q = EventQueue()
         mgr = SessionManager(specs, q, store,
@@ -379,6 +388,10 @@ class TestLeaseAdmission:
     def test_router_unavailable_send_turn(self, store_and_ledger):
         bad_client = LeaseClient("/nonexistent/router.sock", timeout=0.1)
         store, ledger = store_and_ledger
+        store.create_generation("g-1", build_id="b-1", lifecycle_state="active",
+                                capability_snapshot=None, created_at=1000.0)
+        store.insert_epoch("e-1", "g-1", incarnation_meta=None, created_at=1000.0)
+        store.cas_epoch_serving("g-1", "e-1", expected_current_epoch=None)
         specs = {EXECUTOR: make_spec()}
         q = EventQueue()
         mgr = SessionManager(specs, q, store,

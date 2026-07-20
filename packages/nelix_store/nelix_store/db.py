@@ -190,6 +190,7 @@ CREATE TABLE IF NOT EXISTS owner_board_seq (
     owner_id TEXT PRIMARY KEY,
     seq      INTEGER NOT NULL
 );
+
 """
 
 LOCK_FILENAME = ".db-init.lock"
