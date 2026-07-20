@@ -122,15 +122,20 @@ class LeaseClient:
         return removed
 
     def retry_outbox(self):
-        """Retry pending outbox releases. Returns list of still-pending token_ids."""
+        """Retry pending outbox releases. Returns list of still-pending token_ids.
+
+        Re-stamps each entry with the CURRENT reconciliation id (not the stored old
+        one) so the release applies under the now-installed snapshot. A response of
+        released:true OR released:false (idempotent no-op) is acknowledged.
+        """
         pending = []
         with self._lock:
+            current_rid = self._reconciliation_id
             snapshot = dict(self._release_outbox)
         for tid, info in snapshot.items():
             try:
-                self._do_release(tid, override_rid=info["rid"],
+                self._do_release(tid, override_rid=current_rid,
                                  override_revision=info["revision"])
-                # FIX 7: released:true OR released:false = acknowledged
                 self._outbox_remove(tid)
             except (self.RouterUnavailable, NelixError):
                 pending.append(tid)
@@ -176,16 +181,11 @@ class LeaseClient:
         raise NelixError(code, msg)
 
     def _extract_error_rid(self, data):
-        """Extract reconciliation_id from an error response envelope."""
+        """Extract reconciliation_id from the TOP LEVEL of an error response."""
         rid = data.get("reconciliation_id")
         if rid is not None:
             with self._lock:
                 self._reconciliation_id = rid
-        err_data = data.get("error", {})
-        rid2 = err_data.get("reconciliation_id")
-        if rid2 is not None:
-            with self._lock:
-                self._reconciliation_id = rid2
 
     # ── acquire ────────────────────────────────────────────────────────────
 

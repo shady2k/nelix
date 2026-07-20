@@ -298,6 +298,14 @@ class SessionManager:
         self._active_lease_tokens = {}
         # sid -> live-token (set by start; cleared by terminal release)
         self._live_lease_tokens = {}
+        # S3b: activation_id used when each token was acquired (snapshot must
+        # carry the ACTUAL acquisition activation_id, not the session's current
+        # activation counter).
+        self._active_token_activation = {}
+        self._live_token_activation = {}
+        # S3b: in-flight handshake guard — only one thread registers per id.
+        self._handshake_in_flight = None
+        self._handshake_lock = threading.Lock()
         if session_factory is not None:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
         else:
@@ -367,9 +375,11 @@ class SessionManager:
             self._pending_acquire.add(session_id)
 
         tokens = None
+        act_start = 0
         try:
             tokens = self._lease_client.acquire(
-                self._gen_id, self._gen_epoch, session_id, 0, {"active", "live"})
+                self._gen_id, self._gen_epoch, session_id, act_start,
+                {"active", "live"})
         except LeaseClient.RouterUnavailable as e:
             with self._lock:
                 self._pending_acquire.discard(session_id)
@@ -386,10 +396,19 @@ class SessionManager:
             raise RuntimeError(f"lease acquire failed: {e}") from e
 
         try:
-            return self._spawn(
+            started = self._spawn(
                 executor_name, task, cwd, lineage_id=None, restarted_from=None,
                 owner_id=owner_id, model=model, session_id=session_id,
                 lease_tokens=tokens)
+            # Record the activation_id used for this acquire.
+            act_str = str(act_start)
+            if tokens.get("active", {}).get("fresh"):
+                with self._lock:
+                    self._active_token_activation[session_id] = act_str
+            if tokens.get("live", {}).get("fresh"):
+                with self._lock:
+                    self._live_token_activation[session_id] = act_str
+            return started
         except Exception:
             self._release_lease_tokens(tokens)
             raise
@@ -642,8 +661,10 @@ class SessionManager:
                     live_tid = self._extract_tid(live_info)
                     if active_tid:
                         self._active_lease_tokens[sid] = active_tid
+                        self._active_token_activation[sid] = str(0)
                     if live_tid:
                         self._live_lease_tokens[sid] = live_tid
+                        self._live_token_activation[sid] = str(0)
                     # Set idle callback to release the active lease when the session goes idle.
                     sess.on_idle = self._make_on_idle(sid)
                 else:
@@ -950,88 +971,81 @@ class SessionManager:
     def _lease_snapshot(self):
         """Build a snapshot of all held lease tokens for registration.
 
-        FIX 5: capture held tokens AND cutoff revision **atomically under
-        manager._lock** so an in-flight acquire is either fully in the snapshot
-        (committed) or has revision > cutoff (buffered), never silently dropped.
-
-        FIX 8: snapshot entries use the REAL activation_id from each session.
-
-        Returns (active_tokens, live_tokens, revision).
+        Captured atomically under manager._lock. Each token carries the REAL
+        activation_id from when it was acquired (stored in the parallel
+        activation dicts), not the session's current activation counter.
         """
         with self._lock:
             active_tokens = []
             live_tokens = []
             for sid, tid in self._active_lease_tokens.items():
-                sess = self._sessions.get(sid)
-                act_id = getattr(sess, "_activation_counter", 0) if sess else 0
+                act_id = self._active_token_activation.get(sid, "0")
                 active_tokens.append({
                     "token_id": tid,
-                    "key": (self._gen_id, self._gen_epoch, sid, act_id),
+                    "key": (self._gen_id, self._gen_epoch, sid, act_id, "active"),
                 })
             for sid, tid in self._live_lease_tokens.items():
-                sess = self._sessions.get(sid)
-                act_id = getattr(sess, "_activation_counter", 0) if sess else 0
+                act_id = self._live_token_activation.get(sid, "0")
                 live_tokens.append({
                     "token_id": tid,
-                    "key": (self._gen_id, self._gen_epoch, sid, act_id),
+                    "key": (self._gen_id, self._gen_epoch, sid, act_id, "live"),
                 })
             revision = self._lease_client.transition_revision if self._lease_client else 0
         return active_tokens, live_tokens, revision
-
-    def _register_lease_snapshot(self):
-        """Register the current lease snapshot with the router (6-step handshake).
-
-        FIX 2: on success, marks the handshake as done so rollover happens
-        exactly once per reconciliation id. Retries the outbox after registration.
-
-        Returns the router response (includes ``acknowledged_revision``) or None.
-        """
-        if self._lease_client is None:
-            return None
-        active_tokens, live_tokens, revision = self._lease_snapshot()
-        try:
-            result = self._lease_client.register_snapshot(
-                self._gen_id, self._gen_epoch,
-                active_tokens, live_tokens, revision)
-            if self._logger is not None:
-                self._logger.info("manager", "lease_snapshot_registered",
-                                  epoch=self._gen_epoch,
-                                  active_count=len(active_tokens),
-                                  live_count=len(live_tokens),
-                                  revision=revision)
-            # Drain outbox entries up to the acknowledged revision.
-            acked_rev = result.get("acknowledged_revision", revision)
-            self._lease_client.outbox_drain_upto(acked_rev)
-            # Mark handshake done for this reconciliation id.
-            self._lease_client.mark_handshook(
-                self._lease_client.reconciliation_id)
-            # Retry outbox after registration.
-            self._lease_client.retry_outbox()
-            return result
-        except (NelixError, LeaseClient.RouterUnavailable) as e:
-            if self._logger is not None:
-                self._logger.warning("manager", "lease_snapshot_failed",
-                                     epoch=self._gen_epoch, error=str(e))
-            return None
 
     def _ensure_handshake(self):
         """If the router has a new reconciliation id, adopt it and register.
 
         Called when a lease operation returns REBUILDING or STALE_RECONCILIATION_ID.
         The LeaseClient has already extracted the current id from the error envelope.
-        This method registers the snapshot (exactly once per id) and retries the outbox.
+        In-flight guard + CAS ensures exactly ONE thread registers per id; a second
+        thread sees needs_handshake=False and returns.
+
+        Captures the id AT snapshot time and marks THAT id handshook — not
+        self._lease_client.reconciliation_id, which may have advanced to a newer
+        id that was NOT registered.
 
         Returns True if a handshake was performed, False if not needed.
         """
         if self._lease_client is None:
             return False
+        # Get the id we intend to register under, then CAS the in-flight guard.
+        target_rid = self._lease_client.reconciliation_id
+        if target_rid is None:
+            return False
         if not self._lease_client.needs_handshake():
             return False
-        if self._logger is not None:
-            self._logger.info("manager", "lease_handshake_start",
-                              rid=self._lease_client.reconciliation_id)
-        self._register_lease_snapshot()
-        return True
+        with self._handshake_lock:
+            if self._handshake_in_flight == target_rid:
+                return False  # another thread already handles this id
+            self._handshake_in_flight = target_rid
+        try:
+            if not self._lease_client.needs_handshake():
+                return False  # raced — already handshook
+            if self._logger is not None:
+                self._logger.info("manager", "lease_handshake_start", rid=target_rid)
+            # Capture snapshot AND the id at this point.
+            active_tokens, live_tokens, revision = self._lease_snapshot()
+            result = self._lease_client.register_snapshot(
+                self._gen_id, self._gen_epoch,
+                active_tokens, live_tokens, revision)
+            if result is not None:
+                # Mark target_rid handshook (not current rid, which may differ).
+                self._lease_client.mark_handshook(target_rid)
+                acked_rev = result.get("acknowledged_revision", revision)
+                self._lease_client.outbox_drain_upto(acked_rev)
+                self._lease_client.retry_outbox()
+                return True
+            return False
+        except (NelixError, LeaseClient.RouterUnavailable) as e:
+            if self._logger is not None:
+                self._logger.warning("manager", "lease_handshake_failed",
+                                     rid=target_rid, error=str(e))
+            return False
+        finally:
+            with self._handshake_lock:
+                if self._handshake_in_flight == target_rid:
+                    self._handshake_in_flight = None
 
     def retry_lease_outbox(self):
         """Retry all pending outbox releases. Returns number still pending."""
@@ -1257,6 +1271,7 @@ class SessionManager:
                         if old is not None:
                             stale_tokens.append(old)
                         self._active_lease_tokens[session_id] = active_tid
+                        self._active_token_activation[session_id] = str(activation_id)
                     revalidate_ok = True
 
         # Release staged tokens outside the lock (FIX D).

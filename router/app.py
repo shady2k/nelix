@@ -97,15 +97,9 @@ def main() -> None:
         active_limit = load_concurrency_limit(cfg_path)
         live_pty_limit = load_live_pty_limit(cfg_path, default=active_limit)
         lease_service = LeaseService(active_limit=active_limit, live_pty_limit=live_pty_limit)
-        # S3b FIX 1: pre-mark every live generation epoch as REBUILDING under
-        # the fresh reconciliation id. On restart, existing epochs must register
-        # a snapshot before they can accept new acquisitions.
-        if hasattr(registry, "generations"):
-            for gen in registry.generations():
-                lease_service.mark_epoch_rebuilding(gen.generation_id, gen.epoch)
-                _log.info("marked epoch %s/%s REBUILDING under rid %s",
-                          gen.generation_id, gen.epoch,
-                          lease_service.reconciliation_id)
+        # S3b: a fresh reconciliation id is minted in the constructor. Every
+        # epoch starts unreconciled and must register a snapshot before it can
+        # accept new acquisitions — no pre-marking needed.
         # Install shutdown handlers BEFORE creating the server, so SIGTERM that
         # arrives between socket creation and serve_forever() is handled gracefully.
         _install_shutdown_handlers()

@@ -316,8 +316,10 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                                            "session_id, activation_id, kinds").to_envelope())
                 return
             if not reconciliation_id:
-                self._send(503, NelixError(STALE_RECONCILIATION_ID,
-                                           "reconciliation_id is required").to_envelope())
+                env = NelixError(STALE_RECONCILIATION_ID,
+                                 "reconciliation_id is required").to_envelope()
+                env["reconciliation_id"] = lease_service.reconciliation_id
+                self._send(503, env)
                 return
             transition_revision = body.get("transition_revision")
             base_key = (gen_id, gen_epoch, session_id, str(activation_id))
@@ -355,8 +357,10 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                 return
             reconciliation_id = body.get("reconciliation_id")
             if not reconciliation_id:
-                self._send(503, NelixError(STALE_RECONCILIATION_ID,
-                                           "reconciliation_id is required").to_envelope())
+                env = NelixError(STALE_RECONCILIATION_ID,
+                                 "reconciliation_id is required").to_envelope()
+                env["reconciliation_id"] = lease_service.reconciliation_id
+                self._send(503, env)
                 return
             transition_revision = body.get("transition_revision")
             try:
