@@ -927,6 +927,71 @@ class SessionManager:
                     self._logger.warning("manager", "lease_release_error",
                                          token_id=live_tid, exc_info=True)
 
+    # ── S3b: reconciliation-id tracking ────────────────────────────────────
+
+    def _router_reconciliation_id(self):
+        """Current reconciliation id from the lease client, or None if unknown."""
+        if self._lease_client is None:
+            return None
+        return self._lease_client.reconciliation_id
+
+    def _lease_snapshot(self):
+        """Build a snapshot of all held lease tokens for registration.
+
+        Returns (active_tokens, live_tokens, revision) where revision is the
+        current transition revision for this generation epoch.
+        """
+        with self._lock:
+            active_tokens = []
+            live_tokens = []
+            for sid, tid in self._active_lease_tokens.items():
+                active_tokens.append({
+                    "token_id": tid,
+                    "key": (self._gen_id, self._gen_epoch, sid, 0),
+                })
+            for sid, tid in self._live_lease_tokens.items():
+                live_tokens.append({
+                    "token_id": tid,
+                    "key": (self._gen_id, self._gen_epoch, sid, 0),
+                })
+            revision = self._lease_client.transition_revision if self._lease_client else 0
+        return active_tokens, live_tokens, revision
+
+    def _register_lease_snapshot(self):
+        """Register the current lease snapshot with the router (6-step handshake).
+
+        Returns the router response (includes ``acknowledged_revision``) or None.
+        """
+        if self._lease_client is None:
+            return None
+        active_tokens, live_tokens, revision = self._lease_snapshot()
+        try:
+            result = self._lease_client.register_snapshot(
+                self._gen_id, self._gen_epoch,
+                active_tokens, live_tokens, revision)
+            if self._logger is not None:
+                self._logger.info("manager", "lease_snapshot_registered",
+                                  epoch=self._gen_epoch,
+                                  active_count=len(active_tokens),
+                                  live_count=len(live_tokens),
+                                  revision=revision)
+            # Drain outbox entries up to the acknowledged revision.
+            acked_rev = result.get("acknowledged_revision", revision)
+            self._lease_client.outbox_drain_upto(acked_rev)
+            return result
+        except (NelixError, LeaseClient.RouterUnavailable) as e:
+            if self._logger is not None:
+                self._logger.warning("manager", "lease_snapshot_failed",
+                                     epoch=self._gen_epoch, error=str(e))
+            return None
+
+    def retry_lease_outbox(self):
+        """Retry all pending outbox releases. Returns number still pending."""
+        if self._lease_client is None:
+            return 0
+        pending = self._lease_client.retry_outbox()
+        return len(pending)
+
     def get(self, session_id):
         with self._lock:
             return self._sessions.get(session_id)

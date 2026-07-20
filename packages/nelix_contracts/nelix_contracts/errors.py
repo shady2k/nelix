@@ -39,6 +39,12 @@ ADMISSION_UNAVAILABLE = "admission_unavailable"
 # until rebuild completes. Retryable: re-queue and try again after a backoff.
 REBUILDING = "rebuilding"
 
+# A lease message carries a reconciliation_id that does not match the router's current
+# incarnation (S3b). The message is from a prior rebuild cycle and cannot be accepted into
+# the current epoch state. Retryable: the generation should switch to the new id and
+# re-handshake via register_snapshot.
+STALE_RECONCILIATION_ID = "stale_reconciliation_id"
+
 # The terminal result existed and the store retired it from the board before the owner
 # acknowledged it. Distinct from unknown_session ON PURPOSE: deleting the row made "you were too
 # late" and "that session id was never real" the same answer, and they call for opposite
@@ -55,6 +61,7 @@ _RETRYABLE = {
     CONCURRENCY_LIMIT: True,
     ADMISSION_UNAVAILABLE: True,
     REBUILDING: True,
+    STALE_RECONCILIATION_ID: True,
     OWNER_MISMATCH: False,
     UNKNOWN_SESSION: False,
     CURSOR_EXPIRED: False,
