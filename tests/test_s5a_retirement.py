@@ -638,21 +638,31 @@ class TestRetireEndToEnd:
         assert body["status"] == "blocked"
         assert len(body.get("blockers", [])) > 0
 
-    def test_retire_success_after_certified(self, setup):
+    def test_retire_end_to_end_via_operator(self, setup):
+        """REAL retire flow: create a terminal, quiesce via daemon RPC, resolve
+        confirmed, reap, certify, oracle, lifecycle. No manual pre-cert/pre-confirm."""
         store, registry, operator, backend = setup
+        from nelix_store.ledger import StartLedger
+        clock = _FakeClock(1000.0)
+        store._clock = clock
+
         gid = new_generation_id()
+        epoch = new_generation_id()
         store.create_generation(gid, build_id="b-1", lifecycle_state=DRAINING,
                                 capability_snapshot=None, created_at=1000.0)
-        epoch = new_generation_id()
-        store.insert_epoch(epoch, gid, incarnation_meta=None, created_at=1000.0)
+        store.insert_epoch(epoch, gid,
+                           incarnation_meta='{"pid": 1, "start_fingerprint": "fp"}',
+                           created_at=1000.0)
         store.cas_epoch_serving(gid, epoch, expected_current_epoch=None)
 
-        # Pre-certify and confirm high water — do NOT clear current_epoch yet
-        # (the operator clears it after reaping).
-        store.set_epoch_retirement(epoch, retirement_state="certified",
-                                   certificate="test-cert",
-                                   final_high_water=0)
-        store.set_generation_confirmed_high_water(epoch, 0)
+        # Create a terminal record so the confirmed resolver has work to do
+        ledger = StartLedger(paths.nelix_root(), clock=clock)
+        sid = _router_started_session(ledger, store, gid=gid, epoch=epoch)
+        store.create_session(sid, state="done", executor="demo",
+                             task="retire-test", cwd="/tmp", model=None,
+                             created_at=1000.0)
+        store.put_terminal(sid, terminal_kind="done", summary="all done",
+                           ended_at=1005.0)
 
         # Register generation in the registry so daemon RPC works
         from daemon.transport import Transport
@@ -660,12 +670,32 @@ class TestRetireEndToEnd:
                                   Transport.tcp("127.0.0.1", backend.port, "t"),
                                   "b-1", incarnation={"pid": 1, "start_fingerprint": "fp"})
 
+        # Drive retire end-to-end
         status, body = operator.retire(gid)
-        assert status == 200
-        # With daemon reachable and quiesced, and epoch certified, retire should succeed
+        assert status == 200, f"retire returned {status}"
         if body["status"] != "ok":
-            # If blocked, report blockers for debugging
-            pytest.fail(f"retire blocked: {body.get('blockers')}")
+            pytest.fail(f"retire blocked: {body.get('blockers')}, "
+                        f"body={body}")
+
+        # Verify lifecycle reached RETIRED
+        gen = store.get_generation(gid)
+        assert gen.lifecycle_state == RETIRED, \
+            f"expected RETIRED, got {gen.lifecycle_state}"
+
+        # Verify current_epoch cleared
+        assert gen.current_epoch is None
+
+        # Verify confirmed_high_water was advanced by the resolver
+        chw = store.get_generation_confirmed_high_water(epoch)
+        assert chw == 1, f"expected confirmed_high_water=1, got {chw}"
+
+        # Verify the epoch is certified with final_high_water set
+        ep_records = store.list_epochs(gid)
+        certified = [e for e in ep_records if e.retirement_state == "certified"]
+        assert len(certified) == 1
+        assert certified[0].final_high_water == 1
+
+        # (terminal-pending lives on the daemon manager, not accessible from operator)
         assert body["lifecycle_state"] == RETIRED
 
     def test_retire_idempotent_when_already_retired(self, setup):

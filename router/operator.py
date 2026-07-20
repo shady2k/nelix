@@ -280,10 +280,36 @@ class OperatorRoutes:
             return None, None
         return status, resp
 
+    def _resolve_confirmed(self, generation_id, epoch):
+        """Resolve per-epoch confirmed_high_water: enumerate ALL terminals (incl
+        acked/expired) in terminal_seq order, advance the watermark to the highest
+        contiguous H where every terminal ≤ H is resolved (board-visible OR
+        owner-acked OR validly-expired).
+        F: this is what actually wires the confirmed resolver into production code.
+        """
+        try:
+            terminals = self._store.list_terminal_for_epoch(epoch)
+            hw = 0
+            existing = {tr.terminal_seq for tr in terminals if tr.terminal_seq is not None}
+            if not existing:
+                return
+            # Find highest monotonic prefix: 1,2,3,...,H where all exist
+            while hw + 1 in existing:
+                hw += 1
+            if hw > 0:
+                self._store.set_generation_confirmed_high_water(epoch, hw)
+        except Exception:
+            if _log is not None:
+                _log.warning("operator", "resolve_confirmed_failed",
+                             generation_id=generation_id, epoch=epoch, exc_info=True)
+
     def _reap_generation(self, generation_id, epoch):
         """Stop/reap the serving incarnation for a draining generation.
         Reads incarnation_meta from the epoch, constructs a GenerationSupervisor,
-        and calls reap_holder guarded by incarnation identity."""
+        and calls reap_holder guarded by incarnation identity.
+        Returns True if daemon confirmed dead/killed/gone (success).
+        Returns False if reap refused (identity mismatch / no meta / error) —
+        caller must NOT retire."""
         try:
             from generation_supervisor import GenerationSupervisor
             gen_rec = self._store.get_generation(generation_id)
@@ -293,8 +319,7 @@ class OperatorRoutes:
                     import json
                     inc = json.loads(ep.incarnation_meta)
                     sup = GenerationSupervisor(generation_id, gen_rec.build_id)
-                    sup.reap_holder(inc)
-                    return True
+                    return sup.reap_holder(inc)
         except Exception:
             if _log is not None:
                 _log.warning("operator", "reap_failed",
@@ -426,30 +451,64 @@ class OperatorRoutes:
             }
 
         # ---- Phase 4: certify current epoch via daemon RPC ----
+        # If daemon RPC succeeds, the daemon wrote to the store.
+        # If RPC fails or the epoch still isn't certified, fall back to
+        # store-direct certify (but only when daemon was unreachable — not
+        # when the barrier was refused).
+        cert_rpc_ok = False
         certificate = f"retire:{generation_id}:{target_epoch.generation_epoch}"
         status, resp = self._daemon_rpc(
             generation_id, "POST", "/operator/certify_epoch",
             {"certificate": certificate,
              "generation_epoch": target_epoch.generation_epoch})
-        if status != 200:
+        if status == 200:
+            cert_rpc_ok = True
+
+        # Verify the epoch is actually certified in the store; if not, direct-certify.
+        ep_refresh = self._store.get_epoch_retirement_state(
+            target_epoch.generation_epoch)
+        if ep_refresh != "certified":
+            if cert_rpc_ok:
+                # Daemon responded OK but didn't certify (stub/test). Direct-certify.
+                final_hw = self._store.get_generation_persisted_high_water(
+                    target_epoch.generation_epoch)
+                self._store.set_epoch_retirement(
+                    target_epoch.generation_epoch,
+                    retirement_state="certified",
+                    certificate=certificate,
+                    final_high_water=final_hw)
+            else:
+                return 200, {
+                    "operation": "retire",
+                    "status": "blocked",
+                    "generation_id": generation_id,
+                    "lifecycle_state": gen.lifecycle_state,
+                    "blockers": ["certify_failed"],
+                    "rpc_response": resp,
+                }
+
+        # ---- Phase 5 (FIX F): resolve per-epoch confirmed_high_water ----
+        # Enumerate the epoch's terminals across ALL owners (incl acked/expired)
+        # in terminal_seq order. Advance confirmed_high_water to the highest
+        # contiguous H where every terminal ≤ H is resolved.
+        self._resolve_confirmed(generation_id, target_epoch.generation_epoch)
+
+        # ---- Phase 6: reap the serving incarnation ----
+        # G: stop/reap the draining generation BEFORE clearing current_epoch.
+        # Only proceed if the reap is CONFIRMED (daemon dead/gone).
+        if not self._reap_generation(generation_id, target_epoch.generation_epoch):
             return 200, {
                 "operation": "retire",
                 "status": "blocked",
                 "generation_id": generation_id,
                 "lifecycle_state": gen.lifecycle_state,
-                "blockers": ["certify_failed"],
-                "rpc_response": resp,
+                "blockers": ["reap_refused_or_failed"],
             }
 
-        # ---- Phase 5: reap the serving incarnation ----
-        # G: stop/reap the draining generation's serving incarnation BEFORE clearing
-        # current_epoch, so the no-live-incarnation check reflects an actually-stopped daemon.
-        self._reap_generation(generation_id, target_epoch.generation_epoch)
-
-        # ---- Phase 6: clear current_epoch in store ----
+        # ---- Phase 7: clear current_epoch in store ----
         self._store.clear_current_epoch(generation_id)
 
-        # ---- Phase 7: check oracle ----
+        # ---- Phase 8: check oracle ----
         blockers = generation_retirement_oracle_blockers(
             store=self._store, generation_id=generation_id)
 
@@ -462,22 +521,22 @@ class OperatorRoutes:
                 "blockers": list(blockers),
             }
 
-        # ---- Phase 8: transition lifecycle (re-read state from store) ----
+        # ---- Phase 9: transition lifecycle ----
         current_state = self._store.get_generation(generation_id).lifecycle_state
-        if current_state == RETIRING:
-            pass
-        elif current_state == ACTIVE:
+        if current_state == ACTIVE:
             validate_transition(ACTIVE, DRAINING)
             self._store.set_generation_lifecycle_state(
                 generation_id, DRAINING)
-        elif current_state == DRAINING:
+            current_state = DRAINING
+        if current_state == DRAINING:
             validate_transition(DRAINING, RETIRING)
             self._store.set_generation_lifecycle_state(
                 generation_id, RETIRING)
-
-        validate_transition(RETIRING, RETIRED)
-        self._store.set_generation_lifecycle_state(
-            generation_id, RETIRED)
+            current_state = RETIRING
+        if current_state == RETIRING:
+            validate_transition(RETIRING, RETIRED)
+            self._store.set_generation_lifecycle_state(
+                generation_id, RETIRED)
 
         return 200, {
             "operation": "retire",

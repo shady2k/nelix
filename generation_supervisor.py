@@ -412,24 +412,26 @@ class GenerationSupervisor:
         fp = reaper.ProcessInspector().start_fingerprint(pid)
         return {"pid": pid, "start_fingerprint": fp}
 
-    def reap_holder(self, expected_incarnation: dict) -> None:
+    def reap_holder(self, expected_incarnation: dict) -> bool:
         """Kill THIS generation's lock holder ONLY if it matches ``expected_incarnation``
         exactly (both ``pid`` and ``start_fingerprint``). If the holder changed
         (pid or fingerprint differs or is absent), do NOT kill anything.
 
-        This is incarnation-guarded: a replacement daemon that grabbed the lock
-        between our read and this call is left alone. Never kills a newer daemon.
+        Returns True if the daemon is confirmed dead/killed/gone (success).
+        Returns False if the reap was REFUSED (identity mismatch / missing meta) —
+        the daemon may still be alive. Caller must NOT retire past a live incarnation.
         """
         if not expected_incarnation:
-            return
+            return False
         expected_pid = expected_incarnation.get("pid")
         expected_fp = expected_incarnation.get("start_fingerprint")
         if not expected_pid or not expected_fp:
-            return
+            return False
 
         holder = self._live_lock_holder()
         if not holder:
-            return
+            # Daemon already gone — confirmed success.
+            return True
         if (holder.get("pid") != expected_pid
                 or holder.get("start_fingerprint") != expected_fp):
             # Holder changed — do NOT reap the replacement.
@@ -437,9 +439,10 @@ class GenerationSupervisor:
                          "expected=(pid=%s fp=%s) actual=(pid=%s fp=%s); not reaping",
                          self._generation_id, expected_pid, expected_fp,
                          holder.get("pid"), holder.get("start_fingerprint"))
-            return
+            return False
 
         self._reap_daemon(expected_pid, f"reap_holder gen_id={self._generation_id}")
+        return True
 
     # ---- ensure running -----------------------------------------------------
 

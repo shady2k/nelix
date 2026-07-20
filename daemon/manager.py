@@ -18,7 +18,7 @@ from daemon.model_discovery import discover, auth_of, DiscoveryError
 from daemon.session import RespondOutcome, Session
 from nelix_contracts.errors import (
     ADMISSION_UNAVAILABLE, CONCURRENCY_LIMIT, REBUILDING,
-    STALE_RECONCILIATION_ID, NelixError,
+    STALE_RECONCILIATION_ID, UNKNOWN_SESSION, NelixError,
 )
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
@@ -337,9 +337,9 @@ class SessionManager:
 
     def _check_quiescent(self):
         """Check if this epoch is quiescing. Updates local flag from store.
-        D3: FAIL-CLOSED on store connectivity/availability errors → reject.
-        UNKNOWN_SESSION (epoch not found) is NOT fail-closed — it means the
-        store simply has no row for this epoch yet, common in tests.
+        D2: FAIL-CLOSED on any NelixError EXCEPT UNKNOWN_SESSION (epoch genuinely
+        absent — treat as not quiescing). STORE_UNAVAILABLE and any other error
+        MUST reject admission.
         """
         if not self._gen_epoch:
             self._quiescent = False
@@ -347,8 +347,11 @@ class SessionManager:
         try:
             state = self._store.get_epoch_retirement_state(self._gen_epoch)
             self._quiescent = (state == "quiescing" or state == "certified")
-        except NelixError:
-            self._quiescent = False
+        except NelixError as e:
+            if e.code == UNKNOWN_SESSION:
+                self._quiescent = False
+            else:
+                self._quiescent = True
         except Exception:
             self._quiescent = True
         return self._quiescent
@@ -1028,8 +1031,11 @@ class SessionManager:
             # (session not in _terminal_pending, e.g. test-only path without the S5
             # callback). Use the SAME clock value so idempotency works.
             # E: never persist after certified — would invalidate final_high_water.
+            # Check CERTIFIED state DIRECTLY (fail-closed on store error), independent
+            # of the cached _quiescent flag which may be stale-false.
             if snap is not None and session_id not in self._terminal_pending:
-                if not self._quiescent or not self._store_epoch_is_certified():
+                _certified = self._store_epoch_is_certified()
+                if not _certified:
                     try:
                         self._store.put_terminal(
                             session_id,
@@ -1363,8 +1369,9 @@ class SessionManager:
         # Revalidate under the lock. Keep pending_acquire set until after send_turn
         # completes so a racing thread cannot also acquire a lease for this session.
         # FIX D: stage tokens under lock, release RPCs outside lock.
-        # D2: recheck _quiescent under _lock AFTER acquisition — if quiescing now,
-        # release the acquired lease and reject.
+        # D1: recheck _quiescent under _lock AFTER acquisition — if quiescing now,
+        # RELEASE the acquired token and RETURN admission-rejected (do NOT fall
+        # through to the commit/send block below).
         revalidate_ok = False
         active_tid = None
         active_info = tokens.get("active") or {}
@@ -1372,33 +1379,34 @@ class SessionManager:
         stale_tokens = []    # tokens to release outside the lock
         release_tokens = []  # tokens from rollback to release outside the lock
         with self._lock:
+            # D1: if quiescing now, RELEASE the acquired token and REJECT —
+            # do NOT fall through to commit/send.
             if self._quiescent:
                 self._pending_acquire.discard(session_id)
                 if is_fresh:
                     release_tokens = [active_info.get("token_id")] if active_info else []
-            sess = self._sessions.get(session_id)
-            if sess is None:
-                self._pending_acquire.discard(session_id)
-                # Only release tokens that WE acquired freshly (FIX A: idempotent tokens
-                # are owned by the original acquirer; releasing them would under-count).
-                if is_fresh:
-                    release_tokens = [active_info.get("token_id")] if active_info else []
             else:
-                cstate = sess.snapshot().get("control_state")
-                if cstate != "idle":
+                sess = self._sessions.get(session_id)
+                if sess is None:
                     self._pending_acquire.discard(session_id)
                     if is_fresh:
                         release_tokens = [active_info.get("token_id")] if active_info else []
                 else:
-                    # Commit: store the new active token (replacing any stale one).
-                    active_tid = active_info.get("token_id")
-                    if active_tid:
-                        old = self._active_lease_tokens.pop(session_id, None)
-                        if old is not None:
-                            stale_tokens.append(old)
-                        self._active_lease_tokens[session_id] = active_tid
-                        self._active_token_activation[session_id] = str(activation_id)
-                    revalidate_ok = True
+                    cstate = sess.snapshot().get("control_state")
+                    if cstate != "idle":
+                        self._pending_acquire.discard(session_id)
+                        if is_fresh:
+                            release_tokens = [active_info.get("token_id")] if active_info else []
+                    else:
+                        # Commit: store the new active token (replacing any stale one).
+                        active_tid = active_info.get("token_id")
+                        if active_tid:
+                            old = self._active_lease_tokens.pop(session_id, None)
+                            if old is not None:
+                                stale_tokens.append(old)
+                            self._active_lease_tokens[session_id] = active_tid
+                            self._active_token_activation[session_id] = str(activation_id)
+                        revalidate_ok = True
 
         # Release staged tokens outside the lock (FIX D).
         if release_tokens:
