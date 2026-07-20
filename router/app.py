@@ -97,6 +97,9 @@ def main() -> None:
         active_limit = load_concurrency_limit(cfg_path)
         live_pty_limit = load_live_pty_limit(cfg_path, default=active_limit)
         lease_service = LeaseService(active_limit=active_limit, live_pty_limit=live_pty_limit)
+        # S3b: a fresh reconciliation id is minted in the constructor. Every
+        # epoch starts unreconciled and must register a snapshot before it can
+        # accept new acquisitions — no pre-marking needed.
         # Install shutdown handlers BEFORE creating the server, so SIGTERM that
         # arrives between socket creation and serve_forever() is handled gracefully.
         _install_shutdown_handlers()

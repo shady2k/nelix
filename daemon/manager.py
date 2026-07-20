@@ -17,7 +17,8 @@ from daemon.model_cache import ModelCache
 from daemon.model_discovery import discover, auth_of, DiscoveryError
 from daemon.session import RespondOutcome, Session
 from nelix_contracts.errors import (
-    ADMISSION_UNAVAILABLE, CONCURRENCY_LIMIT, REBUILDING, NelixError,
+    ADMISSION_UNAVAILABLE, CONCURRENCY_LIMIT, REBUILDING,
+    STALE_RECONCILIATION_ID, NelixError,
 )
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
@@ -297,6 +298,14 @@ class SessionManager:
         self._active_lease_tokens = {}
         # sid -> live-token (set by start; cleared by terminal release)
         self._live_lease_tokens = {}
+        # S3b: activation_id used when each token was acquired (snapshot must
+        # carry the ACTUAL acquisition activation_id, not the session's current
+        # activation counter).
+        self._active_token_activation = {}
+        self._live_token_activation = {}
+        # S3b: in-flight handshake guard — only one thread registers per id.
+        self._handshake_in_flight = None
+        self._handshake_lock = threading.Lock()
         if session_factory is not None:
             self._make = lambda sid, ex, spec: session_factory(sid, ex, spec, events)
         else:
@@ -365,10 +374,14 @@ class SessionManager:
                 raise RuntimeError(f"concurrent start in progress for {session_id}")
             self._pending_acquire.add(session_id)
 
+        # FIX 4: opportunistic outbox retry before admission.
+        self.retry_lease_outbox()
         tokens = None
+        act_start = 0
         try:
             tokens = self._lease_client.acquire(
-                self._gen_id, self._gen_epoch, session_id, 0, {"active", "live"})
+                self._gen_id, self._gen_epoch, session_id, act_start,
+                {"active", "live"})
         except LeaseClient.RouterUnavailable as e:
             with self._lock:
                 self._pending_acquire.discard(session_id)
@@ -377,6 +390,7 @@ class SessionManager:
         except NelixError:
             with self._lock:
                 self._pending_acquire.discard(session_id)
+            self._ensure_handshake()
             raise
         except Exception as e:
             with self._lock:
@@ -384,10 +398,19 @@ class SessionManager:
             raise RuntimeError(f"lease acquire failed: {e}") from e
 
         try:
-            return self._spawn(
+            started = self._spawn(
                 executor_name, task, cwd, lineage_id=None, restarted_from=None,
                 owner_id=owner_id, model=model, session_id=session_id,
                 lease_tokens=tokens)
+            # Record the activation_id used for this acquire.
+            act_str = str(act_start)
+            if tokens.get("active", {}).get("fresh"):
+                with self._lock:
+                    self._active_token_activation[session_id] = act_str
+            if tokens.get("live", {}).get("fresh"):
+                with self._lock:
+                    self._live_token_activation[session_id] = act_str
+            return started
         except Exception:
             self._release_lease_tokens(tokens)
             raise
@@ -410,7 +433,7 @@ class SessionManager:
             return
         for info in tokens.values():
             if isinstance(info, dict) and info.get("fresh") is False:
-                continue   # idempotent token — original acquirer will release it
+                continue
             tid = info.get("token_id") if isinstance(info, dict) else info
             if tid:
                 try:
@@ -419,6 +442,7 @@ class SessionManager:
                     if self._logger is not None:
                         self._logger.warning("manager", "lease_release_error",
                                              token_id=tid, exc_info=True)
+        self.retry_lease_outbox()
 
     def _extract_tid(self, info):
         """Extract token_id from acquire result entry (dict or legacy string)."""
@@ -640,8 +664,10 @@ class SessionManager:
                     live_tid = self._extract_tid(live_info)
                     if active_tid:
                         self._active_lease_tokens[sid] = active_tid
+                        self._active_token_activation[sid] = str(0)
                     if live_tid:
                         self._live_lease_tokens[sid] = live_tid
+                        self._live_token_activation[sid] = str(0)
                     # Set idle callback to release the active lease when the session goes idle.
                     sess.on_idle = self._make_on_idle(sid)
                 else:
@@ -781,8 +807,8 @@ class SessionManager:
             try:
                 lease_tokens = self._lease_client.acquire(
                     self._gen_id, self._gen_epoch, new_session_id, 0, {"active", "live"})
-            except (NelixError, LeaseClient.RouterUnavailable):
-                # FIX B2: release _reserved on acquire failure to prevent permanent drift.
+            except NelixError:
+                self._ensure_handshake()
                 if still_active:
                     with self._lock:
                         self._reserved -= 1
@@ -791,7 +817,17 @@ class SessionManager:
                                          reason="lease_acquire_failed",
                                          session_id=session_id)
                 return RestartOutcome("start_failed", lineage_id=lineage_id,
-                                      restart_count=count, max_restarts=max_restarts)
+                                       restart_count=count, max_restarts=max_restarts)
+            except LeaseClient.RouterUnavailable:
+                if still_active:
+                    with self._lock:
+                        self._reserved -= 1
+                if self._logger is not None:
+                    self._logger.warning("manager", "restart_rejected",
+                                         reason="lease_acquire_failed",
+                                         session_id=session_id)
+                return RestartOutcome("start_failed", lineage_id=lineage_id,
+                                       restart_count=count, max_restarts=max_restarts)
         # _spawn OWNS the reservation (reserve=reserve): it consumes it atomically with the insert,
         # or releases it in its own finally if it raises before inserting. restart() must NOT also
         # touch self._reserved here (that would double-decrement).
@@ -926,6 +962,92 @@ class SessionManager:
                 if self._logger is not None:
                     self._logger.warning("manager", "lease_release_error",
                                          token_id=live_tid, exc_info=True)
+        # FIX 4: retry outbox after release.
+        self.retry_lease_outbox()
+
+    # ── S3b: reconciliation-id tracking ────────────────────────────────────
+
+    def _router_reconciliation_id(self):
+        """Current reconciliation id from the lease client, or None if unknown."""
+        if self._lease_client is None:
+            return None
+        return self._lease_client.reconciliation_id
+
+    def _lease_snapshot(self):
+        """Build a snapshot of all held lease tokens for registration.
+
+        Captured atomically under manager._lock. Each token carries the REAL
+        activation_id from when it was acquired (stored in the parallel
+        activation dicts), not the session's current activation counter.
+        """
+        with self._lock:
+            active_tokens = []
+            live_tokens = []
+            for sid, tid in self._active_lease_tokens.items():
+                act_id = self._active_token_activation.get(sid, "0")
+                active_tokens.append({
+                    "token_id": tid,
+                    "key": (self._gen_id, self._gen_epoch, sid, act_id, "active"),
+                })
+            for sid, tid in self._live_lease_tokens.items():
+                act_id = self._live_token_activation.get(sid, "0")
+                live_tokens.append({
+                    "token_id": tid,
+                    "key": (self._gen_id, self._gen_epoch, sid, act_id, "live"),
+                })
+        return active_tokens, live_tokens
+
+    def _ensure_handshake(self):
+        """If the router has a new reconciliation id, adopt it and register.
+
+        Called when a lease operation returns REBUILDING or STALE_RECONCILIATION_ID.
+        In-flight guard + CAS ensures exactly ONE thread registers per id.
+        Captures the id AT snapshot time and threads it into register_snapshot
+        so the sent id == the marked id (not self._lease_client.reconciliation_id,
+        which may have advanced).
+        """
+        if self._lease_client is None:
+            return False
+        target_rid = self._lease_client.reconciliation_id
+        if target_rid is None:
+            return False
+        if not self._lease_client.needs_handshake():
+            return False
+        with self._handshake_lock:
+            if self._handshake_in_flight == target_rid:
+                return False
+            self._handshake_in_flight = target_rid
+        try:
+            if not self._lease_client.needs_handshake():
+                return False
+            if self._logger is not None:
+                self._logger.info("manager", "lease_handshake_start", rid=target_rid)
+            active_tokens, live_tokens = self._lease_snapshot()
+            # FIX 2: pass captured target_rid explicitly, not current client id.
+            result = self._lease_client.register_snapshot(
+                self._gen_id, self._gen_epoch,
+                active_tokens, live_tokens, target_rid)
+            if result is not None:
+                self._lease_client.mark_handshook(target_rid)
+                self._lease_client.retry_outbox()
+                return True
+            return False
+        except (NelixError, LeaseClient.RouterUnavailable) as e:
+            if self._logger is not None:
+                self._logger.warning("manager", "lease_handshake_failed",
+                                     rid=target_rid, error=str(e))
+            return False
+        finally:
+            with self._handshake_lock:
+                if self._handshake_in_flight == target_rid:
+                    self._handshake_in_flight = None
+
+    def retry_lease_outbox(self):
+        """Retry all pending outbox releases. Returns number still pending."""
+        if self._lease_client is None:
+            return 0
+        pending = self._lease_client.retry_outbox()
+        return len(pending)
 
     def get(self, session_id):
         with self._lock:
@@ -1082,6 +1204,8 @@ class SessionManager:
             self._pending_acquire.add(session_id)
 
         activation_id = getattr(sess, "_activation_counter", 0)
+        # FIX 4: opportunistic outbox retry before admission.
+        self.retry_lease_outbox()
         try:
             tokens = self._lease_client.acquire(
                 self._gen_id, self._gen_epoch, session_id, activation_id, {"active"})
@@ -1096,7 +1220,11 @@ class SessionManager:
         except NelixError as e:
             with self._lock:
                 self._pending_acquire.discard(session_id)
+            if e.code in (REBUILDING, STALE_RECONCILIATION_ID):
+                self._ensure_handshake()
             if e.code in (ADMISSION_UNAVAILABLE, REBUILDING):
+                return RespondOutcome("admission_unavailable")
+            if e.code == STALE_RECONCILIATION_ID:
                 return RespondOutcome("admission_unavailable")
             if e.code == CONCURRENCY_LIMIT:
                 if self._logger is not None:
@@ -1140,6 +1268,7 @@ class SessionManager:
                         if old is not None:
                             stale_tokens.append(old)
                         self._active_lease_tokens[session_id] = active_tid
+                        self._active_token_activation[session_id] = str(activation_id)
                     revalidate_ok = True
 
         # Release staged tokens outside the lock (FIX D).
