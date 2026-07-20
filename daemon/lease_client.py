@@ -4,12 +4,14 @@ The daemon connects to the router's AF_UNIX socket (``NELIX_ROUTER_SOCK``) using
 peercred auth the router uses for all same-host connections. The router's ``peer_is_self()``
 check allows any same-uid caller, so no additional auth is needed.
 
-S3b additions:
+S3b:
 - ``reconciliation_id`` is tracked from router responses; every request carries it.
 - ``transition_revision`` is a per-epoch monotonic counter bumped on each request.
 - ``register_snapshot()`` implements the 6-step handshake for router restart recovery.
 - A retry-until-ack outbox holds release token_ids that failed to reach the router;
   they are retried until acknowledged.
+- On stale-id/REBUILDING error, the client detects the new reconciliation id from the
+  error envelope and adopts it.
 """
 import json
 import threading
@@ -40,7 +42,9 @@ class LeaseClient:
         self._gen_id = generation_id or ""
         self._gen_epoch = generation_epoch or ""
         self._lock = threading.Lock()
-        self._release_outbox = {}  # token_id -> {"revision": int, "rid": str|None}
+        self._release_outbox = {}
+        # FIX 2: rollover-once guard — the last reconciliation_id we handshook under
+        self._handshook_rid = None
 
     @property
     def reconciliation_id(self):
@@ -63,11 +67,26 @@ class LeaseClient:
             return self._transition_revision
 
     def _update_from_response(self, data):
-        """Extract reconciliation_id from a router response."""
+        """Extract reconciliation_id from a router response (success or error)."""
         rid = data.get("reconciliation_id")
         if rid is not None:
             with self._lock:
                 self._reconciliation_id = rid
+
+    @property
+    def handshook_rid(self):
+        with self._lock:
+            return self._handshook_rid
+
+    def mark_handshook(self, rid):
+        with self._lock:
+            self._handshook_rid = rid
+
+    def needs_handshake(self):
+        """True if we haven't yet handshook under the current reconciliation id."""
+        with self._lock:
+            return (self._reconciliation_id is not None
+                    and self._handshook_rid != self._reconciliation_id)
 
     # ── outbox (retry-until-ack) ───────────────────────────────────────────
 
@@ -103,17 +122,16 @@ class LeaseClient:
         return removed
 
     def retry_outbox(self):
-        """Retry all pending outbox releases. Returns list of still-pending token_ids."""
+        """Retry pending outbox releases. Returns list of still-pending token_ids."""
         pending = []
         with self._lock:
             snapshot = dict(self._release_outbox)
         for tid, info in snapshot.items():
             try:
-                resp_data = self._do_release(tid, info["rid"])
-                if resp_data.get("released", False):
-                    self._outbox_remove(tid)
-                else:
-                    pending.append(tid)
+                self._do_release(tid, override_rid=info["rid"],
+                                 override_revision=info["revision"])
+                # FIX 7: released:true OR released:false = acknowledged
+                self._outbox_remove(tid)
             except (self.RouterUnavailable, NelixError):
                 pending.append(tid)
         return pending
@@ -140,20 +158,34 @@ class LeaseClient:
         except http.client.RemoteDisconnected as e:
             raise self.RouterUnavailable(str(e)) from e
 
-    def _do_release(self, token_id, override_rid=None):
-        """Execute a release call. Used by both public release() and retry_outbox()."""
+    def _do_release(self, token_id, override_rid=None, override_revision=None):
+        """Execute a release call. Used by public release() and retry_outbox()."""
         body = {"token_id": token_id}
         if override_rid:
             body["reconciliation_id"] = override_rid
-        # For outbox retries we use the revision stored in the outbox.
+        if override_revision is not None:
+            body["transition_revision"] = override_revision
         status, data = self._call("/lease/release", body)
         if status == 200:
             self._update_from_response(data)
             return data
         err = data.get("error", {})
+        self._update_from_response(err)
         code = err.get("code", "internal_error")
         msg = err.get("message", "lease release failed")
         raise NelixError(code, msg)
+
+    def _extract_error_rid(self, data):
+        """Extract reconciliation_id from an error response envelope."""
+        rid = data.get("reconciliation_id")
+        if rid is not None:
+            with self._lock:
+                self._reconciliation_id = rid
+        err_data = data.get("error", {})
+        rid2 = err_data.get("reconciliation_id")
+        if rid2 is not None:
+            with self._lock:
+                self._reconciliation_id = rid2
 
     # ── acquire ────────────────────────────────────────────────────────────
 
@@ -171,6 +203,8 @@ class LeaseClient:
                         REBUILDING, CONCURRENCY_LIMIT, …).
         """
         revision = self._next_revision()
+        with self._lock:
+            current_rid = self._reconciliation_id
         body = {
             "generation_id": generation_id,
             "generation_epoch": generation_epoch,
@@ -178,10 +212,8 @@ class LeaseClient:
             "activation_id": str(activation_id),
             "kinds": list(kinds),
             "transition_revision": revision,
+            "reconciliation_id": current_rid or "",
         }
-        with self._lock:
-            if self._reconciliation_id:
-                body["reconciliation_id"] = self._reconciliation_id
         status, data = self._call("/lease/acquire", body)
         if status == 200:
             self._update_from_response(data)
@@ -190,6 +222,8 @@ class LeaseClient:
                 raise self.RouterUnavailable(
                     "lease acquire returned 200 without tokens")
             return tokens
+        # FIX 2: extract reconciliation_id from error envelope
+        self._extract_error_rid(data)
         err = data.get("error", {})
         code = err.get("code", "internal_error")
         msg = err.get("message", "lease acquire failed")
@@ -210,9 +244,8 @@ class LeaseClient:
         body = {
             "token_id": token_id,
             "transition_revision": revision,
+            "reconciliation_id": current_rid or "",
         }
-        if current_rid:
-            body["reconciliation_id"] = current_rid
         try:
             status, data = self._call("/lease/release", body)
         except (self.RouterUnavailable, OSError):
@@ -221,10 +254,11 @@ class LeaseClient:
         if status == 200:
             self._update_from_response(data)
             released = data.get("released", False)
-            if released:
-                self._outbox_remove(token_id)
+            # FIX 7: ack'd regardless of released:true/false
+            self._outbox_remove(token_id)
             return released
         # Non-200: check if retryable.
+        self._extract_error_rid(data)
         err_data = data.get("error", {})
         code = err_data.get("code", "internal_error")
         msg = err_data.get("message", "lease release failed")
@@ -254,7 +288,7 @@ class LeaseClient:
         body = {
             "generation_id": generation_id,
             "generation_epoch": generation_epoch,
-            "reconciliation_id": current_rid,
+            "reconciliation_id": current_rid or "",
             "cutoff_revision": cutoff_revision,
             "active_tokens": active_tokens,
             "live_tokens": live_tokens,
@@ -263,6 +297,7 @@ class LeaseClient:
         if status == 200:
             self._update_from_response(data)
             return data
+        self._extract_error_rid(data)
         err = data.get("error", {})
         code = err.get("code", "internal_error")
         msg = err.get("message", "register_snapshot failed")

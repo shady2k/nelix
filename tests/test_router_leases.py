@@ -58,6 +58,26 @@ class _MockLeaseClient:
     def release(self, token_id):
         return self._service.release(token_id)
 
+    def needs_handshake(self):
+        return False
+
+    def mark_handshook(self, rid):
+        pass
+
+    def retry_outbox(self):
+        return []
+
+    def register_snapshot(self, *a, **k):
+        raise self.RouterUnavailable("mock no route")
+
+    @property
+    def reconciliation_id(self):
+        return getattr(self, "_mock_rid", None)
+
+    @reconciliation_id.setter
+    def reconciliation_id(self, value):
+        self._mock_rid = value
+
 
 def _tid(info):
     """Extract token_id string from acquire result entry (dict or legacy)."""
@@ -477,24 +497,31 @@ class TestS3bReconciliation:
         new_rid = svc.reconciliation_id
 
         # Release token r2 at revision 20 (above cutoff 10).
+        # During REBUILDING the release is BUFFERED, not applied directly.
         r2_tid = r2["active"]["token_id"]
         released = svc.release(r2_tid, reconciliation_id=new_rid, transition_revision=20)
         assert released is True
-        assert svc.active_count == 1
+        # Count unchanged — release is buffered, not yet applied.
+        assert svc.active_count == 2
+        assert svc.epoch_buffer_size("g-1", "e-1") == 1
 
-        # Register snapshot at cutoff 10 with only r1's token (r2 was already released).
+        # Register snapshot at cutoff 10 with both tokens (snapshot taken at R=10
+        # before the release at rev 20).
         active_tokens = [
             {"token_id": r1["active"]["token_id"],
              "key": ("g-1", "e-1", "s-1", "0")},
+            {"token_id": r2["active"]["token_id"],
+             "key": ("g-1", "e-1", "s-2", "0")},
         ]
         result = svc.register_snapshot(
             "g-1", "e-1", new_rid, cutoff_revision=10,
             active_tokens=active_tokens, live_tokens=[])
 
         assert result["acknowledged_revision"] == 10
-        # r2's release at revision 20 > 10 was applied, so active_count = 1.
+        # r2's release at revision 20 > 10 was applied after snapshot replace.
         assert svc.active_count == 1
         assert svc.live_pty_count == 0
+        assert svc.epoch_buffer_size("g-1", "e-1") == 0
 
     def test_buffered_delta_below_cutoff_discarded(self):
         """A release with revision ≤ cutoff is discarded (already in snapshot)."""
@@ -510,10 +537,13 @@ class TestS3bReconciliation:
         new_rid = svc.reconciliation_id
 
         # Release r2 at revision 5 (below cutoff 10).
+        # During REBUILDING the release is BUFFERED, not applied directly.
         r2_tid = r2["active"]["token_id"]
         released = svc.release(r2_tid, reconciliation_id=new_rid, transition_revision=5)
         assert released is True
-        assert svc.active_count == 1
+        # Count unchanged — release is buffered.
+        assert svc.active_count == 2
+        assert svc.epoch_buffer_size("g-1", "e-1") == 1
 
         # Register snapshot at cutoff 10 with BOTH tokens (generation snapshotted
         # at revision 10 before the release happened).
@@ -528,15 +558,10 @@ class TestS3bReconciliation:
             active_tokens=active_tokens, live_tokens=[])
 
         assert result["acknowledged_revision"] == 10
-        # r2's release at revision 5 ≤ 10 was discarded (double-release not applied).
+        # r2's release at revision 5 ≤ 10 was discarded (already in snapshot).
         # Active count = 2 (both tokens in snapshot).
-        # NOTE: since r2 was already released before snapshot (active_count=1 at that point),
-        # and the snapshot only sees 2 tokens, after snapshot active_count = 2.
-        # But r2's token was already removed from tokens dict by the release at revision 5.
-        # The snapshot adds it back. This is correct: the generation snapshotted at revision 10
-        # when it still held r2. The release at revision 5 was BEFORE revision 10, so the
-        # snapshot supersedes it. Active_count = 2 is the correct post-rebuild state.
         assert svc.active_count == 2
+        assert svc.epoch_buffer_size("g-1", "e-1") == 0
 
     def test_buffered_delta_same_cutoff_discarded(self):
         """A release at revision == cutoff is discarded (already in snapshot at R)."""
@@ -549,11 +574,12 @@ class TestS3bReconciliation:
         svc.set_reconciliation_id(uuid.uuid4().hex)
         new_rid = svc.reconciliation_id
 
-        # Release r2 at revision 10 == cutoff.
+        # Release r2 at revision 10 == cutoff (buffered during REBUILDING).
         r2_tid = r2["active"]["token_id"]
         released = svc.release(r2_tid, reconciliation_id=new_rid, transition_revision=10)
         assert released is True
-        assert svc.active_count == 1
+        # Count unchanged — buffered.
+        assert svc.active_count == 2
 
         # Snapshot at cutoff 10 includes both tokens (snapshot was taken BEFORE release).
         active_tokens = [
@@ -685,10 +711,13 @@ class TestS3bReconciliation:
         assert svc.active_count == 1
         assert svc.token_count() == 1
 
-        # Existing worker can still release.
+        # Existing worker can still release. During REBUILDING the release is
+        # buffered (returns True, but count unchanged).
         released = svc.release(r["active"]["token_id"])
         assert released is True
-        assert svc.active_count == 0
+        # Count unchanged — release is buffered, not applied yet.
+        assert svc.active_count == 1
+        assert svc.epoch_buffer_size("g-1", "e-1") == 1
 
     def test_rebuilding_per_epoch_isolated(self):
         """One epoch rebuilding does not affect another epoch's operations."""
@@ -765,3 +794,158 @@ class TestS3bReconciliation:
                 "g-1", "e-1", new_rid, cutoff_revision=10,
                 active_tokens=active_tokens, live_tokens=[])
         assert exc.value.code in ("concurrency_limit", CONCURRENCY_LIMIT)
+
+    # ── REAL wired-flow tests ──────────────────────────────────────────────
+
+    def test_simulated_real_restart_blocks_acquire_until_registered(self):
+        """Simulate a real router restart: fresh LeaseService, pre-mark live epoch
+        REBUILDING, acquire blocked until snapshot registered."""
+        svc = LeaseService(active_limit=5, live_pty_limit=5)
+
+        # Simulate: router restart knows about a live epoch from the registry.
+        svc.mark_epoch_rebuilding("g-1", "e-1")
+        assert svc.is_epoch_rebuilding("g-1", "e-1") is True
+        rid = svc.reconciliation_id
+
+        # Acquire for this epoch must fail with REBUILDING.
+        with pytest.raises(NelixError) as exc:
+            svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"},
+                        reconciliation_id=rid, transition_revision=1)
+        assert exc.value.code == REBUILDING
+
+        # Register an empty snapshot (generation held no leases).
+        result = svc.register_snapshot(
+            "g-1", "e-1", rid, cutoff_revision=10,
+            active_tokens=[], live_tokens=[])
+        assert result["acknowledged_revision"] == 10
+
+        # Now acquire should succeed.
+        svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"},
+                    reconciliation_id=rid, transition_revision=2)
+        assert svc.active_count == 1
+
+    def test_simulated_real_restart_multiple_epochs(self):
+        """Two live epochs, both pre-marked REBUILDING, register independently."""
+        svc = LeaseService(active_limit=10, live_pty_limit=10)
+
+        svc.mark_epoch_rebuilding("g-1", "e-1")
+        svc.mark_epoch_rebuilding("g-2", "e-2")
+        rid = svc.reconciliation_id
+
+        # Both epochs block acquire.
+        for args in [("g-1", "e-1"), ("g-2", "e-2")]:
+            with pytest.raises(NelixError, match="rebuilding"):
+                svc.acquire(args + ("s-1", "0"), {"active"},
+                            reconciliation_id=rid, transition_revision=1)
+
+        # Register e-1.
+        svc.register_snapshot("g-1", "e-1", rid, cutoff_revision=5,
+                               active_tokens=[], live_tokens=[])
+
+        # e-1 should now accept acquires; e-2 still blocked.
+        svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"},
+                    reconciliation_id=rid, transition_revision=2)
+        assert svc.active_count == 1
+        with pytest.raises(NelixError, match="rebuilding"):
+            svc.acquire(("g-2", "e-2", "s-1", "0"), {"active"},
+                        reconciliation_id=rid, transition_revision=1)
+
+    # ── Registration idempotency (FIX 4) ───────────────────────────────────
+
+    def test_registration_idempotent_no_resurrection(self):
+        """Retried register_snapshot after lost ack does NOT resurrect a
+        post-cutoff release that was already applied."""
+        svc = LeaseService(active_limit=10, live_pty_limit=10)
+
+        r1 = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
+        r2 = svc.acquire(("g-1", "e-1", "s-2", "0"), {"active"})
+        assert svc.active_count == 2
+
+        svc.set_reconciliation_id(uuid.uuid4().hex)
+        new_rid = svc.reconciliation_id
+
+        # Buffer a release at revision 15 (> R=10).
+        r2_tid = r2["active"]["token_id"]
+        svc.release(r2_tid, reconciliation_id=new_rid, transition_revision=15)
+
+        # First registration — applies the buffered release (rev 15 > 10).
+        active_tokens = [
+            {"token_id": r1["active"]["token_id"],
+             "key": ("g-1", "e-1", "s-1", "0")},
+            {"token_id": r2["active"]["token_id"],
+             "key": ("g-1", "e-1", "s-2", "0")},
+        ]
+        svc.register_snapshot("g-1", "e-1", new_rid, cutoff_revision=10,
+                               active_tokens=active_tokens, live_tokens=[])
+        assert svc.active_count == 1  # r2 released
+
+        # Ack lost — generation retries same snapshot.
+        # Idempotent: epoch already reconciled under this id.
+        result = svc.register_snapshot(
+            "g-1", "e-1", new_rid, cutoff_revision=10,
+            active_tokens=active_tokens, live_tokens=[])
+        assert result["acknowledged_revision"] == 10
+        # r2 must NOT be resurrected.
+        assert svc.active_count == 1
+
+    # ── Mark epoch rebuilding (FIX 1) ──────────────────────────────────────
+
+    def test_mark_epoch_rebuilding_persists(self):
+        """mark_epoch_rebuilding creates the epoch and sets rebuilding."""
+        svc = LeaseService()
+        svc.mark_epoch_rebuilding("g-1", "e-1")
+        assert svc.is_epoch_rebuilding("g-1", "e-1") is True
+        assert svc.epoch_active_count("g-1", "e-1") == 0
+
+    # ── Global bound validation (FIX 9) ────────────────────────────────────
+
+    def test_snapshot_respects_global_bound_multiple_epochs(self):
+        """register_snapshot rejects a snapshot that pushes the GLOBAL
+        total over the bound, even if the snapshot alone is within limit."""
+        svc = LeaseService(active_limit=3, live_pty_limit=5)
+
+        # Epoch 1 already holds 2 active leases.
+        svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
+        svc.acquire(("g-1", "e-1", "s-2", "0"), {"active"})
+        assert svc.active_count == 2
+
+        svc.set_reconciliation_id(uuid.uuid4().hex)
+        new_rid = svc.reconciliation_id
+
+        # Epoch 2 tries to register a snapshot with 2 active tokens.
+        # Global total would be 4 > limit 3.
+        active_tokens = [
+            {"token_id": "fake-t1", "key": ("g-2", "e-2", "s-3", "0")},
+            {"token_id": "fake-t2", "key": ("g-2", "e-2", "s-4", "0")},
+        ]
+        with pytest.raises(NelixError, match="limit"):
+            svc.register_snapshot("g-2", "e-2", new_rid, cutoff_revision=5,
+                                   active_tokens=active_tokens, live_tokens=[])
+        # Counts must be unchanged after rejection.
+        assert svc.active_count == 2
+        assert svc.epoch_active_count("g-2", "e-2") == 0
+
+    # ── Rollover exactly once (FIX 2) ──────────────────────────────────────
+
+    def test_needs_handshake_rollover_once(self):
+        """needs_handshake returns True only for a new reconciliation id,
+        False after mark_handshook."""
+        client = LeaseClient("/nonexistent/sock", timeout=0.1,
+                             generation_id="g-1", generation_epoch="e-1")
+        assert client.needs_handshake() is False
+
+        # Set a reconciliation id.
+        client.reconciliation_id = "rid-abc"
+        assert client.needs_handshake() is True
+
+        # Mark handshook.
+        client.mark_handshook("rid-abc")
+        assert client.needs_handshake() is False
+
+        # New id triggers again.
+        client.reconciliation_id = "rid-def"
+        assert client.needs_handshake() is True
+
+        # Same id does not re-trigger.
+        client.mark_handshook("rid-def")
+        assert client.needs_handshake() is False

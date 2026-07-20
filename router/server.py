@@ -38,7 +38,8 @@ from urllib.parse import parse_qs, urlparse
 
 from nelix_contracts import routing
 from nelix_contracts.errors import (
-    ADMISSION_UNAVAILABLE, INTERNAL_ERROR, INVALID_REQUEST, OWNER_MISMATCH, NelixError,
+    ADMISSION_UNAVAILABLE, INTERNAL_ERROR, INVALID_REQUEST, OWNER_MISMATCH,
+    STALE_RECONCILIATION_ID, NelixError,
 )
 
 from daemon.transport import peer_is_self
@@ -308,12 +309,16 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             session_id = body.get("session_id")
             activation_id = body.get("activation_id")
             kinds = body.get("kinds", [])
+            reconciliation_id = body.get("reconciliation_id")
             if not all([gen_id, gen_epoch, session_id, activation_id is not None, kinds]):
                 self._send(400, NelixError(INVALID_REQUEST,
                                            "missing required fields: generation_id, generation_epoch, "
                                            "session_id, activation_id, kinds").to_envelope())
                 return
-            reconciliation_id = body.get("reconciliation_id")
+            if not reconciliation_id:
+                self._send(503, NelixError(STALE_RECONCILIATION_ID,
+                                           "reconciliation_id is required").to_envelope())
+                return
             transition_revision = body.get("transition_revision")
             base_key = (gen_id, gen_epoch, session_id, str(activation_id))
             try:
@@ -326,7 +331,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                     "reconciliation_id": lease_service.reconciliation_id,
                 })
             except NelixError as e:
-                self._send(http_status(e.code), e.to_envelope())
+                env = e.to_envelope()
+                env["reconciliation_id"] = lease_service.reconciliation_id
+                self._send(http_status(e.code), env)
 
         def _handle_lease_release(self, raw):
             if lease_service is None:
@@ -347,6 +354,10 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                                            "missing required field: token_id").to_envelope())
                 return
             reconciliation_id = body.get("reconciliation_id")
+            if not reconciliation_id:
+                self._send(503, NelixError(STALE_RECONCILIATION_ID,
+                                           "reconciliation_id is required").to_envelope())
+                return
             transition_revision = body.get("transition_revision")
             try:
                 released = lease_service.release(
@@ -358,7 +369,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                     "reconciliation_id": lease_service.reconciliation_id,
                 })
             except NelixError as e:
-                self._send(http_status(e.code), e.to_envelope())
+                env = e.to_envelope()
+                env["reconciliation_id"] = lease_service.reconciliation_id
+                self._send(http_status(e.code), env)
 
         def _handle_lease_register_snapshot(self, raw):
             if lease_service is None:
@@ -391,7 +404,9 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                 result["reconciliation_id"] = lease_service.reconciliation_id
                 self._send(200, result)
             except NelixError as e:
-                self._send(http_status(e.code), e.to_envelope())
+                env = e.to_envelope()
+                env["reconciliation_id"] = lease_service.reconciliation_id
+                self._send(http_status(e.code), env)
 
         def _handle_session_get(self, path):
             # SESSION-KEYED owner routes (GET half): session_id/owner_id/every other field is a raw

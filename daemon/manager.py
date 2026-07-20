@@ -17,7 +17,8 @@ from daemon.model_cache import ModelCache
 from daemon.model_discovery import discover, auth_of, DiscoveryError
 from daemon.session import RespondOutcome, Session
 from nelix_contracts.errors import (
-    ADMISSION_UNAVAILABLE, CONCURRENCY_LIMIT, REBUILDING, NelixError,
+    ADMISSION_UNAVAILABLE, CONCURRENCY_LIMIT, REBUILDING,
+    STALE_RECONCILIATION_ID, NelixError,
 )
 
 _MODEL_MAX_LEN = 128     # sane shape cap; nelix keeps NO model allowlist (the CLI is the authority)
@@ -377,6 +378,7 @@ class SessionManager:
         except NelixError:
             with self._lock:
                 self._pending_acquire.discard(session_id)
+            self._ensure_handshake()
             raise
         except Exception as e:
             with self._lock:
@@ -781,8 +783,8 @@ class SessionManager:
             try:
                 lease_tokens = self._lease_client.acquire(
                     self._gen_id, self._gen_epoch, new_session_id, 0, {"active", "live"})
-            except (NelixError, LeaseClient.RouterUnavailable):
-                # FIX B2: release _reserved on acquire failure to prevent permanent drift.
+            except NelixError:
+                self._ensure_handshake()
                 if still_active:
                     with self._lock:
                         self._reserved -= 1
@@ -791,7 +793,17 @@ class SessionManager:
                                          reason="lease_acquire_failed",
                                          session_id=session_id)
                 return RestartOutcome("start_failed", lineage_id=lineage_id,
-                                      restart_count=count, max_restarts=max_restarts)
+                                       restart_count=count, max_restarts=max_restarts)
+            except LeaseClient.RouterUnavailable:
+                if still_active:
+                    with self._lock:
+                        self._reserved -= 1
+                if self._logger is not None:
+                    self._logger.warning("manager", "restart_rejected",
+                                         reason="lease_acquire_failed",
+                                         session_id=session_id)
+                return RestartOutcome("start_failed", lineage_id=lineage_id,
+                                       restart_count=count, max_restarts=max_restarts)
         # _spawn OWNS the reservation (reserve=reserve): it consumes it atomically with the insert,
         # or releases it in its own finally if it raises before inserting. restart() must NOT also
         # touch self._reserved here (that would double-decrement).
@@ -938,27 +950,39 @@ class SessionManager:
     def _lease_snapshot(self):
         """Build a snapshot of all held lease tokens for registration.
 
-        Returns (active_tokens, live_tokens, revision) where revision is the
-        current transition revision for this generation epoch.
+        FIX 5: capture held tokens AND cutoff revision **atomically under
+        manager._lock** so an in-flight acquire is either fully in the snapshot
+        (committed) or has revision > cutoff (buffered), never silently dropped.
+
+        FIX 8: snapshot entries use the REAL activation_id from each session.
+
+        Returns (active_tokens, live_tokens, revision).
         """
         with self._lock:
             active_tokens = []
             live_tokens = []
             for sid, tid in self._active_lease_tokens.items():
+                sess = self._sessions.get(sid)
+                act_id = getattr(sess, "_activation_counter", 0) if sess else 0
                 active_tokens.append({
                     "token_id": tid,
-                    "key": (self._gen_id, self._gen_epoch, sid, 0),
+                    "key": (self._gen_id, self._gen_epoch, sid, act_id),
                 })
             for sid, tid in self._live_lease_tokens.items():
+                sess = self._sessions.get(sid)
+                act_id = getattr(sess, "_activation_counter", 0) if sess else 0
                 live_tokens.append({
                     "token_id": tid,
-                    "key": (self._gen_id, self._gen_epoch, sid, 0),
+                    "key": (self._gen_id, self._gen_epoch, sid, act_id),
                 })
             revision = self._lease_client.transition_revision if self._lease_client else 0
         return active_tokens, live_tokens, revision
 
     def _register_lease_snapshot(self):
         """Register the current lease snapshot with the router (6-step handshake).
+
+        FIX 2: on success, marks the handshake as done so rollover happens
+        exactly once per reconciliation id. Retries the outbox after registration.
 
         Returns the router response (includes ``acknowledged_revision``) or None.
         """
@@ -978,12 +1002,36 @@ class SessionManager:
             # Drain outbox entries up to the acknowledged revision.
             acked_rev = result.get("acknowledged_revision", revision)
             self._lease_client.outbox_drain_upto(acked_rev)
+            # Mark handshake done for this reconciliation id.
+            self._lease_client.mark_handshook(
+                self._lease_client.reconciliation_id)
+            # Retry outbox after registration.
+            self._lease_client.retry_outbox()
             return result
         except (NelixError, LeaseClient.RouterUnavailable) as e:
             if self._logger is not None:
                 self._logger.warning("manager", "lease_snapshot_failed",
                                      epoch=self._gen_epoch, error=str(e))
             return None
+
+    def _ensure_handshake(self):
+        """If the router has a new reconciliation id, adopt it and register.
+
+        Called when a lease operation returns REBUILDING or STALE_RECONCILIATION_ID.
+        The LeaseClient has already extracted the current id from the error envelope.
+        This method registers the snapshot (exactly once per id) and retries the outbox.
+
+        Returns True if a handshake was performed, False if not needed.
+        """
+        if self._lease_client is None:
+            return False
+        if not self._lease_client.needs_handshake():
+            return False
+        if self._logger is not None:
+            self._logger.info("manager", "lease_handshake_start",
+                              rid=self._lease_client.reconciliation_id)
+        self._register_lease_snapshot()
+        return True
 
     def retry_lease_outbox(self):
         """Retry all pending outbox releases. Returns number still pending."""
@@ -1161,7 +1209,11 @@ class SessionManager:
         except NelixError as e:
             with self._lock:
                 self._pending_acquire.discard(session_id)
+            if e.code in (REBUILDING, STALE_RECONCILIATION_ID):
+                self._ensure_handshake()
             if e.code in (ADMISSION_UNAVAILABLE, REBUILDING):
+                return RespondOutcome("admission_unavailable")
+            if e.code == STALE_RECONCILIATION_ID:
                 return RespondOutcome("admission_unavailable")
             if e.code == CONCURRENCY_LIMIT:
                 if self._logger is not None:
