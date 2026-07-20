@@ -153,6 +153,27 @@ def test_manifest_records_first_party_digests(tmp_path, monkeypatch):
     }
 
 
+def test_install_folds_first_party_wheels_into_the_build_id(tmp_path, monkeypatch):
+    """nelix-m78 at the install layer: install() must compute the SAME id build_id() does WITH
+    extra_wheels — otherwise a changed store wheel is silently served the old runtime. Heavy steps
+    (interpreter provisioning + the real build) are stubbed; only the identity wiring is under test.
+    """
+    monkeypatch.setattr(runtime, "provision_interpreter", lambda version=None: Path("/fake/python"))
+    monkeypatch.setattr(runtime, "interpreter_id", lambda python: "i")
+    monkeypatch.setattr(runtime, "_build_at", lambda *a, **k: None)
+
+    w = _wheel(tmp_path, payload=b"core")
+    (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir()
+    store_a = _wheel(tmp_path / "a", payload=b"store-a")
+    store_b = _wheel(tmp_path / "b", payload=b"store-b")
+
+    id_a = runtime.install(w, extra_wheels=[store_a])
+    id_b = runtime.install(w, extra_wheels=[store_b])
+
+    assert id_a != id_b
+    assert id_a == runtime.build_id(w.resolve(), "i", extra_wheels=[store_a])
+
+
 # ---------------------------------------------------------------- commit semantics
 
 def test_a_runtime_without_a_manifest_is_not_installed():

@@ -238,7 +238,7 @@ def install(wheel, *, python_version: str = RUNTIME_PYTHON, lock=RUNTIME_LOCK,
     wheel = Path(wheel).resolve()
     lock = Path(lock).resolve()
     base_python = provision_interpreter(python_version)
-    build = build_id(wheel, interpreter_id(base_python), lock)
+    build = build_id(wheel, interpreter_id(base_python), lock, extra_wheels=extra_wheels)
     if is_installed(build):
         return build
 
