@@ -37,7 +37,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from nelix_contracts import routing
-from nelix_contracts.errors import INTERNAL_ERROR, INVALID_REQUEST, OWNER_MISMATCH, NelixError
+from nelix_contracts.errors import (
+    ADMISSION_UNAVAILABLE, INTERNAL_ERROR, INVALID_REQUEST, OWNER_MISMATCH, NelixError,
+)
 
 from daemon.transport import peer_is_self
 from router.board import BoardForward
@@ -107,7 +109,7 @@ class _PreboundUnixHTTPServer(ThreadingHTTPServer):
 
 
 def make_router_server(bound_socket, sock_path, start_path, registry, router_epoch,
-                       store=None, archive_epoch=None):
+                       store=None, archive_epoch=None, lease_service=None):
     # Constructed here (not threaded through the signature) so every existing caller of
     # make_router_server keeps working unchanged — both take only `registry` (+ router_epoch),
     # already parameters of this function.
@@ -209,6 +211,12 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             raw = self._read_raw_body()            # drain the body regardless of route (see above)
             if raw is _STOP:                       # a bad Content-Length already answered
                 return
+            if path == "/lease/acquire":
+                self._handle_lease_acquire(raw)
+                return
+            if path == "/lease/release":
+                self._handle_lease_release(raw)
+                return
             if path == "/start":
                 self._handle_start(raw)
                 return
@@ -278,6 +286,57 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
                 return
             status, resp = restart_path.handle(body)
             self._send(status, resp)
+
+        def _handle_lease_acquire(self, raw):
+            if lease_service is None:
+                self._send(503, NelixError(ADMISSION_UNAVAILABLE,
+                                           "lease service not configured").to_envelope())
+                return
+            try:
+                body = json.loads(raw or b"{}")
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                self._send(400, NelixError(INVALID_REQUEST,
+                                           "lease acquire body must be a JSON object").to_envelope())
+                return
+            gen_id = body.get("generation_id")
+            gen_epoch = body.get("generation_epoch")
+            session_id = body.get("session_id")
+            activation_id = body.get("activation_id")
+            kinds = body.get("kinds", [])
+            if not all([gen_id, gen_epoch, session_id, activation_id is not None, kinds]):
+                self._send(400, NelixError(INVALID_REQUEST,
+                                           "missing required fields: generation_id, generation_epoch, "
+                                           "session_id, activation_id, kinds").to_envelope())
+                return
+            base_key = (gen_id, gen_epoch, session_id, str(activation_id))
+            try:
+                tokens = lease_service.acquire(base_key, set(kinds))
+                self._send(200, {"tokens": tokens})
+            except NelixError as e:
+                self._send(http_status(e.code), e.to_envelope())
+
+        def _handle_lease_release(self, raw):
+            if lease_service is None:
+                self._send(503, NelixError(ADMISSION_UNAVAILABLE,
+                                           "lease service not configured").to_envelope())
+                return
+            try:
+                body = json.loads(raw or b"{}")
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                self._send(400, NelixError(INVALID_REQUEST,
+                                           "lease release body must be a JSON object").to_envelope())
+                return
+            token_id = body.get("token_id")
+            if not token_id:
+                self._send(400, NelixError(INVALID_REQUEST,
+                                           "missing required field: token_id").to_envelope())
+                return
+            released = lease_service.release(token_id)
+            self._send(200, {"released": released})
 
         def _handle_session_get(self, path):
             # SESSION-KEYED owner routes (GET half): session_id/owner_id/every other field is a raw

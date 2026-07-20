@@ -237,6 +237,22 @@ def load_idle_retained_limit(path, default=5):
     return v
 
 
+def load_live_pty_limit(path, default=5):
+    """Global live-PTY lease bound — a SEPARATE counter from the active concurrency bound.
+    A session holds a live-PTY lease from start until terminal (an idle session still holds
+    its PTY/process). Defaults to the active concurrency limit. Malformed TOML/IO or a non-int
+    / bool / below-1 value falls back to `default` — never crash the load."""
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        return default
+    v = data.get("live_pty_limit", default)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return default
+    return v
+
+
 def load_kill_grace_seconds(path, default=5.0):
     """Seconds between SIGTERM and SIGKILL when reaping a process group. Top-level (not
     per-executor): startup reconcile has only a child.json record, not an ExecutorSpec."""

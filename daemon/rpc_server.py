@@ -9,6 +9,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import paths
+from nelix_contracts.errors import (
+    ADMISSION_UNAVAILABLE, CONCURRENCY_LIMIT, REBUILDING, NelixError,
+)
+
 from daemon import owner
 from daemon.config import MSG_MAX_BODY, DEFAULT_DIALOG_PAGE_CHARS
 from daemon.dialog import DialogReader
@@ -527,6 +531,13 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                     # command failed. str(e) is REDACTED (var + reason only, no command/stdout/stderr);
                     # the orchestrator relays it and stops (does not blind-retry).
                     self._send(502, {"error": str(e)}); return
+                except NelixError as e:
+                    # FIX C1: preserve the retryable code from router lease errors.
+                    if e.code in (ADMISSION_UNAVAILABLE, REBUILDING):
+                        self._send(503, e.to_envelope()); return
+                    if e.code == CONCURRENCY_LIMIT:
+                        self._send(429, e.to_envelope()); return
+                    self._send(409, e.to_envelope()); return
                 except (RuntimeError, ValueError) as e:
                     self._send(409, {"error": str(e)}); return
                 except KeyError as e:
@@ -634,6 +645,16 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                         logger.warning("rpc", "respond_at_capacity", session_id=sid, status=503)
                     self._send(503, {"operation": "respond", "status": "at_capacity", "session_id": sid,
                                      "error": "at_capacity", "next_action": "refresh_status"})
+                elif outcome.status == "admission_unavailable":
+                    # FIX C2: router lease service unreachable / rebuilding. Retryable backpressure,
+                    # same as at_capacity — the orchestrator refreshes/retries. NOT the no_pending
+                    # catch-all (which would be a non-retryable 409/fix_call).
+                    if logger is not None:
+                        logger.warning("rpc", "respond_admission_unavailable",
+                                       session_id=sid, status=503)
+                    self._send(503, {"operation": "respond", "status": "admission_unavailable",
+                                     "session_id": sid, "error": "admission_unavailable",
+                                     "next_action": "refresh_status"})
                 else:   # no_pending
                     if logger is not None:
                         logger.warning("rpc", "respond_no_pending", session_id=sid, status=409,

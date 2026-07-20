@@ -180,6 +180,10 @@ class Session:
         # executor appends to via append_progress_note. Deliberately separate from _decision/_events
         # — appending one must NEVER publish (that would trip an armed nelix-wait waiter and wake
         # the orchestrator, the exact phantom-pre-delivery class of bug 92a0dc6 closed elsewhere).
+        # S3a: manager-set callback fired when the session transitions to idle (monitor thread,
+        # outside Session._lock). The manager releases the active lease on idle so the slot is
+        # available for other sessions. Set by SessionManager._spawn.
+        self.on_idle = None
         self._progress = deque(maxlen=MAX_PROGRESS_NOTES)  # last N {progress_seq,ts,summary,details}
         self._progress_total = 0       # monotonic count of ALL notes ever appended (never reset)
         # Async question (message-plane, executor -> orchestrator): a NON-blocking question the
@@ -600,13 +604,23 @@ class Session:
         obs = self._driver.observe(frame, ctx)
         self._cache_last_modal_options(obs)   # nelix-5r3: monitor-owned; RPC-thread respond() hydrates from this
         with self._lock:
+            prev_state = self._state
             actions = self._engine.tick(obs, ctx)
             notes = self._engine.drain_notes()
             self._sync_control_state()
+            went_idle = prev_state != "idle" and self._state == "idle"
         self._apply_actions(actions, obs)
         self._enrich_hook_modal_options(obs)
         self._log_trail(obs, actions)
         self._log_notes(notes)
+        # S3a: fire the idle callback outside the lock so the manager can release the active
+        # lease (which may involve RPC) — never RPC under Session._lock.
+        if went_idle and self.on_idle is not None:
+            try:
+                self.on_idle(self._id)
+            except Exception:
+                if self._log is not None:
+                    self._log.warning("session", "on_idle_failed", session_id=self._id, exc_info=True)
         # nelix-s7v (Approach B): advance the post-delivery free-text submit the monitor owns — write it
         # (verifying the free_text prompt is still up), then confirm from frames pumped on LATER ticks.
         # The monitor pumped THIS frame above, so any confirm here rests on a genuine post-write

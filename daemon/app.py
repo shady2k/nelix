@@ -152,6 +152,14 @@ def main():
     # nelix-9a4.4: import locally so the Store import does not force a pyproject dep —
     # nelix_store ships alongside the core wheel via the runtime installer.
     from nelix_store.store import Store
+    # S3a: connect to the router's lease service when NELIX_ROUTER_SOCK is set.
+    router_sock = os.environ.get("NELIX_ROUTER_SOCK")
+    lease_client = None
+    gen_id = os.environ.get("NELIX_GENERATION_ID", "")
+    gen_epoch = os.environ.get("NELIX_GENERATION_EPOCH", "")
+    if router_sock and gen_id and gen_epoch:
+        from daemon.lease_client import LeaseClient
+        lease_client = LeaseClient(router_sock)
     manager = SessionManager(
         specs, events,
         Store(paths.nelix_root()),
@@ -160,6 +168,7 @@ def main():
         session_retain=retention.session_retain,
         session_max_age_days=retention.session_max_age_days,
         reaper_ctx=reaper_ctx,
+        lease_client=lease_client, generation_id=gen_id, generation_epoch=gen_epoch,
     )
     reaper.reconcile_orphans(paths.sessions_root(), reaper_ctx.daemon_pid,
                              reaper_ctx.daemon_fingerprint, grace,

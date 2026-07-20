@@ -15,8 +15,10 @@ import sys
 import uuid
 
 import paths
+from daemon.config import load_concurrency_limit, load_live_pty_limit
 from nelix_store.ledger import StartLedger
 from nelix_store.store import Store
+from router.leases import LeaseService
 from router.registry import GenerationRegistry
 from router.runtime_dir import RouterLockHeld, establish
 from router.server import make_router_server
@@ -90,12 +92,18 @@ def main() -> None:
         # Eager re-adoption runs IN the constructor (§7.6).
         registry = GenerationRegistry(store=store, build_id=build_id)
         start_path = StartPath(ledger, registry)
+        # S3a: router-owned lease service — one active + live-PTY bound across all generations.
+        cfg_path = str(paths.config_path())
+        active_limit = load_concurrency_limit(cfg_path)
+        live_pty_limit = load_live_pty_limit(cfg_path, default=active_limit)
+        lease_service = LeaseService(active_limit=active_limit, live_pty_limit=live_pty_limit)
         # Install shutdown handlers BEFORE creating the server, so SIGTERM that
         # arrives between socket creation and serve_forever() is handled gracefully.
         _install_shutdown_handlers()
         server = make_router_server(handle.socket, handle.sock_path,
                                      start_path, registry, router_epoch,
-                                     store=store, archive_epoch=archive_epoch)
+                                     store=store, archive_epoch=archive_epoch,
+                                     lease_service=lease_service)
     except Exception:
         # H13: Clean up EVERYTHING, not just when registry is None.
         # A StartPath/server-creation failure must also release the router

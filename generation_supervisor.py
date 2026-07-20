@@ -492,6 +492,7 @@ class GenerationSupervisor:
                                        "NELIX_HOME": str(paths.nelix_root()),
                                        "NELIX_GENERATION_ID": self._generation_id,
                                        "NELIX_GENERATION_EPOCH": generation_epoch,
+                                       "NELIX_ROUTER_SOCK": str(paths.router_sock()),
                                        })
         if transport.kind == "unix":
             env["NELIX_RPC_SOCK"] = transport.path
