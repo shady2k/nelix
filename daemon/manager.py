@@ -779,22 +779,25 @@ class SessionManager:
             except Exception:
                 pass
             # FIX 1+2: clean up so no outstanding trace remains. Delete the sessions
-            # row (and any terminal stop() may have created) so list_starts_for_epoch
-            # excludes it. Release+clear lease tokens.
+            # rows (terminal + sessions) in ONE transaction. Propagate errors so the
+            # start genuinely fails and router+daemon agree.
+            self._store._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._store._conn.execute(
                     "DELETE FROM terminal WHERE session_id=?", (sid,))
-            except Exception:
-                pass
-            try:
                 self._store._conn.execute(
                     "DELETE FROM sessions WHERE session_id=?", (sid,))
+                self._store._conn.execute("COMMIT")
             except Exception:
-                pass
+                self._store._conn.execute("ROLLBACK")
+                raise
             with self._lock:
                 self._sessions.pop(sid, None)
+                self._terminal_obligations.discard(sid)
                 active_tid = self._active_lease_tokens.pop(sid, None)
                 live_tid = self._live_lease_tokens.pop(sid, None)
+                self._active_token_activation.pop(sid, None)
+                self._live_token_activation.pop(sid, None)
             if active_tid is not None or live_tid is not None:
                 self._release_terminal_leases(active_tid, live_tid)
             self._log_spawn_failure("session_start_failed", sid, e)

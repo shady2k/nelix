@@ -972,7 +972,6 @@ class Store:
                 (generation_id, generation_epoch))
 
     @translates_sqlite
-    @translates_sqlite
     def list_starts_for_epoch(self, generation_epoch: str) -> list:
         """Return start rows for an epoch that have a sessions row but no terminal
         (outstanding obligations). These are admitted sessions that never received a
