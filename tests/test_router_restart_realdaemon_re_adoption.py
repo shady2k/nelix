@@ -16,6 +16,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+# All tests in this file share a REAL SQLite Store and file-system generation
+# dirs — running them in parallel (xdist) causes collisions.  Lock to one
+# worker via xdist_group.
+pytestmark = pytest.mark.xdist_group(name="re_adoption_serial")
+
 import paths
 from daemon.protocol import RPC_PROTOCOL_VERSION
 from daemon import reaper
@@ -298,10 +303,323 @@ def test_refresh_rejects_nonserving_pointer():
 
         # active() hits _refresh_active_locked → matching pointer but epoch
         # is not serving → must raise.
-        with patch.object(GenerationSupervisor, 'reap_holder', return_value=None):
+        # Patch endpoint (TCP holder) and _check_health_strict (identity) so
+        # the flow proceeds past lines 422-430 into the state check at :483-497.
+        with patch.object(GenerationSupervisor, 'reap_holder', return_value=None), \
+             patch.object(GenerationSupervisor, 'endpoint', return_value="mock_tcp"), \
+             patch.object(GenerationSupervisor, '_check_health_strict', return_value=True):
             with pytest.raises(NelixError) as exc2:
                 reg.active()
             assert exc2.value.code == GENERATION_UNAVAILABLE
+            assert "not serving" in str(exc2.value), (
+                f"Expected 'not serving' in error, got: {exc2.value}")
     finally:
         _teardown(daemon_srv)
+
+
+# ── S1-C1: multiple historical starting epochs reconciled ─────────────────────
+
+
+def test_historical_starting_epochs_reconciled():
+    """When eager reconcile finds multiple starting epochs (plus current_epoch),
+    ALL non-current starting epochs must be reconciled to dead.
+    Regression test for the loop at registry.py:363-372."""
+    from nelix_store.store import Store
+
+    gid = new_generation_id()
+    current = new_generation_id()
+    starting_a = new_generation_id()
+    starting_b = new_generation_id()
+
+    store, daemon_srv, _port, _token = _setup_gen_and_daemon(gid, current, None)
+    try:
+        inc_meta = json.dumps({"pid": os.getpid(), "start_fingerprint": "fp"})
+        store.cas_epoch_serving(gid, current, expected_current_epoch=None,
+                                incarnation_meta=inc_meta)
+
+        # Insert two extra starting epochs.
+        store.insert_epoch(starting_a, gid, incarnation_meta=None, created_at=1100.0)
+        store.insert_epoch(starting_b, gid, incarnation_meta=None, created_at=1200.0)
+
+        # Remove the lock file so there is no holder → eager reconcile falls through
+        # to the reconcile-all section (lines 349-372).
+        lock_path = paths.generation_lock(gid)
+        state_path = paths.generation_state(gid)
+        lock_path.unlink(missing_ok=True)
+        state_path.unlink(missing_ok=True)
+
+        _ = GenerationRegistry(store=Store(paths.nelix_root()), build_id=None)
+
+        epochs = store.list_epochs_strict(gid)
+        epoch_map = {e.generation_epoch: e.process_state for e in epochs}
+
+        # current epoch should be dead (reconciled at line 353).
+        assert epoch_map.get(current) == "dead", (
+            f"current epoch should be dead, got {epoch_map.get(current)}")
+
+        # Both starting epochs must be dead.
+        assert epoch_map.get(starting_a) == "dead", (
+            f"starting_a should be dead, got {epoch_map.get(starting_a)}")
+        assert epoch_map.get(starting_b) == "dead", (
+            f"starting_b should be dead, got {epoch_map.get(starting_b)}")
+    finally:
+        _teardown(daemon_srv)
+
+
+def test_reconcile_starting_epoch_error_propagates():
+    """When reconcile_epoch_dead raises NelixError on a starting epoch,
+    the ORIGINAL error must propagate (not AttributeError from the
+    except-shadow bug at registry.py:369)."""
+    from unittest.mock import patch
+    from nelix_store.store import Store
+
+    gid = new_generation_id()
+    current = new_generation_id()
+    starting_a = new_generation_id()
+    starting_b = new_generation_id()
+
+    store, daemon_srv, _port, _token = _setup_gen_and_daemon(gid, current, None)
+    try:
+        inc_meta = json.dumps({"pid": os.getpid(), "start_fingerprint": "fp"})
+        store.cas_epoch_serving(gid, current, expected_current_epoch=None,
+                                incarnation_meta=inc_meta)
+        store.insert_epoch(starting_a, gid, incarnation_meta=None, created_at=1100.0)
+        store.insert_epoch(starting_b, gid, incarnation_meta=None, created_at=1200.0)
+
+        lock_path = paths.generation_lock(gid)
+        state_path = paths.generation_state(gid)
+        lock_path.unlink(missing_ok=True)
+        state_path.unlink(missing_ok=True)
+
+        # Patch reconcile_epoch_dead to raise NelixError for starting_b.
+        original_reconcile = Store.reconcile_epoch_dead
+
+        def _failing_reconcile(self, gen_id, epoch):
+            if epoch == starting_b:
+                raise NelixError(GENERATION_UNAVAILABLE, "forced reconcile failure")
+            return original_reconcile(self, gen_id, epoch)
+
+        with patch.object(Store, 'reconcile_epoch_dead', _failing_reconcile):
+            with pytest.raises(NelixError) as exc:
+                GenerationRegistry(store=Store(paths.nelix_root()), build_id=None)
+            # Must be the original NelixError, not an AttributeError
+            # (which would have no code attribute or show a different message).
+            assert "forced reconcile failure" in str(exc.value), (
+                f"Expected original error to propagate, got: {exc.value}")
+            assert exc.value.code == GENERATION_UNAVAILABLE
+    finally:
+        _teardown(daemon_srv)
+
+
+# ── S1-D1: TCP holder rejects non-serving epoch ───────────────────────────────
+
+
+def test_tcp_holder_rejects_nonserving_epoch():
+    """TCP-holder adoption branch must gate on process_state == 'serving'
+    (registry.py:334). When epoch row is dead/starting, eager reconcile
+    must NOT adopt — even if the TCP endpoint answers."""
+
+    gid = new_generation_id()
+    gepoch = new_generation_id()
+
+    store, daemon_srv, _port, _token = _setup_gen_and_daemon(gid, gepoch, None)
+    try:
+        # Make the epoch non-serving (dead).
+        store.reconcile_epoch_dead(gid, gepoch)
+        store.set_current_epoch(gid, gepoch)
+        ep_list = store.list_epochs_strict(gid)
+        ep_row = [e for e in ep_list if e.generation_epoch == gepoch]
+        assert ep_row and ep_row[0].process_state == "dead"
+
+        # Build registry — eager reconcile must NOT adopt a dead epoch
+        # even though the TCP daemon is alive and endpoint() would respond.
+        reg = GenerationRegistry(store=Store(paths.nelix_root()), build_id=None)
+
+        # _active must remain None — the dead epoch was not adopted.
+        assert reg._active is None, (
+            f"Expected _active=None, got {reg._active}")
+    finally:
+        _teardown(daemon_srv)
+
+
+# ── S1-B1: bounded health retry for starting epoch ────────────────────────────
+
+
+def test_starting_epoch_retry_health():
+    """When a starting epoch's daemon is alive but not yet passing /health,
+    a bounded retry must be attempted before giving up.
+    Default (health_retries=0) preserves the original behavior; a retry>0
+    avoids premature reconciliation of a still-booting daemon."""
+    import tempfile
+    from unittest.mock import patch
+    from generation_supervisor import GenerationSupervisor
+    from nelix_store.store import Store
+
+    gid = new_generation_id()
+    gepoch = new_generation_id()
+    build_id = None
+
+    sock_dir = tempfile.mkdtemp()
+    sock_path = os.path.join(sock_dir, "daemon.sock")
+
+    _srv = _start_fake_daemon_unix(sock_path, gid, gepoch, build_id)
+    try:
+        gen_dir = paths.generation_dir(gid)
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(gen_dir, 0o700)
+        try: os.chmod(gen_dir.parent, 0o700)
+        except Exception: pass
+
+        store = Store(paths.nelix_root())
+        clock = 1000.0
+        store.create_generation(gid, build_id=build_id, lifecycle_state="active",
+                                capability_snapshot=None, created_at=clock)
+        store.insert_epoch(gepoch, gid, incarnation_meta=None, created_at=clock)
+        # Keep as "starting" — do NOT promote to serving, but set current_epoch
+        # so the eager reconcile enters the holder-processing path.
+        store.set_current_epoch(gid, gepoch)
+
+        pid = os.getpid()
+        lock_meta = {"pid": pid, "start_fingerprint": "mock-fp",
+                     "transport": "unix", "path": sock_path}
+        paths.generation_lock(gid).write_text(json.dumps(lock_meta))
+        paths.generation_state(gid).write_text(json.dumps(lock_meta))
+
+        # Mock _check_health: flaky — fail first call, succeed on retry.
+        call_count = [0]
+
+        def _flaky_check(self, transport):
+            call_count[0] += 1
+            return call_count[0] >= 2
+
+        def _mock_fingerprint(*args):
+            return "mock-fp"
+
+        with patch.object(GenerationSupervisor, '_check_health', _flaky_check), \
+             patch.object(reaper.ProcessInspector, 'start_fingerprint', _mock_fingerprint):
+            reg = GenerationRegistry(
+                store=Store(paths.nelix_root()),
+                build_id=None,
+                health_retries=2,
+                health_retry_delay=0.0,
+            )
+
+        # With retries, the flaky health check should recover and adopt.
+        assert reg._active is not None, (
+            "Expected _active to be set after retry")
+        assert reg._active["epoch"] == gepoch, (
+            f"Expected epoch {gepoch}, got {reg._active['epoch']}")
+        # _check_health should have been called twice (fail once, then succeed).
+        assert call_count[0] >= 2, (
+            f"Expected at least 2 _check_health calls, got {call_count[0]}")
+    finally:
+        _srv.shutdown()
+        _srv.server_close()
+        import shutil
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def test_starting_epoch_no_retry_reconciles_dead():
+    """With health_retries=0 (default), a starting epoch whose daemon
+    is alive but NOT passing /health is reconciled dead immediately
+    (preserves the original pre-hardening behavior)."""
+    import tempfile
+    from unittest.mock import patch
+    from generation_supervisor import GenerationSupervisor
+    from nelix_store.store import Store
+
+    gid = new_generation_id()
+    gepoch = new_generation_id()
+    build_id = None
+
+    sock_dir = tempfile.mkdtemp()
+    sock_path = os.path.join(sock_dir, "daemon.sock")
+    _srv = _start_fake_daemon_unix(sock_path, gid, gepoch, build_id)
+    try:
+        gen_dir = paths.generation_dir(gid)
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        store = Store(paths.nelix_root())
+        clock = 2000.0
+        store.create_generation(gid, build_id=build_id, lifecycle_state="active",
+                                capability_snapshot=None, created_at=clock)
+        store.insert_epoch(gepoch, gid, incarnation_meta=None, created_at=clock)
+        store.set_current_epoch(gid, gepoch)
+
+        pid = os.getpid()
+        lock_meta = {"pid": pid, "start_fingerprint": "mock-fp",
+                     "transport": "unix", "path": sock_path}
+        paths.generation_lock(gid).write_text(json.dumps(lock_meta))
+        paths.generation_state(gid).write_text(json.dumps(lock_meta))
+
+        def _mock_fp(*args):
+            return "mock-fp"
+
+        def _failing_check(self, transport):
+            return False
+
+        with patch.object(GenerationSupervisor, '_check_health', _failing_check), \
+             patch.object(reaper.ProcessInspector, 'start_fingerprint', _mock_fp):
+            reg = GenerationRegistry(
+                store=Store(paths.nelix_root()),
+                build_id=None,
+                health_retries=0,
+            )
+
+        assert reg._active is None, (
+            "Expected _active=None with health_retries=0")
+    finally:
+        _srv.shutdown()
+        _srv.server_close()
+        import shutil
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+# ── S1-A1: dir-only orphans reaped when no active generation ─────────────────
+
+
+def test_orphan_dir_reaped_no_active():
+    """When there is no active generation row but a stray generation dir exists
+    on disk with a lock holder, eager reconcile must STILL reap that orphan.
+    Regression: the reap block was previously after the no-active return."""
+    import json
+    from unittest.mock import patch
+    from generation_supervisor import GenerationSupervisor
+
+    orphan_gid = new_generation_id()
+
+    # Create a stray generation dir on disk with NO corresponding DB row.
+    gen_dir = paths.generation_dir(orphan_gid)
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    # Write a lock file so it looks like a real gen dir (even though _live_lock_holder
+    # will return None because the fingerprint won't match — we patch it below).
+    paths.generation_lock(orphan_gid).write_text(json.dumps({"pid": os.getpid()}))
+    paths.generation_state(orphan_gid).write_text(json.dumps({}))
+
+    try:
+        # Build registry — no active gen exists, but the reap loop should
+        # find the orphan dir and call reap_holder on it.
+        reaped_dirs = []
+
+        def _mock_live_lock_holder(self):
+            """Return a fake holder for any gen dir so the reap loop
+            calls reap_holder on it."""
+            return {"pid": 999999, "start_fingerprint": "mock-fp"}
+
+        def _tracking_reap(self, incarnation):
+            reaped_dirs.append(self._gen_dir.name)
+            # Do NOT call original — it would kill a real process.
+            return None
+
+        with patch.object(GenerationSupervisor, 'reap_holder', _tracking_reap), \
+             patch.object(GenerationSupervisor, '_live_lock_holder', _mock_live_lock_holder):
+            _ = GenerationRegistry(store=Store(paths.nelix_root()), build_id=None)
+
+        # The orphan dir's holder should have been reaped.
+        assert orphan_gid in reaped_dirs, (
+            f"Expected {orphan_gid} to be reaped, got {reaped_dirs}")
+    finally:
+        # Cleanup stray dir.
+        import shutil
+        if gen_dir.exists():
+            shutil.rmtree(gen_dir, ignore_errors=True)
 
