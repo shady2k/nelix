@@ -103,9 +103,9 @@ def test_gc_deletes_in_fk_order(store, ledger, clock):
     assert result["terminals_deleted"] == 1
     assert result["sessions_deleted"] == 1
     assert result["starts_deleted"] == 1
-    store._conn.execute("SELECT 1 FROM terminal WHERE session_id=?", (sid,)).fetchone() is None
-    store._conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (sid,)).fetchone() is None
-    store._conn.execute("SELECT 1 FROM starts WHERE session_id=?", (sid,)).fetchone() is None
+    assert store._conn.execute("SELECT 1 FROM terminal WHERE session_id=?", (sid,)).fetchone() is None
+    assert store._conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (sid,)).fetchone() is None
+    assert store._conn.execute("SELECT 1 FROM starts WHERE session_id=?", (sid,)).fetchone() is None
 
 
 # ---- only-retired ----
@@ -311,3 +311,43 @@ def test_runtime_not_deleted_when_retirement_not_confirmed(store, tmp_path, monk
 
     result = gc_runtime_dirs(store)
     assert result["dirs_deleted"] == 0
+
+
+def test_runtime_not_deleted_when_oracle_clean_but_not_retired_gen_shares_build(
+        store, tmp_path, monkeypatch):
+    """The refcount guard, NOT the oracle, protects a build shared with a generation
+    that is oracle-clean (no current epoch, every epoch certified, confirmed>=final)
+    yet lifecycle_state != retired — the transient window during retire(). The oracle
+    checks epochs/high-water but NOT lifecycle_state, so it returns no blockers here;
+    only the ``any_non_retired`` refcount check keeps the shared runtime dir alive.
+    """
+    from nelix_contracts.retirement import generation_retirement_oracle_blockers
+    import nelix_store.gc as gc_mod
+    monkeypatch.setattr(gc_mod.paths, "runtimes_root", lambda: tmp_path / "runtimes")
+    rt_root = tmp_path / "runtimes"
+    _touch_runtime(rt_root, "build_shared")
+
+    # Oracle-clean but lifecycle_state=active (NOT retired): certified dead epoch,
+    # confirmed >= final, no current epoch — yet never flipped to "retired".
+    store.create_generation(
+        GID1, build_id="build_shared", lifecycle_state="ready",
+        capability_snapshot=None, created_at=100.0)
+    store.set_generation_lifecycle_state(GID1, "active")
+    store.insert_epoch(GEPOCH1, GID1, incarnation_meta=None, created_at=101.0)
+    store.set_epoch_process_state(GEPOCH1, "dead")
+    store.set_epoch_retirement(GEPOCH1, retirement_state="certified",
+                               certificate='{"ok":true}', final_high_water=10)
+    store.set_generation_confirmed_high_water(GEPOCH1, 10)
+    store.clear_current_epoch(GID1)
+    # A retired peer sharing the same build.
+    _make_retired(store, gen_id=GID2, epoch_id=GEPOCH2, build_id="build_shared")
+
+    # Precondition that makes this test load-bearing for any_non_retired: the live gen
+    # IS oracle-clean, so oracle-confirm alone would NOT stop the delete.
+    assert generation_retirement_oracle_blockers(
+        store=store, generation_id=GID1) == ()
+    assert store.get_generation(GID1).lifecycle_state != "retired"
+
+    result = gc_runtime_dirs(store)
+    assert result["dirs_deleted"] == 0
+    assert (rt_root / "build_shared").is_dir()
