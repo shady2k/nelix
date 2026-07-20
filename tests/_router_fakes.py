@@ -51,7 +51,7 @@ class Backend:
         self.wait_events = {}            # session_id -> event dict returned by /wait
         self.wait_cursor_expired = False
         self.wait_calls = []             # every /wait: {"after_seq", "session_ids", "owner_id"}
-        # S5a: quiescence stub state
+        # S5a: quiescence stub state (can be overridden per-test)
         self.quiesce_calls = 0
         self.quiesce_status = {
             "live_sessions": 0,
@@ -60,6 +60,8 @@ class Backend:
             "in_flight_admissions": 0,
             "quiescent": True,
         }
+        # If set, store reference for certify_epoch to write to
+        self._store = None
         self.certify_calls = []
         backend = self
 
@@ -213,6 +215,11 @@ class Backend:
                     self._send(200, {"operation": "quiesce", "status": "ok"})
                 elif path == "/operator/certify_epoch":
                     backend.certify_calls.append(body)
+                    backend.quiesce_status["outstanding_obligations"] = 0
+                    backend.quiesce_status["live_sessions"] = 0
+                    backend.quiesce_status["terminal_pending"] = 0
+                    backend.quiesce_status["in_flight_admissions"] = 0
+                    backend.quiesce_status["quiescent"] = True
                     self._send(200, {"operation": "certify_epoch", "status": "ok"})
                 else:
                     self._send(404, {"error": "not found"})

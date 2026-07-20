@@ -1378,6 +1378,10 @@ class SessionManager:
         is_fresh = active_info.get("fresh", True)
         stale_tokens = []    # tokens to release outside the lock
         release_tokens = []  # tokens from rollback to release outside the lock
+        # FIX 5: re-check authoritative store state (not just cached _quiescent)
+        # before committing the token. A concurrent begin_quiescence that committed
+        # to the store during our lock-dropped lease acquire is caught here.
+        self._check_quiescent()
         with self._lock:
             # D1: if quiescing now, RELEASE the acquired token and REJECT —
             # do NOT fall through to commit/send.
