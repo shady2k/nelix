@@ -224,6 +224,7 @@ class Session:
         #                                (mirrors on_terminal/reaper_ctx wiring). None until the manager
         #                                assigns it; a session-only unit test leaves it None.
         self.reaper_ctx = None         # daemon-set reaper.ReaperContext (None => no reaping)
+        self._record_child_store = None  # S5b: callback to record child group in store
         self._closing = False          # terminal cleanup started: respond/screen must not write
 
     def _belief_config(self):
@@ -324,6 +325,13 @@ class Session:
         except OSError:
             if self._log is not None:
                 self._log.warning("session", "child_record_failed", session_id=self._id)
+        # S5b: also record in the store so the router can reap this child group
+        # during crash reconciliation if the daemon crashes.
+        if self._record_child_store is not None:
+            try:
+                self._record_child_store(pid, pgid)
+            except Exception:
+                pass
 
     # ---- low-level PTY ops (split from the old blind _submit) ----
     def _type_text(self, text, timeout=None, drain_output=False):

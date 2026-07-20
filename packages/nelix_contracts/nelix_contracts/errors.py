@@ -15,6 +15,7 @@ CONCURRENCY_LIMIT = "concurrency_limit"
 DUPLICATE_START = "duplicate_start"
 GENERATION_UNAVAILABLE = "generation_unavailable"
 ORPHAN_REAPED = "orphan_reaped"
+GENERATION_LOST = "generation_lost"
 INVALID_REQUEST = "invalid_request"
 SCHEMA_TOO_NEW = "schema_too_new"
 IDEMPOTENCY_CONFLICT = "idempotency_conflict"
@@ -69,6 +70,7 @@ _RETRYABLE = {
     UNSUPPORTED_BY_GENERATION: False,
     DUPLICATE_START: False,
     ORPHAN_REAPED: False,
+    GENERATION_LOST: False,
     INVALID_REQUEST: False,
     SCHEMA_TOO_NEW: False,
     IDEMPOTENCY_CONFLICT: False,

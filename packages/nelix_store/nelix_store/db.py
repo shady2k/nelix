@@ -190,6 +190,21 @@ CREATE TABLE IF NOT EXISTS owner_board_seq (
     owner_id TEXT PRIMARY KEY,
     seq      INTEGER NOT NULL
 );
+
+-- S5b: per-epoch child process groups the router must reap when the daemon
+-- crashes. Each row records one child process (pid + pgid + start fingerprint)
+-- spawned by the epoch's daemon. The router reads this during crash reconciliation
+-- to kill survivors and verify the child group is gone before certifying.
+CREATE TABLE IF NOT EXISTS epoch_child_groups (
+    generation_epoch   TEXT NOT NULL,
+    child_pid          INTEGER NOT NULL,
+    child_pgid         INTEGER,
+    leader_fingerprint TEXT,
+    recorded_at        REAL NOT NULL,
+    FOREIGN KEY (generation_epoch) REFERENCES epochs (generation_epoch) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS ecg_by_epoch
+    ON epoch_child_groups (generation_epoch);
 """
 
 LOCK_FILENAME = ".db-init.lock"
