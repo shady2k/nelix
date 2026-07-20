@@ -3,30 +3,28 @@
 Each generation epoch carries an independent lease state (active + live tokens). A
 reconciliation id marks the router incarnation. An epoch ADMITS lease mutations only
 if ``es.reconciled_rid == current reconciliation_id``; otherwise the mutation is
-rejected RETRYABLY with ``REBUILDING``. This means the router never buffers deltas —
-the generation registers an authoritative snapshot, then resumes.
+rejected RETRYABLY with ``REBUILDING``. No delta buffer, no cutoff revision.
 
 S3a semantics preserved:
   * **All-or-nothing**: capacity for ALL requested kinds is validated FIRST.
   * **Idempotent-by-fenced-key, counted once**: same key+kind returns same token.
   * **Exactly-once release**: ``release(token)`` removes the token and decrements
-    once. A stale/duplicate release returns ``False``.
+    once. A stale/duplicate release returns ``False`` from a RECONCILED epoch only.
   * **No additive refcount**: the ``_pending_acquire`` mechanism prevents racing.
 """
 import threading
 import uuid
 
 from nelix_contracts.errors import (
-    CONCURRENCY_LIMIT, REBUILDING, STALE_RECONCILIATION_ID, NelixError,
+    CONCURRENCY_LIMIT, INVALID_REQUEST, REBUILDING,
+    STALE_RECONCILIATION_ID, NelixError,
 )
-
-from nelix_contracts.errors import INVALID_REQUEST
 
 
 class _EpochLeaseState:
     __slots__ = (
         'active_count', 'live_pty_count', 'tokens', 'by_kind_key',
-        'rebuilding', 'transition_revision', 'reconciled_rid',
+        'rebuilding', 'reconciled_rid',
     )
 
     def __init__(self):
@@ -35,19 +33,11 @@ class _EpochLeaseState:
         self.tokens = {}
         self.by_kind_key = {}
         self.rebuilding = False
-        self.transition_revision = 0
         self.reconciled_rid = None
 
 
 class LeaseService:
-    """Lease service with per-epoch state and reconciliation.
-
-    ``active_limit`` caps concurrent active-slot leases (one counter across ALL generations).
-    ``live_pty_limit`` caps concurrent live-PTY leases.
-
-    On (re)start the router mints a fresh ``_reconciliation_id``. Every epoch starts
-    unreconciled and must register a snapshot before mutations are allowed.
-    """
+    """Lease service with per-epoch state and reconciliation."""
 
     def __init__(self, active_limit=5, live_pty_limit=5):
         self._active_limit = active_limit
@@ -79,31 +69,26 @@ class LeaseService:
             self._epochs[key] = es
         return es
 
-    def _kind_key(self, base_key, kind):
-        return base_key + (kind,)
-
     def epoch_keys(self):
         with self._lock:
             return list(self._epochs.keys())
 
     # ── acquire ────────────────────────────────────────────────────────────
 
-    def acquire(self, base_key, kinds, reconciliation_id=None,
-                transition_revision=None):
+    def acquire(self, base_key, kinds, reconciliation_id=None):
         with self._lock:
             gen_id, gen_epoch = base_key[0], base_key[1]
 
-            if reconciliation_id is not None and reconciliation_id != self._reconciliation_id:
+            # FIX 7: mandatory id — None or mismatched on unreconciled → REBUILDING
+            if reconciliation_id is None or reconciliation_id != self._reconciliation_id:
                 raise NelixError(
                     STALE_RECONCILIATION_ID,
-                    f"stale reconciliation_id {reconciliation_id!r}, "
+                    f"missing or stale reconciliation_id {reconciliation_id!r}, "
                     f"current is {self._reconciliation_id!r}")
 
             es = self._epoch(gen_id, gen_epoch)
 
-            # Reconciled gate: when a reconciliation_id is provided, the epoch
-            # must be reconciled under the current id; otherwise reject.
-            if reconciliation_id is not None and es.reconciled_rid != self._reconciliation_id:
+            if es.reconciled_rid != self._reconciliation_id:
                 raise NelixError(
                     REBUILDING, "lease service is rebuilding in-memory state")
 
@@ -112,7 +97,7 @@ class LeaseService:
             results = {}
 
             if needs_active:
-                kk = self._kind_key(base_key, "active")
+                kk = base_key + ("active",)
                 existing = es.by_kind_key.get(kk)
                 if existing is not None:
                     results["active"] = {"token_id": existing["token_id"],
@@ -123,7 +108,7 @@ class LeaseService:
                         CONCURRENCY_LIMIT,
                         f"active lease limit ({self._active_limit}) reached")
             if needs_live:
-                kk = self._kind_key(base_key, "live")
+                kk = base_key + ("live",)
                 existing = es.by_kind_key.get(kk)
                 if existing is not None:
                     results["live"] = {"token_id": existing["token_id"],
@@ -136,7 +121,7 @@ class LeaseService:
 
             if needs_active:
                 token_id = uuid.uuid4().hex
-                kk = self._kind_key(base_key, "active")
+                kk = base_key + ("active",)
                 entry = {"key": kk, "kind": "active", "token_id": token_id}
                 es.tokens[token_id] = entry
                 es.by_kind_key[kk] = entry
@@ -145,7 +130,7 @@ class LeaseService:
                 results["active"] = {"token_id": token_id, "fresh": True}
             if needs_live:
                 token_id = uuid.uuid4().hex
-                kk = self._kind_key(base_key, "live")
+                kk = base_key + ("live",)
                 entry = {"key": kk, "kind": "live", "token_id": token_id}
                 es.tokens[token_id] = entry
                 es.by_kind_key[kk] = entry
@@ -153,33 +138,37 @@ class LeaseService:
                 self._global_live_pty_count += 1
                 results["live"] = {"token_id": token_id, "fresh": True}
 
-            if transition_revision is not None:
-                es.transition_revision = max(es.transition_revision, transition_revision)
-
             return results
 
     # ── release ────────────────────────────────────────────────────────────
 
-    def release(self, token_id, reconciliation_id=None, transition_revision=None):
+    def release(self, gen_id, gen_epoch, token_id, reconciliation_id=None):
+        """Release a single token.
+
+        FIX 1: checks the reconciled gate BEFORE the unknown-token path so a
+        release that arrives at a fresh router (no tokens yet) raises REBUILDING
+        instead of returning False — the client keeps the outbox entry and
+        retries after registration.
+
+        Returns True if freed, False if already absent (under a reconciled epoch).
+        """
         with self._lock:
-            if reconciliation_id is not None and reconciliation_id != self._reconciliation_id:
+            # FIX 7: mandatory id
+            if reconciliation_id is None or reconciliation_id != self._reconciliation_id:
                 raise NelixError(
                     STALE_RECONCILIATION_ID,
-                    f"stale reconciliation_id {reconciliation_id!r}, "
+                    f"missing or stale reconciliation_id {reconciliation_id!r}, "
                     f"current is {self._reconciliation_id!r}")
 
-            for es in self._epochs.values():
-                entry = es.tokens.get(token_id)
-                if entry is not None:
-                    break
-            else:
-                return False
-
-            # Reconciled gate: when a reconciliation_id is provided, the epoch
-            # must be reconciled under the current id; otherwise reject.
-            if reconciliation_id is not None and es.reconciled_rid != self._reconciliation_id:
+            # FIX 1: gate on reconciled BEFORE token lookup.
+            es = self._epoch(gen_id, gen_epoch)
+            if es.reconciled_rid != self._reconciliation_id:
                 raise NelixError(
                     REBUILDING, "lease service is rebuilding in-memory state")
+
+            entry = es.tokens.get(token_id)
+            if entry is None:
+                return False
 
             es.tokens.pop(token_id, None)
             es.by_kind_key.pop(entry["key"], None)
@@ -191,34 +180,12 @@ class LeaseService:
                 es.live_pty_count -= 1
                 self._global_live_pty_count -= 1
 
-            if transition_revision is not None:
-                es.transition_revision = max(es.transition_revision, transition_revision)
-
             return True
 
     # ── 6-step handshake: register snapshot ────────────────────────────────
 
-    @staticmethod
-    def _validate_snapshot_entries(entries, kind_label):
-        for i, entry in enumerate(entries):
-            if not isinstance(entry, dict):
-                raise NelixError(
-                    INVALID_REQUEST,
-                    f"{kind_label} token {i}: expected dict, got {type(entry).__name__}")
-            tid = entry.get("token_id")
-            if not isinstance(tid, str) or not tid:
-                raise NelixError(
-                    INVALID_REQUEST,
-                    f"{kind_label} token {i}: token_id must be a non-empty string")
-            key = entry.get("key")
-            if not isinstance(key, (list, tuple)) or len(key) != 5:
-                raise NelixError(
-                    INVALID_REQUEST,
-                    f"{kind_label} token {i}: key must be a list/tuple of length 5 "
-                    f"(gen_id, gen_epoch, session_id, activation_id, kind)")
-
     def register_snapshot(self, gen_id, gen_epoch, reconciliation_id,
-                          cutoff_revision, active_tokens, live_tokens):
+                          active_tokens, live_tokens):
         with self._lock:
             if reconciliation_id != self._reconciliation_id:
                 raise NelixError(
@@ -228,42 +195,35 @@ class LeaseService:
 
             es = self._epoch(gen_id, gen_epoch)
 
-            # Idempotent: epoch already reconciled under this id.
             if es.reconciled_rid == self._reconciliation_id:
-                return {"acknowledged_revision": cutoff_revision,
-                        "reconciliation_id": self._reconciliation_id}
+                return {"reconciliation_id": self._reconciliation_id}
 
-            # Validate entire payload before mutating.
-            self._validate_snapshot_entries(active_tokens, "active")
-            self._validate_snapshot_entries(live_tokens, "live")
+            self._validate_snapshot_entry_batch(active_tokens, "active",
+                                                gen_id, gen_epoch)
+            self._validate_snapshot_entry_batch(live_tokens, "live",
+                                                gen_id, gen_epoch)
 
             seen_tids = set()
-            for entry in active_tokens:
-                tid = entry["token_id"]
-                if tid in seen_tids:
-                    raise NelixError(INVALID_REQUEST,
-                                     f"duplicate token_id {tid!r} in active_tokens")
-                seen_tids.add(tid)
-            for entry in live_tokens:
-                tid = entry["token_id"]
-                if tid in seen_tids:
-                    raise NelixError(INVALID_REQUEST,
-                                     f"duplicate token_id {tid!r} (in live_tokens, "
-                                     f"already in active_tokens)")
-                seen_tids.add(tid)
-
             seen_keys = set()
             for entry in active_tokens:
-                kk = self._kind_key(tuple(entry["key"]), "active")
-                if kk in seen_keys:
+                tid = entry["token_id"]
+                kk = tuple(entry["key"])
+                if tid in seen_tids:
                     raise NelixError(INVALID_REQUEST,
-                                     "duplicate kind-key in active_tokens")
+                                     f"duplicate token_id {tid!r}")
+                seen_tids.add(tid)
+                if kk in seen_keys:
+                    raise NelixError(INVALID_REQUEST, "duplicate kind-key")
                 seen_keys.add(kk)
             for entry in live_tokens:
-                kk = self._kind_key(tuple(entry["key"]), "live")
-                if kk in seen_keys:
+                tid = entry["token_id"]
+                kk = tuple(entry["key"])
+                if tid in seen_tids:
                     raise NelixError(INVALID_REQUEST,
-                                     "duplicate kind-key in live_tokens")
+                                     f"duplicate token_id {tid!r}")
+                seen_tids.add(tid)
+                if kk in seen_keys:
+                    raise NelixError(INVALID_REQUEST, "duplicate kind-key")
                 seen_keys.add(kk)
 
             snapshot_active_count = len(active_tokens)
@@ -286,7 +246,6 @@ class LeaseService:
                     f"snapshot would push global live count to "
                     f"{projected_live} exceeding limit ({self._live_pty_limit})")
 
-            # All valid — mutate.
             self._global_active_count -= old_active_count
             self._global_live_pty_count -= old_live_pty_count
 
@@ -308,7 +267,6 @@ class LeaseService:
 
             es.active_count = snapshot_active_count
             es.live_pty_count = snapshot_live_pty_count
-            es.transition_revision = max(es.transition_revision, cutoff_revision)
 
             self._global_active_count += snapshot_active_count
             self._global_live_pty_count += snapshot_live_pty_count
@@ -316,16 +274,48 @@ class LeaseService:
             es.rebuilding = False
             es.reconciled_rid = self._reconciliation_id
 
-            return {"acknowledged_revision": cutoff_revision,
-                    "reconciliation_id": self._reconciliation_id}
+            return {"reconciliation_id": self._reconciliation_id}
+
+    @staticmethod
+    def _validate_snapshot_entry_batch(entries, expected_kind,
+                                       gen_id, gen_epoch):
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise NelixError(
+                    INVALID_REQUEST,
+                    f"{expected_kind} token {i}: expected dict")
+            tid = entry.get("token_id")
+            if not isinstance(tid, str) or not tid:
+                raise NelixError(
+                    INVALID_REQUEST,
+                    f"{expected_kind} token {i}: non-empty string token_id required")
+            key = entry.get("key")
+            if not isinstance(key, (list, tuple)) or len(key) != 5:
+                raise NelixError(
+                    INVALID_REQUEST,
+                    f"{expected_kind} token {i}: key must have arity 5 "
+                    f"(gen_id, gen_epoch, session_id, activation_id, kind)")
+            if not isinstance(key[3], str):
+                raise NelixError(
+                    INVALID_REQUEST,
+                    f"{expected_kind} token {i}: activation_id must be a string")
+            kind = key[4]
+            if kind != expected_kind:
+                raise NelixError(
+                    INVALID_REQUEST,
+                    f"{expected_kind} token {i}: key kind {kind!r} "
+                    f"does not match expected {expected_kind!r}")
+            if key[0] != gen_id or key[1] != gen_epoch:
+                raise NelixError(
+                    INVALID_REQUEST,
+                    f"{expected_kind} token {i}: key gen_id/gen_epoch "
+                    f"does not match epoch being registered")
+
+    # ── rebuilding (legacy) ────────────────────────────────────────────────
 
     def mark_epoch_rebuilding(self, gen_id, gen_epoch):
-        """Pre-mark a live epoch as REBUILDING under the current reconciliation id."""
         with self._lock:
-            es = self._epoch(gen_id, gen_epoch)
-            es.rebuilding = True
-
-    # ── rebuilding (legacy, for backward compat) ───────────────────────────
+            self._epoch(gen_id, gen_epoch).rebuilding = True
 
     def set_epoch_rebuilding(self, gen_id, gen_epoch, value):
         with self._lock:
@@ -337,9 +327,7 @@ class LeaseService:
     def is_epoch_rebuilding(self, gen_id, gen_epoch):
         with self._lock:
             es = self._epochs.get((gen_id, gen_epoch))
-            if es is None:
-                return False
-            return es.rebuilding
+            return es.rebuilding if es else False
 
     @property
     def rebuilding(self):
@@ -352,7 +340,7 @@ class LeaseService:
             for es in self._epochs.values():
                 es.rebuilding = v
                 if v:
-                    es.reconciled_rid = None  # force gate to reject
+                    es.reconciled_rid = None
 
     # ── inspection ─────────────────────────────────────────────────────────
 
@@ -381,27 +369,14 @@ class LeaseService:
     def epoch_token_count(self, gen_id, gen_epoch):
         with self._lock:
             es = self._epochs.get((gen_id, gen_epoch))
-            if es is None:
-                return 0
-            return len(es.tokens)
+            return len(es.tokens) if es else 0
 
     def epoch_active_count(self, gen_id, gen_epoch):
         with self._lock:
             es = self._epochs.get((gen_id, gen_epoch))
-            if es is None:
-                return 0
-            return es.active_count
+            return es.active_count if es else 0
 
     def epoch_live_pty_count(self, gen_id, gen_epoch):
         with self._lock:
             es = self._epochs.get((gen_id, gen_epoch))
-            if es is None:
-                return 0
-            return es.live_pty_count
-
-    def epoch_transition_revision(self, gen_id, gen_epoch):
-        with self._lock:
-            es = self._epochs.get((gen_id, gen_epoch))
-            if es is None:
-                return 0
-            return es.transition_revision
+            return es.live_pty_count if es else 0

@@ -291,18 +291,26 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             status, resp = restart_path.handle(body)
             self._send(status, resp)
 
+        def _send_error(self, code, msg, status=503):
+            """Send an error envelope WITH current reconciliation_id (FIX 8)."""
+            env = NelixError(code, msg).to_envelope()
+            if lease_service is not None:
+                env["reconciliation_id"] = lease_service.reconciliation_id
+            self._send(status, env)
+
         def _handle_lease_acquire(self, raw):
             if lease_service is None:
-                self._send(503, NelixError(ADMISSION_UNAVAILABLE,
-                                           "lease service not configured").to_envelope())
+                self._send_error(ADMISSION_UNAVAILABLE, "lease service not configured")
                 return
             try:
                 body = json.loads(raw or b"{}")
             except ValueError:
-                body = None
+                self._send_error(INVALID_REQUEST,
+                                 "lease acquire body must be valid JSON", 400)
+                return
             if not isinstance(body, dict):
-                self._send(400, NelixError(INVALID_REQUEST,
-                                           "lease acquire body must be a JSON object").to_envelope())
+                self._send_error(INVALID_REQUEST,
+                                 "lease acquire body must be a JSON object", 400)
                 return
             gen_id = body.get("generation_id")
             gen_epoch = body.get("generation_epoch")
@@ -311,23 +319,20 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
             kinds = body.get("kinds", [])
             reconciliation_id = body.get("reconciliation_id")
             if not all([gen_id, gen_epoch, session_id, activation_id is not None, kinds]):
-                self._send(400, NelixError(INVALID_REQUEST,
-                                           "missing required fields: generation_id, generation_epoch, "
-                                           "session_id, activation_id, kinds").to_envelope())
+                self._send_error(INVALID_REQUEST,
+                                 "missing required fields: generation_id, generation_epoch, "
+                                 "session_id, activation_id, kinds",
+                                 status=400)
                 return
             if not reconciliation_id:
-                env = NelixError(STALE_RECONCILIATION_ID,
-                                 "reconciliation_id is required").to_envelope()
-                env["reconciliation_id"] = lease_service.reconciliation_id
-                self._send(503, env)
+                self._send_error(STALE_RECONCILIATION_ID,
+                                 "reconciliation_id is required")
                 return
-            transition_revision = body.get("transition_revision")
             base_key = (gen_id, gen_epoch, session_id, str(activation_id))
             try:
                 tokens = lease_service.acquire(
                     base_key, set(kinds),
-                    reconciliation_id=reconciliation_id,
-                    transition_revision=transition_revision)
+                    reconciliation_id=reconciliation_id)
                 self._send(200, {
                     "tokens": tokens,
                     "reconciliation_id": lease_service.reconciliation_id,
@@ -339,35 +344,34 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
 
         def _handle_lease_release(self, raw):
             if lease_service is None:
-                self._send(503, NelixError(ADMISSION_UNAVAILABLE,
-                                           "lease service not configured").to_envelope())
+                self._send_error(ADMISSION_UNAVAILABLE, "lease service not configured")
                 return
             try:
                 body = json.loads(raw or b"{}")
             except ValueError:
-                body = None
+                self._send_error(INVALID_REQUEST,
+                                 "lease release body must be valid JSON", 400)
+                return
             if not isinstance(body, dict):
-                self._send(400, NelixError(INVALID_REQUEST,
-                                           "lease release body must be a JSON object").to_envelope())
+                self._send_error(INVALID_REQUEST,
+                                 "lease release body must be a JSON object", 400)
                 return
             token_id = body.get("token_id")
+            gen_id = body.get("generation_id")
+            gen_epoch = body.get("generation_epoch")
             if not token_id:
-                self._send(400, NelixError(INVALID_REQUEST,
-                                           "missing required field: token_id").to_envelope())
+                self._send_error(INVALID_REQUEST,
+                                 "missing required field: token_id", 400)
                 return
             reconciliation_id = body.get("reconciliation_id")
             if not reconciliation_id:
-                env = NelixError(STALE_RECONCILIATION_ID,
-                                 "reconciliation_id is required").to_envelope()
-                env["reconciliation_id"] = lease_service.reconciliation_id
-                self._send(503, env)
+                self._send_error(STALE_RECONCILIATION_ID,
+                                 "reconciliation_id is required")
                 return
-            transition_revision = body.get("transition_revision")
             try:
                 released = lease_service.release(
-                    token_id,
-                    reconciliation_id=reconciliation_id,
-                    transition_revision=transition_revision)
+                    gen_id, gen_epoch, token_id,
+                    reconciliation_id=reconciliation_id)
                 self._send(200, {
                     "released": released,
                     "reconciliation_id": lease_service.reconciliation_id,
@@ -379,32 +383,33 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
 
         def _handle_lease_register_snapshot(self, raw):
             if lease_service is None:
-                self._send(503, NelixError(ADMISSION_UNAVAILABLE,
-                                           "lease service not configured").to_envelope())
+                self._send_error(ADMISSION_UNAVAILABLE, "lease service not configured")
                 return
             try:
                 body = json.loads(raw or b"{}")
             except ValueError:
-                body = None
+                self._send_error(INVALID_REQUEST,
+                                 "register_snapshot body must be valid JSON", 400)
+                return
             if not isinstance(body, dict):
-                self._send(400, NelixError(INVALID_REQUEST,
-                                           "register_snapshot body must be a JSON object").to_envelope())
+                self._send_error(INVALID_REQUEST,
+                                 "register_snapshot body must be a JSON object", 400)
                 return
             gen_id = body.get("generation_id")
             gen_epoch = body.get("generation_epoch")
             reconciliation_id = body.get("reconciliation_id")
-            cutoff_revision = body.get("cutoff_revision")
             active_tokens = body.get("active_tokens", [])
             live_tokens = body.get("live_tokens", [])
-            if not all([gen_id, gen_epoch, reconciliation_id, cutoff_revision is not None]):
-                self._send(400, NelixError(INVALID_REQUEST,
-                                           "missing required fields: generation_id, generation_epoch, "
-                                           "reconciliation_id, cutoff_revision").to_envelope())
+            if not all([gen_id, gen_epoch, reconciliation_id]):
+                self._send_error(INVALID_REQUEST,
+                                 "missing required fields: generation_id, generation_epoch, "
+                                 "reconciliation_id",
+                                 status=400)
                 return
             try:
                 result = lease_service.register_snapshot(
                     gen_id, gen_epoch, reconciliation_id,
-                    cutoff_revision, active_tokens, live_tokens)
+                    active_tokens, live_tokens)
                 result["reconciliation_id"] = lease_service.reconciliation_id
                 self._send(200, result)
             except NelixError as e:

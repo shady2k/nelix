@@ -374,6 +374,8 @@ class SessionManager:
                 raise RuntimeError(f"concurrent start in progress for {session_id}")
             self._pending_acquire.add(session_id)
 
+        # FIX 4: opportunistic outbox retry before admission.
+        self.retry_lease_outbox()
         tokens = None
         act_start = 0
         try:
@@ -431,7 +433,7 @@ class SessionManager:
             return
         for info in tokens.values():
             if isinstance(info, dict) and info.get("fresh") is False:
-                continue   # idempotent token — original acquirer will release it
+                continue
             tid = info.get("token_id") if isinstance(info, dict) else info
             if tid:
                 try:
@@ -440,6 +442,7 @@ class SessionManager:
                     if self._logger is not None:
                         self._logger.warning("manager", "lease_release_error",
                                              token_id=tid, exc_info=True)
+        self.retry_lease_outbox()
 
     def _extract_tid(self, info):
         """Extract token_id from acquire result entry (dict or legacy string)."""
@@ -959,6 +962,8 @@ class SessionManager:
                 if self._logger is not None:
                     self._logger.warning("manager", "lease_release_error",
                                          token_id=live_tid, exc_info=True)
+        # FIX 4: retry outbox after release.
+        self.retry_lease_outbox()
 
     # ── S3b: reconciliation-id tracking ────────────────────────────────────
 
@@ -990,26 +995,19 @@ class SessionManager:
                     "token_id": tid,
                     "key": (self._gen_id, self._gen_epoch, sid, act_id, "live"),
                 })
-            revision = self._lease_client.transition_revision if self._lease_client else 0
-        return active_tokens, live_tokens, revision
+        return active_tokens, live_tokens
 
     def _ensure_handshake(self):
         """If the router has a new reconciliation id, adopt it and register.
 
         Called when a lease operation returns REBUILDING or STALE_RECONCILIATION_ID.
-        The LeaseClient has already extracted the current id from the error envelope.
-        In-flight guard + CAS ensures exactly ONE thread registers per id; a second
-        thread sees needs_handshake=False and returns.
-
-        Captures the id AT snapshot time and marks THAT id handshook — not
-        self._lease_client.reconciliation_id, which may have advanced to a newer
-        id that was NOT registered.
-
-        Returns True if a handshake was performed, False if not needed.
+        In-flight guard + CAS ensures exactly ONE thread registers per id.
+        Captures the id AT snapshot time and threads it into register_snapshot
+        so the sent id == the marked id (not self._lease_client.reconciliation_id,
+        which may have advanced).
         """
         if self._lease_client is None:
             return False
-        # Get the id we intend to register under, then CAS the in-flight guard.
         target_rid = self._lease_client.reconciliation_id
         if target_rid is None:
             return False
@@ -1017,23 +1015,20 @@ class SessionManager:
             return False
         with self._handshake_lock:
             if self._handshake_in_flight == target_rid:
-                return False  # another thread already handles this id
+                return False
             self._handshake_in_flight = target_rid
         try:
             if not self._lease_client.needs_handshake():
-                return False  # raced — already handshook
+                return False
             if self._logger is not None:
                 self._logger.info("manager", "lease_handshake_start", rid=target_rid)
-            # Capture snapshot AND the id at this point.
-            active_tokens, live_tokens, revision = self._lease_snapshot()
+            active_tokens, live_tokens = self._lease_snapshot()
+            # FIX 2: pass captured target_rid explicitly, not current client id.
             result = self._lease_client.register_snapshot(
                 self._gen_id, self._gen_epoch,
-                active_tokens, live_tokens, revision)
+                active_tokens, live_tokens, target_rid)
             if result is not None:
-                # Mark target_rid handshook (not current rid, which may differ).
                 self._lease_client.mark_handshook(target_rid)
-                acked_rev = result.get("acknowledged_revision", revision)
-                self._lease_client.outbox_drain_upto(acked_rev)
                 self._lease_client.retry_outbox()
                 return True
             return False
@@ -1209,6 +1204,8 @@ class SessionManager:
             self._pending_acquire.add(session_id)
 
         activation_id = getattr(sess, "_activation_counter", 0)
+        # FIX 4: opportunistic outbox retry before admission.
+        self.retry_lease_outbox()
         try:
             tokens = self._lease_client.acquire(
                 self._gen_id, self._gen_epoch, session_id, activation_id, {"active"})
