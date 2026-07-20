@@ -134,6 +134,25 @@ def test_build_id_without_extra_wheels_is_unchanged(tmp_path):
     assert runtime.build_id(w, "i", extra_wheels=[]) == runtime.build_id(w, "i")
 
 
+def test_manifest_records_first_party_digests(tmp_path, monkeypatch):
+    """nelix-m78: the committed manifest must be self-describing — it records the digest of every
+    first-party wheel, so a store/contracts change is visible without recomputing the build."""
+    monkeypatch.setattr(runtime, "interpreter_id", lambda python: "cpython-3.11.15-x-y")
+    build = "0.1.0-deadbeef0000"
+    paths.runtime_dir(build).mkdir(parents=True, exist_ok=True)
+    wheel = _wheel(tmp_path, payload=b"core")
+    (tmp_path / "s").mkdir(); (tmp_path / "c").mkdir()
+    store = _wheel(tmp_path / "s", payload=b"store")
+    contracts = _wheel(tmp_path / "c", payload=b"contracts")
+    runtime._write_manifest(build, wheel, runtime.RUNTIME_LOCK, Path("/base/python"),
+                            "3.11.15", extra_wheels=[store, contracts])
+    manifest = json.loads(paths.runtime_manifest(build).read_text())
+    assert manifest["first_party_digests"] == {
+        store.name: runtime.wheel_digest(store),
+        contracts.name: runtime.wheel_digest(contracts),
+    }
+
+
 # ---------------------------------------------------------------- commit semantics
 
 def test_a_runtime_without_a_manifest_is_not_installed():

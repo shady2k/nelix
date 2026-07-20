@@ -295,7 +295,7 @@ def _build_at(rt: Path, wheel: Path, lock: Path, base_python: Path,
         if inst.returncode != 0:
             raise RuntimeInstallError(f"runtime install failed:\n{inst.stdout}\n{inst.stderr}")
 
-        _write_manifest(build, wheel, lock, base_python, python_version)
+        _write_manifest(build, wheel, lock, base_python, python_version, extra_wheels)
     except BaseException:
         shutil.rmtree(rt, ignore_errors=True)      # never leave a half-built runtime behind
         raise
@@ -309,15 +309,17 @@ def _file_sha256(path) -> str:
     return h.hexdigest()
 
 
-def _write_manifest(build, wheel, lock, base_python, python_version) -> None:
+def _write_manifest(build, wheel, lock, base_python, python_version, extra_wheels=()) -> None:
     """The commit. Written via tmp+replace so a runtime is never PARTLY committed: the manifest
-    either exists whole or not at all."""
+    either exists whole or not at all. It records the FULL first-party closure's digests (nelix-m78)
+    so the committed runtime is self-describing and a store/contracts change is visible."""
     m = paths.runtime_manifest(build)
     tmp = m.with_suffix(".json.tmp")
     body = json.dumps({
         "build_id": build,
         "core_version": _core_version(wheel),
         "wheel_digest": wheel_digest(wheel),
+        "first_party_digests": {Path(ew).name: wheel_digest(ew) for ew in extra_wheels},
         "python_version": python_version,
         "interpreter_id": interpreter_id(paths.runtime_python(build)),
         "provisioned_from": str(base_python),
