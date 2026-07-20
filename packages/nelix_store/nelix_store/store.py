@@ -971,49 +971,23 @@ class Store:
                 "WHERE generation_id=? AND current_epoch=?",
                 (generation_id, generation_epoch))
 
-    def record_epoch_child_group(self, generation_epoch: str, *,
-                                  session_id: str, child_pid: int,
-                                  child_pgid: int | None = None,
-                                  leader_fingerprint: str = "") -> None:
-        if not isinstance(generation_epoch, str) or not generation_epoch:
-            raise NelixError(INVALID_REQUEST,
-                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
-        if not isinstance(session_id, str) or not session_id:
-            raise NelixError(INVALID_REQUEST,
-                             f"session_id must be a non-empty string: {session_id!r}")
-        if isinstance(child_pid, bool) or not isinstance(child_pid, int) or child_pid < 0:
-            raise NelixError(INVALID_REQUEST,
-                             f"child_pid must be a non-negative int: {child_pid!r}")
-        if not isinstance(leader_fingerprint, str) or not leader_fingerprint:
-            raise NelixError(INVALID_REQUEST,
-                             "leader_fingerprint must be a non-empty string")
-        self._conn.execute(
-            "INSERT INTO epoch_child_groups "
-            "(generation_epoch, session_id, child_pid, child_pgid, "
-            "leader_fingerprint, recorded_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (generation_epoch, session_id, child_pid, child_pgid,
-             leader_fingerprint, self._clock()))
-
     @translates_sqlite
-    def list_epoch_child_groups(self, generation_epoch: str) -> list:
+    @translates_sqlite
+    def list_all_starts_for_epoch(self, generation_epoch: str) -> list:
+        """Return ALL start rows for an epoch (regardless of terminal status).
+        Used by crash reconciliation to enumerate every admitted session for
+        child-group completeness proof (FIX 1 — child.json derivation)."""
         if not isinstance(generation_epoch, str) or not generation_epoch:
             raise NelixError(INVALID_REQUEST,
                              f"generation_epoch must be a non-empty string: {generation_epoch!r}")
         rows = self._conn.execute(
-            "SELECT session_id, child_pid, child_pgid, leader_fingerprint, recorded_at "
-            "FROM epoch_child_groups WHERE generation_epoch=?",
+            "SELECT st.session_id, st.owner_id, st.orchestration_id, "
+            "st.state, st.generation_id, st.generation_epoch, st.created_at "
+            "FROM starts st "
+            "JOIN sessions s ON s.session_id = st.session_id "
+            "WHERE st.generation_epoch=?",
             (generation_epoch,)).fetchall()
         return [dict(r) for r in rows]
-
-    @translates_sqlite
-    def clear_epoch_child_groups(self, generation_epoch: str) -> None:
-        if not isinstance(generation_epoch, str) or not generation_epoch:
-            raise NelixError(INVALID_REQUEST,
-                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
-        self._conn.execute(
-            "DELETE FROM epoch_child_groups WHERE generation_epoch=?",
-            (generation_epoch,))
 
     @translates_sqlite
     def list_starts_for_epoch(self, generation_epoch: str) -> list:

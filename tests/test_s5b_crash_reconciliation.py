@@ -6,12 +6,29 @@ retirement_state=certified while process_state=dead, certificate+final_high_wate
 recorded, oracle lets generation retire. Child-group reap gate blocks on EPERM.
 """
 import pytest
+import json
+import os as _os
 import paths
 from nelix_contracts.ids import new_generation_id
 from nelix_contracts.lifecycle import DRAINING, RETIRED
 from nelix_contracts.retirement import generation_may_retire
 from nelix_store.store import Store
 from router.operator import OperatorRoutes
+
+
+def _write_child_json(sid, pid=99998, pgid=99998, fingerprint="fp-child"):
+    """Write a child.json record on disk for a session."""
+    sess_dir = paths.sessions_root() / sid
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "sid": sid,
+        "daemon_pid": 99999,
+        "daemon_fingerprint": "fp-daemon",
+        "pid": pid,
+        "pgid": pgid,
+        "child_fingerprint": fingerprint,
+    }
+    (sess_dir / "child.json").write_text(json.dumps(record))
 
 
 # ============================================================
@@ -33,6 +50,7 @@ class TestCrashReconciliationEndToEnd:
         from daemon.transport import Transport
         from tests.conftest import EXECUTOR, OWNER, make_spec
         from router.registry import GenerationRegistry
+        from router.leases import LeaseService
         from tests._router_fakes import Supervisor
 
         clock = _FakeClock(1000.0)
@@ -98,86 +116,69 @@ class TestCrashReconciliationEndToEnd:
         # SESSION 1: start AND stop → has a real terminal (done)
         sid1 = _router_started_session(ledger, store, gid=gid, epoch=epoch)
         mgr.start(EXECUTOR, "task-1", "/tmp", owner_id=OWNER, session_id=sid1)
+        _write_child_json(sid1, pid=99999, pgid=99999, fingerprint="fp-child-1")
         mgr.stop(sid1, owner_id=OWNER)
 
         # SESSION 2: start only → NO terminal (outstanding obligation)
         sid2 = _router_started_session(ledger, store, gid=gid, epoch=epoch)
         mgr.start(EXECUTOR, "task-2", "/tmp", owner_id=OWNER, session_id=sid2)
+        _write_child_json(sid2, pid=99998, pgid=99998, fingerprint="fp-child-2")
 
         # SESSION 3: start only → NO terminal
         sid3 = _router_started_session(ledger, store, gid=gid, epoch=epoch)
         mgr.start(EXECUTOR, "task-3", "/tmp", owner_id=OWNER, session_id=sid3)
+        _write_child_json(sid3, pid=99997, pgid=99997, fingerprint="fp-child-3")
 
-        # Record child-group records for sid2 and sid3 (daemon would do this at spawn)
-        store.record_epoch_child_group(epoch, session_id=sid2, child_pid=99998, child_pgid=99998,
-                                        leader_fingerprint="fp-child-2")
-        store.record_epoch_child_group(epoch, session_id=sid3, child_pid=99997, child_pgid=99997,
-                                        leader_fingerprint="fp-child-3")
-
-        # Simulate daemon crash: set epoch dead
         store.set_epoch_process_state(epoch, "dead")
 
-        # Wire transport into registry
         daemon_transport = Transport.tcp("127.0.0.1", server.server_address[1], "t")
         registry = GenerationRegistry(supervisor=Supervisor(daemon_transport))
         registry.adopt_generation(gid, epoch, daemon_transport,
                                   "b-1", incarnation={"pid": 99999, "start_fingerprint": "fp-crash"})
 
-        operator = OperatorRoutes(registry, "r-test", store=store)
+        lease_service = LeaseService(active_limit=5, live_pty_limit=5)
+        operator = OperatorRoutes(registry, "r-test", store=store, lease_service=lease_service)
 
         def _fake_reap(gen_id, ep):
             return True
         operator._reap_fn = _fake_reap
 
-        # Verify sid1 has a real terminal
         term1 = store.get_terminal(sid1, owner_id=OWNER)
         assert term1.terminal_kind == "done"
 
-        # Verify sid2 and sid3 have NO terminals
         for sid in (sid2, sid3):
             row = store._conn.execute(
                 "SELECT session_id FROM terminal WHERE session_id=?", (sid,)).fetchone()
             assert row is None, f"session {sid} should not have a terminal yet"
 
-        # Drive retire → should trigger crash reconciliation
         status, body = operator.retire(gid)
         assert status == 200, f"retire returned {status}"
         if body["status"] != "ok":
             pytest.fail(f"retire blocked: {body.get('blockers')}, body={body}")
 
-        # Verify generation retired
         gen = store.get_generation(gid)
         assert gen.lifecycle_state == RETIRED
 
-        # Verify epoch is certified while process_state=dead
         epochs = store.list_epochs(gid)
         certified = [e for e in epochs if e.retirement_state == "certified"]
         assert len(certified) == 1
         ep = certified[0]
-        assert ep.process_state == "dead", \
-            "epoch must remain process_state=dead while retirement_state=certified"
+        assert ep.process_state == "dead"
         assert ep.certificate is not None
         assert "crash-reconcile:" in ep.certificate
         assert ep.final_high_water is not None
 
-        # Verify generation_lost was persisted for each outstanding obligation
         term2 = store.get_terminal(sid2, owner_id=OWNER)
-        assert term2.terminal_kind == "generation_lost", \
-            f"expected generation_lost for sid2, got {term2.terminal_kind}"
+        assert term2.terminal_kind == "generation_lost"
 
         term3 = store.get_terminal(sid3, owner_id=OWNER)
-        assert term3.terminal_kind == "generation_lost", \
-            f"expected generation_lost for sid3, got {term3.terminal_kind}"
+        assert term3.terminal_kind == "generation_lost"
 
-        # Verify sid1's terminal was NOT overwritten (still "done")
         term1b = store.get_terminal(sid1, owner_id=OWNER)
-        assert term1b.terminal_kind == "done", \
-            "generation_lost must not overwrite a persisted terminal"
+        assert term1b.terminal_kind == "done"
 
-        # Verify oracle allows retirement
         assert generation_may_retire(store=store, generation_id=gid)
 
-        # Verify confirmed_high_water was resolved
         chw = store.get_generation_confirmed_high_water(epoch)
         assert chw >= 1, f"expected confirmed_high_water>=1, got {chw}"
 
@@ -194,8 +195,6 @@ class TestChildGroupReapGate:
 
     def test_child_group_alive_blocks_crash_reconcile(self, tmp_path):
         """A live child (EPERM/alive) blocks crash reconciliation."""
-        import os
-
         store = Store(paths.nelix_root(), clock=lambda: 1000.0)
         gid = new_generation_id()
         epoch = new_generation_id()
@@ -204,40 +203,43 @@ class TestChildGroupReapGate:
         store.insert_epoch(epoch, gid,
                            incarnation_meta='{"pid": 99999, "start_fingerprint": "fp"}',
                            created_at=1000.0)
+        sid_alive = "s-" + "a" * 32
+        oid = "o-" + "1" * 32
         store.set_epoch_process_state(epoch, "dead")
+        store._conn.execute(
+            "INSERT INTO starts (session_id, owner_id, orchestration_id, "
+            "idempotency_key, request_fingerprint, state, generation_id, "
+            "generation_epoch, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (sid_alive, "owner", oid, "k-1", "fp", "started",
+             gid, epoch, 1000.0))
+        store.create_session(sid_alive, state="starting", executor="demo",
+                              task="x", cwd="/tmp", model=None, created_at=1000.0)
 
-        # Record a child group with pid 42
-        store.record_epoch_child_group(epoch, session_id="s-test-alive", child_pid=42,
-                                        child_pgid=42, leader_fingerprint="fp-alive")
-
+        _write_child_json(sid_alive, pid=42, pgid=42, fingerprint="fp-alive")
         operator = OperatorRoutes(None, "r-test", store=store)
 
-        # Mock os.kill AND os.killpg so pid 42/pgid 42 returns PermissionError (alive)
-        original_kill = os.kill
-        original_killpg = os.killpg
-        call_log = []
+        original_kill = _os.kill
+        original_killpg = _os.killpg
         def _mock_kill(pid, sig, **kw):
-            call_log.append(("kill", pid, sig))
             if pid == 42:
                 raise PermissionError("EPERM mock — child is alive")
             return original_kill(pid, sig, **kw)
         def _mock_killpg(pgid, sig):
-            call_log.append(("killpg", pgid, sig))
             if pgid == 42:
                 raise PermissionError("EPERM mock — child group is alive")
             return original_killpg(pgid, sig)
 
-        os.kill = _mock_kill
-        os.killpg = _mock_killpg
+        _os.kill = _mock_kill
+        _os.killpg = _mock_killpg
         try:
             success, blocker = operator._crash_reconcile_epoch(gid, epoch)
             assert not success, "must block when child is alive"
             assert blocker == "child_group_still_alive", f"got blocker={blocker!r}"
         finally:
-            os.kill = original_kill
-            os.killpg = original_killpg
+            _os.kill = original_kill
+            _os.killpg = original_killpg
 
-        # Verify epoch is NOT certified
         ep = store.get_epoch_retirement_state(epoch)
         assert ep != "certified", "epoch must NOT be certified when child blocks"
         store.close()
@@ -252,34 +254,139 @@ class TestChildGroupReapGate:
         store.insert_epoch(epoch, gid,
                            incarnation_meta='{"pid": 99999, "start_fingerprint": "fp"}',
                            created_at=1000.0)
+        sid_dead = "s-" + "b" * 32
+        oid = "o-" + "1" * 32
         store.set_epoch_process_state(epoch, "dead")
+        store._conn.execute(
+            "INSERT INTO starts (session_id, owner_id, orchestration_id, "
+            "idempotency_key, request_fingerprint, state, generation_id, "
+            "generation_epoch, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (sid_dead, "owner", oid, "k-1", "fp", "started",
+             gid, epoch, 1000.0))
+        store.create_session(sid_dead, state="starting", executor="demo",
+                              task="x", cwd="/tmp", model=None, created_at=1000.0)
 
-        # Record a child with a non-existent pid (will be ESRCH)
-        store.record_epoch_child_group(epoch, session_id="s-test-dead", child_pid=99998,
-                                        child_pgid=99998, leader_fingerprint="fp-dead")
-
+        _write_child_json(sid_dead, pid=99998, pgid=99998, fingerprint="fp-dead")
         operator = OperatorRoutes(None, "r-test", store=store)
 
         success, blocker = operator._crash_reconcile_epoch(gid, epoch)
         assert success, f"crash reconcile failed with blocker={blocker!r}"
 
-        # Verify epoch IS certified
         ep_state = store.get_epoch_retirement_state(epoch)
         assert ep_state == "certified", "epoch must be certified after successful reconcile"
         store.close()
 
+    def test_child_record_missing_blocks(self, tmp_path):
+        """An admitted session with NO child.json => blocked."""
+        store = Store(paths.nelix_root(), clock=lambda: 1000.0)
+        gid = new_generation_id()
+        epoch = new_generation_id()
+        store.create_generation(gid, build_id="b-1", lifecycle_state=DRAINING,
+                                capability_snapshot=None, created_at=1000.0)
+        store.insert_epoch(epoch, gid,
+                           incarnation_meta='{"pid": 99999, "start_fingerprint": "fp"}',
+                           created_at=1000.0)
+        sid_no = "s-" + "c" * 32
+        oid = "o-" + "1" * 32
+        store.set_epoch_process_state(epoch, "dead")
+        store._conn.execute(
+            "INSERT INTO starts (session_id, owner_id, orchestration_id, "
+            "idempotency_key, request_fingerprint, state, generation_id, "
+            "generation_epoch, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (sid_no, "owner", oid, "k-1", "fp", "started",
+             gid, epoch, 1000.0))
+        store.create_session(sid_no, state="starting", executor="demo",
+                              task="x", cwd="/tmp", model=None, created_at=1000.0)
+        # Intentionally do NOT write child.json
+
+        operator = OperatorRoutes(None, "r-test", store=store)
+        success, blocker = operator._crash_reconcile_epoch(gid, epoch)
+        assert not success, "must block when child record missing"
+        assert "child_record_missing" in blocker
+        store.close()
+
 
 # ============================================================
-# 3. Reconciliation incarnation — admission gate
+# 3. PID validation
+# ============================================================
+
+class TestPidValidation:
+    """Death proof requires int>0 pid; bool, non-int, <=0 all => blocked."""
+
+    def _make_dead_epoch_with_pid(self, pid_value):
+        store = Store(paths.nelix_root(), clock=lambda: 1000.0)
+        gid = new_generation_id()
+        epoch = new_generation_id()
+        store.create_generation(gid, build_id="b-1", lifecycle_state=DRAINING,
+                                capability_snapshot=None, created_at=1000.0)
+        meta = {"pid": pid_value}
+        if pid_value is not None:
+            meta["start_fingerprint"] = "fp"
+        store.insert_epoch(epoch, gid,
+                           incarnation_meta=json.dumps(meta),
+                           created_at=1000.0)
+        store.set_epoch_process_state(epoch, "dead")
+        return store, gid, epoch
+
+    def test_non_int_pid_blocks(self):
+        store, gid, epoch = self._make_dead_epoch_with_pid("not-an-int")
+        op = OperatorRoutes(None, "r-test", store=store)
+        success, blocker = op._crash_reconcile_epoch(gid, epoch)
+        assert not success
+        assert "invalid_incarnation_pid" in blocker
+        store.close()
+
+    def test_zero_pid_blocks(self):
+        store, gid, epoch = self._make_dead_epoch_with_pid(0)
+        op = OperatorRoutes(None, "r-test", store=store)
+        success, blocker = op._crash_reconcile_epoch(gid, epoch)
+        assert not success
+        assert "invalid_incarnation_pid" in blocker
+        store.close()
+
+    def test_negative_pid_blocks(self):
+        store, gid, epoch = self._make_dead_epoch_with_pid(-999)
+        op = OperatorRoutes(None, "r-test", store=store)
+        success, blocker = op._crash_reconcile_epoch(gid, epoch)
+        assert not success
+        assert "invalid_incarnation_pid" in blocker
+        store.close()
+
+    def test_bool_pid_blocks(self):
+        store, gid, epoch = self._make_dead_epoch_with_pid(True)
+        op = OperatorRoutes(None, "r-test", store=store)
+        success, blocker = op._crash_reconcile_epoch(gid, epoch)
+        assert not success
+        assert "invalid_incarnation_pid" in blocker
+        store.close()
+
+    def test_non_dict_meta_blocks(self):
+        store = Store(paths.nelix_root(), clock=lambda: 1000.0)
+        gid = new_generation_id()
+        epoch = new_generation_id()
+        store.create_generation(gid, build_id="b-1", lifecycle_state=DRAINING,
+                                capability_snapshot=None, created_at=1000.0)
+        store.insert_epoch(epoch, gid,
+                           incarnation_meta='["list", "not", "object"]',
+                           created_at=1000.0)
+        store.set_epoch_process_state(epoch, "dead")
+        op = OperatorRoutes(None, "r-test", store=store)
+        success, blocker = op._crash_reconcile_epoch(gid, epoch)
+        assert not success
+        assert "malformed_incarnation_meta" in blocker
+        store.close()
+
+
+# ============================================================
+# 4. Reconciliation incarnation — admission gate
 # ============================================================
 
 class TestReconciliationIncarnationGate:
     """A reconciliation incarnation must not admit new sessions."""
 
     def test_reconciliation_incarnation_rejects_admission(self, tmp_path):
-        """The crash-reconciled epoch has retirement_state=certified, which gates
-        admission (the start path only forwards to the active generation, not a
-        certified epoch)."""
         store = Store(paths.nelix_root(), clock=lambda: 1000.0)
         gid = new_generation_id()
         epoch = new_generation_id()
@@ -294,9 +401,6 @@ class TestReconciliationIncarnationGate:
         success, blocker = operator._crash_reconcile_epoch(gid, epoch)
         assert success, f"crash reconcile failed: {blocker}"
 
-        # After crash reconcile, the epoch is certified.
-        # Verify no new generation can be created for this epoch
-        # by checking current_epoch is cleared by retire()
         gen = store.get_generation(gid)
         assert gen.current_epoch is None or gen.lifecycle_state == RETIRED, \
             "generation should have no current_epoch after reconciliation"

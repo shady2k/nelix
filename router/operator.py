@@ -339,23 +339,18 @@ class OperatorRoutes:
     def _crash_reconcile_epoch(self, generation_id, epoch):
         """Crash reconciliation for a dead epoch (§3.5 crash path + §3.3f).
 
-        Under the operator lock (caller must hold it):
         1. Verify epoch is ALREADY process_state=dead.
-        2. Prove daemon death: require valid incarnation_meta with int>0 pid that
-           ``_pid_alive`` confirms NOT alive. Missing/malformed/non-int/<=0 => BLOCKED.
-        3. Set retirement_state=quiescing BEFORE enumerating (close admission).
-        4. Reap child groups — prove completeness + verify gone (FIX 3 fail-closed).
+        2. Prove daemon death: valid incarnation_meta with int>0 pid (reject bool,
+           non-object JSON); ``_pid_alive`` confirms NOT alive.
+        3. Quiesce (close admission) before enumerating outstanding sessions.
+        4. Reap child groups — derive from per-session child.json on disk (FIX 1).
         5. Persist ``generation_lost`` for EVERY outstanding obligation.
-        6. Release the epoch's LeaseService tokens (FIX 4 — failure => BLOCKED).
-        7. Certify (router-issued), set retirement_state=certified.
-
-        Returns ``(success: bool, blocker: str|None)``.
+        6. Certify (router-issued), set retirement_state=certified.
         """
         from generation_supervisor import _pid_alive
         import json
         import time as _time
 
-        # 1. Verify epoch exists and is ALREADY dead
         epochs = self._store.list_epochs_strict(generation_id)
         target_ep = None
         for ep in epochs:
@@ -367,29 +362,27 @@ class OperatorRoutes:
         if target_ep.process_state != "dead":
             return False, "epoch_not_dead"
 
-        # 2. Death proof: valid incarnation_meta with int>0 pid (FIX 2)
         if not target_ep.incarnation_meta:
             return False, "missing_incarnation_meta"
         try:
             inc = json.loads(target_ep.incarnation_meta)
         except (json.JSONDecodeError, TypeError):
             return False, "malformed_incarnation_meta"
+        if not isinstance(inc, dict):
+            return False, "malformed_incarnation_meta"
         expected_pid = inc.get("pid")
-        if not isinstance(expected_pid, int) or expected_pid <= 0:
+        if isinstance(expected_pid, bool) or not isinstance(expected_pid, int) or expected_pid <= 0:
             return False, "invalid_incarnation_pid"
         if _pid_alive(expected_pid):
             return False, "daemon_still_alive"
 
-        # 3. Quiesce first (close admission before enumerating)
         if target_ep.retirement_state == "open":
             self._store.set_epoch_retirement(epoch, retirement_state="quiescing")
 
-        # 4. Reap child groups (FIX 3 — fail-closed completeness + group kill)
         _reap_ok, _blocker = self._reap_child_groups(epoch, generation_id)
         if not _reap_ok:
             return False, _blocker
 
-        # 5. Persist generation_lost for EVERY outstanding obligation
         try:
             outstanding = self._store.list_starts_for_epoch(epoch)
         except Exception as e:
@@ -408,20 +401,6 @@ class OperatorRoutes:
                                  generation_id, epoch, sid, e)
                 return False, f"generation_lost_failed:{sid}:{e}"
 
-        # 6. Release leases (FIX 4 — failure MUST block)
-        if self._lease_service is not None:
-            try:
-                self._lease_service.release_epoch(generation_id, epoch)
-            except Exception as e:
-                if _log is not None:
-                    _log.warning("operator: lease_release_failed "
-                                 "gen=%s epoch=%s err=%s",
-                                 generation_id, epoch, e)
-                return False, f"lease_release_failed:{e}"
-        elif self._lease_service is None:
-            pass
-
-        # 7. Certify — final high-water AFTER all persisted
         final_hw = self._store.get_generation_persisted_high_water(epoch)
         certificate = f"crash-reconcile:{generation_id}:{epoch}"
         self._store.set_epoch_retirement(
@@ -436,66 +415,67 @@ class OperatorRoutes:
         return True, None
 
     def _reap_child_groups(self, epoch, generation_id):
-        """Reap and verify child groups are gone (FIX 3 — fail-closed).
+        """Derive child groups from per-session child.json on disk (FIX 1).
 
-        Proves completeness: every admitted session without a terminal MUST have a
-        readable child-group record with non-null leader_fingerprint. Any missing/
-        incomplete/null-fingerprint/unreadable record => BLOCKED.
+        For EVERY admitted session (from starts + sessions rows), read child.json
+        from ``paths.sessions_root()/sid/child.json``. Any missing/unreadable/
+        incomplete record => BLOCKED. Never treat absence as ``proven gone``.
 
-        For each complete record: kills the process group (SIGTERM then SIGKILL),
-        verifies the WHOLE GROUP gone via ``os.killpg(pgid,0)`` => ESRCH. A record
-        whose leader_fingerprint no longer matches the live pid => reused pid => skip.
+        For each valid record: validate pgid>0, killpg(SIGTERM → SIGKILL),
+        prove WHOLE GROUP gone via killpg(pgid,0)→ESRCH. A leader-fingerprint
+        mismatch => pid reused => blocked (conservative). Never swallow killpg
+        errors. Do not delete evidence (retry re-derives, no deadlock).
 
         Returns ``(ok: bool, blocker: str|None)``.
         """
-        from daemon.reaper import ProcessInspector
+        import paths
+        from daemon.reaper import ProcessInspector, read_child
         import signal
         import time as _time
 
-        child_groups = self._store.list_epoch_child_groups(epoch)
+        inspector = ProcessInspector()
 
-        # --- Part A: completeness proof ---
+        # Enumerate ALL admitted sessions for the epoch
         try:
-            outstanding = self._store.list_starts_for_epoch(epoch)
+            all_starts = self._store.list_all_starts_for_epoch(epoch)
         except Exception as e:
             return False, f"list_starts_failed:{e}"
 
-        outstanding_sids = {r["session_id"] for r in outstanding}
-        recorded_sids = {cg["session_id"] for cg in child_groups
-                         if cg.get("session_id")}
+        for srow in all_starts:
+            sid = srow["session_id"]
+            record = read_child(paths.sessions_root() / sid)
 
-        for sid in outstanding_sids:
-            if sid not in recorded_sids:
+            if record is None:
                 if _log is not None:
                     _log.warning("operator: child_record_missing "
                                  "gen=%s epoch=%s sid=%s",
                                  generation_id, epoch, sid)
                 return False, f"child_record_missing:{sid}"
 
-        # --- Part B: validate and reap each child group ---
-        inspector = ProcessInspector()
-        for cg in child_groups:
-            child_pid = cg.get("child_pid")
-            child_pgid = cg.get("child_pgid")
-            leader_fp = cg.get("leader_fingerprint")
-            cg_sid = cg.get("session_id")
+            child_pid = record.get("pid")
+            child_pgid = record.get("pgid")
+            leader_fp = record.get("child_fingerprint")
 
-            if not cg_sid:
-                return False, "child_record_missing_session_id"
             if not child_pid:
-                return False, f"incomplete_child_record:{cg_sid}"
-            if child_pgid is None:
-                return False, f"child_missing_pgid:{cg_sid}"
+                return False, f"incomplete_child_record:{sid}"
+            if not child_pgid:
+                return False, f"child_missing_pgid:{sid}"
             if not leader_fp:
-                return False, f"child_null_fingerprint:{cg_sid}"
+                return False, f"child_null_fingerprint:{sid}"
 
-            # Reject stale PID/PGID via leader_fingerprint (FIX 3)
+            if not isinstance(child_pid, int) or child_pid <= 0:
+                return False, f"invalid_child_pid:{sid}"
+            if not isinstance(child_pgid, int) or child_pgid <= 0:
+                return False, f"invalid_child_pgid:{sid}"
+
+            # Reject stale PID/PGID via leader_fingerprint
             try:
                 actual_fp = inspector.start_fingerprint(child_pid)
             except Exception:
                 actual_fp = None
             if actual_fp is not None and actual_fp != leader_fp:
-                continue
+                # PID reused — treat this record as unresolvable: block
+                return False, f"child_fingerprint_mismatch:{sid}"
 
             # Kill the group — SIGTERM then SIGKILL
             try:
@@ -505,10 +485,6 @@ class OperatorRoutes:
             except ProcessLookupError:
                 pass
             except OSError as e:
-                if _log is not None:
-                    _log.warning("operator: killpg_sigterm_failed "
-                                 "gen=%s epoch=%s pgid=%s err=%s",
-                                 generation_id, epoch, child_pgid, e)
                 return False, f"killpg_sigterm_failed:{child_pgid}:{e}"
 
             _time.sleep(0.1)
@@ -520,15 +496,11 @@ class OperatorRoutes:
             except ProcessLookupError:
                 pass
             except OSError as e:
-                if _log is not None:
-                    _log.warning("operator: killpg_sigkill_failed "
-                                 "gen=%s epoch=%s pgid=%s err=%s",
-                                 generation_id, epoch, child_pgid, e)
                 return False, f"killpg_sigkill_failed:{child_pgid}:{e}"
 
             _time.sleep(0.1)
 
-            # Verify THE WHOLE GROUP is gone: os.killpg(pgid,0) => ESRCH
+            # Verify WHOLE GROUP gone: killpg(pgid,0)→ESRCH
             try:
                 os.killpg(child_pgid, 0)
             except ProcessLookupError:
@@ -540,7 +512,6 @@ class OperatorRoutes:
             else:
                 return False, "child_group_still_alive"
 
-        self._store.clear_epoch_child_groups(epoch)
         return True, None
 
     def retire(self, generation_id: str):
@@ -549,17 +520,13 @@ class OperatorRoutes:
         PHASE 1 — CERTIFY (skip for already-certified epochs):
            For each uncertified epoch: crash-reconcile if dead, clean-path if serving.
 
-        PHASE 2 — FINALIZATION GATES (run EVERY call, even for certified epochs):
-           a) Reap any live/recorded incarnation (idempotent — must prove gone).
-           b) Release leases for every epoch (idempotent — must succeed).
+        PHASE 2 — FINALIZATION GATES (run EVERY call, even for certified):
+           a) Reap any live incarnation (FIX 6: dead/crash-certified => no-op success).
+           b) Release leases for every epoch (FIX 4: must succeed; missing => blocked).
            c) Resolve confirmed high-water for all epochs.
-           d) Aggregate oracle check (all certified + confirmed>=final).
+           d) Aggregate oracle (all certified + confirmed>=final).
 
-        PHASE 3 — FINALIZE:
-           clear_current_epoch + FSM→retired ONLY after all gates pass.
-
-        FIX 1: finalization gates re-run every call; a certified epoch skips
-        re-certification but still passes reap+lease+oracle.
+        PHASE 3 — FINALIZE (FIX 3: clear_current_epoch + FSM ONLY after all gates pass):
         """
         if not isinstance(generation_id, str) or not generation_id:
             raise NelixError(INVALID_REQUEST,
@@ -694,21 +661,25 @@ class OperatorRoutes:
 
             # ================================================================
             # PHASE 2 — FINALIZATION GATES (re-run EVERY call, FIX 1)
+            # Order: reap → release → resolve → oracle → clear+FSM (FIX 3)
             # ================================================================
 
-            # 2a. Reap any live incarnation (idempotent)
+            # 2a. Reap any live incarnation (FIX 6: crash-certified dead => no-op)
             for ep in self._store.list_epochs(generation_id):
-                if ep.incarnation_meta:
-                    if not self._reap_generation(generation_id, ep.generation_epoch):
-                        return 200, {
-                            "operation": "retire",
-                            "status": "blocked",
-                            "generation_id": generation_id,
-                            "lifecycle_state": gen.lifecycle_state,
-                            "blockers": ["reap_refused_or_failed"],
-                        }
+                if not ep.incarnation_meta:
+                    continue
+                if ep.process_state == "dead":
+                    continue
+                if not self._reap_generation(generation_id, ep.generation_epoch):
+                    return 200, {
+                        "operation": "retire",
+                        "status": "blocked",
+                        "generation_id": generation_id,
+                        "lifecycle_state": gen.lifecycle_state,
+                        "blockers": ["reap_refused_or_failed"],
+                    }
 
-            # 2b. Clear current_epoch (so oracle can pass)
+            # 2b. Clear current_epoch BEFORE oracle (reap above proved death)
             if self._store.get_generation(generation_id).current_epoch is not None:
                 self._store.clear_current_epoch(generation_id)
 
@@ -729,6 +700,18 @@ class OperatorRoutes:
                             "lifecycle_state": gen.lifecycle_state,
                             "blockers": [f"lease_release_failed:{ep.generation_epoch}:{e}"],
                         }
+            # FIX 4: if lease service is absent but epoch has incarnation (had leases),
+            # block — cannot finalize with unaccounted leases.
+            elif self._lease_service is None:
+                for ep in self._store.list_epochs(generation_id):
+                    if ep.incarnation_meta or ep.retirement_state == "certified":
+                        return 200, {
+                            "operation": "retire",
+                            "status": "blocked",
+                            "generation_id": generation_id,
+                            "lifecycle_state": gen.lifecycle_state,
+                            "blockers": ["lease_service_required"],
+                        }
 
             # 2c. Resolve confirmed for ALL epochs
             for ep in self._store.list_epochs(generation_id):
@@ -747,8 +730,11 @@ class OperatorRoutes:
                 }
 
             # ================================================================
-            # PHASE 3 — FINALIZE (FSM → retired)
+            # PHASE 3 — FINALIZE (FIX 3: clear + FSM only after all gates pass)
             # ================================================================
+            if self._store.get_generation(generation_id).current_epoch is not None:
+                self._store.clear_current_epoch(generation_id)
+
             if self._store.get_generation(generation_id).lifecycle_state == ACTIVE:
                 validate_transition(ACTIVE, DRAINING)
                 self._store.set_generation_lifecycle_state(generation_id, DRAINING)

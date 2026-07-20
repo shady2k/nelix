@@ -720,7 +720,6 @@ class SessionManager:
                 # slot accounting an idle-freed session needs is preserved on the monitor-driven write.
                 sess.deliver_turn = lambda text, _sid=sid: self.send_turn(_sid, text)
                 sess.reaper_ctx = self._reaper_ctx
-                sess._record_child_store = self._record_child_group_store
                 sess.lineage_id = lineage_id or sid          # first in chain -> lineage = own id
                 sess.restarted_from = restarted_from
                 sess.restart_count = self._lineages.get(sess.lineage_id, 0)
@@ -941,17 +940,6 @@ class SessionManager:
         # MUST hold self._lock. Retained `idle` sessions (completed, alive), bounded by idle_retained_limit.
         return sum(1 for s in self._sessions.values()
                    if s.snapshot().get("control_state") == "idle")
-
-    def _record_child_group_store(self, session_id, child_pid, child_pgid, leader_fingerprint):
-        """Record the child process group in the store for router-side crash reconciliation.
-        FIX 3: includes session_id (completeness proof) + leader_fingerprint (PID-reuse
-        protection); exceptions propagate (fail-closed)."""
-        if not self._gen_epoch:
-            return
-        self._store.record_epoch_child_group(
-            self._gen_epoch, session_id=session_id,
-            child_pid=child_pid, child_pgid=child_pgid,
-            leader_fingerprint=leader_fingerprint)
 
     def _persist_terminal_for_publish(self, session_id, terminal_kind, screen_excerpt):
         """S5a persist-before-visible-wake: persist terminal record BEFORE the event ring

@@ -732,7 +732,9 @@ class TestRetireEndToEnd:
         registry.adopt_generation(gid, epoch, daemon_transport,
                                   "b-1", incarnation={"pid": 1, "start_fingerprint": "fp"})
 
-        operator = OperatorRoutes(registry, "r-test", store=store)
+        from router.leases import LeaseService
+        lease_service = LeaseService(active_limit=5, live_pty_limit=5)
+        operator = OperatorRoutes(registry, "r-test", store=store, lease_service=lease_service)
         # Inject a controllable reap function for deterministic test
         reap_called_with = []
         def _fake_reap(gen_id, ep):
@@ -784,6 +786,7 @@ class TestRetireEndToEnd:
         def _refuse_reap(gen_id, ep):
             refused.append((gen_id, ep))
             return False
+        operator2._lease_service = lease_service
         operator2._reap_fn = _refuse_reap
 
         # Reset the generation to pre-retire state for the blocked test
