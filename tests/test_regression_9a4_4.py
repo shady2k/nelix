@@ -167,10 +167,10 @@ class _BrokenStore:
         raise NelixError("store_unavailable", "database is unavailable")
 
 
-def test_t2_status_surfaces_store_errors(tmp_path):
-    """T2: A SessionManager whose store.list_terminal raises must propagate
-    the error — caller sees 'store_unavailable', NOT a silently empty board.
-    MUST FAIL if the `except Exception: store_records = []` swallow is restored."""
+def test_t2_daemon_status_no_longer_calls_store(tmp_path):
+    """T2 (updated for S2a.2): The daemon's status() no longer supplements
+    recent_terminal from the store (the router's archive read owns that).
+    So a broken list_terminal no longer causes status() to raise."""
     from nelix_store.ledger import StartLedger
     root = tmp_path / "nelix-db"
     root.mkdir()
@@ -183,10 +183,13 @@ def test_t2_status_surfaces_store_errors(tmp_path):
     _out = mgr.start(EXECUTOR, "do it", "/tmp", owner_id=OWNER, session_id=sid)
     own(sid, OWNER)
     mgr.stop(sid, owner_id=OWNER)
-    with pytest.raises(NelixError) as ei:
-        mgr.status(owner_id=OWNER)
-    assert "store_unavailable" in str(ei.value.code) or "store_unavailable" in str(ei.value), (
-        f"T2 FAIL: expected store_unavailable error, got {ei.value}"
+    # S2a.2: status() no longer calls store.list_terminal, so a broken store
+    # does NOT raise. The daemon's live board instead returns no recent_terminal
+    # for the persisted session (advertised=False).
+    status = mgr.status(owner_id=OWNER)
+    assert sid not in status["recent_terminal"], (
+        "S2a.2: daemon status must not surface persisted terminals; "
+        "the router's archive read is the single source."
     )
 
 

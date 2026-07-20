@@ -9,6 +9,7 @@ UNKNOWN_SESSION = "unknown_session"
 CURSOR_EXPIRED = "cursor_expired"
 BOARD_CHANGED = "board_changed"
 BOARD_INCOMPLETE = "board_incomplete"
+ARCHIVE_INCOMPLETE = "archive_incomplete"
 UNSUPPORTED_BY_GENERATION = "unsupported_by_generation"
 CONCURRENCY_LIMIT = "concurrency_limit"
 DUPLICATE_START = "duplicate_start"
@@ -38,6 +39,7 @@ TERMINAL_EXPIRED = "terminal_expired"
 # re-arm", so a verbatim retry would spin.
 _RETRYABLE = {
     BOARD_INCOMPLETE: True,
+    ARCHIVE_INCOMPLETE: True,
     GENERATION_UNAVAILABLE: True,
     CONCURRENCY_LIMIT: True,
     OWNER_MISMATCH: False,

@@ -252,7 +252,7 @@ class SessionManager:
         self._sessions = {}
         self._lineages = {}            # lineage_id -> restart count (durable across session removal)
         self._reserved = 0             # in-flight restart slot reservations (cap accounting)
-        self._terminal = {}            # sid -> (snapshot_dict, expires_at): disappeared-session relay
+        self._terminal = {}            # sid -> (snapshot_dict, expires_at, advertised): disappeared-session relay
         # sid -> ({"id":..., "reason":"executor_finished"}, expires_at): Task 6 terminal survival for
         # an async question still outstanding when the executor exits. Written ALONGSIDE self._terminal
         # in _free_slot with the SAME expires_at (one lifetime policy, not two) — never write this
@@ -691,7 +691,10 @@ class SessionManager:
                 # record must share self._terminal's exact retention policy, never a second one.
                 expires_at = self._clock() + self._terminal_ttl
                 if snap is not None:
-                    self._terminal[session_id] = (snap, expires_at)
+                    # S2a.2: once persisted, mark advertised=False so the daemon's live board
+                    # stops surfacing this terminal — the router's archive read owns it now.
+                    # TODO(S5): terminal-pending confirmation handshake + retirement
+                    self._terminal[session_id] = (snap, expires_at, False)
                 if qid is not None:
                     self._terminal_async[session_id] = (
                         {"id": qid, "reason": "executor_finished"}, expires_at)
@@ -860,15 +863,19 @@ class SessionManager:
             # it whether or not we retain the ring). This is the safe teardown seam at which to
             # release their event-ring retention + per-session bookkeeping (nelix-9a4.5 #4): doing it
             # at slot-free instead would discard spec §5's final wake before a waiter could read it.
-            expired_terminals = [sid for sid, (snap, exp) in self._terminal.items() if exp <= now]
-            self._terminal = {sid: (snap, exp) for sid, (snap, exp) in self._terminal.items()
+            expired_terminals = [sid for sid, (snap, exp, _advertised) in self._terminal.items() if exp <= now]
+            self._terminal = {sid: (snap, exp, advertised) for sid, (snap, exp, advertised) in self._terminal.items()
                               if exp > now}
             # Same expiry sweep, same policy, as self._terminal (Task 6): opportunistic purge here
             # keeps both stores from growing unbounded; respond()'s own lookup also re-checks
             # exp > now at read time, so a missed sweep is never a correctness issue, only bookkeeping.
             self._terminal_async = {sid: (rec, exp) for sid, (rec, exp) in self._terminal_async.items()
                                     if exp > now}
-            recent_all = {sid: snap for sid, (snap, exp) in self._terminal.items()}
+            # S2a.2: only advertised terminals appear in the daemon's live board. A terminal whose
+            # record has been persisted to the store (advertised=False) is surfaced by the router's
+            # archive read instead, preventing the resurrection bug on ack/expiry.
+            recent_all = {sid: snap for sid, (snap, exp, advertised) in self._terminal.items()
+                          if advertised}
             for sid in expired_terminals:
                 # Guard against a same-id relive (restart mints a NEW sid, so this is belt-and-braces):
                 # never forget a session that is live again. The event queue takes its own _cv here —
@@ -891,40 +898,6 @@ class SessionManager:
             sessions[sid] = {**s_snap, "seq": per_seq.get(sid, 0)}
         recent = {sid: snap for sid, snap in recent_all.items()
                   if owner.owns_session(sid, owner_id)}
-        # nelix-9a4.4: supplement recent_terminal from the durable store for sessions whose
-        # volatile entry has expired past the TTL. A store-backed result that is still on the
-        # board (unacknowledged, not expired) is surfaced here — this is the fix for the live
-        # defect: a harness away past the TTL still sees its terminal results.
-        # A store read failure propagates as a NelixError — the caller sees "store unavailable"
-        # instead of a silently empty board (nelix-9a4.4).
-        store_records = self._store.list_terminal(owner_id)
-        for tr in store_records:
-            if tr.session_id in recent:
-                continue  # volatile entry is fresher (within TTL window)
-            # Build a minimal dict compatible with recent_terminal consumers.
-            # The store has terminal_kind + summary; for executor/task/cwd we
-            # read the session record from the store (one query per unrepresented
-            # terminal — acceptable because the board is bounded by max_count).
-            entry = {
-                "session_id": tr.session_id,
-                "terminal_kind": tr.terminal_kind,
-                "screen_excerpt": tr.summary,
-                "control_state": "terminal",
-                "pending": False,
-                "terminal": True,
-                "store_backed": True,
-            }
-            # Best-effort session enrichment: executor, task, cwd from the
-            # session record (the session row exists because put_terminal was
-            # called after create_session).
-            try:
-                sr = self._store.get_session(tr.session_id, owner_id=owner_id)
-                entry["executor"] = sr.executor
-                entry["task"] = sr.task
-                entry["cwd"] = sr.cwd
-            except Exception:
-                pass
-            recent[tr.session_id] = entry
         return {"sessions": sessions,
                 "limit": self._limit,
                 "cursor": cursor,

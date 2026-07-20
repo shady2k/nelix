@@ -113,8 +113,8 @@ def test_main_wires_shared_pieces_and_serves_then_tears_down(monkeypatch):
         def shutdown(self):
             self.shutdown_called = True
 
-    def _fake_make_server(sock, sock_path, start_path, registry, router_epoch):
-        captured["server_args"] = (sock, sock_path, start_path, registry, router_epoch)
+    def _fake_make_server(sock, sock_path, start_path, registry, router_epoch, **kw):
+        captured["server_args"] = (sock, sock_path, start_path, registry, router_epoch, kw)
         return _FakeServer()
 
     monkeypatch.setattr(app, "establish", lambda: handle)
@@ -132,10 +132,12 @@ def test_main_wires_shared_pieces_and_serves_then_tears_down(monkeypatch):
         app.main()
 
     assert captured["served"] is True
-    sock, sock_path, start_path, registry, router_epoch = captured["server_args"]
+    sock, sock_path, start_path, registry, router_epoch, extra_kw = captured["server_args"]
     assert sock is handle.socket and sock_path == handle.sock_path
     assert registry == "REGISTRY"
     assert re.match(r"^r-[0-9a-f]{32}$", router_epoch)       # a per-process router epoch
+    assert "store" in extra_kw                                # S2a.2: store threaded through
+    assert "archive_epoch" in extra_kw                        # S2a.2: archive epoch threaded through
     # The ONE shared ledger the registry/start path use is closed, and the runtime dir released.
     assert handle.closed is True
     assert ledger_box["sp"] is start_path                     # the start path is wired to serve

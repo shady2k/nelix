@@ -5,7 +5,7 @@ already OWNER-FILTERED and already carries a GLOBAL int cursor (per-GENERATION, 
 within that generation -- `EventQueue.latest_seq()`). This module's job is entirely router-side:
 
   1. Forward that board to every generation the registry currently tracks (`registry.generations()`
-     -- the same NON-SPAWNING snapshot /health, /capabilities and /generation_list already read; a
+     -- the same NON-SPAWNING snapshot /health, /capabilities and /generation_list read; a
      "read-only" board probe must not subprocess.Popen a daemon as a side effect either).
   2. MERGE the per-generation boards into ONE router-owned envelope via `merge_boards` -- a REAL
      N-way union (keyed by session_id, which is globally unique across generations, spec §3), not
@@ -38,13 +38,22 @@ within that generation -- `EventQueue.latest_seq()`). This module's job is entir
      a false `board_incomplete: false` empty board that only self-heals once something else happens
      to touch the registry.
 
+S2a.2 (this slice): the router also reads the archived board from the SHARED store DIRECTLY
+and merges it with the per-generation LIVE boards. An archived terminal row is AUTHORITATIVE
+for a session's terminal state and SUPPRESSES any live entry for the same session in the merged
+result — the merged output never lists one session in both `sessions` and `recent_terminal`.
+The cursor gains an archive component (archive_epoch, archive_seq) populated from the store read.
+
 `/wait` (cursor DECODE + long-poll + CURSOR_EXPIRED/BOARD_CHANGED + advance) is 3c.3b, not this
 slice -- this module only CONSTRUCTS and ENCODES the cursor.
 """
+import sqlite3
 import urllib.parse
 
 from nelix_contracts.cursor import encode, new_cursor
-from nelix_contracts.errors import GENERATION_UNAVAILABLE, INVALID_REQUEST, NelixError
+from nelix_contracts.errors import (
+    GENERATION_UNAVAILABLE, INVALID_REQUEST, STORE_UNAVAILABLE, NelixError,
+)
 from nelix_contracts.ids import InvalidId, validate_owner_id
 
 from router.forwarding import relay
@@ -85,12 +94,48 @@ def merge_boards(per_generation) -> dict:
     return {"sessions": sessions, "recent_terminal": recent_terminal}
 
 
-class BoardForward:
-    """Router GET /status with NO session_id -- the fan-out board read."""
+def merge_archive_into(live, archive_records):
+    """Merge archived terminal records into the live board.
 
-    def __init__(self, registry, router_epoch):
+    Archived terminal rows are AUTHORITATIVE: they SUPPRESS any live entry for the same
+    session (in both `sessions` and `recent_terminal`). The merged output never lists one
+    session in both maps.
+
+    `live` is mutated in place (the merged dict from merge_boards). `archive_records` is
+    the list of TerminalRecord from store.read_board_snapshot.
+    """
+    for tr in archive_records:
+        sid = tr.session_id
+        live["sessions"].pop(sid, None)
+        live["recent_terminal"].pop(sid, None)
+        entry = {
+            "session_id": sid,
+            "terminal_kind": tr.terminal_kind,
+            "screen_excerpt": tr.summary,
+            "control_state": "terminal",
+            "pending": False,
+            "terminal": True,
+        }
+        live["recent_terminal"][sid] = entry
+    return live
+
+
+class BoardForward:
+    """Router GET /status with NO session_id -- the fan-out board read.
+
+    S2a.2: also reads the archived board from the store and merges it into the live result.
+    The store is optional (None when no store is available, such as in some test scenarios).
+    """
+
+    def __init__(self, registry, router_epoch, store=None, archive_epoch=None):
+        if (store is None) != (archive_epoch is None):
+            raise ValueError(
+                "store and archive_epoch must be both set or both None; "
+                f"got store={store!r}, archive_epoch={archive_epoch!r}")
         self._registry = registry
         self._router_epoch = router_epoch
+        self._store = store
+        self._archive_epoch = archive_epoch
 
     def status(self, owner_id) -> "tuple[int, dict]":
         owner_id = _owner(owner_id)
@@ -112,8 +157,26 @@ class BoardForward:
             # restart); the per-incarnation epoch is carried as the VALUE, alongside the seq.
             cursor = cursor.advance(gen.generation_id, gen.epoch, reply["cursor"])
         merged = merge_boards(healthy)
+        # S2a.2: read the archived board from the shared store and merge it.
+        # An archived terminal is AUTHORITATIVE and suppresses any live entry for the same session.
+        archive_incomplete = False
+        if self._store is not None:
+            try:
+                archive_seq, records = self._store.read_board_snapshot(owner_id)
+            except (sqlite3.Error, OSError):
+                archive_incomplete = True
+            except NelixError as e:
+                if e.code == STORE_UNAVAILABLE:
+                    archive_incomplete = True
+                else:
+                    raise
+            else:
+                merged = merge_archive_into(merged, records)
+                cursor = cursor.advance_archive(self._archive_epoch, archive_seq)
         merged["cursor"] = encode(cursor)
         merged["board_incomplete"] = unavailable if unavailable else False
+        if archive_incomplete:
+            merged["archive_incomplete"] = True
         return 200, merged
 
     def _forward_one(self, gen, owner_id):

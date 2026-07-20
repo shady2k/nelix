@@ -157,7 +157,10 @@ def test_operator_stop_publishes_single_stopped_event(tmp_path, store_and_ledger
     new = [e for e in events._events if e.session_id == sid and e.seq > before]
     assert [e.kind for e in new] == ["stopped"]
     assert events.wait_event(after_seq=before, timeout=0, session_id=sid).kind == "stopped"
-    assert sid in mgr.status(owner_id=OWNER)["recent_terminal"]
+    # S2a.2: daemon no longer surfaces persisted terminals in recent_terminal.
+    # Verify the store has the terminal record instead.
+    term = store.get_terminal(sid, owner_id=OWNER)
+    assert term.terminal_kind == "stopped"
 
 
 def test_status_lists_all_and_stop(store_and_ledger):

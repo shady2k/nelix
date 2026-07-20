@@ -117,6 +117,9 @@ class WaitForward:
         # 3. The generation(s). N=1 today; active() = the authoritative current generation (the same
         #    read the session-keyed forwards use), raising GENERATION_UNAVAILABLE (retryable) if none
         #    can be made available.
+        # TODO(S2a.3): archive wake arm (bounded cross-process poll on board_seq). Check the
+        # cursor's archive component against the current board_seq; if stale, poll/notify
+        # the store rather than only forwarding to the generation ring.
         gen = self._registry.active()
         # Plan 4: partition `sessions` by their ledger generation_id -> slot, derive (subset,
         # after_seq) PER generation, forward each wait, and return on the FIRST event -> advancing
