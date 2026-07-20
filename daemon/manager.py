@@ -282,6 +282,10 @@ class SessionManager:
         # S5a: quiescence flag — when set, reject new sessions, restarts, idle-resume, pending admissions.
         self._quiescent = False
         self._terminal_ttl = terminal_snapshot_ttl
+        # S6 — orphan detection state.
+        self._active_waiter_sids = set()     # session_ids with an outstanding /wait in flight
+        self._orphan_stop = threading.Event()
+        self._orphan_thread = None
         self._clock = clock
         # nelix-9a4.4: the durable store for terminal records (generation-neutral). MANDATORY:
         # a generation daemon is always router-fronted, and the router owns the start ledger —
@@ -322,6 +326,7 @@ class SessionManager:
         else:
             self._make = lambda sid, ex, spec: _default_session_factory(
                 sid, ex, spec, events, launcher_factory, driver_factory, logger)
+        self._start_orphan_checker()
 
     def _store_epoch_is_certified(self):
         """Check the store directly if the epoch is certified.
@@ -1736,7 +1741,175 @@ class SessionManager:
                               certificate=certificate)
         return {"final_high_water": final_hw, "certificate": certificate}
 
+    # ── S6: orphan detection / reaping ────────────────────────────────────
+
+    def _start_orphan_checker(self):
+        if self._orphan_thread is not None:
+            return
+        self._orphan_stop.clear()
+        self._orphan_thread = threading.Thread(target=self._orphan_loop, daemon=True)
+        self._orphan_thread.start()
+
+    def _stop_orphan_checker(self):
+        self._orphan_stop.set()
+
+    def _orphan_loop(self):
+        while not self._orphan_stop.is_set():
+            try:
+                self._check_orphans()
+            except Exception:
+                if self._logger is not None:
+                    self._logger.warning("manager", "orphan_check_error", exc_info=True)
+            self._orphan_stop.wait(15.0)
+
+    def register_waiter(self, session_id):
+        """Mark session as having an outstanding /wait. Thread-safe."""
+        with self._lock:
+            self._active_waiter_sids.add(session_id)
+
+    def unregister_waiter(self, session_id):
+        """Clear the outstanding /wait marker. Thread-safe."""
+        with self._lock:
+            self._active_waiter_sids.discard(session_id)
+
+    def observe_session(self, session_id):
+        """Record an observation (heartbeat) on a session. Thread-safe."""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+        if sess is not None:
+            sess.observe()
+
+    def _check_orphans(self):
+        """Orphan detection + reap loop: check every live session for observation lapse.
+        Three-stage: (1) active waiter -> observed, skip; (2) past grace -> mark orphaned;
+        (3) marked + past grace -> reap (persist orphan_reaped terminal, expire session).
+        """
+        now = self._clock()
+        sids = []
+        with self._lock:
+            sids = list(self._sessions.keys())
+        for sid in sids:
+            with self._lock:
+                sess = self._sessions.get(sid)
+                if sess is None:
+                    continue
+                # Active waiter always counts as observed — reset clock.
+                if sid in self._active_waiter_sids:
+                    sess.observe()
+                    continue
+                last_obs = sess.last_observed()
+                orphan_marked = sess.orphan_marked_ts()
+            if last_obs is None:
+                continue
+            age = now - last_obs
+            spec = self._specs.get(getattr(sess, 'executor', None))
+            grace = spec.observation_grace_seconds if (spec is not None and spec.observation_grace_seconds > 0) else 0
+            if grace == 0:
+                continue  # orphaning disabled
+            if orphan_marked is not None:
+                # Already marked: reap if grace has elapsed since marking.
+                if now - orphan_marked >= grace:
+                    self._reap_orphan(sid)
+            else:
+                # Not yet marked: mark if unobserved past grace.
+                if age >= grace:
+                    sess.mark_orphaned(grace)
+
+    def _reap_orphan(self, session_id):
+        """Reap an orphaned session: persist orphan_reaped terminal via S5 path,
+        kill the process, clean up. Does NOT call _free_slot (bypasses Session finish).
+        Strategy: set _finalized first (under each session's own lock) to prevent the
+        monitor thread from running _finish, then stop the process, persist the terminal,
+        and clean up manager state.
+        """
+        sess = None
+        excerpt = ""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                return
+            snap = sess.snapshot()
+            excerpt = snap.get("screen_excerpt", snap.get("text", ""))
+            if self._logger is not None:
+                self._logger.info("manager", "orphan_reaping",
+                                  session_id=session_id,
+                                  control_state=snap.get("control_state"),
+                                  excerpt_len=len(excerpt))
+        if sess is None:
+            return
+        # Finalize the session under its own lock so the monitor thread's _finish
+        # sees _finalized=True and returns immediately.
+        # Acquire session lock then manager lock (consistent ordering: session -> manager).
+        with sess._lock:
+            sess._finalized = True
+            sess._closing = True
+            sess._stop.set()
+        # Kill the process group (best-effort) — outside both locks.
+        try:
+            sess._launcher.stop()
+        except Exception:
+            pass
+        try:
+            if sess._handle is not None:
+                sess._handle.close()
+        except Exception:
+            pass
+        # Join the monitor thread (it will see _stop and exit; _finish sees _finalized).
+        if sess._thread is not None:
+            sess._thread.join(timeout=10)
+
+        # Persist orphan_reaped terminal via the S5 path.
+        try:
+            self._persist_terminal_for_publish(session_id, "orphan_reaped", excerpt)
+        except NelixError as e:
+            if e.code == "idempotency_conflict":
+                if self._logger is not None:
+                    self._logger.warning("manager", "orphan_reap_idempotent",
+                                         session_id=session_id)
+            else:
+                if self._logger is not None:
+                    self._logger.error("manager", "orphan_reap_persist_failed",
+                                       session_id=session_id, error=str(e))
+                return
+        except Exception as e:
+            if self._logger is not None:
+                self._logger.error("manager", "orphan_reap_persist_failed",
+                                   session_id=session_id, error=str(e))
+            return
+
+        # Publish an event so any blocking /wait wakes up (the session is terminal).
+        try:
+            self._events.publish(
+                session_id,
+                getattr(sess, "executor", ""),
+                "orphan_reaped",
+                excerpt[:200],
+                "crashed",
+                hint="session orphaned and reaped",
+                hung=False,
+                requires_response=False,
+            )
+        except Exception:
+            if self._logger is not None:
+                self._logger.warning("manager", "orphan_reap_publish_failed",
+                                     session_id=session_id, exc_info=True)
+
+        # Remove from _sessions and final cleanup.
+        with self._lock:
+            self._sessions.pop(session_id, None)
+            self._terminal_obligations.discard(session_id)
+            active_tid = self._active_lease_tokens.pop(session_id, None)
+            live_tid = self._live_lease_tokens.pop(session_id, None)
+            self._active_token_activation.pop(session_id, None)
+            self._live_token_activation.pop(session_id, None)
+        if active_tid is not None or live_tid is not None:
+            self._release_terminal_leases(active_tid, live_tid)
+        if self._logger is not None:
+            self._logger.info("manager", "orphan_reaped",
+                              session_id=session_id)
+
     def stop_all(self, reason="shutdown"):
+        self._stop_orphan_checker()
         # Daemon shutdown: every session goes, whoever owns it. _stop, not stop — see _stop.
         with self._lock:
             sids = list(self._sessions)

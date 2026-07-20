@@ -225,6 +225,11 @@ class Session:
         #                                assigns it; a session-only unit test leaves it None.
         self.reaper_ctx = None         # daemon-set reaper.ReaperContext (None => no reaping)
         self._closing = False          # terminal cleanup started: respond/screen must not write
+        # S6 — orphan detection: last-observed timestamp (heartbeat or active /wait), and
+        # orphan-marked timestamp (None = not marked). Session is observed as long as a
+        # heartbeat arrives or an outstanding /wait is in flight.
+        self._last_observed = self._clock.now()
+        self._orphan_marked_ts = None
 
     def _belief_config(self):
         # Build the engine config from the executor spec (liveness-scaled budgets, grace, etc.).
@@ -896,6 +901,40 @@ class Session:
         """
         if self._persist_terminal is not None:
             self._persist_terminal(self._id, kind, screen_excerpt)
+
+    # ── S6: observation / orphan tracking ────────────────────────────────
+
+    def observe(self):
+        """Record observation (heartbeat or active /wait). Un-marks if previously orphan-marked.
+        Thread-safe: called from RPC thread (heartbeat route) or orphan checker thread."""
+        with self._lock:
+            self._last_observed = self._clock.now()
+            self._orphan_marked_ts = None
+
+    def mark_orphaned(self, grace):
+        """Mark this session as orphaned if grace has elapsed since last observation.
+        Still recoverable if re-observed. Thread-safe: called from orphan checker thread.
+        `grace` is the observation_grace_seconds value; if <= 0, marking is disabled."""
+        if grace <= 0:
+            return
+        with self._lock:
+            now = self._clock.now()
+            # Re-check observation age under the lock so a concurrent observe()
+            # that renewed _last_observed prevents stale marking.
+            if now - self._last_observed < grace:
+                return
+            if self._orphan_marked_ts is None:
+                self._orphan_marked_ts = now
+
+    def last_observed(self):
+        with self._lock:
+            return self._last_observed
+
+    def orphan_marked_ts(self):
+        with self._lock:
+            return self._orphan_marked_ts
+
+    # ── terminal path ────────────────────────────────────────────────────
 
     def _finish_publish(self, status, alive):
         # 1. monitor itself crashed; leader may still be alive

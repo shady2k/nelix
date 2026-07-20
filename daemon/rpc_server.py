@@ -262,7 +262,12 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                                          "hint": "unknown session, or not this owner's; a wait on it"
                                                  " would never wake. Do not retry."})
                         return
-                    evt = manager._events.wait_event(after_seq=after, timeout=wait_timeout, session_id=sid)
+                    # S6: register the waiter so the orphan checker knows this session is observed.
+                    manager.register_waiter(sid)
+                    try:
+                        evt = manager._events.wait_event(after_seq=after, timeout=wait_timeout, session_id=sid)
+                    finally:
+                        manager.unregister_waiter(sid)
                 else:
                     # ------------------------------- multi-session (orchestration) /wait (3c.3b)
                     # Shape-check EACH sid BEFORE any of them resolves `sessions_root() / sid`, same
@@ -282,8 +287,15 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                                          "hint": "no session in the set is this owner's; a wait on"
                                                  " it would never wake. Do not retry."})
                         return
-                    evt = manager._events.wait_event_any(after_seq=after, timeout=wait_timeout,
-                                                             session_ids=owned)
+                    # S6: register all owned waiters so the orphan checker knows they are observed.
+                    for owned_sid in owned:
+                        manager.register_waiter(owned_sid)
+                    try:
+                        evt = manager._events.wait_event_any(after_seq=after, timeout=wait_timeout,
+                                                                 session_ids=owned)
+                    finally:
+                        for owned_sid in owned:
+                            manager.unregister_waiter(owned_sid)
                 if evt is CURSOR_EXPIRED:
                     # The cursor fell off the back of the bounded ring: events this waiter never saw
                     # were evicted. Answer with an EXPLICIT resync marker (not a silent event:null),
@@ -499,11 +511,27 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 self._send(404, {"error": "unknown_session"}); return
             self._send(200, {"status": "recorded", "progress_seq": seq})
 
+        def _dispatch_observe(self, p):
+            """POST /observe/<sid>: lightweight observer heartbeat. Records that the session
+            is still being watched (renews `last_observed`). Owner-gated: only the session's
+            owner can observe it, so a non-owner cannot keep a session alive."""
+            sid = p.path[len("/observe/"):]
+            if not self._require_valid_sid(sid):
+                return
+            body = self._read_json(max_body=4096)
+            owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
+            if not owner.owns_session(sid, owner_id):
+                self._send(404, {"error": "unknown session"}); return
+            manager.observe_session(sid)
+            self._send(200, {"status": "observed"})
+
         def _dispatch_post(self, p):
             if p.path.startswith("/hook/"):
                 self._dispatch_hook(p); return
             if p.path.startswith("/message/"):
                 self._dispatch_message(p); return
+            if p.path.startswith("/observe/"):
+                self._dispatch_observe(p); return
             body = self._read_json()
             if p.path == "/start":
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
