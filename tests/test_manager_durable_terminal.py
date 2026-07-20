@@ -67,6 +67,10 @@ class TerminatingSession:
                              "all done", self._terminal_kind)
         if self.on_terminal is not None:
             self.on_terminal(self.sid)
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 def _setup_store_and_ledger(tmp_path, clock):

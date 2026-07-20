@@ -27,6 +27,10 @@ class _CapSession:
     def snapshot(self): return {"session_id": self.sid, "control_state": "busy",
                                 "task_delivery": "pending"}
     def stop(self): pass
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 def _mgr(store_and_ledger, spec=None, limit=5, driver_factory=None, logger=None):
@@ -231,6 +235,10 @@ class _RestartCapSession:
     def cwd(self): return self._cwd
     def start(self, task, cwd): self._task = task; self._cwd = cwd
     def stop(self): self.stopped = True
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
     def snapshot(self): return {"session_id": self._id, "control_state": "busy"}
     def terminal_snapshot(self):
         return {"session_id": self._id, "terminal": True, "terminal_kind": "crashed",

@@ -45,6 +45,10 @@ class _FakeSession:
     def start(self, task, cwd):
         self.started = True
     def stop(self): pass
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
     def snapshot(self): return {"session_id": self._id, "control_state": "busy", "task_delivery": "pending"}
 
 

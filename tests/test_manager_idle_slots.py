@@ -43,6 +43,10 @@ class FakeSession:
         from daemon.session import RespondOutcome
         return RespondOutcome("resumed")
     def stop(self): pass
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 def _manager(store_and_ledger, tmp_path, limit=2, idle_retained_limit=None):

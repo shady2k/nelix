@@ -10,6 +10,10 @@ class _FakeSession:
         self.lineage_id = None
     def start(self, task, cwd): pass
     def stop(self): pass
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
     def snapshot(self): return {"session_id": self._id, "state": "working"}
 
 

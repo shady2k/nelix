@@ -14,6 +14,9 @@ class FakeManager:
     def __init__(self):
         self._events = EventQueue(); self.started = None; self.responded = []; self.stopped = []
         self.respond_status = "resumed"; self.started_model = "__unset__"
+    def register_waiter(self, sid): pass
+    def unregister_waiter(self, sid): pass
+    def observe_session(self, sid): pass
     def start(self, executor, task, cwd, *, owner_id, model=None, session_id=None):
         self.started = (executor, task, cwd); self.started_model = model
         return StartOutcome(session_id="s-00000001", base_seq=0,
@@ -654,6 +657,10 @@ class _FakeDialog:
 
 class _FakeSession:
     dialog = _FakeDialog()
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 class FakeManagerWithDialog:
@@ -777,6 +784,10 @@ class _CapturingDialog:
 
 class _CapturingSession:
     dialog = _CapturingDialog()
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 class _CapturingManager:

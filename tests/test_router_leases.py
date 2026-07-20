@@ -31,6 +31,10 @@ class FakeSession:
         return {"session_id": self.sid, "executor": self.executor,
                 "control_state": cs, "task_delivery": "delivered"}
     def stop(self): self.stopped = True
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
     def send_turn(self, text):
         return RespondOutcome("resumed", seq=2)
 
@@ -265,6 +269,10 @@ class _LeasedFakeSession(FakeSession):
         self.stopped = True
         if self.on_terminal is not None:
             self.on_terminal(self.sid)
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 def _lease_mgr(store_and_ledger, active_limit=2, live_pty_limit=2):

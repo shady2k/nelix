@@ -92,7 +92,7 @@ def _excerpt(screen, max_chars):
 
 class Session:
     def __init__(self, session_id, executor, driver, launcher, spec, events,
-                 cols=120, rows=40, logger=None, clock=None):
+                 cols=120, rows=40, logger=None, clock=None, obs_clock=None):
         self._id = session_id
         self._executor = executor
         self._driver = driver
@@ -106,6 +106,10 @@ class Session:
         # directly — so a recorded capture can drive the engine deterministically.
         self._clock = clock if clock is not None else WallClock()
         self._engine = BeliefEngine(self._belief_config(), self._clock)
+        # S6 FIX 2: observation clock — MUST match the manager's clock domain (time.time) so the
+        # orphan checker's comparisons (manager._clock()) and the observation timestamps live in the
+        # SAME domain. Defaults to time.time (POSIX wall clock) which matches SessionManager's default.
+        self._obs_clock = obs_clock if obs_clock is not None else time.time
         # Hook path (spec §7): a Claude agent reports its own lifecycle via hooks to POST /hook/<id>,
         # authenticated by this per-session secret. on_hook enqueues each event; the monitor thread
         # drains the queue every _loop iteration and feeds the (authoritative) belief engine.
@@ -225,6 +229,13 @@ class Session:
         #                                assigns it; a session-only unit test leaves it None.
         self.reaper_ctx = None         # daemon-set reaper.ReaperContext (None => no reaping)
         self._closing = False          # terminal cleanup started: respond/screen must not write
+        # S6 — orphan detection: last-observed timestamp (heartbeat or active /wait), and
+        # orphan-marked timestamp (None = not marked). Session is observed as long as a
+        # heartbeat arrives or an outstanding /wait is in flight.
+        # Uses _obs_clock (same domain as the manager's orphan checker) so age comparisons
+        # never cross clock domains (FIX 2).
+        self._last_observed = self._obs_clock()
+        self._orphan_marked_ts = None
 
     def _belief_config(self):
         # Build the engine config from the executor spec (liveness-scaled budgets, grace, etc.).
@@ -896,6 +907,43 @@ class Session:
         """
         if self._persist_terminal is not None:
             self._persist_terminal(self._id, kind, screen_excerpt)
+
+    # ── S6: observation / orphan tracking ────────────────────────────────
+
+    def observe(self):
+        """Record observation (heartbeat or active /wait). Un-marks if previously orphan-marked.
+        Thread-safe: called from RPC thread (heartbeat route) or orphan checker thread.
+        Uses _obs_clock (manager-clock domain, FIX 2) so the manager's orphan checker sees
+        timestamps in the same domain as its own clock."""
+        with self._lock:
+            self._last_observed = self._obs_clock()
+            self._orphan_marked_ts = None
+
+    def mark_orphaned(self, grace):
+        """Mark this session as orphaned if grace has elapsed since last observation.
+        Still recoverable if re-observed. Thread-safe: called from orphan checker thread.
+        `grace` is the observation_grace_seconds value; if <= 0, marking is disabled.
+        Uses _obs_clock (FIX 2) — same domain as the manager's clock."""
+        if grace <= 0:
+            return
+        with self._lock:
+            now = self._obs_clock()
+            # Re-check observation age under the lock so a concurrent observe()
+            # that renewed _last_observed prevents stale marking.
+            if now - self._last_observed < grace:
+                return
+            if self._orphan_marked_ts is None:
+                self._orphan_marked_ts = now
+
+    def last_observed(self):
+        with self._lock:
+            return self._last_observed
+
+    def orphan_marked_ts(self):
+        with self._lock:
+            return self._orphan_marked_ts
+
+    # ── terminal path ────────────────────────────────────────────────────
 
     def _finish_publish(self, status, alive):
         # 1. monitor itself crashed; leader may still be alive

@@ -71,6 +71,11 @@ class ExecutorSpec:
     respond_write_seconds: float = 5.0       # deadline for the respond() PTY write (wedged-stdin guard)
     respond_confirm_seconds: float = 6.0     # window to confirm a respond's answer LEFT the box (nelix-sud)
     max_idle_seconds: float = 600.0      # pre-delivery blocked no-progress backstop; 0 = disabled
+    # S6: observation grace — how long a session can go unobserved (no heartbeat,
+    # no outstanding /wait) before being marked orphaned. Distinct from max_idle_seconds
+    # (stalled-worker escalation) and startup_timeout_seconds (pre-delivery deadline).
+    # Default 3600s (1 hour); 0 = disabled (no orphaning).
+    observation_grace_seconds: float = 3600.0
     startup_timeout_seconds: float = 60.0  # pre-delivery startup deadline: no classifiable output within
                                          # this (from the readiness point) -> terminal fail; 0 = disabled
     max_restarts: int = 3                # recovery: consecutive auto-restarts before escalating (Hermes)
@@ -167,6 +172,7 @@ def _build_spec(name, spec):
         respond_write_seconds=_spec_num(spec, "respond_write_seconds", 5.0, cast=float),
         respond_confirm_seconds=_spec_num(spec, "respond_confirm_seconds", 6.0, cast=float),
         max_idle_seconds=_spec_num(spec, "max_idle_seconds", 600.0, cast=float),
+        observation_grace_seconds=_spec_num(spec, "observation_grace_seconds", 3600.0, cast=float),
         startup_timeout_seconds=_spec_num(spec, "startup_timeout_seconds", 60.0, cast=float),
         max_restarts=_spec_num(spec, "max_restarts", 3, cast=int),
         post_submit_grace=_spec_num(spec, "post_submit_grace", 8.0, cast=float),

@@ -118,6 +118,10 @@ class FakeSession:
 
     def stop(self):
         self.stopped = True
+    def observe(self): pass
+    def last_observed(self): return 0.0
+    def orphan_marked_ts(self): return None
+    def mark_orphaned(self, grace): pass
 
 
 @pytest.fixture
@@ -697,7 +701,8 @@ def test_every_caller_facing_route_is_covered():
     routes = set(re.findall(r'p\.path == "(/[a-z]+)"', src))
     routes |= {m.rstrip("/") for m in re.findall(r'p\.path\.startswith\("(/[a-z]+/)"\)', src)}
     caller_facing = {"/wait", "/status", "/dialog", "/screen",
-                     "/start", "/respond", "/stop", "/restart", "/capabilities"}
+                     "/start", "/respond", "/stop", "/restart", "/capabilities",
+                     "/observe"}
     exempt = {"/hook", "/message"}                # per-session secret, stronger than an owner id
     no_owner_state = {"/health"}                  # no session, no per-caller state to gate at all
     assert routes == caller_facing | exempt | no_owner_state, (
