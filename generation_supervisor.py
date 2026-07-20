@@ -412,34 +412,52 @@ class GenerationSupervisor:
         fp = reaper.ProcessInspector().start_fingerprint(pid)
         return {"pid": pid, "start_fingerprint": fp}
 
-    def reap_holder(self, expected_incarnation: dict) -> None:
+    def reap_holder(self, expected_incarnation: dict) -> bool:
         """Kill THIS generation's lock holder ONLY if it matches ``expected_incarnation``
         exactly (both ``pid`` and ``start_fingerprint``). If the holder changed
         (pid or fingerprint differs or is absent), do NOT kill anything.
 
-        This is incarnation-guarded: a replacement daemon that grabbed the lock
-        between our read and this call is left alone. Never kills a newer daemon.
+        Returns True ONLY when it has POSITIVE proof the recorded incarnation is
+        gone: either the lock holder is confirmed absent AND a liveness/fingerprint
+        check confirms the recorded PID is not alive, or the process was signalled
+        and a FINAL liveness re-check confirms it is dead. Returns False on a
+        refused identity match, an unreadable holder, or a failed kill with the
+        process still alive. Caller must NOT retire past a live incarnation.
         """
         if not expected_incarnation:
-            return
+            return False
         expected_pid = expected_incarnation.get("pid")
         expected_fp = expected_incarnation.get("start_fingerprint")
         if not expected_pid or not expected_fp:
-            return
+            return False
 
         holder = self._live_lock_holder()
         if not holder:
-            return
+            # Lock file absent — confirm the recorded PID is not alive.
+            if not _pid_alive(expected_pid):
+                return True
+            # PID still alive but lock file gone — daemon is running elsewhere.
+            # Do NOT return success; something is incoherent.
+            _log.warning("generation daemon: reap_holder gen_id=%s "
+                         "expected pid=%s alive but lock absent; not confirming death",
+                         self._generation_id, expected_pid)
+            return False
         if (holder.get("pid") != expected_pid
                 or holder.get("start_fingerprint") != expected_fp):
-            # Holder changed — do NOT reap the replacement.
             _log.warning("generation daemon: holder replaced gen_id=%s "
                          "expected=(pid=%s fp=%s) actual=(pid=%s fp=%s); not reaping",
                          self._generation_id, expected_pid, expected_fp,
                          holder.get("pid"), holder.get("start_fingerprint"))
-            return
+            return False
 
         self._reap_daemon(expected_pid, f"reap_holder gen_id={self._generation_id}")
+        # FINAL liveness re-check: confirm the process actually died.
+        if _pid_alive(expected_pid):
+            _log.warning("generation daemon: reap_holder gen_id=%s "
+                         "pid=%s still alive after reap; not confirming death",
+                         self._generation_id, expected_pid)
+            return False
+        return True
 
     # ---- ensure running -----------------------------------------------------
 
@@ -692,9 +710,13 @@ def _graceful_wait(pid: int) -> None:
         time.sleep(0.5)
 
 
-def _force_kill(pid: int) -> None:
+def _force_kill(pid: int) -> bool:
+    """SIGKILL the process and report success/failure.
+    Returns True if the process is confirmed dead after the kill.
+    Returns False if it is still alive (kill failed / swallowed).
+    """
     if not _pid_alive(pid):
-        return
+        return True
     try:
         os.kill(pid, signal.SIGKILL)
         try:
@@ -703,11 +725,19 @@ def _force_kill(pid: int) -> None:
             pass
     except (KeyboardInterrupt, Exception):
         pass
+    return not _pid_alive(pid)
 
 
 def _pid_alive(pid: int) -> bool:
+    """Check if a process is alive. EPERM (PermissionError) → alive (exists).
+    ESRCH (ProcessLookupError) → dead. Any other error → alive (fail-closed:
+    cannot prove death → reap_holder refuses → retire blocks)."""
     try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True

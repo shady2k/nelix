@@ -14,6 +14,10 @@ fooled that way.
 The ordering this encodes:
     publish terminal event -> persist generation-neutral record -> router makes it visible
       -> remove live session -> router confirms -> generation may exit
+
+S5a: generation-level oracle — a generation retires iff it has no live/current incarnation
+AND every epoch has retirement_state=certified AND confirmed_high_water >= final_high_water.
+The oracle checks retirement_state, NEVER process_state.
 """
 
 
@@ -55,3 +59,45 @@ def may_retire(*, live_pty_count: int, inflight_or_starting_count: int,
         inflight_or_starting_count=inflight_or_starting_count,
         terminal_persisted_high_water=terminal_persisted_high_water,
         router_visible_high_water=router_visible_high_water)
+
+
+# ---- S5a: generation-level oracle (aggregate check across ALL epochs) ----
+
+
+def generation_retirement_oracle_blockers(*, store, generation_id: str) -> tuple:
+    """Check whether a generation may be retired, reading from the store.
+
+    Returns blockers (empty tuple = clear to retire). A generation retires iff:
+    - It has no live/current incarnation (current_epoch is NULL)
+    - Every epoch has retirement_state=certified
+    - For every epoch, confirmed_high_water >= final_high_water
+    - Checks retirement_state, NEVER process_state
+    """
+    blockers = []
+
+    gen = store.get_generation(generation_id)
+    if gen.current_epoch is not None:
+        blockers.append("has_current_epoch")
+
+    epochs = store.list_epochs(generation_id)
+    if not epochs:
+        blockers.append("no_epochs")
+        return tuple(blockers)
+
+    for ep in epochs:
+        if ep.retirement_state != "certified":
+            blockers.append(f"epoch_not_certified:{ep.generation_epoch}")
+        else:
+            confirmed = store.get_generation_confirmed_high_water(ep.generation_epoch)
+            if confirmed < (ep.final_high_water or 0):
+                blockers.append(
+                    f"confirmed_below_final:{ep.generation_epoch}"
+                    f"({confirmed}<{ep.final_high_water})")
+
+    return tuple(blockers)
+
+
+def generation_may_retire(*, store, generation_id: str) -> bool:
+    """True iff the generation-level oracle sees no blockers."""
+    return not generation_retirement_oracle_blockers(
+        store=store, generation_id=generation_id)

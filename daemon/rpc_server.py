@@ -371,6 +371,10 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                 # manager.screen owner-gates via _owned. Note `force` bypasses the anti-poll
                 # withhold, NOT the owner gate: they are checked in that order inside screen().
                 self._send(200, manager.screen(sid, owner_id=owner_id, raw=raw, force=force))
+            elif p.path == "/operator/quiesce_status":
+                self._send(200, {"operation": "quiesce_status",
+                                  "status": manager.quiescence_status()})
+                return
             elif p.path == "/capabilities":
                 # spec §8: per-session capabilities. NOTE the query key is `sid` (not
                 # `session_id` like every other route) — verbatim per the brief. owner_id is
@@ -661,6 +665,27 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                                        provided_decision_id=provided)
                     self._send(409, {"operation": "respond", "status": "no_pending", "session_id": sid,
                                      "error": "no_pending_decision", "next_action": "fix_call"})
+            elif p.path == "/operator/quiesce":
+                if logger is not None:
+                    logger.info("rpc", "operator_quiesce", epoch=manager._gen_epoch)
+                manager.begin_quiescence()
+                self._send(200, {"operation": "quiesce", "status": "ok"})
+                return
+            elif p.path == "/operator/certify_epoch":
+                certificate = body.get("certificate") if isinstance(body, dict) else None
+                epoch = body.get("generation_epoch") if isinstance(body, dict) else None
+                if not certificate or not epoch:
+                    self._send(400, {"error": "certificate and generation_epoch are required"})
+                    return
+                try:
+                    result = manager.certify_epoch(epoch, certificate)
+                except RuntimeError as e:
+                    self._send(409, {"operation": "certify_epoch", "status": "blocked",
+                                      "error": str(e)})
+                    return
+                self._send(200, {"operation": "certify_epoch", "status": "ok",
+                                  "generation_epoch": epoch, **result})
+                return
             elif p.path == "/stop":
                 owner_id = self._owner(body.get("owner_id") if isinstance(body, dict) else None)
                 try:
