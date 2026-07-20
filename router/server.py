@@ -111,7 +111,7 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
     # Constructed here (not threaded through the signature) so every existing caller of
     # make_router_server keeps working unchanged — both take only `registry` (+ router_epoch),
     # already parameters of this function.
-    session_forward = SessionForward(registry)
+    session_forward = SessionForward(registry, ledger=start_path.ledger, store=store)
     restart_path = RestartPath(start_path.ledger, registry)
     operator_routes = OperatorRoutes(registry, router_epoch)
     # S2a.2: the router owns the archive board read. store is threaded from app.py so BoardForward
