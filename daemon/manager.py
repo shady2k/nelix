@@ -336,6 +336,10 @@ class SessionManager:
 
         Pre-lock validation, acquire {active, live} atomically from the router, then
         re-take lock for final validation + session creation.
+
+        Preserves NelixError codes so the daemon RPC layer can relay the proper retryable
+        error envelope (FIX C1). Maps LeaseClient.RouterUnavailable ->
+        NelixError(ADMISSION_UNAVAILABLE).
         """
         owner.validate(owner_id)
         spec = self._specs.get(executor_name)
@@ -365,16 +369,15 @@ class SessionManager:
         try:
             tokens = self._lease_client.acquire(
                 self._gen_id, self._gen_epoch, session_id, 0, {"active", "live"})
-        except (NelixError, LeaseClient.RouterUnavailable) as e:
+        except LeaseClient.RouterUnavailable as e:
             with self._lock:
                 self._pending_acquire.discard(session_id)
-            if isinstance(e, NelixError) and e.code == CONCURRENCY_LIMIT:
-                raise RuntimeError(
-                    "concurrency_limit reached (lease service: active cap)")
-            if isinstance(e, NelixError) and e.code in (ADMISSION_UNAVAILABLE, REBUILDING):
-                raise RuntimeError(
-                    f"lease service unavailable: {e.code}")
-            raise RuntimeError(f"lease acquire failed: {e}") from e
+            raise NelixError(ADMISSION_UNAVAILABLE,
+                             f"lease service unreachable: {e}") from e
+        except NelixError:
+            with self._lock:
+                self._pending_acquire.discard(session_id)
+            raise
         except Exception as e:
             with self._lock:
                 self._pending_acquire.discard(session_id)
@@ -393,10 +396,41 @@ class SessionManager:
                 self._pending_acquire.discard(session_id)
 
     def _release_lease_tokens(self, tokens):
-        """Best-effort release of lease tokens (active + live). Called on rollback paths."""
+        """Best-effort release of lease tokens (active + live). Called on rollback paths.
+
+        ``tokens`` is the dict returned by ``acquire``: ``{"active": {"token_id": ...,
+        "fresh": ...}, "live": ...}``. Only tokens whose ``fresh`` is True are released
+        (idempotent tokens are owned by the original acquirer).
+
+        FIX D: the tokens dict is captured (already built before this call), so no lock is
+        held when the release RPCs fire. Callers must ensure tokens are staged before dropping
+        ``manager._lock``.
+        """
         if self._lease_client is None or not tokens:
             return
-        for tid in tokens.values():
+        for info in tokens.values():
+            if isinstance(info, dict) and info.get("fresh") is False:
+                continue   # idempotent token — original acquirer will release it
+            tid = info.get("token_id") if isinstance(info, dict) else info
+            if tid:
+                try:
+                    self._lease_client.release(tid)
+                except Exception:
+                    if self._logger is not None:
+                        self._logger.warning("manager", "lease_release_error",
+                                             token_id=tid, exc_info=True)
+
+    def _extract_tid(self, info):
+        """Extract token_id from acquire result entry (dict or legacy string)."""
+        if isinstance(info, dict):
+            return info.get("token_id")
+        return info
+
+    def _release_lease_tokens_staged(self, staged):
+        """Release a list of token_ids previously staged under lock. FIX D."""
+        if self._lease_client is None or not staged:
+            return
+        for tid in staged:
             try:
                 self._lease_client.release(tid)
             except Exception:
@@ -571,7 +605,8 @@ class SessionManager:
                         raise RuntimeError(
                             f"concurrency_limit={self._limit} reached "
                             f"(active: {sorted(self._sessions)})")
-                if not reserve and self._idle_count() >= self._idle_limit:
+                # FIX E: when router leases are authoritative, bypass BOTH local caps.
+                if not reserve and lease_tokens is None and self._idle_count() >= self._idle_limit:
                     if self._logger is not None:
                         self._logger.warning("manager", "session_start_rejected",
                                              reason="idle_retained_limit", executor=executor_name)
@@ -599,8 +634,10 @@ class SessionManager:
                 # S3a: store lease tokens on the session for release on idle/terminal.
                 sess._activation_counter = 0
                 if lease_tokens is not None:
-                    active_tid = lease_tokens.get("active")
-                    live_tid = lease_tokens.get("live")
+                    active_info = lease_tokens.get("active") or {}
+                    live_info = lease_tokens.get("live") or {}
+                    active_tid = self._extract_tid(active_info)
+                    live_tid = self._extract_tid(live_info)
                     if active_tid:
                         self._active_lease_tokens[sid] = active_tid
                     if live_tid:
@@ -737,24 +774,22 @@ class SessionManager:
                 if self._logger is not None:
                     self._logger.warning("manager", "restart_stop_error",
                                          session_id=session_id, exc_info=True)
-        # S3a: acquire new leases for the restarted session. _free_slot (called from the old
-        # session's stop path) releases the old leases.
+        # FIX B1: ALWAYS acquire router leases for a restart spawn (both active and terminal
+        # paths). _free_slot (called from the old session's stop path) releases the old leases.
         lease_tokens = None
-        if self._lease_client is not None and still_active:
+        if self._lease_client is not None:
             try:
                 lease_tokens = self._lease_client.acquire(
                     self._gen_id, self._gen_epoch, new_session_id, 0, {"active", "live"})
-            except (NelixError, LeaseClient.RouterUnavailable) as e:
-                if isinstance(e, NelixError) and e.code == CONCURRENCY_LIMIT:
-                    if self._logger is not None:
-                        self._logger.warning("manager", "restart_rejected",
-                                             reason="concurrency_limit",
-                                             session_id=session_id)
-                    return RestartOutcome("start_failed", lineage_id=lineage_id,
-                                          restart_count=count, max_restarts=max_restarts)
+            except (NelixError, LeaseClient.RouterUnavailable):
+                # FIX B2: release _reserved on acquire failure to prevent permanent drift.
+                if still_active:
+                    with self._lock:
+                        self._reserved -= 1
                 if self._logger is not None:
                     self._logger.warning("manager", "restart_rejected",
-                                         reason=str(e), session_id=session_id)
+                                         reason="lease_acquire_failed",
+                                         session_id=session_id)
                 return RestartOutcome("start_failed", lineage_id=lineage_id,
                                       restart_count=count, max_restarts=max_restarts)
         # _spawn OWNS the reservation (reserve=reserve): it consumes it atomically with the insert,
@@ -770,6 +805,9 @@ class SessionManager:
                                   lease_tokens=lease_tokens)
             new_sid, base_seq = started.session_id, started.base_seq
         except Exception as e:
+            # FIX B3: release acquired tokens on _spawn failure (mirrors _lease_start).
+            if lease_tokens is not None:
+                self._release_lease_tokens(lease_tokens)
             self._log_spawn_failure("restart_spawn_failed", session_id, e)
             return RestartOutcome("start_failed", lineage_id=lineage_id,
                                   restart_count=count, max_restarts=max_restarts)
@@ -1073,36 +1111,47 @@ class SessionManager:
 
         # Revalidate under the lock. Keep pending_acquire set until after send_turn
         # completes so a racing thread cannot also acquire a lease for this session.
+        # FIX D: stage tokens under lock, release RPCs outside lock.
         revalidate_ok = False
         active_tid = None
+        active_info = tokens.get("active") or {}
+        is_fresh = active_info.get("fresh", True)
+        stale_tokens = []    # tokens to release outside the lock
+        release_tokens = []  # tokens from rollback to release outside the lock
         with self._lock:
             sess = self._sessions.get(session_id)
             if sess is None:
                 self._pending_acquire.discard(session_id)
-                self._release_lease_tokens(tokens)
-                return RespondOutcome("unknown_session")
-            cstate = sess.snapshot().get("control_state")
-            if cstate != "idle":
-                self._pending_acquire.discard(session_id)
-                self._release_lease_tokens(tokens)
+                # Only release tokens that WE acquired freshly (FIX A: idempotent tokens
+                # are owned by the original acquirer; releasing them would under-count).
+                if is_fresh:
+                    release_tokens = [active_info.get("token_id")] if active_info else []
+            else:
+                cstate = sess.snapshot().get("control_state")
+                if cstate != "idle":
+                    self._pending_acquire.discard(session_id)
+                    if is_fresh:
+                        release_tokens = [active_info.get("token_id")] if active_info else []
+                else:
+                    # Commit: store the new active token (replacing any stale one).
+                    active_tid = active_info.get("token_id")
+                    if active_tid:
+                        old = self._active_lease_tokens.pop(session_id, None)
+                        if old is not None:
+                            stale_tokens.append(old)
+                        self._active_lease_tokens[session_id] = active_tid
+                    revalidate_ok = True
+
+        # Release staged tokens outside the lock (FIX D).
+        if release_tokens:
+            self._release_lease_tokens_staged(release_tokens)
+        for old_tid in stale_tokens:
+            try:
+                self._lease_client.release(old_tid)
+            except Exception:
                 if self._logger is not None:
-                    self._logger.warning("manager", "send_turn_rejected",
-                                         reason="not_idle_revalidate",
-                                         session_id=session_id)
-                return RespondOutcome("no_pending")
-            # Commit: store the new active token (replacing any stale one).
-            active_tid = tokens.get("active")
-            if active_tid:
-                old = self._active_lease_tokens.pop(session_id, None)
-                if old is not None:
-                    try:
-                        self._lease_client.release(old)
-                    except Exception:
-                        if self._logger is not None:
-                            self._logger.warning("manager", "lease_release_error",
-                                                 session_id=session_id, exc_info=True)
-                self._active_lease_tokens[session_id] = active_tid
-            revalidate_ok = True
+                    self._logger.warning("manager", "lease_release_error",
+                                         session_id=session_id, exc_info=True)
 
         if not revalidate_ok:
             return RespondOutcome("no_pending")

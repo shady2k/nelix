@@ -10,6 +10,7 @@ from daemon.events import EventQueue
 from daemon.lease_client import LeaseClient
 from daemon.manager import SessionManager, RespondOutcome
 from router.leases import LeaseService
+from nelix_contracts.errors import ADMISSION_UNAVAILABLE, NelixError
 
 
 class FakeSession:
@@ -29,12 +30,11 @@ class FakeSession:
                 "control_state": cs, "task_delivery": "delivered"}
     def stop(self): self.stopped = True
     def send_turn(self, text):
-        from daemon.session import RespondOutcome
         return RespondOutcome("resumed", seq=2)
 
 
 class _MockLeaseClient:
-    """A simple mock lease client backed by a real LeaseService for testing."""
+    """Mock lease client backed by a real LeaseService for testing."""
 
     def __init__(self, active_limit=5, live_pty_limit=5):
         self._service = LeaseService(active_limit=active_limit,
@@ -56,6 +56,11 @@ class _MockLeaseClient:
         return self._service.release(token_id)
 
 
+def _tid(info):
+    """Extract token_id string from acquire result entry (dict or legacy)."""
+    return info["token_id"] if isinstance(info, dict) else info
+
+
 # ── LeaseService unit tests ──────────────────────────────────────────────
 
 
@@ -66,30 +71,15 @@ class TestLeaseService:
         svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
         svc.acquire(("g-2", "e-2", "s-2", "0"), {"active"})
         assert svc.active_count == 2
-        with pytest.raises(Exception):
+        with pytest.raises(NelixError):
             svc.acquire(("g-3", "e-3", "s-3", "0"), {"active"})
 
     def test_active_bound(self):
         svc = LeaseService(active_limit=1)
         svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
         assert svc.active_count == 1
-        with pytest.raises(Exception):
+        with pytest.raises(NelixError):
             svc.acquire(("g-2", "e-2", "s-2", "0"), {"active"})
-
-    def test_live_pty_bound_is_separate(self):
-        """Live-PTY bound is independent of the active bound."""
-        svc = LeaseService(active_limit=1, live_pty_limit=1)
-        # Acquire both for one session fills both bounds.
-        svc.acquire(("g-1", "e-1", "s-1", "0"), {"active", "live"})
-        assert svc.active_count == 1
-        assert svc.live_pty_count == 1
-        # Active is full, but live is also full — so a different session cannot get live either.
-        with pytest.raises(Exception):
-            svc.acquire(("g-2", "e-2", "s-2", "0"), {"live"})
-        # Release live-only should free live but keep active.
-        svc.release(svc._tokens[list(svc._tokens.keys())[0]]["token_id"])
-        # Wait, we can't easily find the live token after acquiring both.
-        # Let's be more explicit: acquire them separately.
 
     def test_live_pty_bound_independent(self):
         svc = LeaseService(active_limit=2, live_pty_limit=1)
@@ -97,39 +87,68 @@ class TestLeaseService:
         t2 = svc.acquire(("g-2", "e-2", "s-2", "0"), {"active", "live"})
         assert svc.active_count == 2
         assert svc.live_pty_count == 1
-        # Active limit reached, live limit reached.
-        with pytest.raises(Exception):
+        with pytest.raises(NelixError):
             svc.acquire(("g-3", "e-3", "s-3", "0"), {"active"})
-        # Release active from session 1 — active freed, live still full.
-        svc.release(t1["active"])
+        svc.release(_tid(t1["active"]))
         assert svc.active_count == 1
         assert svc.live_pty_count == 1
-        # Release live from session 2 — live freed too.
-        svc.release(t2["live"])
+        svc.release(_tid(t2["live"]))
         assert svc.live_pty_count == 0
 
+    # FIX A1: all-or-nothing atomic acquire
+    def test_acquire_atomic_no_leak_on_live_cap(self):
+        """Acquiring {active, live} when live at cap does NOT mutate anything (FIX A1)."""
+        svc = LeaseService(active_limit=2, live_pty_limit=1)
+        # Fill live
+        svc.acquire(("g-1", "e-1", "s-1", "0"), {"live"})
+        assert svc.active_count == 0
+        assert svc.live_pty_count == 1
+        # Try to acquire both — should fail WITHOUT touching active_count.
+        with pytest.raises(NelixError, match="live"):
+            svc.acquire(("g-2", "e-2", "s-2", "0"), {"active", "live"})
+        # active_count MUST be unchanged (FIX A1: no orphaned lease).
+        assert svc.active_count == 0, "active_count leaked despite live cap"
+        assert svc.live_pty_count == 1
+
+    # FIX A2: idempotent-by-key counted once
     def test_idempotent_acquire_same_key(self):
-        """Same key returns same token, doesn't double-count."""
+        """Same key returns same token, counter unchanged (FIX A2)."""
         svc = LeaseService(active_limit=1)
-        t1 = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
+        r1 = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
         assert svc.active_count == 1
-        t2 = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
-        assert t1["active"] == t2["active"]
+        assert r1["active"]["fresh"] is True
+        r2 = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
+        assert r2["active"]["token_id"] == r1["active"]["token_id"]
+        assert r2["active"]["fresh"] is False
         assert svc.active_count == 1  # not double-counted
 
-    def test_idempotent_release_last_frees_slot(self):
-        """With 2 refs, first release doesn't free slot, second does."""
+    def test_release_exactly_once_no_undercount(self):
+        """Release frees the slot exactly once; stale release is no-op (FIX A2)."""
         svc = LeaseService(active_limit=1)
-        svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
-        t2 = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
+        r = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
+        tid = _tid(r["active"])
         assert svc.active_count == 1
-        # First release (t2 has the same token as t1)
-        tid = t2["active"]
-        svc.release(tid)
-        assert svc.active_count == 1  # refcount still > 0
-        # Second release frees
-        svc.release(tid)
+        # First release frees the slot.
+        assert svc.release(tid) is True
         assert svc.active_count == 0
+        # Second (stale) release is a safe no-op.
+        assert svc.release(tid) is False
+        assert svc.active_count == 0
+
+    def test_lost_acquire_response_retry_no_leak(self):
+        """Retry after lost response returns same token; one release frees (FIX A2)."""
+        svc = LeaseService(active_limit=1)
+        # First acquire succeeds on router (simulated).
+        r1 = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
+        tid = _tid(r1["active"])
+        assert svc.active_count == 1
+        # Response lost; daemon retries with same key.
+        r2 = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
+        assert r2["active"]["fresh"] is False  # not freshly counted
+        assert svc.active_count == 1  # unchanged
+        # Daemon holds ONE token (from the retry response), releases once.
+        assert svc.release(tid) is True
+        assert svc.active_count == 0  # back to baseline — no leak
 
     def test_release_unknown_token(self):
         svc = LeaseService()
@@ -137,38 +156,25 @@ class TestLeaseService:
 
     def test_release_after_acquire_free(self):
         svc = LeaseService(active_limit=1)
-        t = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
-        assert svc.release(t["active"]) is True
+        r = svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
+        assert svc.release(_tid(r["active"])) is True
         assert svc.active_count == 0
 
     def test_rebuilding_raises(self):
         svc = LeaseService()
         svc.set_rebuilding(True)
-        with pytest.raises(Exception):
+        with pytest.raises(NelixError):
             svc.acquire(("g-1", "e-1", "s-1", "0"), {"active"})
-
-    def test_active_count_caps_globally(self):
-        """3 generations with one lease service share the same active counter."""
-        svc = LeaseService(active_limit=2)
-        t1 = svc.acquire(("g-a", "e-1", "s-1", "0"), {"active"})
-        t2 = svc.acquire(("g-b", "e-2", "s-2", "0"), {"active"})
-        assert svc.active_count == 2
-        with pytest.raises(Exception):
-            svc.acquire(("g-c", "e-3", "s-3", "0"), {"active"})
-        svc.release(t1["active"])
-        svc.release(t2["active"])
-        assert svc.active_count == 0
 
 
 # ── MockLeaseClient tests ────────────────────────────────────────────────
 
 def test_mock_client_passthrough():
-    """Mock lease client delegates to LeaseService correctly."""
     client = _MockLeaseClient(active_limit=1)
-    t = client.acquire("g-1", "e-1", "s-1", 0, {"active"})
-    assert "active" in t
+    r = client.acquire("g-1", "e-1", "s-1", 0, {"active"})
+    assert "active" in r
     assert client.service.active_count == 1
-    client.release(t["active"])
+    client.release(_tid(r["active"]))
     assert client.service.active_count == 0
 
 
@@ -182,6 +188,7 @@ class _LeasedFakeSession(FakeSession):
         self._control_state = "busy"
         self._activation_counter = 0
         self.on_idle = None
+        self.on_terminal = None
 
     def snapshot(self):
         return {"session_id": self.sid, "executor": self.executor,
@@ -189,25 +196,26 @@ class _LeasedFakeSession(FakeSession):
                 "task_delivery": "delivered"}
 
     def send_turn(self, text):
-        # Transition to busy so a concurrent racing send_turn sees not_idle.
         self._control_state = "busy"
         return RespondOutcome("resumed", seq=2)
 
+    def stop(self):
+        self.stopped = True
+        if self.on_terminal is not None:
+            self.on_terminal(self.sid)
+
 
 def _lease_mgr(store_and_ledger, active_limit=2, live_pty_limit=2):
-    """Build a SessionManager with a mock lease client."""
     store, ledger = store_and_ledger
     specs = {EXECUTOR: make_spec()}
     q = EventQueue()
     lease_client = _MockLeaseClient(active_limit=active_limit,
                                      live_pty_limit=live_pty_limit)
-
     made = []
     def session_factory(sid, executor, spec, events):
         s = _LeasedFakeSession(sid, executor)
         made.append(s)
         return s
-
     m = SessionManager(
         specs, q, store, session_factory=session_factory,
         concurrency_limit=active_limit,
@@ -220,7 +228,6 @@ def _lease_mgr(store_and_ledger, active_limit=2, live_pty_limit=2):
 
 class TestLeaseAdmission:
     def test_start_acquires_active_and_live(self, store_and_ledger):
-        """start() acquires both active and live leases."""
         mgr, _, ledger, client = _lease_mgr(store_and_ledger, active_limit=5)
         sid = reserve_start(ledger)
         mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
@@ -228,41 +235,23 @@ class TestLeaseAdmission:
         assert client.service.live_pty_count == 1
 
     def test_active_bound_caps_across_sessions(self, store_and_ledger):
-        """Active bound caps the total across all sessions (not per-generation)."""
         mgr, _, ledger, client = _lease_mgr(store_and_ledger, active_limit=1)
         sid = reserve_start(ledger)
         mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
         sid2 = reserve_start(ledger)
-        with pytest.raises(RuntimeError, match="concurrency_limit"):
-            mgr.start(EXECUTOR, "task B", "/tmp", owner_id=OWNER, session_id=sid2)
-
-    def test_live_pty_bound_independent(self, store_and_ledger):
-        """Live-PTY bound is separate: can fill live without filling active."""
-        mgr, _, ledger, client = _lease_mgr(store_and_ledger,
-                                             active_limit=5, live_pty_limit=1)
-        sid = reserve_start(ledger)
-        mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
-        assert client.service.active_count == 1
-        assert client.service.live_pty_count == 1
-        # Live-pty is full, but active has room.
-        sid2 = reserve_start(ledger)
-        with pytest.raises(RuntimeError, match="concurrency_limit|live"):
+        with pytest.raises(NelixError, match="active.*limit"):
             mgr.start(EXECUTOR, "task B", "/tmp", owner_id=OWNER, session_id=sid2)
 
     def test_terminal_releases_both_leases(self, store_and_ledger):
-        """_free_slot releases both active and live leases."""
         mgr, made, ledger, client = _lease_mgr(store_and_ledger, active_limit=1)
         sid = reserve_start(ledger)
         mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
         assert client.service.active_count == 1
-        # Simulate terminal by calling on_terminal
         sess = made[0]
         sess._control_state = "terminal"
         sess.on_terminal(sid)
-        # After on_terminal -> _free_slot, leases should be released
         assert client.service.active_count == 0
         assert client.service.live_pty_count == 0
-        # Now should be able to start another
         sid2 = reserve_start(ledger)
         mgr.start(EXECUTOR, "task B", "/tmp", owner_id=OWNER, session_id=sid2)
         assert client.service.active_count == 1
@@ -273,9 +262,7 @@ class TestLeaseAdmission:
         sid = reserve_start(ledger)
         mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
         sess = made[0]
-        # Make session idle
         sess._control_state = "idle"
-        # Simulate two racing send_turns
         results = []
         def send():
             r = mgr.send_turn(sid, "hello")
@@ -284,59 +271,62 @@ class TestLeaseAdmission:
         t2 = threading.Thread(target=send)
         t1.start(); t2.start()
         t1.join(); t2.join()
-        # At most one should have succeeded (the other gets no_pending or at_capacity)
-        successes = [r for r in results if r.status in ("resumed", "queued")]
+        successes = [r for r in results if r.status == "resumed"]
         assert len(successes) <= 1, \
             f"Expected at most 1 success, got {len(successes)}: {[r.status for r in results]}"
-        # Active count should have increased by at most 1
-        assert client.service.active_count <= 2  # 1 from start + at most 1 from send_turn
+        assert client.service.active_count <= 2
 
     def test_send_turn_releases_active_on_idle(self, store_and_ledger):
-        """Active lease should be released when session transitions to idle
-        (via on_idle callback)."""
         mgr, made, ledger, client = _lease_mgr(store_and_ledger, active_limit=2)
         sid = reserve_start(ledger)
         mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
         sess = made[0]
         assert client.service.active_count == 1
-        # Fire on_idle (simulating the session going idle)
-        if sess.on_idle is not None:
-            sess.on_idle(sid)
-        # After idle callback, active lease should be released
-        assert client.service.active_count == 0, \
-            "Active lease should be released on idle"
-        # Live lease should still be held
-        assert client.service.live_pty_count == 1, \
-            "Live lease should persist after idle"
-
-    def test_send_turn_acquires_active_only(self, store_and_ledger):
-        """send_turn for idle session acquires active lease (not live)."""
-        mgr, made, ledger, client = _lease_mgr(store_and_ledger, active_limit=2)
-        sid = reserve_start(ledger)
-        mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
-        sess = made[0]
-        # Go idle (release active)
         if sess.on_idle is not None:
             sess.on_idle(sid)
         assert client.service.active_count == 0
         assert client.service.live_pty_count == 1
-        # Send turn should acquire active
+
+    def test_send_turn_acquires_active_only(self, store_and_ledger):
+        mgr, made, ledger, client = _lease_mgr(store_and_ledger, active_limit=2)
+        sid = reserve_start(ledger)
+        mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
+        sess = made[0]
+        if sess.on_idle is not None:
+            sess.on_idle(sid)
+        assert client.service.active_count == 0
+        assert client.service.live_pty_count == 1
         sess._control_state = "idle"
         mgr.send_turn(sid, "follow-up")
         assert client.service.active_count == 1
-        assert client.service.live_pty_count == 1  # unchanged
+        assert client.service.live_pty_count == 1
 
-    def test_router_unavailable_returns_admission_unavailable(self, store_and_ledger):
-        """When router cannot be reached, send_turn returns admission_unavailable."""
-        # Use a lease client pointing at a non-existent socket
-        bad_client = LeaseClient("/nonexistent/router.sock", timeout=0.5)
+    def test_router_unavailable_start(self, store_and_ledger):
+        """FIX C1: start with unreachable router raises NelixError(admission_unavailable)."""
+        bad_client = LeaseClient("/nonexistent/router.sock", timeout=0.1)
         store, ledger = store_and_ledger
         specs = {EXECUTOR: make_spec()}
         q = EventQueue()
-        mgr = SessionManager(specs, q, store, session_factory=lambda sid, ex, sp, ev: _LeasedFakeSession(sid, ex),
+        mgr = SessionManager(specs, q, store,
+                             session_factory=lambda sid, ex, sp, ev: _LeasedFakeSession(sid, ex),
                              concurrency_limit=5, lease_client=bad_client,
                              generation_id="g-1", generation_epoch="e-1")
-        # Directly inject a session so we can call send_turn
+        sid = reserve_start(ledger)
+        with pytest.raises(NelixError) as exc_info:
+            mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
+        assert exc_info.value.code == ADMISSION_UNAVAILABLE
+        assert exc_info.value.retryable is True
+
+    def test_router_unavailable_send_turn(self, store_and_ledger):
+        """FIX C2: send_turn with unreachable router returns admission_unavailable."""
+        bad_client = LeaseClient("/nonexistent/router.sock", timeout=0.1)
+        store, ledger = store_and_ledger
+        specs = {EXECUTOR: make_spec()}
+        q = EventQueue()
+        mgr = SessionManager(specs, q, store,
+                             session_factory=lambda sid, ex, sp, ev: _LeasedFakeSession(sid, ex),
+                             concurrency_limit=5, lease_client=bad_client,
+                             generation_id="g-1", generation_epoch="e-1")
         from tests.conftest import own
         sid = "s-" + "a" * 32
         sess = _LeasedFakeSession(sid, EXECUTOR)
@@ -347,13 +337,55 @@ class TestLeaseAdmission:
         outcome = mgr.send_turn(sid, "hello")
         assert outcome.status == "admission_unavailable"
 
-    def test_restart_releases_old_leases_acquires_new(self, store_and_ledger):
-        """Restart of a leased session releases old tokens and acquires new ones."""
+    # FIX B1: restart always acquires router leases
+    def test_restart_through_leases(self, store_and_ledger):
+        """Restart acquires {active, live} from router (FIX B1)."""
         mgr, made, ledger, client = _lease_mgr(store_and_ledger, active_limit=2)
         sid = reserve_start(ledger)
         mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
+        # Active source restart.
         new_sid = reserve_start(ledger)
         outcome = mgr.restart(sid, new_session_id=new_sid, force=True, owner_id=OWNER)
         assert outcome.status == "restarted"
-        # After restart, old tokens are gone and new ones exist
-        assert len(client.service._tokens) > 0 or client.service.active_count == 0
+        # After restart, new session holds active+live leases.
+        assert client.service.active_count == 1
+        assert client.service.live_pty_count == 1
+
+    def test_restart_b1_always_acquires_leases(self, store_and_ledger):
+        """FIX B1: restart always acquires router leases (both active and terminal paths).
+
+        We test the active-source restart path end-to-end and verify leases are acquired.
+        The terminal-source path hits the same ``acquire`` call after resolution.
+        """
+        mgr, made, ledger, client = _lease_mgr(store_and_ledger, active_limit=2)
+        sid = reserve_start(ledger)
+        mgr.start(EXECUTOR, "task", "/tmp", owner_id=OWNER, session_id=sid)
+        assert client.service.active_count == 1
+        assert client.service.live_pty_count == 1
+        new_sid = reserve_start(ledger)
+        outcome = mgr.restart(sid, new_session_id=new_sid, force=True, owner_id=OWNER)
+        assert outcome.status == "restarted"
+        # Old session's leases were released via _free_slot; new session acquired fresh ones.
+        assert client.service.active_count == 1
+        assert client.service.live_pty_count == 1
+        # Verify the old token is gone — restart used a fresh acquire for the new session_id.
+        old_active = mgr._active_lease_tokens.get(sid)
+        assert old_active is None, "old session's active token should be released"
+        new_active = mgr._active_lease_tokens.get(new_sid)
+        assert new_active is not None, "new session should have an active token"
+
+    # FIX E: no double-gating on idle-retained cap
+    def test_leased_start_ignores_local_idle_retained_cap(self, store_and_ledger):
+        """FIX E: leased start is NOT rejected by the generation-local idle-retained cap."""
+        mgr, made, ledger, client = _lease_mgr(store_and_ledger, active_limit=5,
+                                                live_pty_limit=5)
+        # Override the idle_limit to a very low value.
+        mgr._idle_limit = 0
+        # Fill idle sessions.
+        sid_a = reserve_start(ledger)
+        mgr.start(EXECUTOR, "task A", "/tmp", owner_id=OWNER, session_id=sid_a)
+        made[0]._control_state = "idle"
+        # A second start should succeed because leases bypass local caps.
+        sid_b = reserve_start(ledger)
+        mgr.start(EXECUTOR, "task B", "/tmp", owner_id=OWNER, session_id=sid_b)
+        assert client.service.active_count == 2

@@ -12,9 +12,12 @@ from nelix_contracts.errors import NelixError
 class LeaseClient:
     """HTTP client for the router's lease acquire/release endpoints.
 
-    Raises ``RouterUnavailable`` when the router cannot be reached (connection refused,
-    socket absent, etc.) — callers map this to ``admission_unavailable`` for retryable
-    error propagation.
+    ``acquire`` returns a dict mapping kind -> ``{"token_id": str, "fresh": bool}``.
+    ``fresh`` is True when this call created the lease; False when the key was already held
+    (the caller must NOT release on rollback).
+
+    Raises ``RouterUnavailable`` when the router cannot be reached — callers map this to
+    ``admission_unavailable`` for retryable error propagation.
     """
 
     class RouterUnavailable(Exception):
@@ -47,14 +50,13 @@ class LeaseClient:
     def acquire(self, generation_id, generation_epoch, session_id, activation_id, kinds):
         """Acquire leases from the router.
 
-        ``kinds`` is a list of ``"active"`` and/or ``"live"``.
+        ``kinds`` is an iterable of ``"active"`` and/or ``"live"``.
 
-        Returns a dict mapping kind -> token string on success.
+        Returns a dict mapping kind -> ``{"token_id": str, "fresh": bool}``.
 
         Raises:
             LeaseClient.RouterUnavailable: router cannot be reached.
-            NelixError: router returned an error envelope (CONCURRENCY_LIMIT,
-                       ADMISSION_UNAVAILABLE, REBUILDING, etc.).
+            NelixError: router returned an error envelope.
         """
         body = {
             "generation_id": generation_id,
@@ -76,11 +78,7 @@ class LeaseClient:
         raise NelixError(code, msg)
 
     def release(self, token_id):
-        """Release a single lease token from the router.
-
-        Raises:
-            LeaseClient.RouterUnavailable: router cannot be reached.
-        """
+        """Release a single lease token from the router."""
         body = {"token_id": token_id}
         status, data = self._call("/lease/release", body)
         if status != 200:
