@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from nelix_contracts.errors import GENERATION_UNAVAILABLE, IDEMPOTENCY_CONFLICT, NelixError
+from nelix_contracts.errors import GENERATION_UNAVAILABLE, IDEMPOTENCY_CONFLICT, UNKNOWN_SESSION, NelixError
 from nelix_contracts.ids import new_generation_id
 
 from generation_supervisor import GenerationSupervisor
@@ -665,8 +665,49 @@ class GenerationRegistry:
             "incarnation": current_incarnation, "epoch": epoch,
             "generation_id": gid, "transport": transport, "build_id": build_id,
         }
+        self._bump_topology_locked()
         return GenerationHandle(generation_id=gid, epoch=epoch, transport=transport,
                                 build_id=build_id, incarnation=current_incarnation)
+
+    # ── generation resolution by (id, epoch) ──────────────────────────────
+
+    def resolve_generation_state(self, generation_id: str, generation_epoch: str):
+        """Resolve a generation by (id, epoch), returning state info.
+
+        Returns (process_state, lifecycle_state, capability_snapshot, handle_or_None).
+        When process_state is 'serving' and the generation matches the active one,
+        a GenerationHandle is returned for forwarding.
+        """
+        if self._store is None:
+            return None, None, None, None
+
+        gen_rec = self._store.get_generation(generation_id)
+        epochs = self._store.list_epochs(generation_id)
+        epoch_rec = next((e for e in epochs if e.generation_epoch == generation_epoch), None)
+        if epoch_rec is None:
+            raise NelixError(UNKNOWN_SESSION,
+                             f"epoch {generation_epoch} not found for generation {generation_id}")
+
+        proc_state = epoch_rec.process_state
+        lc_state = gen_rec.lifecycle_state
+        cap_snap = gen_rec.capability_snapshot
+
+        handle = None
+        if proc_state == "serving":
+            with self._lock:
+                if self._active is not None:
+                    a = self._active
+                    if a["generation_id"] == generation_id and a["epoch"] == generation_epoch:
+                        try:
+                            handle = self._refresh_active_locked()
+                        except NelixError:
+                            pass
+        return proc_state, lc_state, cap_snap, handle
+
+    # ── topology revision ────────────────────────────────────────────────
+
+    def _bump_topology_locked(self):
+        self._topology_revision += 1
 
     # ── compat path (test mock) ───────────────────────────────────────────
 

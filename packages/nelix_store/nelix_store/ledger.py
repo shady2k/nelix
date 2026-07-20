@@ -258,6 +258,19 @@ class StartLedger:
                 (reason, session_id))
 
     @translates_sqlite
+    def get_session_generation(self, session_id: str) -> "tuple[str, str]":
+        """Return (generation_id, generation_epoch) for a session, or raise UNKNOWN_SESSION."""
+        try:
+            validate_session_id(session_id)
+        except InvalidId as e:
+            raise NelixError(INVALID_REQUEST, str(e)) from None
+        row = self._require(session_id)
+        if row["generation_id"] is None:
+            raise NelixError(UNKNOWN_SESSION,
+                             f"session {session_id} has no generation assigned")
+        return row["generation_id"], row["generation_epoch"]
+
+    @translates_sqlite
     def sessions_for_orchestration(self, owner_id: str, orchestration_id: str) -> "list[str]":
         """The session_ids reserved under (owner_id, orchestration_id) that are CANDIDATES TO WAIT
         ON — state in ('starting', 'started'), 'failed' excluded (a failed start never acquired a
