@@ -120,7 +120,8 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
     board_forward = BoardForward(registry, router_epoch, store=store, archive_epoch=archive_epoch)
     # The orchestration /wait waiter (3c.3b). Wired off the SAME shared StartLedger as the start
     # path (start_path.ledger) — one instance, never per-request (nelix-91y).
-    wait_forward = WaitForward(start_path.ledger, registry, router_epoch)
+    wait_forward = WaitForward(start_path.ledger, registry, router_epoch,
+                                store=store, archive_epoch=archive_epoch)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):

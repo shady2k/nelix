@@ -214,6 +214,17 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
             elif p.path == "/wait":
                 qs = parse_qs(p.query)
                 after = self._int(qs.get("after_seq", ["0"])[0], 0)
+                # S2a.3: optional bounded timeout so the router can multiplex the generation wait
+                # with archive-board polling (short timeouts, loop). Default 25s preserves
+                # byte-for-byte backward compatibility.
+                raw_timeout = qs.get("timeout", [None])[0]
+                if raw_timeout is not None:
+                    try:
+                        wait_timeout = float(raw_timeout)
+                    except (TypeError, ValueError):
+                        wait_timeout = 25.0
+                else:
+                    wait_timeout = 25.0
                 # ALL session_id values: ONE param = the single-session /wait (backward compatible,
                 # unchanged below); repeated params = the router's MULTI-SESSION orchestration wait
                 # (3c.3b — one waiter for an orchestration's N sessions).
@@ -247,7 +258,7 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                                          "hint": "unknown session, or not this owner's; a wait on it"
                                                  " would never wake. Do not retry."})
                         return
-                    evt = manager._events.wait_event(after_seq=after, timeout=25, session_id=sid)
+                    evt = manager._events.wait_event(after_seq=after, timeout=wait_timeout, session_id=sid)
                 else:
                     # ------------------------------- multi-session (orchestration) /wait (3c.3b)
                     # Shape-check EACH sid BEFORE any of them resolves `sessions_root() / sid`, same
@@ -267,8 +278,8 @@ def make_server(manager, transport, logger=None, *, clock=time.monotonic):
                                          "hint": "no session in the set is this owner's; a wait on"
                                                  " it would never wake. Do not retry."})
                         return
-                    evt = manager._events.wait_event_any(after_seq=after, timeout=25,
-                                                         session_ids=owned)
+                    evt = manager._events.wait_event_any(after_seq=after, timeout=wait_timeout,
+                                                             session_ids=owned)
                 if evt is CURSOR_EXPIRED:
                     # The cursor fell off the back of the bounded ring: events this waiter never saw
                     # were evicted. Answer with an EXPLICIT resync marker (not a silent event:null),

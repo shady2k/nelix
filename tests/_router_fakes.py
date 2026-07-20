@@ -127,7 +127,8 @@ class Backend:
                 elif path == "/wait":
                     ids = qs.get("session_id", [])
                     backend.wait_calls.append({"after_seq": one("after_seq"),
-                                               "session_ids": ids, "owner_id": owner_id})
+                                               "session_ids": ids, "owner_id": owner_id,
+                                               "timeout": one("timeout")})
                     owned = [s for s in dict.fromkeys(ids) if self._owned(s, owner_id)]
                     if not owned:
                         self._send(404, {"error": "unknown session",
