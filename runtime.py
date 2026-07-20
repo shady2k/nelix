@@ -137,17 +137,23 @@ def _core_version(wheel) -> str:
     return Path(wheel).name.split("-")[1]
 
 
-def build_id(wheel, interp_id: str, lock=RUNTIME_LOCK) -> str:
+def build_id(wheel, interp_id: str, lock=RUNTIME_LOCK, *, extra_wheels=()) -> str:
     """The identity of everything that determines what code a generation runs: the core's payload,
-    its pinned third-party closure, and the interpreter. Change any one and you have a different
-    runtime that must live in a different directory — that is the whole mechanism.
+    the FIRST-PARTY wheels shipped alongside it (nelix_store, nelix_contracts — nelix-m78), its
+    pinned third-party closure, and the interpreter. Change any one and you have a different runtime
+    that must live in a different directory — that is the whole mechanism.
 
     Content-addressed rather than sequential so `install()` is idempotent: installing the same
-    inputs twice is a no-op on the second call rather than a second 78MB copy.
+    inputs twice is a no-op on the second call rather than a second 78MB copy. The first-party wheels
+    are folded in by their sorted `wheel_digest`, so the id does not depend on the order they were
+    passed and an empty `extra_wheels` reproduces the pre-nelix-m78 id exactly.
     """
     h = hashlib.sha256()
     for part in (wheel_digest(wheel), Path(lock).read_bytes().decode(), interp_id):
         h.update(part.encode() if isinstance(part, str) else part)
+        h.update(b"\0")
+    for d in sorted(wheel_digest(ew) for ew in extra_wheels):
+        h.update(d.encode())
         h.update(b"\0")
     return f"{_core_version(wheel)}-{h.hexdigest()[:_BUILD_ID_HASH_LEN]}"
 

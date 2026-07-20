@@ -105,6 +105,35 @@ def test_build_id_carries_the_readable_core_version(tmp_path):
     assert runtime.build_id(_wheel(tmp_path, version="2.5.0"), "i").startswith("2.5.0-")
 
 
+def test_build_id_changes_when_a_first_party_wheel_changes(tmp_path):
+    """nelix-m78: the build id must cover nelix_store / nelix_contracts, not just the core wheel.
+    Same core wheel + interpreter + lock; a different first-party (extra) wheel -> different id."""
+    w = _wheel(tmp_path)
+    (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir()
+    store_a = _wheel(tmp_path / "a", payload=b"store-a")
+    store_b = _wheel(tmp_path / "b", payload=b"store-b")
+    assert runtime.build_id(w, "i", extra_wheels=[store_a]) != \
+           runtime.build_id(w, "i", extra_wheels=[store_b])
+
+
+def test_build_id_over_first_party_wheels_is_idempotent_and_order_independent(tmp_path):
+    """Identical first-party content -> identical id (so reinstalling identical inputs is a no-op),
+    and the ORDER the wheels are passed in must not change the id."""
+    w = _wheel(tmp_path)
+    (tmp_path / "s").mkdir(); (tmp_path / "c").mkdir()
+    s = _wheel(tmp_path / "s", payload=b"store")
+    c = _wheel(tmp_path / "c", payload=b"contracts")
+    assert runtime.build_id(w, "i", extra_wheels=[s, c]) == \
+           runtime.build_id(w, "i", extra_wheels=[c, s])
+
+
+def test_build_id_without_extra_wheels_is_unchanged(tmp_path):
+    """Backward-compat: the empty-extra-wheels path must equal the bare call, so existing callers
+    and prior runtimes' identities are preserved."""
+    w = _wheel(tmp_path)
+    assert runtime.build_id(w, "i", extra_wheels=[]) == runtime.build_id(w, "i")
+
+
 # ---------------------------------------------------------------- commit semantics
 
 def test_a_runtime_without_a_manifest_is_not_installed():
