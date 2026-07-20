@@ -732,6 +732,16 @@ class TestRetireEndToEnd:
                                   "b-1", incarnation={"pid": 1, "start_fingerprint": "fp"})
 
         operator = OperatorRoutes(registry, "r-test", store=store)
+        # Inject a controllable reap function for deterministic test
+        reap_called_with = []
+        def _fake_reap(gen_id, ep):
+            reap_called_with.append((gen_id, ep))
+            return True  # success
+        operator._reap_fn = _fake_reap
+
+        # Verify session is in _terminal_pending before retirement
+        assert sid in mgr._terminal_pending, \
+            "session should be in terminal_pending after persist"
 
         # Drive retire end-to-end
         status, body = operator.retire(gid)
@@ -753,6 +763,52 @@ class TestRetireEndToEnd:
         ep_records = store.list_epochs(gid)
         certified = [e for e in ep_records if e.retirement_state == "certified"]
         assert len(certified) == 1
+
+        # Verify reap was called with the right incarnation
+        assert len(reap_called_with) == 1
+        assert reap_called_with[0][0] == gid
+        assert reap_called_with[0][1] == epoch
+
+        # Verify _terminal_pending is drained
+        assert sid not in mgr._terminal_pending, \
+            "terminal_pending should be empty after confirmed resolve"
+
+        # ADD: test reap refusal blocks retirement
+        operator2 = OperatorRoutes(registry, "r-test", store=store)
+        refused = []
+        def _refuse_reap(gen_id, ep):
+            refused.append((gen_id, ep))
+            return False
+        operator2._reap_fn = _refuse_reap
+
+        # Reset the generation to pre-retire state for the blocked test
+        gid2 = new_generation_id()
+        epoch2 = new_generation_id()
+        store.create_generation(gid2, build_id="b-1", lifecycle_state=DRAINING,
+                                capability_snapshot=None, created_at=1000.0)
+        store.insert_epoch(epoch2, gid2, incarnation_meta=None, created_at=1000.0)
+        store.cas_epoch_serving(gid2, epoch2, expected_current_epoch=None,
+                                incarnation_meta='{"pid": 99999, "start_fingerprint": "fp"}')
+        # Register and drive — should block on reap
+        registry2 = GenerationRegistry(supervisor=Supervisor(daemon_transport))
+        registry2.adopt_generation(gid2, epoch2, daemon_transport,
+                                   "b-1", incarnation={"pid": 99999, "start_fingerprint": "fp"})
+        operator2._registry = registry2  # ensure registry has the gen
+
+        # Pre-certify so we get past the certify phase
+        store.set_epoch_retirement(epoch2, retirement_state="certified",
+                                   certificate="test-cert", final_high_water=0)
+        store.set_generation_confirmed_high_water(epoch2, 0)
+
+        status2, body2 = operator2.retire(gid2)
+        assert status2 == 200
+        assert body2["status"] == "blocked"
+        assert "reap_refused_or_failed" in body2.get("blockers", [])
+        assert len(refused) == 1
+        # Verify current_epoch NOT cleared
+        gen2 = store.get_generation(gid2)
+        assert gen2.current_epoch == epoch2, \
+            "current_epoch must NOT be cleared when reap refused"
 
         server.shutdown()
         store.close()

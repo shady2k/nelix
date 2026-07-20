@@ -729,8 +729,15 @@ def _force_kill(pid: int) -> bool:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Check if a process is alive. EPERM (PermissionError) → alive (exists).
+    ESRCH (ProcessLookupError) → dead. Any other error → alive (fail-closed:
+    cannot prove death → reap_holder refuses → retire blocks)."""
     try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
