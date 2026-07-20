@@ -184,12 +184,12 @@ class TestOperatorRoutes:
         assert states[g1] == ACTIVE
         assert states[g2] == DRAINING
 
-    def test_retire_is_feature_disabled(self, ops):
+    def test_retire_requires_valid_generation(self, ops):
         operator, _, _, _ = ops
         with pytest.raises(NelixError) as exc:
             operator.retire("g-00000000000000000000000000000000")
         assert exc.value.code == INVALID_REQUEST
-        assert "S5" in exc.value.message
+        assert "no such generation" in exc.value.message
 
 
 # ============================================================

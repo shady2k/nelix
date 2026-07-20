@@ -270,6 +270,17 @@ class SessionManager:
         # in _free_slot with the SAME expires_at (one lifetime policy, not two) — never write this
         # without also having just computed self._terminal's expiry for the same session.
         self._terminal_async = {}
+        # S5a: terminal obligation ledger — every admitted live session owns ONE outstanding
+        # obligation from spawn, discharged ONLY after its terminal is persisted. This set (NOT a
+        # counter) is the quiescence barrier: _sessions empty is NOT sufficient to certify.
+        self._terminal_obligations = set()
+        # S5a: terminal-pending-confirmation inventory — sessions whose terminal has been persisted
+        # but NOT yet confirmed by the router as board-visible/owner-acked/validly-expired. Entries
+        # consume NEITHER active NOR live leases (both were released at persist). Dropped when the
+        # router advances confirmed_high_water past this terminal's seq.
+        self._terminal_pending = {}    # sid -> {terminal_kind, terminal_seq, epoch}
+        # S5a: quiescence flag — when set, reject new sessions, restarts, idle-resume, pending admissions.
+        self._quiescent = False
         self._terminal_ttl = terminal_snapshot_ttl
         self._clock = clock
         # nelix-9a4.4: the durable store for terminal records (generation-neutral). MANDATORY:
@@ -311,6 +322,17 @@ class SessionManager:
         else:
             self._make = lambda sid, ex, spec: _default_session_factory(
                 sid, ex, spec, events, launcher_factory, driver_factory, logger)
+
+    def _check_quiescent(self):
+        """Check if this epoch is quiescing. Updates local flag from store.
+        When quiescent, rejects new sessions/restarts/idle-resume.
+        """
+        try:
+            state = self._store.get_epoch_retirement_state(self._gen_epoch)
+            self._quiescent = (state == "quiescing" or state == "certified")
+        except Exception:
+            pass
+        return self._quiescent
 
     def _owned(self, session_id, owner_id):
         """The owner-scoped session lookup behind EVERY caller-facing route (daemon/owner.py).
@@ -367,6 +389,10 @@ class SessionManager:
         if model is not None:
             spec, applied_model = self._apply_model_override(spec, executor_name, model)
             self._check_model_available(spec, executor_name, applied_model)
+
+        # S5a: reject admission if this epoch is quiescing.
+        if self._check_quiescent():
+            raise RuntimeError(f"epoch {self._gen_epoch} is quiescing; no new sessions")
 
         # Under lock: install pending-acquire marker so racing send_turns etc. see it.
         with self._lock:
@@ -564,6 +590,9 @@ class SessionManager:
 
     def _spawn(self, executor_name, task, cwd, *, lineage_id, restarted_from, owner_id,
                session_id, reserve=False, model=None, lease_tokens=None):
+        # S5a: reject admission if epoch is quiescing.
+        if self._check_quiescent():
+            raise RuntimeError(f"epoch {self._gen_epoch} is quiescing; no new sessions")
         # reserve=True: a slot reservation was made for us by restart() (old session popped +
         # self._reserved bumped under the lock). We OWN that reservation and must release it exactly
         # once: consume it ATOMICALLY with inserting the new session (so len(_sessions)+_reserved
@@ -646,6 +675,12 @@ class SessionManager:
                 base_seq = self._events.latest_seq()  # waiter arms past anything already emitted
                 sess = self._make(sid, executor_name, spec)
                 sess.on_terminal = self._free_slot
+                # S5a: persist-before-visible-wake — the manager persists BEFORE the ring
+                # event publishes, so waiters never wake before the record is durable.
+                sess._persist_terminal = self._persist_terminal_for_publish
+                # S5a: arm the terminal obligation — discharged only in
+                # _persist_terminal_for_publish when the terminal persists.
+                self._terminal_obligations.add(sid)
                 # Task 4: the monitor delivers a queued async reply as a fresh turn but has no manager
                 # handle of its own — give it one that re-acquires an active slot (send_turn), so the
                 # slot accounting an idle-freed session needs is preserved on the monitor-driven write.
@@ -768,6 +803,9 @@ class SessionManager:
                 meta.get("lineage_id") or session_id, None, meta.get("model"), stored_owner)
 
     def restart(self, session_id, *, new_session_id, owner_id, force=False):
+        # S5a: reject restart spawn if epoch is quiescing.
+        if self._check_quiescent():
+            return RestartOutcome("start_failed")
         src = self._restart_source(session_id, owner_id)
         if src is None:
             return RestartOutcome("unknown_session")
@@ -869,6 +907,61 @@ class SessionManager:
         return sum(1 for s in self._sessions.values()
                    if s.snapshot().get("control_state") == "idle")
 
+    def _persist_terminal_for_publish(self, session_id, terminal_kind, screen_excerpt):
+        """S5a persist-before-visible-wake: persist terminal record BEFORE the event ring
+        publishes. Called from session._finish_publish before _publish().
+
+        Discharges the terminal obligation, releases BOTH leases (active+live), and moves
+        the session to the terminal-pending-confirmation inventory (outside _sessions,
+        consuming neither lease). The put_terminal is idempotent so _free_slot's later call
+        is a no-op.
+        """
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                return
+            try:
+                snap = sess.terminal_snapshot()
+            except Exception:
+                snap = None
+            if snap is None:
+                snap = {"terminal_kind": terminal_kind, "screen_excerpt": screen_excerpt}
+
+        # Persist to durable store BEFORE any waiter sees the ring event.
+        if snap is not None:
+            try:
+                self._store.put_terminal(
+                    session_id,
+                    terminal_kind=snap.get("terminal_kind", terminal_kind),
+                    summary=snap.get("screen_excerpt", screen_excerpt),
+                    ended_at=self._clock())
+            except Exception as _pe:
+                if str(getattr(_pe, "code", "")) != "unknown_session":
+                    raise
+
+        with self._lock:
+            # Discharge the terminal obligation: this session's terminal is now persisted.
+            self._terminal_obligations.discard(session_id)
+            # Release leases at persist time (NEVER at _free_slot for this session).
+            active_tid = self._active_lease_tokens.pop(session_id, None)
+            live_tid = self._live_lease_tokens.pop(session_id, None)
+            # Move to terminal-pending inventory (outside _sessions, consumes no leases).
+            pending_seq = None
+            try:
+                tr = self._store.get_terminal(session_id, owner_id="")  # no owner check for seq
+                pending_seq = tr.terminal_seq
+            except Exception:
+                pass
+            self._terminal_pending[session_id] = {
+                "terminal_kind": terminal_kind,
+                "terminal_seq": pending_seq,
+                "epoch": self._gen_epoch,
+            }
+
+        # Release leases outside the lock.
+        if active_tid is not None or live_tid is not None:
+            self._release_terminal_leases(active_tid, live_tid)
+
     def _free_slot(self, session_id):
         with self._lock:
             sess = self._sessions.get(session_id)
@@ -884,30 +977,25 @@ class SessionManager:
                 except Exception:
                     qid = None
                 if qid is not None:
-                    # Terminal survival (Task 6): an async question was still outstanding when the
-                    # executor exited. Auto-resolve it now — CORRELATION only (mark the async event
-                    # answered + clear the slot). resolve_async_question is closing-aware (session._finish
-                    # already set _closing before on_terminal ever fires) so this always returns
-                    # not_delivered and types NOTHING — the executor is gone, there is no PTY to write to.
                     try:
                         sess.resolve_async_question(qid, None)
                     except Exception:
                         pass
-            # S3a: collect lease tokens BEFORE popping the session so we can release them
-            # outside the lock (never RPC under manager._lock). TODO(S3d/S5): staged release.
-            active_tid = self._active_lease_tokens.pop(session_id, None)
-            live_tid = self._live_lease_tokens.pop(session_id, None)
-            # a CLEAN terminal (terminal_kind="done") ends the lineage; a crash/stop keeps it for a
-            # possible restart. Keyed on terminal_kind, not a state string (NIT-16).
+            # S5a: leases were ALREADY released in _persist_terminal_for_publish.
+            # Only collect tokens that weren't already released (e.g. if persist
+            # callback was never invoked — terminal without a store, or test path).
+            already_released = session_id not in self._active_lease_tokens
+            if not already_released:
+                active_tid = self._active_lease_tokens.pop(session_id, None)
+                live_tid = self._live_lease_tokens.pop(session_id, None)
+            else:
+                active_tid = None
+                live_tid = None
             if snap is not None and snap.get("terminal_kind") == "done":
                 self._lineages.pop(snap.get("lineage_id"), None)
-            # nelix-9a4.4: persist the generation-neutral record to the durable store
-            # BEFORE making it board-visible (spec §5 ordering: persist -> board-visible ->
-            # remove live session). Persist runs UNCONDITIONALLY regardless of terminal_ttl —
-            # the TTL only governs the volatile _terminal dict. The store's put_terminal reads
-            # identity from the start row; the router always creates one, so this never fails
-            # because of a missing reservation. If the session was created outside the normal
-            # SessionManager.start() flow (no store row), unknown_session is caught and logged.
+            # S5a: persist was already done in _persist_terminal_for_publish BEFORE the
+            # ring event. _free_slot's old put_terminal call is now a no-op (idempotent).
+            # Still call it for safety (tests / paths without the S5 callback).
             if snap is not None:
                 try:
                     self._store.put_terminal(
@@ -919,26 +1007,13 @@ class SessionManager:
                     if str(getattr(_pe, "code", "")) != "unknown_session":
                         raise
             if self._terminal_ttl > 0:
-                # ONE expiry computed here, reused for BOTH stores below: the recent-terminal async
-                # record must share self._terminal's exact retention policy, never a second one.
                 expires_at = self._clock() + self._terminal_ttl
                 if snap is not None:
-                    # S2a.2: once persisted, mark advertised=False so the daemon's live board
-                    # stops surfacing this terminal — the router's archive read owns it now.
-                    # TODO(S5): terminal-pending confirmation handshake + retirement
                     self._terminal[session_id] = (snap, expires_at, False)
                 if qid is not None:
                     self._terminal_async[session_id] = (
                         {"id": qid, "reason": "executor_finished"}, expires_at)
             existed = self._sessions.pop(session_id, None) is not None
-            # NB: the event ring is NOT forgotten here. forget_session is wired at exactly ONE seam —
-            # the terminal-snapshot TTL-expiry sweep in status() — which waits out the terminal TTL so
-            # spec §5's final wake is never discarded before a waiter can read it. Pruning the
-            # non-default corners that never reach that seam (ttl<=0, a None terminal snapshot, or a
-            # publish racing after slot-free) is DEFERRED to the retirement work (see forget_session's
-            # docstring); the events themselves stay bounded by the normal ring regardless.
-        # S3a: release lease tokens OUTSIDE the lock (never RPC under manager._lock).
-        # TODO(S3d/S5): staged release — simple release for now.
         if active_tid is not None or live_tid is not None:
             self._release_terminal_leases(active_tid, live_tid)
         if existed and self._logger is not None:
@@ -1193,6 +1268,12 @@ class SessionManager:
                                          reason="concurrent_acquire",
                                          session_id=session_id)
                 return RespondOutcome("at_capacity")
+            # S5a: reject idle-resume if epoch is quiescing.
+            if self._check_quiescent():
+                if self._logger is not None:
+                    self._logger.warning("manager", "send_turn_rejected",
+                                         reason="quiescing", session_id=session_id)
+                return RespondOutcome("no_pending")
             # Check session is idle (only idle sessions can receive a follow-up turn).
             cstate = sess.snapshot().get("control_state")
             if cstate != "idle":
@@ -1449,6 +1530,55 @@ class SessionManager:
             self._logger.info("manager", "session_stopped", session_id=session_id,
                               reason=reason, status=status)
         return StopOutcome(status, snapshot=snap)
+
+    # ── S5a: quiescence / retirement support ────────────────────────────────
+
+    def begin_quiescence(self):
+        """Begin quiescence for this epoch. Sets retirement_state=quiescing in
+        the store and sets the local flag so admission is rejected."""
+        self._store.set_epoch_retirement(
+            self._gen_epoch, retirement_state="quiescing")
+        self._quiescent = True
+        if self._logger is not None:
+            self._logger.info("manager", "quiescence_started",
+                              epoch=self._gen_epoch)
+
+    def quiescence_status(self):
+        """Return a snapshot of quiescence-relevant counters:
+        {
+            live_sessions: int,       # _sessions count
+            outstanding_obligations: int,  # _terminal_obligations count
+            terminal_pending: int,    # _terminal_pending count
+            quiescent: bool,
+        }
+        The operator uses this to decide when to certify.
+        """
+        with self._lock:
+            return {
+                "live_sessions": len(self._sessions),
+                "outstanding_obligations": len(self._terminal_obligations),
+                "terminal_pending": len(self._terminal_pending),
+                "quiescent": self._quiescent,
+            }
+
+    def certify_epoch(self, certificate):
+        """Certify this epoch after quiescence completes.
+        Reads the final persisted high-water and sets retirement_state=certified
+        in the store. Returns the final_high_water and certificate.
+        """
+        final_hw = self._store.get_generation_persisted_high_water(
+            self._gen_epoch)
+        self._store.set_epoch_retirement(
+            self._gen_epoch,
+            retirement_state="certified",
+            certificate=certificate,
+            final_high_water=final_hw)
+        if self._logger is not None:
+            self._logger.info("manager", "epoch_certified",
+                              epoch=self._gen_epoch,
+                              final_high_water=final_hw,
+                              certificate=certificate)
+        return {"final_high_water": final_hw, "certificate": certificate}
 
     def stop_all(self, reason="shutdown"):
         # Daemon shutdown: every session goes, whoever owns it. _stop, not stop — see _stop.

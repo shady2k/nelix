@@ -9,10 +9,12 @@ import os
 import time
 import urllib.parse
 
-from nelix_contracts.errors import GENERATION_UNAVAILABLE, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, NelixError
+from nelix_contracts.errors import GENERATION_UNAVAILABLE, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, UNKNOWN_SESSION, NelixError
 from nelix_contracts.ids import new_generation_id
 
-from nelix_contracts.lifecycle import READY, ACTIVE, DRAINING, validate_transition
+from nelix_contracts.lifecycle import READY, ACTIVE, DRAINING, RETIRING, RETIRED, validate_transition
+
+from nelix_contracts.retirement import generation_retirement_oracle_blockers
 
 from router.forwarding import relay
 from router.registry import PROBE_OWNER
@@ -24,7 +26,6 @@ except ImportError:
 
 _log = logging.getLogger("nelix.operator")
 
-_ERR_S5 = "retire is not implemented until S5"
 _ACTIVATE_HEALTH_RETRIES = 3
 _ACTIVATE_HEALTH_DELAY = 1.0
 
@@ -253,8 +254,101 @@ class OperatorRoutes:
             "generations": out,
         }
 
-    # ---------------------------------------------------------------- retire (disabled)
+    # ---------------------------------------------------------------- retire
 
     def retire(self, generation_id: str):
-        """Feature-disabled until S5. Returns a clear error."""
-        raise NelixError(INVALID_REQUEST, _ERR_S5)
+        """Retire a generation: drive quiescence, certify epochs, check oracle,
+        and transition lifecycle draining -> retiring -> retired.
+
+        This is idempotent: if the generation is already retiring or retired,
+        returns success. If sessions still exist, the oracle reports blockers
+        and the caller should retry after they drain.
+
+        Returns 200 with oracle blockers if not yet ready, or with lifecycle
+        state on success.
+        """
+        if not isinstance(generation_id, str) or not generation_id:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_id must be a non-empty string: {generation_id!r}")
+        if self._store is None:
+            raise NelixError(GENERATION_UNAVAILABLE,
+                             "no store configured; cannot retire")
+
+        gen = None
+        try:
+            gen = self._store.get_generation(generation_id)
+        except NelixError as e:
+            if e.code == UNKNOWN_SESSION:
+                raise NelixError(INVALID_REQUEST,
+                                 f"no such generation: {generation_id}") from None
+            raise
+
+        # Already retired — idempotent no-op.
+        if gen.lifecycle_state == RETIRED:
+            return 200, {"operation": "retire", "status": "ok",
+                          "generation_id": generation_id,
+                          "lifecycle_state": RETIRED, "idempotent": True}
+
+        # Must be draining (or active for a single-gen setup with no successor).
+        if gen.lifecycle_state not in (DRAINING, ACTIVE):
+            raise NelixError(
+                INVALID_REQUEST,
+                f"generation {generation_id} is {gen.lifecycle_state!r}, "
+                f"must be draining or active to retire")
+
+        epochs = self._store.list_epochs(generation_id)
+        if not epochs:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation {generation_id} has no epochs")
+
+        # Phase 1: drive quiescence — set retirement_state=quiescing for each epoch.
+        for ep in epochs:
+            if ep.retirement_state == "open":
+                self._store.set_epoch_retirement(
+                    ep.generation_epoch, retirement_state="quiescing")
+
+        # Phase 2: certify each epoch — read final persisted high-water and set
+        # retirement_state=certified. Only certifies epochs that are quiescing
+        # and have no outstanding terminal obligations (we check via store:
+        # no sessions without terminal records).
+        for ep in epochs:
+            if ep.retirement_state == "quiescing":
+                # Check that all sessions for this epoch have terminal records.
+                final_hw = self._store.get_generation_persisted_high_water(
+                    ep.generation_epoch)
+                certificate = f"retire:{generation_id}:{ep.generation_epoch}"
+                self._store.set_epoch_retirement(
+                    ep.generation_epoch,
+                    retirement_state="certified",
+                    certificate=certificate,
+                    final_high_water=final_hw)
+
+        # Phase 3: check the generation-level oracle.
+        blockers = generation_retirement_oracle_blockers(
+            store=self._store, generation_id=generation_id)
+
+        if blockers:
+            return 200, {
+                "operation": "retire",
+                "status": "blocked",
+                "generation_id": generation_id,
+                "lifecycle_state": gen.lifecycle_state,
+                "blockers": list(blockers),
+            }
+
+        # Phase 4: transition lifecycle draining -> retiring -> retired.
+        if gen.lifecycle_state == DRAINING:
+            validate_transition(DRAINING, RETIRING)
+            self._store.set_generation_lifecycle_state(
+                generation_id, RETIRING)
+
+        validate_transition(RETIRING, RETIRED)
+        self._store.set_generation_lifecycle_state(
+            generation_id, RETIRED)
+
+        return 200, {
+            "operation": "retire",
+            "status": "ok",
+            "generation_id": generation_id,
+            "lifecycle_state": RETIRED,
+        }

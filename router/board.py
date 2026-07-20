@@ -173,6 +173,19 @@ class BoardForward:
             else:
                 merged = merge_archive_into(merged, records)
                 cursor = cursor.advance_archive(self._archive_epoch, archive_seq)
+                # S5a: advance confirmed_high_water for every epoch whose archived
+                # terminals we just resolved as board-visible. This is the router's
+                # monotonic watermark advance: for every seq <= archive_seq, the
+                # terminal is now confirmed as visible/acked/expired.
+                # Drop terminal-pending entries for confirmed seqs.
+                for tr in records:
+                    epoch = getattr(tr, "generation_epoch", None)
+                    if epoch and self._store is not None:
+                        try:
+                            self._store.set_generation_confirmed_high_water(
+                                epoch, archive_seq)
+                        except (sqlite3.Error, NelixError):
+                            pass
         merged["cursor"] = encode(cursor)
         merged["board_incomplete"] = unavailable if unavailable else False
         if archive_incomplete:

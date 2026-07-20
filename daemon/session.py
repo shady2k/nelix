@@ -217,6 +217,7 @@ class Session:
         #                                keep working unchanged.
         self._sessions_dir = _sessions_root()
         self.on_terminal = None        # manager-set: free the slot on terminal state
+        self._persist_terminal = None  # manager-set: persist terminal record before publish
         self.deliver_turn = None       # manager-set (Task 4): deliver a queued async reply as a FRESH
         #                                turn via the manager's slot-reacquiring send_turn. The monitor
         #                                has no manager handle of its own, so it calls back through this
@@ -887,12 +888,24 @@ class Session:
         finally:
             self._finish_cleanup(alive)
 
+    def _persist_terminal_before_publish(self, kind, screen_excerpt):
+        """Persist terminal record BEFORE publishing to the event ring (S5 ordering).
+
+        Called from each _finish_publish branch before self._publish(). The manager's
+        callback persists to store, discharges the terminal obligation, and releases
+        leases (moves session to terminal-pending inventory).
+        """
+        if self._persist_terminal is not None:
+            self._persist_terminal(self._id, kind, screen_excerpt)
+
     def _finish_publish(self, status, alive):
         # 1. monitor itself crashed; leader may still be alive
         if self._exc is not None:
             with self._lock:
                 self._state = "crashed"
                 self._terminal_kind = "crashed"
+                excerpt = self._last_screen_excerpt
+            self._persist_terminal_before_publish("crashed", excerpt)
             self._publish("crashed", hint=None, hung=False, requires_response=False)
             if self._log is not None:
                 self._log.error("session", "monitor_exception", session_id=self._id,
@@ -920,6 +933,8 @@ class Session:
             with self._lock:
                 self._state = "stopped"
                 self._terminal_kind = "stopped"
+                excerpt = self._last_screen_excerpt
+            self._persist_terminal_before_publish("stopped", excerpt)
             self._publish("stopped", hint=None, hung=False, requires_response=False)
             if self._log is not None:
                 self._log.debug("session", "monitor_exited", session_id=self._id)
@@ -927,9 +942,12 @@ class Session:
         # 4. executor genuinely exited -> the ONE terminal exit event, status-mapped
         if not alive:
             kind, final_state = self._exit_kind(status)
+            terminal_kind = "done" if kind == "done" else "crashed"
             with self._lock:
                 self._state = final_state
-                self._terminal_kind = "done" if kind == "done" else "crashed"
+                self._terminal_kind = terminal_kind
+                excerpt = self._last_screen_excerpt
+            self._persist_terminal_before_publish(terminal_kind, excerpt)
             self._publish("done" if kind == "done" else "crashed",
                           hint=None, hung=False, requires_response=False)
             self._log_exited(kind if kind == "done" else "crashed", status)
@@ -940,6 +958,8 @@ class Session:
         with self._lock:
             self._state = "crashed"
             self._terminal_kind = "crashed"
+            excerpt = self._last_screen_excerpt
+        self._persist_terminal_before_publish("crashed", excerpt)
         self._publish("crashed", hint=None, hung=False, requires_response=False)
         if self._log is not None:
             self._log.warning("session", "cli_crashed", session_id=self._id)

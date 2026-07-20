@@ -669,6 +669,19 @@ class Store:
                              f"no such epoch: {generation_epoch}")
 
     @translates_sqlite
+    def get_epoch_retirement_state(self, generation_epoch: str) -> str:
+        """Return the retirement_state for an epoch ('open', 'quiescing', or 'certified')."""
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        row = self._conn.execute(
+            "SELECT retirement_state FROM epochs WHERE generation_epoch=?",
+            (generation_epoch,)).fetchone()
+        if row is None:
+            raise NelixError(UNKNOWN_SESSION, f"no such epoch: {generation_epoch}")
+        return row["retirement_state"]
+
+    @translates_sqlite
     def set_epoch_retirement(self, generation_epoch: str, *,
                              retirement_state: str, certificate=None,
                              final_high_water=None) -> None:
@@ -821,6 +834,17 @@ class Store:
             "UPDATE generation_progress SET confirmed_high_water = MAX("
             "confirmed_high_water, ?) WHERE generation_id=?",
             (seq, generation_epoch))
+
+    @translates_sqlite
+    def get_generation_confirmed_high_water(self, generation_epoch: str) -> int:
+        """Return the confirmed_high_water for an epoch (0 if none)."""
+        if not isinstance(generation_epoch, str) or not generation_epoch:
+            raise NelixError(INVALID_REQUEST,
+                             f"generation_epoch must be a non-empty string: {generation_epoch!r}")
+        row = self._conn.execute(
+            "SELECT confirmed_high_water FROM generation_progress WHERE generation_id=?",
+            (generation_epoch,)).fetchone()
+        return row["confirmed_high_water"] if row else 0
 
     @translates_sqlite
     def set_generation_lifecycle_state_atomic(self, old_id: str, new_id: str,
