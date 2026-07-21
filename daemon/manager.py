@@ -1923,7 +1923,7 @@ class SessionManager:
             sess._thread.join(timeout=10)
         try:
             sess._launcher.stop(sess._handle)
-        except Exception:
+        except OSError:
             pass
         # Safety net: close the handle even if the launcher's stop is a no-op or
         # failed. The monitor has already been joined, so no concurrent access to

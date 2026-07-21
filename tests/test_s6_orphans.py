@@ -93,7 +93,7 @@ class _ObservingFakeSession:
     def stop(self):
         self._stop.set()
         if self._launcher is not None:
-            try: self._launcher.stop()
+            try: self._launcher.stop(self._handle)
             except Exception: pass
     def snapshot(self):
         return {"session_id": self._id, "executor": self.executor,
@@ -127,7 +127,7 @@ class _ObservingFakeSession:
 
 
 class _FakeLauncher:
-    def stop(self): pass
+    def stop(self, handle): pass
 
 
 class _FakeHandle:
