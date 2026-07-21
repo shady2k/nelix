@@ -21,7 +21,6 @@ runtime dir is removed) so nothing leaks across tests or blocks the suite.
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import threading
 
@@ -104,34 +103,6 @@ def test_daemon_wait_help_exits_zero(capsys):
 # --------------------------------------------------------------------------------------------
 # `ensure` against a REAL router subprocess: probe -> spawn -> health-check -> idempotent reuse.
 # --------------------------------------------------------------------------------------------
-
-@pytest.fixture
-def real_router(monkeypatch):
-    """Spies on every subprocess.Popen call (so a test can assert exactly how many router
-    processes were spawned) and guarantees cleanup: SIGTERM/kill each spawned process and remove
-    the leaf runtime dir, so a router `ensure` brings up never survives the test."""
-    spawned = []
-    real_popen = subprocess.Popen
-
-    def _spy(*a, **kw):
-        p = real_popen(*a, **kw)
-        spawned.append(p)
-        return p
-
-    monkeypatch.setattr(subprocess, "Popen", _spy)
-    try:
-        yield spawned
-    finally:
-        for p in spawned:
-            if p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait()
-        shutil.rmtree(paths.router_sock().parent, ignore_errors=True)
-
 
 def test_ensure_spawns_a_real_router_and_it_becomes_healthy(real_router, capsys):
     assert paths.router_sock().exists() is False           # nothing running yet

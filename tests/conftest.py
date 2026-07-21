@@ -1,9 +1,13 @@
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import paths  # noqa: E402
 
 from daemon.config import ExecutorSpec  # noqa: E402  (after sys.path insert)
 
@@ -77,6 +81,34 @@ def serve(manager, token="t"):
     from daemon.transport import Transport
     srv = make_server(manager, Transport.tcp("127.0.0.1", 0, token))
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+@pytest.fixture
+def real_router(monkeypatch):
+    """Spies on every subprocess.Popen call (so a test can assert exactly how many router
+    processes were spawned) and guarantees cleanup: SIGTERM/kill each spawned process and remove
+    the leaf runtime dir, so a router `ensure` brings up never survives the test."""
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def _spy(*a, **kw):
+        p = real_popen(*a, **kw)
+        spawned.append(p)
+        return p
+
+    monkeypatch.setattr(subprocess, "Popen", _spy)
+    try:
+        yield spawned
+    finally:
+        for p in spawned:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+        shutil.rmtree(paths.router_sock().parent, ignore_errors=True)
 
 
 def reserve_start(ledger, owner_id=OWNER, idempotency_key=None):
