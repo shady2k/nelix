@@ -1,6 +1,7 @@
 """The bootstrapper is the only piece that runs BEFORE nelix exists, so its self-containment is the
 property under test — and it must be tested against the BUILT ARTIFACT, not the source tree, because
 the source tree has everything importable and the artifact is exactly what a user gets."""
+import hashlib
 import json
 import subprocess
 import sys
@@ -51,12 +52,40 @@ def test_it_reports_its_own_version_as_json(pyz, tmp_path):
     assert json.loads(r.stdout)["bootstrap_schema"] == 1
 
 
-def test_a_release_build_emits_the_pyz_beside_the_wheels(tmp_path):
+def test_the_pyz_is_NOT_in_the_manifest_it_pins(tmp_path):
+    """Circularity: the .pyz carries the manifest's digest, so the manifest cannot carry the .pyz's
+    — changing one would change the other forever. The .pyz is the VERIFIER; its own authenticity
+    comes from the plugin that ships its bytes, not from the manifest it checks."""
     manifest_path = release.build(tmp_path, version="0.1.0")
     manifest = json.loads(manifest_path.read_text())
 
-    assert (tmp_path / "nelix-bootstrap.pyz").exists()
     names = {a["name"] for a in manifest["artifacts"]}
-    assert "nelix-bootstrap.pyz" in names, (
-        "the pyz must be IN the manifest: a plugin pins its digest, so a release that ships it "
-        "unnamed ships it untrusted")
+    assert (tmp_path / "nelix-bootstrap.pyz").exists(), "it is still built and published"
+    assert "nelix-bootstrap.pyz" not in names
+    assert any(n.endswith(".whl") for n in names)
+    assert "requirements-runtime.lock" in names
+
+
+def test_the_pyz_carries_the_digest_of_the_manifest_it_was_built_with(tmp_path):
+    manifest_path = release.build(tmp_path, version="0.1.0", base_url="https://example.invalid/v0.1.0")
+    expected = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+    src = zipfile.ZipFile(tmp_path / "nelix-bootstrap.pyz").read("bootstrap/_pin.py").decode()
+
+    assert expected in src
+    assert "0.1.0" in src
+    assert "https://example.invalid/v0.1.0" in src
+
+
+def test_a_pin_is_readable_from_inside_the_built_artifact(tmp_path):
+    """Read it the way the bootstrapper will: import it out of the zipapp."""
+    pyz = release.build(tmp_path, version="0.1.0", base_url="https://example.invalid/v0.1.0").parent / "nelix-bootstrap.pyz"
+    probe = "import bootstrap._pin as p, json; print(json.dumps({'v': p.VERSION, 'm': p.MANIFEST_SHA256, 'u': p.BASE_URL}))"
+
+    r = subprocess.run([sys.executable, "-c",
+                        f"import sys; sys.path.insert(0, {str(pyz)!r}); {probe}"],
+                       capture_output=True, text=True)
+
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    assert got["v"] == "0.1.0" and len(got["m"]) == 64
