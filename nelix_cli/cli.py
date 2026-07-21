@@ -4,7 +4,7 @@ added without touching any other verb's code."""
 import argparse
 import sys
 
-from nelix_cli import daemon_cmds
+from nelix_cli import config_cmds, daemon_cmds
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -14,6 +14,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     "the wake doorbell, and executor configuration.")
     top = parser.add_subparsers(dest="command", required=True)
     _add_daemon(top)
+    config_cmds.add_parser(top)
     return parser
 
 
