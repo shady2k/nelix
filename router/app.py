@@ -39,6 +39,23 @@ def _new_archive_epoch() -> int:
     return int.from_bytes(uuid.uuid4().bytes[:4], 'big')
 
 
+def _pin_active_build(store):
+    """The build new daemons are spawned from. Reconciles the cache FIRST: runtimes/current is what
+    this read consults, and a stale pointer here means every daemon this router spawns runs the
+    previous build while the store says otherwise."""
+    from router.reconcile_current import reconcile
+    reconcile(store)
+    # C8: ONLY ModuleNotFoundError(name='runtime') means "no runtime" (dev checkout). Any other
+    # ImportError (broken module, missing export) must PROPAGATE.
+    try:
+        from runtime import active
+    except ModuleNotFoundError as e:
+        if e.name != "runtime":
+            raise
+        return None
+    return active() or None                      # let RuntimeError propagate — fail closed
+
+
 def _install_shutdown_handlers() -> None:
     """SIGTERM/SIGINT -> orderly serve_forever() exit. Mirrors daemon/app.py's working shutdown: the
     handler RAISES SystemExit to unwind serve_forever() from the SERVING (main) thread, then main()'s
@@ -75,19 +92,7 @@ def main() -> None:
     try:
         ledger = StartLedger(paths.nelix_root())
         store = Store(paths.nelix_root())
-        # Bootstrap: pin the active runtime's build_id so the registry NEVER
-        # spawns a daemon from checkout code (spec §7.9 / C8).
-        # C8: ONLY ModuleNotFoundError(name='runtime') means "no runtime" (dev checkout).
-        # Any other ImportError (broken module, missing export) must PROPAGATE.
-        try:
-            from runtime import active
-        except ModuleNotFoundError as e:
-            if e.name != "runtime":
-                raise
-            active_runtime = None
-        else:
-            active_runtime = active()  # let RuntimeError propagate — fail closed
-        build_id = active_runtime if active_runtime else None
+        build_id = _pin_active_build(store)
 
         # Eager re-adoption runs IN the constructor (§7.6).
         registry = GenerationRegistry(store=store, build_id=build_id)
