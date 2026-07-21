@@ -24,6 +24,8 @@ try:
 except ImportError:
     from .rpc_client import RpcClient
 
+from runtime import activate as runtime_activate
+
 _log = logging.getLogger("nelix.operator")
 
 _ACTIVATE_HEALTH_RETRIES = 3
@@ -227,13 +229,30 @@ class OperatorRoutes:
                 expected_old_state=READY,
                 expected_new_state=READY)
 
+        # The store has committed: this generation is active. Now let the CACHE follow.
+        # `runtimes/current` is what router/app.py reads at startup to pin the build new daemons
+        # are spawned from, so leaving it behind would mean the next router start builds from the
+        # PREVIOUS build while the store says otherwise.
+        #
+        # A failure here is NOT an activation failure. The promotion is already durable; raising
+        # would report failure for work that succeeded, and the startup reconciler repairs
+        # the pointer on the next start. Loud log, honest flag, carry on.
+        current_updated = True
+        try:
+            runtime_activate(build_id)
+        except Exception as e:                       # noqa: BLE001 - the cache must never fail the flip
+            current_updated = False
+            _log.error("activated generation %s (build %s) but could not update runtimes/current: "
+                       "%s; the next router start will repair it", new_gid, build_id, e)
+
         # Adopt into registry and bump topology revision.
         self._registry.adopt_generation(new_gid, new_epoch, transport, build_id,
                                          incarnation=current_inc)
 
         return 200, {"operation": "activate", "status": "ok",
                       "generation_id": new_gid, "build_id": build_id,
-                      "epoch": new_epoch}
+                      "epoch": new_epoch,
+                      "current_updated": current_updated}
 
     # ---------------------------------------------------------------- list
 
