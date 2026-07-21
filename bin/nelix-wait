@@ -17,9 +17,7 @@ import paths
 from daemon.transport import Transport
 from rpc_client import RpcClient
 
-# Small, fixed-size triage fields only — never executor content. event_id is intentionally absent:
-# decision identity comes from the nelix_status pull, not an opaque token the model must echo.
-_DOORBELL_FIELDS = ("session_id", "seq", "kind", "requires_response", "hung")
+from nelix_cli.doorbell import DOORBELL_FIELDS, classify
 
 
 def _discover():
@@ -70,24 +68,19 @@ def main():
         print(json.dumps({"kind": "none"}, ensure_ascii=False))
         return 0
 
-    if body.get("cursor_expired") or body.get("board_changed"):
+    classified = classify(body)
+    if classified["reason"] == "resync":
         out = {"schema": "nelix.wake.v1", "status_required": True,
                "cursor_expired": body.get("cursor_expired", False),
                "board_changed": body.get("board_changed", False)}
-        print(json.dumps(out, ensure_ascii=False))
-        return 0
-
-    evt = body.get("event")
-    if evt is None:
-        print(json.dumps({"kind": "none"}, ensure_ascii=False))
-        return 0
-
-    # Doorbell: tiny triage metadata only.
-    out = {k: evt.get(k) for k in _DOORBELL_FIELDS}
-    out["schema"] = "nelix.wake.v1"
-    out["status_required"] = True
-    if body.get("cursor"):
-        out["cursor"] = body["cursor"]
+    elif classified["reason"] == "event":
+        out = dict(classified["events"][0])
+        out["schema"] = "nelix.wake.v1"
+        out["status_required"] = True
+        if body.get("cursor"):
+            out["cursor"] = body["cursor"]
+    else:                                   # "none" and "empty" both stayed `kind: none` before
+        out = {"kind": "none"}
     print(json.dumps(out, ensure_ascii=False))
     return 0
 

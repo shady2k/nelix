@@ -6,6 +6,7 @@ import sys
 
 from nelix_cli import daemon_cmds
 from nelix_cli import rpc
+from nelix_cli import wait_cmd
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -16,6 +17,7 @@ def _build_parser() -> argparse.ArgumentParser:
     top = parser.add_subparsers(dest="command", required=True)
     _add_daemon(top)
     rpc.add_parser(top)
+    wait_cmd.add_parser(top)
     return parser
 
 
