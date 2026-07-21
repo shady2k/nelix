@@ -35,9 +35,7 @@ def _die(message):
 
 
 def main():
-    home = os.environ.get("NELIX_HOME", "").strip() or os.path.join(
-        os.path.expanduser("~"), ".nelix")
-    home = os.path.abspath(home)
+    home = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     current = os.path.join(home, "runtimes", "current")
 
     # ONE resolution. An activation (or a future GC) may repoint this at any instant; reading it
@@ -57,6 +55,7 @@ def main():
         _die("the active build " + build + " is not executable: " + target)
 
     env = dict(os.environ)
+    env["NELIX_HOME"] = home
     env[PINNED_BUILD_ENV] = build
     os.execve(target, [target] + sys.argv[1:], env)
 

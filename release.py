@@ -14,6 +14,7 @@ import json
 import shutil
 import subprocess
 import sys
+import zipapp
 from pathlib import Path
 
 MANIFEST_SCHEMA = 1
@@ -23,6 +24,28 @@ REQUIRES_PYTHON = "==3.11.*"
 REPO = Path(__file__).resolve().parent
 LOCK = REPO / "requirements-runtime.lock"
 PROJECTS = (REPO, REPO / "packages" / "nelix_store", REPO / "packages" / "nelix_contracts")
+
+_PYZ_MODULES = ("runtime.py", "paths.py", "launcher.py")
+
+
+def build_pyz(dist_dir) -> Path:
+    """Stage the bootstrapper and its three carried modules, and zip them into nelix-bootstrap.pyz."""
+    dist_dir = Path(dist_dir)
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    stage = dist_dir / "_pyz_stage"
+    shutil.rmtree(stage, ignore_errors=True)
+    (stage / "bootstrap").mkdir(parents=True)
+
+    for name in _PYZ_MODULES:
+        shutil.copy2(REPO / name, stage / name)
+    for name in ("__init__.py", "__main__.py", "cli.py", "install.py"):
+        shutil.copy2(REPO / "bootstrap" / name, stage / "bootstrap" / name)
+    shutil.copy2(REPO / "bootstrap" / "__main__.py", stage / "__main__.py")
+
+    out = dist_dir / "nelix-bootstrap.pyz"
+    zipapp.create_archive(stage, target=out, interpreter="/usr/bin/env python3")
+    shutil.rmtree(stage, ignore_errors=True)
+    return out
 
 
 def file_sha256(path) -> str:
@@ -59,7 +82,8 @@ def build(dist_dir, *, version: str) -> Path:
                        check=True)
     shutil.copy2(LOCK, dist_dir / LOCK.name)
 
-    artifacts = sorted(p for p in dist_dir.glob("*.whl"))
+    build_pyz(dist_dir)
+    artifacts = sorted(list(dist_dir.glob("*.whl")) + [dist_dir / "nelix-bootstrap.pyz"])
     manifest = manifest_for(artifacts, version=version,
                             lock_sha256=file_sha256(dist_dir / LOCK.name))
     out = dist_dir / "release-manifest.json"
