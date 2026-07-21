@@ -191,7 +191,7 @@ class BoardForward:
         # are attached to it right now. Both are router-local; neither touches a generation.
         # Skipped entirely without a ledger, so every direct BoardForward construction that
         # predates these two keyword arguments keeps its exact previous board shape.
-        if self._ledger is not None:
+        if self._ledger is not None and self._waiters is not None:
             merged["orchestrations"] = {
                 orch: {"sessions": len(self._ledger.sessions_for_orchestration(owner_id, orch)),
                        "waiters": self._waiters.count(orch)}
