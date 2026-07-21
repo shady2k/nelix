@@ -43,6 +43,11 @@ check-python:  ## Fail unless the venv is Python 3.11 (the daemon's floor)
 test: check-python  ## Run the test suite
 	$(PY) -m pytest -q
 
+.PHONY: release
+release: venv  ## Build the release bundle (wheels + lock + manifest) into dist/: make release VERSION=0.1.0
+	@test -n "$(VERSION)" || (echo "release: set VERSION=<x.y.z>" >&2; exit 1)
+	$(PY) release.py --version "$(VERSION)"
+
 .PHONY: clean
 clean:  ## Remove Python caches (keeps the venv)
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
