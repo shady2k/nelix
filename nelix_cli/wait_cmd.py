@@ -47,26 +47,27 @@ def cmd_wait(args) -> int:
     while True:
         started = time.monotonic()
         try:
-            body = _poll(args.owner, args.orchestration, cursor)
-        except ROUTER_ERRORS as e:
-            return emit_error("router_call_failed", f"wait failed: {e}",
-                              exit_class=EXIT_UNAVAILABLE)
+            try:
+                body = _poll(args.owner, args.orchestration, cursor)
+            except ROUTER_ERRORS as e:
+                return emit_error("router_call_failed", f"wait failed: {e}",
+                                  exit_class=EXIT_UNAVAILABLE)
+            classified = doorbell.classify(body)
+            if classified["cursor"]:
+                cursor = classified["cursor"]           # carry it across the window seam
+            if classified["reason"] != "none" or time.monotonic() >= deadline:
+                classified["cursor"] = cursor
+                print(doorbell.render(classified, owner=args.owner,
+                                      orchestration=args.orchestration))
+                return EXIT_OK
+            elapsed = time.monotonic() - started
+            if elapsed < _MIN_INTERVAL:
+                time.sleep(_MIN_INTERVAL - elapsed)
         except KeyboardInterrupt:
-            classified = {"reason": "none", "cursor": cursor}
+            classified = {"reason": "none", "events": [], "cursor": cursor}
             print(doorbell.render(classified, owner=args.owner,
                                   orchestration=args.orchestration))
             return EXIT_OK
-        classified = doorbell.classify(body)
-        if classified["cursor"]:
-            cursor = classified["cursor"]           # carry it across the window seam
-        if classified["reason"] != "none" or time.monotonic() >= deadline:
-            classified["cursor"] = cursor
-            print(doorbell.render(classified, owner=args.owner,
-                                  orchestration=args.orchestration))
-            return EXIT_OK
-        elapsed = time.monotonic() - started
-        if elapsed < _MIN_INTERVAL:
-            time.sleep(_MIN_INTERVAL - elapsed)
 
 
 def add_parser(top) -> None:

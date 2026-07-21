@@ -50,45 +50,49 @@ def main():
     signal.signal(signal.SIGTERM, _signal_to_keyboard_interrupt)
 
     try:
-        transport = _discover()
-    except (OSError, ValueError, KeyError) as e:
+        try:
+            transport = _discover()
+        except (OSError, ValueError, KeyError):
+            print(json.dumps({"kind": "none"}, ensure_ascii=False))
+            return 0
+
+        client = RpcClient(transport, args.owner_id)
+
+        try:
+            # H14: Use the router's orchestration /wait.
+            # Build params manually since RpcClient.wait() uses the daemon's shape.
+            import urllib.parse
+            params = {"owner_id": args.owner_id, "orchestration_id": args.orchestration_id}
+            if args.cursor_token:
+                params["cursor"] = args.cursor_token
+            path = "/wait?" + urllib.parse.urlencode(params)
+            _, body = client._call("GET", path, timeout=45)
+        except (OSError, ConnectionError):
+            print(json.dumps({"kind": "none"}, ensure_ascii=False))
+            return 0
+
+        if not isinstance(body, dict):
+            print(json.dumps({"kind": "none"}, ensure_ascii=False))
+            return 0
+
+        classified = classify(body)
+        if classified["reason"] == "resync":
+            out = {"schema": "nelix.wake.v1", "status_required": True,
+                   "cursor_expired": body.get("cursor_expired", False),
+                   "board_changed": body.get("board_changed", False)}
+        elif classified["reason"] == "event":
+            out = dict(classified["events"][0])
+            out["schema"] = "nelix.wake.v1"
+            out["status_required"] = True
+            if body.get("cursor"):
+                out["cursor"] = body["cursor"]
+        else:                                   # "none" and "empty" both stayed `kind: none` before
+            out = {"kind": "none"}
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    except KeyboardInterrupt:
         print(json.dumps({"kind": "none"}, ensure_ascii=False))
         return 0
-
-    client = RpcClient(transport, args.owner_id)
-
-    try:
-        # H14: Use the router's orchestration /wait.
-        # Build params manually since RpcClient.wait() uses the daemon's shape.
-        import urllib.parse
-        params = {"owner_id": args.owner_id, "orchestration_id": args.orchestration_id}
-        if args.cursor_token:
-            params["cursor"] = args.cursor_token
-        path = "/wait?" + urllib.parse.urlencode(params)
-        _, body = client._call("GET", path, timeout=45)
-    except (OSError, ConnectionError, KeyboardInterrupt):
-        print(json.dumps({"kind": "none"}, ensure_ascii=False))
-        return 0
-
-    if not isinstance(body, dict):
-        print(json.dumps({"kind": "none"}, ensure_ascii=False))
-        return 0
-
-    classified = classify(body)
-    if classified["reason"] == "resync":
-        out = {"schema": "nelix.wake.v1", "status_required": True,
-               "cursor_expired": body.get("cursor_expired", False),
-               "board_changed": body.get("board_changed", False)}
-    elif classified["reason"] == "event":
-        out = dict(classified["events"][0])
-        out["schema"] = "nelix.wake.v1"
-        out["status_required"] = True
-        if body.get("cursor"):
-            out["cursor"] = body["cursor"]
-    else:                                   # "none" and "empty" both stayed `kind: none` before
-        out = {"kind": "none"}
-    print(json.dumps(out, ensure_ascii=False))
-    return 0
 
 
 if __name__ == "__main__":
