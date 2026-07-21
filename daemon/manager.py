@@ -1899,21 +1899,40 @@ class SessionManager:
             raise
 
         # ── 3. Finalize the session (now that persist succeeded, FIX 4) ──────
+        # Teardown order matches Session.stop(): join the monitor thread BEFORE
+        # closing the handle so an in-flight pump/render never operates on a
+        # renderer whose WASM references have already been nulled. The monitor
+        # owns all PTY reads/writes and the dialog writes; closing underneath it
+        # creates a use-after-close race that can crash the monitor via
+        # AttributeError on the nulled renderer refs.
+        #
+        # If the monitor does not exit within the timeout (stuck in an
+        # uninterruptible syscall or a hung child), the close that follows will
+        # tear the fd/renderer down underneath it anyway. The thread will then
+        # hit a closed fd / nulled renderer and exit through _finish, which is
+        # already gated by _finalized=True set above, so no duplicate terminal
+        # event is published. This is safe: the session is already persisted as
+        # terminal, leases are released, and the window where the monitor could
+        # observe a dead renderer is bounded by a single post-join pump
+        # iteration.
         with sess._lock:
             sess._finalized = True
             sess._closing = True
             sess._stop.set()
+        if sess._thread is not None and sess._thread is not threading.current_thread():
+            sess._thread.join(timeout=10)
         try:
-            sess._launcher.stop()
+            sess._launcher.stop(sess._handle)
         except Exception:
             pass
+        # Safety net: close the handle even if the launcher's stop is a no-op or
+        # failed. The monitor has already been joined, so no concurrent access to
+        # the renderer exists.
         try:
             if sess._handle is not None:
                 sess._handle.close()
         except Exception:
             pass
-        if sess._thread is not None:
-            sess._thread.join(timeout=10)
 
         # ── 4. Publish event (wakes any /wait) ──────────────────────────────
         try:
