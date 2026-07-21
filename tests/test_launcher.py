@@ -118,13 +118,31 @@ def test_a_runtime_without_its_nelix_binary_is_named_too(tmp_path):
     assert "b-1111" in r.stderr
 
 
-def test_it_honours_an_explicit_nelix_home_over_the_default(tmp_path):
+def test_it_derives_home_from_its_own_location_ignoring_env(tmp_path):
+    """The launcher lives at <home>/bin/nelix; it must dispatch to ITS OWN home, ignoring
+    NELIX_HOME from the caller's environment — otherwise a plugin calling its own launcher
+    without setting NELIX_HOME lands in the wrong installation."""
     home = _make_home(tmp_path)
     path = launcher.install(home)
 
     got = json.loads(_run(path, ["x"], home, extra_env={"HOME": str(tmp_path / "elsewhere")}).stdout)
 
-    assert got["pinned"] == "b-1111", "NELIX_HOME must win over ~/.nelix"
+    assert got["pinned"] == "b-1111", "the launcher must dispatch to its own home regardless of env"
+
+
+def test_it_dispatches_to_its_own_home_even_when_env_points_elsewhere(tmp_path):
+    """Put the launcher in home A, run it with NELIX_HOME set to home B — it must dispatch to A."""
+    home_a = _make_home(tmp_path / "a", build="b-AAAA")
+    home_b = _make_home(tmp_path / "b", build="b-BBBB")
+    path_a = launcher.install(home_a)
+
+    r = _run(path_a, ["x"], home_b)
+
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    assert got["pinned"] == "b-AAAA", (
+        "the launcher must dispatch to its own home even when NELIX_HOME points elsewhere")
+    assert "b-AAAA" in got["exe"], "the target must be in home A, not B"
 
 
 def test_the_dispatcher_imports_nothing_of_ours(tmp_path):

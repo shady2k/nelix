@@ -5,6 +5,10 @@ every artifact by sha256, so checking the manifest and then the artifacts turns 
 into a verified bundle. Verification happens BEFORE the first byte is written under $NELIX_HOME, so a
 bad bundle leaves the machine exactly as it was.
 
+When download lands: artifact STAGING (writing into a temp dir under $NELIX_HOME) MUST be inside the
+distribution lock — unlike verification, staging IS a mutation and must not race with another
+installer. Only the read-only checks stay outside.
+
 Python 3.8-compatible, stdlib only: this runs on whatever python3 the machine has.
 """
 import contextlib
@@ -115,14 +119,17 @@ def run_install(bundle_dir, manifest_sha256, home=None):
     if missing:
         return fail(missing[0], missing[1], EXIT_UNAVAILABLE)
 
-    with distribution_lock():
-        try:
-            build = runtime.install(checked["core_wheel"], lock=checked["lock"],
-                                    extra_wheels=checked["extra_wheels"])
-            runtime.activate(build)
-            launcher_path = launcher.install(paths.nelix_root())
-        except Exception as e:
-            return fail("install_failed", str(e), EXIT_UNAVAILABLE)
+    try:
+        with distribution_lock():
+            try:
+                build = runtime.install(checked["core_wheel"], lock=checked["lock"],
+                                        extra_wheels=checked["extra_wheels"])
+                runtime.activate(build)
+                launcher_path = launcher.install(paths.nelix_root())
+            except Exception as e:
+                return fail("install_failed", str(e), EXIT_UNAVAILABLE)
+    except BundleError as e:
+        return fail(e.code, str(e), EXIT_UNAVAILABLE)
 
     emit({"build": build, "home": str(paths.nelix_root()), "launcher": str(launcher_path),
           "version": checked["version"]})

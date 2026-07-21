@@ -1,8 +1,13 @@
 """Verification is the point: the plugin pins one digest, and everything else follows from it. A
 bundle that fails any check must leave the machine EXACTLY as it was — no runtime dir, no launcher,
 no half-written anything."""
+import contextlib
 import hashlib
+import io as _io
+import json as _json
 import shutil
+import sys as _sys
+import threading
 
 import pytest
 
@@ -89,3 +94,57 @@ def test_a_real_install_produces_an_activated_runtime_and_a_launcher(bundle, tmp
     current = home / "runtimes" / "current"
     assert current.is_symlink()
     assert (home / "runtimes" / current.readlink().name / "venv" / "bin" / "nelix").exists()
+
+
+def test_a_held_lock_gives_a_clean_json_not_a_traceback(bundle, tmp_path, monkeypatch):
+    """run_install must return a clean JSON envelope even when the lock is held — never a traceback."""
+    d, digest = bundle
+    home = tmp_path / "home"
+    monkeypatch.setenv("NELIX_HOME", str(home))
+
+    held = threading.Event()
+    release_it = threading.Event()
+
+    def _hold():
+        with bootstrap_install.distribution_lock(wait_seconds=30):
+            held.set()
+            release_it.wait(timeout=10)
+
+    t = threading.Thread(target=_hold)
+    t.start()
+    held.wait(timeout=5)
+
+    saved_out = _sys.stdout
+    saved_err = _sys.stderr
+    _sys.stdout = _io.StringIO()
+    _sys.stderr = _io.StringIO()
+
+    try:
+        _orig = bootstrap_install.distribution_lock
+
+        @contextlib.contextmanager
+        def _instant_lock():
+            with _orig(wait_seconds=0):
+                yield
+
+        bootstrap_install.distribution_lock = _instant_lock
+
+        rc = bootstrap_install.run_install(bundle_dir=d, manifest_sha256=digest, home=str(home))
+        stdout = _sys.stdout.getvalue()
+        stderr = _sys.stderr.getvalue()
+    finally:
+        bootstrap_install.distribution_lock = _orig
+        _sys.stdout = saved_out
+        _sys.stderr = saved_err
+        release_it.set()
+        t.join(timeout=5)
+
+    assert rc == 3, f"expected EXIT_UNAVAILABLE (3), got {rc}; stderr: {stderr}"
+    assert "Traceback" not in stdout, "stdout must not contain a traceback"
+    assert "Traceback" not in stderr, "stderr must not contain a traceback"
+    try:
+        envelope = _json.loads(stdout.strip())
+    except _json.JSONDecodeError:
+        pytest.fail(f"stdout must be a single JSON object, got: {stdout!r}")
+    assert envelope.get("ok") is False
+    assert envelope["error"]["code"] == "install_in_progress"

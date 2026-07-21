@@ -1,6 +1,6 @@
 """Two installs racing on one NELIX_HOME must not interleave: they write the same runtimes root and
-the same launcher. The outer lock covers the WHOLE mutation — verification through launcher — not
-just the builder's own critical section."""
+the same launcher. The outer lock covers the mutation — build through launcher. Verification is a
+read-only check and runs BEFORE the lock (failing fast on a bad bundle without waiting)."""
 import threading
 
 import pytest
