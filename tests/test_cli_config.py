@@ -54,6 +54,17 @@ def test_add_is_refused_when_the_command_is_not_on_path(capsys):
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "command_not_found"
 
 
+def test_add_refused_with_executor_exists_when_name_taken_even_if_command_missing(capsys):
+    assert nelix_cli.main(["config", "add", "--name", "coder", "--command", "sh"]) == 0
+    capsys.readouterr()
+
+    rc = nelix_cli.main(["config", "add", "--name", "coder",
+                         "--command", "definitely-not-installed-xyz"])
+
+    assert rc == envelope.EXIT_REJECTED
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "executor_exists"
+
+
 def test_add_appends_without_destroying_an_existing_executor(capsys):
     assert nelix_cli.main(["config", "add", "--name", "one", "--command", "sh"]) == 0
     assert nelix_cli.main(["config", "add", "--name", "two", "--command", "sh"]) == 0

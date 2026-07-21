@@ -11,15 +11,8 @@ re-arm line, which doubles as a liveness check on the whole loop.
 import time
 import urllib.parse
 
-import paths
-from daemon.transport import Transport
-from nelix_cli import daemon_cmds, doorbell
+from nelix_cli import daemon_cmds, doorbell, rpc
 from nelix_cli.envelope import EXIT_OK, EXIT_UNAVAILABLE, ROUTER_ERRORS, emit_error
-from rpc_client import RpcClient
-
-
-def _client_for(owner_id: str) -> RpcClient:
-    return RpcClient(Transport.unix(str(paths.router_sock())), owner_id)
 
 # Per-call ceiling, comfortably above the router's own ~25s window (mirrors bin/nelix-wait's 45s).
 _WINDOW_TIMEOUT = 45.0
@@ -32,7 +25,7 @@ def _poll(owner_id: str, orchestration_id: str, cursor) -> dict:
     params = {"owner_id": owner_id, "orchestration_id": orchestration_id}
     if cursor:
         params["cursor"] = cursor
-    _status, body = _client_for(owner_id)._call(
+    _status, body = rpc.client_for(owner_id)._call(
         "GET", "/wait?" + urllib.parse.urlencode(params), timeout=_WINDOW_TIMEOUT)
     return body if isinstance(body, dict) else {}
 
