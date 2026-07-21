@@ -264,7 +264,7 @@ def test_installed_core_puts_nelix_on_the_path(installed):
 
     r = _run([exe, "--help"], cwd=tmp, env=_clean_env())
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
-    for verb in ("daemon", "rpc", "wait", "config"):
+    for verb in ("launcher", "daemon", "rpc", "wait", "config"):
         assert verb in r.stdout, f"`nelix --help` does not offer {verb}: {r.stdout}"
 
 

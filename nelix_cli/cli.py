@@ -6,6 +6,7 @@ import sys
 
 from nelix_cli import config_cmds
 from nelix_cli import daemon_cmds
+from nelix_cli import launcher_cmds
 from nelix_cli import rpc
 from nelix_cli import wait_cmd
 
@@ -17,6 +18,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     "the wake doorbell, and executor configuration.")
     top = parser.add_subparsers(dest="command", required=True)
     _add_daemon(top)
+    launcher_cmds.add_parser(top)
     rpc.add_parser(top)
     wait_cmd.add_parser(top)
     config_cmds.add_parser(top)

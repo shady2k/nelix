@@ -48,7 +48,7 @@ nelix-note = "daemon.tools.note:main"
 # router/ adds generation_supervisor and rpc_client, and nelix_cli adds runtime. All five are
 # stdlib-only (verified by tests/test_runtime_closure.py for the builder half). supervisor.py is
 # deliberately absent: nothing shipped imports it.
-py-modules = ["paths", "launcher_resolve", "rpc_client", "runtime", "generation_supervisor"]
+py-modules = ["launcher", "paths", "launcher_resolve", "rpc_client", "runtime", "generation_supervisor"]
 
 [tool.setuptools.packages.find]
 where = ["."]
