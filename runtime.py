@@ -52,6 +52,7 @@ This module is deliberately NOT part of the wheel (like supervisor.py, and unlik
 thing that installs runtimes lives outside them. `nelix daemon ensure` [nelix-3rm] is the caller
 this is raw material for, and shipping it is that slice's call to make, not this one's.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -242,9 +243,7 @@ def install(wheel, *, python_version: str = RUNTIME_PYTHON, lock=RUNTIME_LOCK,
     if is_installed(build):
         return build
 
-    paths.ensure_private_dir(paths.runtimes_root())
-    from daemon import singleton
-    fd = singleton.acquire(paths.runtime_install_lock(), {"pid": os.getpid(), "build": build})
+    fd = _acquire_install_lock(paths.runtime_install_lock(), {"pid": os.getpid(), "build": build})
     if fd is None:
         raise RuntimeInstallError("another nelix runtime install is in progress")
     try:
@@ -255,6 +254,29 @@ def install(wheel, *, python_version: str = RUNTIME_PYTHON, lock=RUNTIME_LOCK,
         return build
     finally:
         os.close(fd)
+
+
+def _acquire_install_lock(lock_path, meta: dict):
+    """Exclusive, non-blocking flock over the runtime-install lock. Returns the open fd — the CALLER
+    MUST KEEP IT for the duration, since closing it releases the lock — or None if another process
+    holds it.
+
+    This is deliberately a local stdlib copy of what daemon.singleton.acquire does, NOT an import of
+    it: the same builder has to run inside a stdlib-only bootstrapper that has no daemon/ package at
+    all. Same semantics, including non-blocking: a concurrent install is reported, never waited on
+    (the bounded outer wait belongs to distribution.lock, a different lock, in a later slice).
+    """
+    paths.ensure_private_dir(os.path.dirname(lock_path) or ".")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, json.dumps(meta).encode())
+    os.fsync(fd)
+    return fd
 
 
 def _build_at(rt: Path, wheel: Path, lock: Path, base_python: Path,
