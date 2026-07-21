@@ -60,7 +60,7 @@ include = ["daemon*", "router*", "nelix_cli*"]
 "daemon.renderer" = ["shim.wasm"]
 
 [tool.pytest.ini_options]
-addopts = "-n auto"
+addopts = "-n auto --dist=loadscope"
 markers = [
     "slow: builds a wheel and a venv; seconds, not milliseconds (tests/test_real_wheel.py)",
 ]
