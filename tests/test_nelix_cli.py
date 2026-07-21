@@ -296,7 +296,7 @@ def test_status_reports_the_empty_board_via_a_real_router_with_no_daemon(real_ro
     assert rc == 0
     body = json.loads(capsys.readouterr().out)
     assert body == {"sessions": {}, "recent_terminal": {}, "cursor": body["cursor"],
-                    "board_incomplete": False}
+                    "board_incomplete": False, "orchestrations": {}}
 
 
 def test_wait_prints_the_explicit_empty_orchestration_signal(real_router, capsys):

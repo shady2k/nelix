@@ -127,7 +127,8 @@ class BoardForward:
     The store is optional (None when no store is available, such as in some test scenarios).
     """
 
-    def __init__(self, registry, router_epoch, store=None, archive_epoch=None):
+    def __init__(self, registry, router_epoch, store=None, archive_epoch=None,
+                 ledger=None, waiters=None):
         if (store is None) != (archive_epoch is None):
             raise ValueError(
                 "store and archive_epoch must be both set or both None; "
@@ -136,6 +137,8 @@ class BoardForward:
         self._router_epoch = router_epoch
         self._store = store
         self._archive_epoch = archive_epoch
+        self._ledger = ledger
+        self._waiters = waiters
 
     def status(self, owner_id) -> "tuple[int, dict]":
         owner_id = _owner(owner_id)
@@ -183,6 +186,17 @@ class BoardForward:
         merged["board_incomplete"] = unavailable if unavailable else False
         if archive_incomplete:
             merged["archive_incomplete"] = True
+        # The orchestration-level facts a host adapter needs to tell "someone is listening" from
+        # "nobody is": how many waitable sessions each orchestration has, and how many long-polls
+        # are attached to it right now. Both are router-local; neither touches a generation.
+        # Skipped entirely without a ledger, so every direct BoardForward construction that
+        # predates these two keyword arguments keeps its exact previous board shape.
+        if self._ledger is not None and self._waiters is not None:
+            merged["orchestrations"] = {
+                orch: {"sessions": len(self._ledger.sessions_for_orchestration(owner_id, orch)),
+                       "waiters": self._waiters.count(orch)}
+                for orch in self._ledger.orchestrations_for_owner(owner_id)
+            }
         return 200, merged
 
     def _forward_one(self, gen, owner_id):
