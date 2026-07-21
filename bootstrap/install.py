@@ -272,5 +272,7 @@ def run(args):
                     "provide --bundle and --manifest-sha256",
                     EXIT_USAGE)
     _version, manifest_sha256, base_url = pin
+    if args.base_url is not None:
+        base_url = args.base_url  # override source, NOT the digest — trust model unchanged
     return run_install(bundle_dir=None, manifest_sha256=manifest_sha256,
                        home=args.home, base_url=base_url, pin_digest=manifest_sha256)

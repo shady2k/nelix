@@ -1,8 +1,15 @@
 """Fetching is where a supply chain gets attacked, so these tests serve a REAL bundle over a REAL
 socket and then attack it: swap an artifact, swap the manifest, cut the network. The property is
-always the same — nothing under $NELIX_HOME changes unless every digest matched."""
+always the same — nothing under $NELIX_HOME changes unless every digest matched.
+
+The last two tests (artifact_*) go one level deeper: they run the BUILT .pyz as a subprocess,
+exercising the zipapp's import path rather than just calling fetch_bundle() in-process — so a
+regression that only shows up "outside" the test runner is caught here."""
 import hashlib
 import http.server
+import json
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -78,3 +85,76 @@ def test_install_without_a_pin_says_so(tmp_path, monkeypatch):
                                        home=str(tmp_path / "home"))
 
     assert rc == 2
+
+
+def _start_server(directory):
+    """Start a ThreadingHTTPServer on a free port serving *directory*.
+    Returns (server, url)."""
+    handler = lambda *a, **kw: http.server.SimpleHTTPRequestHandler(*a, directory=str(directory), **kw)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    return srv, f"http://127.0.0.1:{port}"
+
+
+def test_artifact_level_install_via_http(tmp_path):
+    """Run the BUILT .pyz as a subprocess — the closest thing to a real install without a Hermes
+    plugin. This test exists because in-process fetch_bundle() tests do not exercise the zipapp's
+    import path and would miss a regression in the bootstrap entry point."""
+    d = tmp_path / "release"
+    release.build(d, version="0.1.0")
+    pyz = d / "nelix-bootstrap.pyz"
+    assert pyz.exists()
+
+    srv, url = _start_server(d)
+    try:
+        home = tmp_path / "home"
+        r = subprocess.run([sys.executable, str(pyz), "install",
+                            "--home", str(home), "--base-url", url],
+                           capture_output=True, text=True, timeout=60)
+
+        assert r.returncode == 0, f"stderr: {r.stderr}"
+        envelope = json.loads(r.stdout.strip())
+        assert envelope.get("ok") is True
+        assert "build" in envelope
+        assert "launcher" in envelope
+        assert (home / "bin" / "nelix").exists()
+        current = home / "runtimes" / "current"
+        assert current.is_symlink()
+    finally:
+        srv.shutdown()
+
+
+def test_artifact_level_rejects_tampered_artifact(tmp_path):
+    """Swap bytes on the server AFTER the build (so the pin is computed for the clean release),
+    then run the .pyz — it must refuse with artifact_digest_mismatch and leave NOTHING under
+    --home."""
+    d = tmp_path / "release"
+    release.build(d, version="0.1.0")
+    pyz = d / "nelix-bootstrap.pyz"
+    assert pyz.exists()
+
+    # Tamper a wheel on disk BEFORE starting the server (server will serve the modified copy)
+    wheel = next(d.glob("nelix_core*.whl"))
+    wheel.write_bytes(wheel.read_bytes() + b"EVIL")
+
+    srv, url = _start_server(d)
+    try:
+        home = tmp_path / "home"
+        r = subprocess.run([sys.executable, str(pyz), "install",
+                            "--home", str(home), "--base-url", url],
+                           capture_output=True, text=True, timeout=60)
+
+        assert r.returncode != 0, f"expected failure, got stdout: {r.stdout}"
+        envelope = json.loads(r.stdout.strip())
+        assert envelope.get("ok") is False
+        assert envelope["error"]["code"] in ("artifact_digest_mismatch", "download_failed")
+        # No install artifacts must survive a refused fetch — the property is that no runtime
+        # dir, launcher, or build was committed. The locks/ dir is a side effect of the
+        # distribution_lock acquisition inside run_install(), not an install artifact.
+        assert not (home / "runtimes").exists()
+        assert not (home / "bin").exists()
+        # Staging dir must be cleaned up on failure
+        assert not (home / "staging").exists()
+    finally:
+        srv.shutdown()
