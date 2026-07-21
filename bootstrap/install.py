@@ -16,7 +16,11 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
+import socket
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import launcher
@@ -36,6 +40,23 @@ def _sha256(path):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _hash_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_pin():
+    """Read the baked-in pin from bootstrap._pin (inside a release-built .pyz).
+    Returns None when the .pyz was hand-built without a release."""
+    try:
+        from bootstrap import _pin  # type: ignore
+        return _pin.VERSION, _pin.MANIFEST_SHA256, _pin.BASE_URL
+    except ImportError:
+        return None
+
+
+_DOWNLOAD_TIMEOUT = 30
 
 
 @contextlib.contextmanager
@@ -140,12 +161,77 @@ def verify_bundle(bundle_dir, manifest_sha256):
             "extra_wheels": sorted(w for w in wheels if w != core[0])}
 
 
-def run_install(bundle_dir, manifest_sha256, home=None):
-    """Verify -> build -> activate -> launcher. Returns an exit class; prints one JSON object."""
-    from bootstrap.cli import EXIT_OK, EXIT_REJECTED, EXIT_UNAVAILABLE, emit, fail, require_prerequisites
+def fetch_bundle(base_url, manifest_sha256, dest):
+    """Download the manifest from *base_url*, verify its digest against *manifest_sha256*,
+    then download every artifact the manifest names, verifying each against its claimed sha256.
+    *dest* is created fresh; on any error it is removed before the exception propagates.
+    Returns *dest* (the bundle directory with all files)."""
+    dest = Path(dest)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    try:
+        actual_digest = _download_to(dest, base_url, "release-manifest.json")
+        if actual_digest != manifest_sha256:
+            raise BundleError("manifest_digest_mismatch",
+                              "release-manifest.json is " + actual_digest
+                              + ", pinned " + manifest_sha256)
+
+        manifest = json.loads((dest / "release-manifest.json").read_text(encoding="utf-8"))
+        for art in manifest.get("artifacts", []):
+            name = art["name"]
+            pname = Path(name)
+            if pname.name != name or ".." in name:
+                raise BundleError("invalid_artifact_name",
+                                  "artifact name must be a simple filename, got " + repr(name))
+            art_digest = _download_to(dest, base_url, name)
+            if art_digest != art["sha256"]:
+                raise BundleError("artifact_digest_mismatch",
+                                  name + " is " + art_digest + ", the manifest says " + art["sha256"])
+        return dest
+    except BundleError:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+
+def _download_to(dest_dir, base_url, name):
+    """Download ``base_url/name`` into ``dest_dir/name``. Returns the sha256 of the downloaded
+    bytes. Raises BundleError("download_failed", ...) on any network or I/O error."""
+    url = base_url.rstrip("/") + "/" + name
+    try:
+        resp = urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT)
+        data = resp.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout, OSError) as e:
+        raise BundleError("download_failed", "cannot fetch " + url + ": " + str(e)) from e
+    (dest_dir / name).write_bytes(data)
+    return _hash_bytes(data)
+
+
+def run_install(bundle_dir, manifest_sha256, home=None, base_url=None, pin_digest=None):
+    """Verify -> build -> activate -> launcher. Returns an exit class; prints one JSON object.
+
+    When *bundle_dir* is None, reads the baked-in pin and fetches from *base_url* using
+    *pin_digest* as the trusted manifest digest. Fetching writes under NELIX_HOME, so it runs
+    INSIDE distribution_lock — unlike the offline path, where verification is a read-only check.
+    """
+    from bootstrap.cli import EXIT_OK, EXIT_REJECTED, EXIT_UNAVAILABLE, EXIT_USAGE, emit, fail, require_prerequisites
 
     if home:
         os.environ["NELIX_HOME"] = str(home)
+
+    if bundle_dir is None:
+        if pin_digest is None or base_url is None:
+            return fail("no_pin",
+                        "this .pyz was hand-built without a release pin; "
+                        "provide --bundle and --manifest-sha256",
+                        EXIT_USAGE)
+        try:
+            with distribution_lock():
+                staging = paths.nelix_root() / "staging"
+                bundle_dir = fetch_bundle(base_url, pin_digest, staging)
+        except BundleError as e:
+            return fail(e.code, str(e), EXIT_UNAVAILABLE)
+        manifest_sha256 = pin_digest  # the pin IS the pinned manifest digest
 
     try:
         checked = verify_bundle(bundle_dir, manifest_sha256)
@@ -174,4 +260,19 @@ def run_install(bundle_dir, manifest_sha256, home=None):
 
 
 def run(args):
-    return run_install(args.bundle, args.manifest_sha256, home=args.home)
+    """Dispatch from the CLI. When --bundle is given, runs the offline path; otherwise reads the
+    baked-in pin and fetches."""
+    if args.bundle is not None:
+        return run_install(args.bundle, args.manifest_sha256, home=args.home)
+    pin = read_pin()
+    if pin is None:
+        from bootstrap.cli import EXIT_USAGE, fail
+        return fail("no_pin",
+                    "this .pyz was hand-built without a release pin; "
+                    "provide --bundle and --manifest-sha256",
+                    EXIT_USAGE)
+    _version, manifest_sha256, base_url = pin
+    if args.base_url is not None:
+        base_url = args.base_url  # override source, NOT the digest — trust model unchanged
+    return run_install(bundle_dir=None, manifest_sha256=manifest_sha256,
+                       home=args.home, base_url=base_url, pin_digest=manifest_sha256)
