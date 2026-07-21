@@ -107,6 +107,23 @@ def test_wait_gives_up_at_its_deadline_and_still_teaches_the_rearm(monkeypatch, 
     assert out.strip().splitlines()[-1].endswith("--cursor c-9")
 
 
+def test_wait_handles_keyboard_interrupt_gracefully(monkeypatch, capsys):
+    """KeyboardInterrupt during polling -> exits 0 with a 'none' doorbell, no traceback."""
+    def raising_poll(owner_id, orchestration_id, cursor):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(wait_cmd, "_poll", raising_poll)
+    monkeypatch.setattr(wait_cmd.daemon_cmds, "_router_health", lambda timeout=2: {"ok": True})
+
+    rc = nelix_cli.main(["wait", "--owner", OWNER, "--orchestration", ORCH])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "NELIX WAKE" in out
+    assert "no events" in out
+    assert "Re-arm:" in out
+
+
 def test_wait_does_not_spin_on_an_empty_orchestration(monkeypatch, capsys):
     """The router answers empty_orchestration INSTANTLY — one call, then out."""
     calls = []

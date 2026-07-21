@@ -10,7 +10,7 @@ against — from nelix_status, an uncapped tool-result channel.
 S1c-2 / H14: uses the ROUTER's orchestration /wait (owner_id + orchestration_id + vector cursor),
 not the daemon's state-file /wait.
 """
-import argparse, json, os, sys
+import argparse, json, os, signal, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import paths
@@ -18,6 +18,10 @@ from daemon.transport import Transport
 from rpc_client import RpcClient
 
 from nelix_cli.doorbell import DOORBELL_FIELDS, classify
+
+
+def _signal_to_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt()
 
 
 def _discover():
@@ -43,6 +47,8 @@ def main():
                     help="Opaque vector cursor token (empty = start from now)")
     args = ap.parse_args()
 
+    signal.signal(signal.SIGTERM, _signal_to_keyboard_interrupt)
+
     try:
         transport = _discover()
     except (OSError, ValueError, KeyError) as e:
@@ -60,7 +66,7 @@ def main():
             params["cursor"] = args.cursor_token
         path = "/wait?" + urllib.parse.urlencode(params)
         _, body = client._call("GET", path, timeout=45)
-    except (OSError, ConnectionError):
+    except (OSError, ConnectionError, KeyboardInterrupt):
         print(json.dumps({"kind": "none"}, ensure_ascii=False))
         return 0
 
