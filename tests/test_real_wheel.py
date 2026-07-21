@@ -242,3 +242,43 @@ print(json.dumps({"pytest": importlib.util.find_spec("pytest") is not None,
 """)
     assert out["wasmtime"] is True, "wasmtime is a real runtime dep and must install"
     assert out["pytest"] is False, "the wheel dragged pytest into a runtime install"
+
+
+def test_installed_core_imports_the_router_and_the_cli(installed):
+    out = _probe(installed, """
+import json
+import router.app
+import nelix_cli.cli
+import rpc_client, runtime, generation_supervisor, paths, launcher_resolve
+print(json.dumps({"router": router.app.__file__, "cli": nelix_cli.cli.__file__}))
+""")
+    assert "site-packages" in out["router"], f"router imported from {out['router']}, not the install"
+    assert "site-packages" in out["cli"], f"nelix_cli imported from {out['cli']}, not the install"
+    assert not out["router"].startswith(str(REPO)), f"the repo leaked: {out['router']}"
+
+
+def test_installed_core_puts_nelix_on_the_path(installed):
+    py, tmp = installed
+    exe = py.parent / "nelix"
+    assert exe.exists(), "the wheel must install a nelix console script"
+
+    r = _run([exe, "--help"], cwd=tmp, env=_clean_env())
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    for verb in ("daemon", "rpc", "wait", "config"):
+        assert verb in r.stdout, f"`nelix --help` does not offer {verb}: {r.stdout}"
+
+
+def test_installed_nelix_answers_the_cli_api_envelope(installed):
+    py, tmp = installed
+    home = tmp / "cli_home"
+    home.mkdir(exist_ok=True)
+
+    r = _run([py.parent / "nelix", "rpc", "status", "--owner", "harness-x"],
+             cwd=tmp, env={**_clean_env(), "NELIX_HOME": str(home)})
+
+    assert r.returncode == 3, f"expected the unavailable exit class, got {r.returncode}: {r.stderr}"
+    body = json.loads(r.stdout.strip().splitlines()[-1])
+    assert body["cli_api"] == 1
+    assert body["ok"] is False
+    assert body["error"]["code"] == "router_unavailable"
+    assert "Traceback" not in r.stderr

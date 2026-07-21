@@ -30,30 +30,29 @@ dependencies = ["wasmtime==45.0.0"]
 # wheels alongside the core via the runtime installer (nelix-9a4.4).
 dev = ["pytest==8.3.4", "pyyaml==6.0.3"]
 
-# Only the two WORKER-facing CLIs ship. daemon/hook_settings.py hands their absolute paths to every
-# hook-capable executor, so an install without them is a broken core — they are the daemon's own
-# runtime requirement, not a convenience.
+# The `nelix` CLI is the single entry point every adapter invokes — through the stable launcher,
+# but the console script is what the launcher execs into. nelix-question and nelix-note are the
+# two WORKER-facing CLIs: daemon/hook_settings.py hands their absolute paths to every hook-capable
+# executor, so an install without them is a broken core — they are the daemon's own runtime
+# requirement, not a convenience.
 #
 # nelix-doctor / nelix-reap / nelix-wait / nelix-capture / nelix-inventory deliberately do NOT ship.
-# They are operator tools, and shipping them now would mean shipping supervisor.py + rpc_client.py
-# (nelix-doctor, nelix-reap and nelix-wait import them) and dragging pyyaml into every install — to
-# freeze a CLI surface that nelix-3rm is about to replace with the `nelix` CLI. An installed core
-# you cannot inspect is a real cost; paying it for one slice is cheaper than shipping names we plan
-# to break. They keep working from the checkout, which is where an operator has them today.
+# They are operator tools, and the `nelix` CLI replaces their surface.
 [project.scripts]
+nelix = "nelix_cli.cli:main"
 nelix-question = "daemon.tools.question:main"
 nelix-note = "daemon.tools.note:main"
 
 [tool.setuptools]
-# paths.py and launcher_resolve.py are TOP-LEVEL modules that daemon/ imports (paths: 9 modules
-# incl. app.py; launcher_resolve: daemon/launchers/__init__.py). Without them the wheel installs
-# and dies at `import daemon.app`. Listed explicitly because auto-discovery on a flat layout would
-# also sweep in tests/, spikes/, supervisor.py and rpc_client.py.
-py-modules = ["paths", "launcher_resolve"]
+# TOP-LEVEL modules the shipped packages import. paths + launcher_resolve were always required;
+# router/ adds generation_supervisor and rpc_client, and nelix_cli adds runtime. All five are
+# stdlib-only (verified by tests/test_runtime_closure.py for the builder half). supervisor.py is
+# deliberately absent: nothing shipped imports it.
+py-modules = ["paths", "launcher_resolve", "rpc_client", "runtime", "generation_supervisor"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["daemon*"]
+include = ["daemon*", "router*", "nelix_cli*"]
 
 [tool.setuptools.package-data]
 # The only non-.py file under daemon/, and ghostty.py:7 loads it relative to its own __file__.
