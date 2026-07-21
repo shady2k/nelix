@@ -11,7 +11,7 @@ def test_concurrent_spawns_under_pumping_never_hang(tmp_path):
     allocation) while new spawns happen concurrently. With the broker, every spawn must
     succeed and no spawn may hang. Pre-broker this would intermittently deadlock/crash."""
     bc = BrokerClient()
-    sessions, errors = [], []
+    sessions, errors, pumpers = [], [], []
     stop = threading.Event()
 
     def pumper(s):
@@ -27,7 +27,9 @@ def test_concurrent_spawns_under_pumping_never_hang(tmp_path):
             master, pid, pgid = bc.spawn(["cat"], str(tmp_path), dict(os.environ), 80, 24)
             s = PtySession(master, pid, pgid)
             sessions.append(s)
-            threading.Thread(target=pumper, args=(s,), daemon=True).start()
+            pt = threading.Thread(target=pumper, args=(s,), daemon=True)
+            pt.start()
+            pumpers.append(pt)
         except Exception as e:                      # noqa: BLE001 — capture any hang-surrogate error
             errors.append(repr(e))
 
@@ -48,6 +50,8 @@ def test_concurrent_spawns_under_pumping_never_hang(tmp_path):
             assert s.leader_pid() == s.leader_pgid()
     finally:
         stop.set()
+        for pt in pumpers:
+            pt.join(timeout=2.0)
         for s in sessions:
             pid = s.leader_pid(); s.close()
             try:
