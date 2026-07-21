@@ -59,8 +59,8 @@ def build_parser():
     p.add_argument("--version", action="store_true", help="print this bootstrapper's schema and exit")
     sub = p.add_subparsers(dest="command")
     inst = sub.add_parser("install", help="install a release bundle into $NELIX_HOME")
-    inst.add_argument("--bundle", required=True, help="directory holding the release artifacts")
-    inst.add_argument("--manifest-sha256", dest="manifest_sha256", required=True,
+    inst.add_argument("--bundle", default=None, help="directory holding the release artifacts")
+    inst.add_argument("--manifest-sha256", dest="manifest_sha256", default=None,
                       help="the pinned digest of release-manifest.json")
     inst.add_argument("--home", default=None, help="NELIX_HOME (default: $NELIX_HOME or ~/.nelix)")
     inst.set_defaults(func=lambda a: __import__("bootstrap.install", fromlist=["run"]).run(a))
