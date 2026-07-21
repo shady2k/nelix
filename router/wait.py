@@ -61,6 +61,7 @@ from nelix_contracts.errors import (
 from nelix_contracts.ids import InvalidId, validate_orchestration_id, validate_owner_id
 
 from router.forwarding import relay
+from router.waiters import WaiterRegistry
 
 try:
     from rpc_client import RpcClient
@@ -95,7 +96,8 @@ class WaitForward:
     _WAIT_WINDOW = 25.0
     _POLL_INTERVAL = 1.0
 
-    def __init__(self, ledger, registry, router_epoch, store=None, archive_epoch=None):
+    def __init__(self, ledger, registry, router_epoch, store=None, archive_epoch=None,
+                 waiters=None):
         if (store is None) != (archive_epoch is None):
             raise ValueError(
                 "store and archive_epoch must be both set or both None; "
@@ -105,6 +107,7 @@ class WaitForward:
         self._router_epoch = router_epoch
         self._store = store
         self._archive_epoch = archive_epoch
+        self._waiters = waiters if waiters is not None else WaiterRegistry()
 
     def wait(self, owner_id, orchestration_id, cursor_token) -> "tuple[int, dict]":
         """Long-poll the orchestration. The effective long-poll window is always the generation's
@@ -113,6 +116,14 @@ class WaitForward:
         owner_id = _owner(owner_id)
         orchestration_id = _orchestration(orchestration_id)
 
+        # The waiter count covers EVERY path that can block and NO path that merely validates: the
+        # two id validations above can reject before anyone is attached, and everything after this
+        # line is inside the count. That is what makes "waiters > 0" mean "someone is listening",
+        # never "someone sent a malformed id".
+        with self._waiters.attached(orchestration_id):
+            return self._wait_inner(owner_id, orchestration_id, cursor_token)
+
+    def _wait_inner(self, owner_id, orchestration_id, cursor_token) -> "tuple[int, dict]":
         # 1. The orchestration's waitable sessions (owner-scoped). Empty -> can never wake.
         sessions = self._ledger.sessions_for_orchestration(owner_id, orchestration_id)
         if not sessions:

@@ -305,6 +305,22 @@ class StartLedger:
         return out
 
     @translates_sqlite
+    def orchestrations_for_owner(self, owner_id: str) -> "list[str]":
+        """The DISTINCT orchestration_ids this owner currently has waitable sessions under — the
+        same state filter sessions_for_orchestration uses ('starting', 'started'), so the two
+        answers can never disagree about what is live. Owner-scoped for the same reason: an
+        orchestration id is not a capability, and no owner may enumerate another's."""
+        try:
+            validate_owner_id(owner_id)
+        except InvalidId as e:
+            raise NelixError(INVALID_REQUEST, str(e)) from None
+        rows = self._conn.execute(
+            "SELECT DISTINCT orchestration_id FROM starts WHERE owner_id=? "
+            "AND state IN ('starting', 'started') ORDER BY orchestration_id",
+            (owner_id,)).fetchall()
+        return [row["orchestration_id"] for row in rows]
+
+    @translates_sqlite
     def lookup(self, idempotency_key: str, *, owner_id: str) -> "Reservation | None":
         """Owner-guarded: rev 1's lookup took no owner at all, so it handed any caller
         another owner's session_id, state and generation."""

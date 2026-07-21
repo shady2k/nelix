@@ -49,6 +49,7 @@ from router.restart import RestartPath
 from router.session_forward import SessionForward
 from router.start import http_status
 from router.wait import WaitForward
+from router.waiters import WaiterRegistry
 
 _MAX_BODY = 4 * 1024 * 1024        # 4 MiB post-auth body cap (mirrors the daemon's rpc_server)
 
@@ -120,11 +121,15 @@ def make_router_server(bound_socket, sock_path, start_path, registry, router_epo
     # S2a.2: the router owns the archive board read. store is threaded from app.py so BoardForward
     # can call store.read_board_snapshot(owner_id) directly. archive_epoch is the per-process
     # epoch for the archive cursor component, minted like router_epoch.
-    board_forward = BoardForward(registry, router_epoch, store=store, archive_epoch=archive_epoch)
+    # ONE registry, handed to both: WaitForward increments it while it blocks and BoardForward
+    # reports it, so the board's waiter counts are the very same long-polls this router is holding.
+    waiters = WaiterRegistry()
+    board_forward = BoardForward(registry, router_epoch, store=store, archive_epoch=archive_epoch,
+                                 ledger=start_path.ledger, waiters=waiters)
     # The orchestration /wait waiter (3c.3b). Wired off the SAME shared StartLedger as the start
     # path (start_path.ledger) — one instance, never per-request (nelix-91y).
     wait_forward = WaitForward(start_path.ledger, registry, router_epoch,
-                                store=store, archive_epoch=archive_epoch)
+                                store=store, archive_epoch=archive_epoch, waiters=waiters)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
