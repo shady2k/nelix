@@ -83,7 +83,8 @@ def build(dist_dir, *, version: str) -> Path:
     shutil.copy2(LOCK, dist_dir / LOCK.name)
 
     build_pyz(dist_dir)
-    artifacts = sorted(list(dist_dir.glob("*.whl")) + [dist_dir / "nelix-bootstrap.pyz"])
+    artifacts = sorted(list(dist_dir.glob("*.whl")) + [dist_dir / "nelix-bootstrap.pyz",
+                                                        dist_dir / LOCK.name])
     manifest = manifest_for(artifacts, version=version,
                             lock_sha256=file_sha256(dist_dir / LOCK.name))
     out = dist_dir / "release-manifest.json"

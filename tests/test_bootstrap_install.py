@@ -66,7 +66,89 @@ def test_a_missing_artifact_is_refused(bundle, tmp_path):
     with pytest.raises(bootstrap_install.BundleError) as ei:
         bootstrap_install.verify_bundle(copy, digest)
 
-    assert ei.value.code == "artifact_missing"
+    assert ei.value.code == "artifact_not_file"
+
+
+def test_a_tampered_lock_is_refused(bundle, tmp_path):
+    """The lock is an ordinary artifact now — tampering with its content must fail the digest check."""
+    d, digest = bundle
+    copy = tmp_path / "tampered_lock"
+    shutil.copytree(d, copy)
+    lock = copy / "requirements-runtime.lock"
+    lock.write_bytes(lock.read_bytes() + b"// tampered")
+
+    with pytest.raises(bootstrap_install.BundleError) as ei:
+        bootstrap_install.verify_bundle(copy, digest)
+
+    assert ei.value.code == "artifact_digest_mismatch"
+    assert "requirements-runtime.lock" in str(ei.value)
+
+
+def test_an_artifact_name_escaping_the_directory_is_refused(bundle, tmp_path):
+    d, digest = bundle
+    copy = tmp_path / "escape_name"
+    shutil.copytree(d, copy)
+    manifest_path = copy / "release-manifest.json"
+    manifest = _json.loads(manifest_path.read_text())
+    manifest["artifacts"].append({"name": "../evil.whl", "sha256": "0" * 64, "size": 0})
+    new_manifest_bytes = _json.dumps(manifest).encode()
+    manifest_path.write_bytes(new_manifest_bytes)
+    new_digest = hashlib.sha256(new_manifest_bytes).hexdigest()
+
+    with pytest.raises(bootstrap_install.BundleError) as ei:
+        bootstrap_install.verify_bundle(copy, new_digest)
+
+    assert ei.value.code == "invalid_artifact_name"
+
+
+def test_an_artifact_symlink_pointing_outside_is_refused(bundle, tmp_path):
+    d, digest = bundle
+    copy = tmp_path / "symlink_out"
+    shutil.copytree(d, copy)
+    manifest_path = copy / "release-manifest.json"
+    manifest = _json.loads(manifest_path.read_text())
+
+    outside = tmp_path / "outside.whl"
+    outside.write_bytes(b"evil")
+    outside_hash = hashlib.sha256(outside.read_bytes()).hexdigest()
+    (copy / "evil_link.whl").symlink_to(outside)
+
+    manifest["artifacts"].append({"name": "evil_link.whl", "sha256": outside_hash, "size": len(b"evil")})
+    manifest_path.write_text(_json.dumps(manifest))
+
+    with pytest.raises(bootstrap_install.BundleError) as ei:
+        bootstrap_install.verify_bundle(copy, hashlib.sha256(manifest_path.read_bytes()).hexdigest())
+
+    assert ei.value.code in ("artifact_is_symlink", "artifact_path_escape")
+
+
+def test_a_duplicate_artifact_name_is_refused(bundle, tmp_path):
+    d, digest = bundle
+    copy = tmp_path / "duplicate_name"
+    shutil.copytree(d, copy)
+    manifest_path = copy / "release-manifest.json"
+    manifest = _json.loads(manifest_path.read_text())
+    manifest["artifacts"].append(manifest["artifacts"][0].copy())
+    new_manifest_bytes = _json.dumps(manifest).encode()
+    manifest_path.write_bytes(new_manifest_bytes)
+    new_digest = hashlib.sha256(new_manifest_bytes).hexdigest()
+
+    with pytest.raises(bootstrap_install.BundleError) as ei:
+        bootstrap_install.verify_bundle(copy, new_digest)
+
+    assert ei.value.code == "duplicate_artifact_name"
+
+
+def test_an_extra_wheel_not_named_in_the_manifest_is_refused(bundle, tmp_path):
+    d, digest = bundle
+    copy = tmp_path / "extra_wheel"
+    shutil.copytree(d, copy)
+    (copy / "intruder-1.0.0-py3-none-any.whl").write_bytes(b"i am not in the manifest")
+
+    with pytest.raises(bootstrap_install.BundleError) as ei:
+        bootstrap_install.verify_bundle(copy, digest)
+
+    assert ei.value.code == "extra_wheel_in_bundle"
 
 
 def test_verification_failure_writes_nothing_into_nelix_home(bundle, tmp_path, monkeypatch):
