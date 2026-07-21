@@ -21,7 +21,6 @@ Three subcommands, one per caller-facing need:
 `nelix daemon ensure` first and exit non-zero, rather than silently spawning one as a side effect
 of what looks like a read.
 """
-import argparse
 import http.client
 import json
 import os
@@ -35,7 +34,7 @@ import paths
 from rpc_client import UnixHTTPConnection
 from runtime import active_python
 
-_REPO_ROOT = Path(__file__).resolve().parent
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Mirrors supervisor.py's _HEALTH_TIMEOUT: how long `ensure` waits for a freshly spawned router to
 # answer /health before giving up.
@@ -209,44 +208,3 @@ def _cmd_wait(args) -> int:
     # One line, machine-readable (spec §11: a harness consumes this, not a human reading prose).
     print(json.dumps(body, ensure_ascii=False))
     return 0 if status == 200 else 1
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="nelix",
-        description="Minimal nelix CLI: ensure the router is running, read its board, "
-                    "arm the orchestration wait doorbell (spec Implementation-plans §3, §11).")
-    top = parser.add_subparsers(dest="command", required=True)
-
-    daemon = top.add_parser("daemon", help="router lifecycle, board reads, orchestration wait")
-    sub = daemon.add_subparsers(dest="daemon_command", required=True)
-
-    p_ensure = sub.add_parser(
-        "ensure", help="ensure the router is running for this NELIX_HOME (idempotent)")
-    p_ensure.set_defaults(func=_cmd_ensure)
-
-    p_status = sub.add_parser("status", help="print the router's owner-filtered board")
-    p_status.add_argument("--owner", required=True, help="the owner_id to filter the board by")
-    p_status.set_defaults(func=_cmd_status)
-
-    p_wait = sub.add_parser(
-        "wait", help="arm the orchestration doorbell and print the one-shot result, then exit")
-    p_wait.add_argument("--owner", required=True, help="the owner_id the wait is scoped to")
-    p_wait.add_argument("--orchestration", required=True,
-                        help="the orchestration_id to wait on")
-    p_wait.add_argument("--cursor", default=None,
-                        help="opaque cursor token from a prior wait/status reply; "
-                             "omit to arm from now")
-    p_wait.set_defaults(func=_cmd_wait)
-
-    return parser
-
-
-def main(argv=None) -> int:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-    return args.func(args)
-
-
-if __name__ == "__main__":
-    sys.exit(main())

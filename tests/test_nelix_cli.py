@@ -1,5 +1,5 @@
 """nelix-3rm slice 3d: the minimal `nelix` CLI (daemon ensure|status|wait — spec Implementation-
-plans §3, §11 "the wake executable"). nelix_cli.py at the repo root is a CLIENT + LAUNCHER only:
+plans §3, §11 "the wake executable"). The nelix_cli/ package is a CLIENT + LAUNCHER only:
 these tests never assert on router/daemon BEHAVIOR (that belongs to router/'s own suite), only
 that the CLI's argparse surface, its ROUTER spawn/health-check (mirroring supervisor.py's shape),
 and its status/wait wrappers do what they claim against a REAL router.
@@ -28,6 +28,7 @@ import threading
 import pytest
 
 import nelix_cli
+import nelix_cli.daemon_cmds
 import paths
 from tests.conftest import EXECUTOR, OWNER, make_spec
 from daemon.events import EventQueue
@@ -172,7 +173,7 @@ def test_ensure_router_recovers_when_its_own_spawn_loses_the_lock_race(monkeypat
         None,                                                       # first loop iteration: not yet
         {"status": "ok", "router_epoch": "r-x", "active_generation": None},  # post-exit recovery probe
     ])
-    monkeypatch.setattr(nelix_cli, "_router_health", lambda timeout=2: next(healths))
+    monkeypatch.setattr(nelix_cli.daemon_cmds, "_router_health", lambda timeout=2: next(healths))
 
     class _FakeExitedProc:
         pid = 999999
@@ -208,7 +209,7 @@ def test_ensure_router_keeps_polling_past_a_lost_lock_race_until_the_winner_is_h
                                                                       # have raised by here
         {"status": "ok", "router_epoch": "r-y", "active_generation": None},  # loop iter 4: winner is up
     ])
-    monkeypatch.setattr(nelix_cli, "_router_health", lambda timeout=2: next(healths))
+    monkeypatch.setattr(nelix_cli.daemon_cmds, "_router_health", lambda timeout=2: next(healths))
 
     class _FakeExitedProc:
         pid = 999997
@@ -230,7 +231,7 @@ def test_ensure_router_keeps_polling_past_a_lost_lock_race_until_the_winner_is_h
 
 
 def test_ensure_router_raises_when_the_spawn_never_becomes_healthy(monkeypatch):
-    monkeypatch.setattr(nelix_cli, "_router_health", lambda timeout=2: None)
+    monkeypatch.setattr(nelix_cli.daemon_cmds, "_router_health", lambda timeout=2: None)
 
     class _FakeHangingProc:
         """Simulates a truly stuck child: terminate() is requested but the process does not die
