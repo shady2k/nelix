@@ -34,6 +34,11 @@ except ImportError:           # loaded as a top-level module (tests), not as a p
     from daemon import reaper, singleton
 
 _HEALTH_TIMEOUT = 10.0
+# Per-call health-check timeout raised from 2s to 5s for load tolerance.
+# Under pytest -n auto (14 workers) the 2s timeout was hit intermittently
+# because parallel workers create machine-level load that delays local
+# unix-socket/TCP health-check RPCs (nelix-azx).
+_HEALTH_CHECK_TIMEOUT = 5.0
 _log = logging.getLogger("nelix.gen_supervisor")
 
 # The owner the generation supervisor's PROBE speaks as. Same rationale as
@@ -320,7 +325,7 @@ class GenerationSupervisor:
             from rpc_client import RpcClient
         try:
             st, body = RpcClient(transport, _PROBE_OWNER)._call(
-                "GET", f"/status?owner_id={_PROBE_OWNER}", timeout=2)
+                "GET", f"/status?owner_id={_PROBE_OWNER}", timeout=_HEALTH_CHECK_TIMEOUT)
             return self._compatible(body) if st == 200 else False
         except Exception:
             return False
@@ -360,7 +365,7 @@ class GenerationSupervisor:
         except ImportError:
             from rpc_client import RpcClient
         try:
-            health = RpcClient(transport, _PROBE_OWNER).health(timeout=2)
+            health = RpcClient(transport, _PROBE_OWNER).health(timeout=_HEALTH_CHECK_TIMEOUT)
         except Exception:
             return None
         # C3: Key PRESENCE — all three keys must exist in the response.
@@ -387,7 +392,7 @@ class GenerationSupervisor:
         except ImportError:
             from rpc_client import RpcClient
         try:
-            health = RpcClient(transport, _PROBE_OWNER).health(timeout=2)
+            health = RpcClient(transport, _PROBE_OWNER).health(timeout=_HEALTH_CHECK_TIMEOUT)
         except Exception:
             return False
 
