@@ -99,43 +99,6 @@ def test_orchestrations_for_owner_is_owner_scoped(ledger):
     assert ledger.orchestrations_for_owner("harness-y") == []
 
 
-import shutil
-import subprocess
-
-import paths
-
-
-@pytest.fixture
-def real_router(monkeypatch):
-    """Spies on every subprocess.Popen call (so a test can assert exactly how many router
-    processes were spawned) and guarantees cleanup: SIGTERM/kill each spawned process and remove
-    the leaf runtime dir, so a router `ensure` brings up never survives the test.
-
-    A LOCAL copy of tests/test_nelix_cli.py's fixture on purpose: that module is being edited in
-    parallel, so this module carries its own rather than reaching into a file it does not own."""
-    spawned = []
-    real_popen = subprocess.Popen
-
-    def _spy(*a, **kw):
-        p = real_popen(*a, **kw)
-        spawned.append(p)
-        return p
-
-    monkeypatch.setattr(subprocess, "Popen", _spy)
-    try:
-        yield spawned
-    finally:
-        for p in spawned:
-            if p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait()
-        shutil.rmtree(paths.router_sock().parent, ignore_errors=True)
-
-
 def test_the_board_reports_waiters_for_a_live_orchestration(real_router, capsys):
     """A real router, a real board read: with nothing attached the orchestration map is empty,
     and it never crashes when no orchestration exists at all.
@@ -167,6 +130,7 @@ from router.board import BoardForward
 from router.registry import GenerationRegistry
 from router.wait import WaitForward
 
+import paths
 from tests._router_fakes import Backend, Supervisor
 
 EPOCH = "r-" + "0" * 32
