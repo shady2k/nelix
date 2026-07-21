@@ -236,6 +236,14 @@ def runtime_install_lock() -> Path:
     return runtimes_root() / ".install.lock"
 
 
+def distribution_lock() -> Path:
+    """Serializes WHOLE distribution mutations — install (and later upgrade/rollback) — across the
+    verification, runtime build, activation and launcher write. Distinct from runtime_install_lock:
+    the builder takes that one INSIDE this scope, which is nesting by design. The only forbidden
+    thing is a holder re-acquiring the lock it already holds."""
+    return nelix_root() / "locks" / "distribution.lock"
+
+
 def generations_install_lock() -> Path:
     """Serializes concurrent operator activate/install operations on generations.
 
