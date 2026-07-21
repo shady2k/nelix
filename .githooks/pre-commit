@@ -31,15 +31,15 @@ if [ -x "$RUFF" ]; then
   fi
 fi
 
-# 2) Full test suite. The KNOWN flaky tests are deselected so the gate does not coin-flip on
-#    unrelated commits — REMOVE each once its bead is fixed:
-#      nelix-s6q: test_nelix_wait_graceful_interrupt (~1/3 OSError)
-#      nelix-7ho: test_respond_unknown_session_is_404_refresh_status (~1/5 server-bind race)
+# 2) Full test suite — NO deselects. Both former exclusions are gone because their beads are fixed:
+#      nelix-s6q: test_nelix_wait_graceful_interrupt — fixed 2026-07-21. It was never a flake: it
+#        failed 3/3 deterministically, and this very deselect is what hid that from every gate run.
+#      nelix-7ho/nelix-ov7: test_respond_unknown_session_is_404_refresh_status — fixed 2026-07-19.
 #    (nelix-45h is a warning, not a failure, so it does not gate.)
+#    Deselecting a test to keep a gate green makes the gate lie. If one starts flaking again, fix it
+#    or file it — do not re-add it here without a bead that says why.
 echo "pre-commit: pytest (full suite; this takes a few minutes) ..."
-if ! "$PY" -m pytest -q \
-      --deselect tests/test_nelix_wait.py::test_nelix_wait_graceful_interrupt \
-      --deselect tests/test_rpc_server.py::test_respond_unknown_session_is_404_refresh_status ; then
+if ! "$PY" -m pytest -q ; then
   echo "pre-commit: tests failed — commit BLOCKED." >&2
   exit 1
 fi
