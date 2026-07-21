@@ -66,6 +66,7 @@ def test_a_silent_window_still_teaches_the_rearm():
     assert "--cursor c-9" in text.splitlines()[-1]
 
 
+import builtins
 import nelix_cli
 from nelix_cli import wait_cmd
 
@@ -107,6 +108,23 @@ def test_wait_gives_up_at_its_deadline_and_still_teaches_the_rearm(monkeypatch, 
     assert out.strip().splitlines()[-1].endswith("--cursor c-9")
 
 
+def test_wait_handles_keyboard_interrupt_gracefully(monkeypatch, capsys):
+    """KeyboardInterrupt during polling -> exits 0 with a 'none' doorbell, no traceback."""
+    def raising_poll(owner_id, orchestration_id, cursor):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(wait_cmd, "_poll", raising_poll)
+    monkeypatch.setattr(wait_cmd.daemon_cmds, "_router_health", lambda timeout=2: {"ok": True})
+
+    rc = nelix_cli.main(["wait", "--owner", OWNER, "--orchestration", ORCH])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "NELIX WAKE" in out
+    assert "no events" in out
+    assert "Re-arm:" in out
+
+
 def test_wait_does_not_spin_on_an_empty_orchestration(monkeypatch, capsys):
     """The router answers empty_orchestration INSTANTLY — one call, then out."""
     calls = []
@@ -123,3 +141,52 @@ def test_wait_does_not_spin_on_an_empty_orchestration(monkeypatch, capsys):
     assert rc == 0
     assert len(calls) == 1
     assert "no sessions to wait on" in capsys.readouterr().out
+
+
+def test_wait_handles_keyboard_interrupt_during_sleep(monkeypatch, capsys):
+    """KeyboardInterrupt during time.sleep between windows -> exits 0 with 'none' doorbell."""
+    monkeypatch.setattr(wait_cmd, "_poll",
+                        lambda owner, orch, cursor: {"event": None, "cursor": "c-1"})
+    monkeypatch.setattr(wait_cmd.daemon_cmds, "_router_health", lambda timeout=2: {"ok": True})
+
+    def interrupt_on_sleep(secs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(wait_cmd.time, "sleep", interrupt_on_sleep)
+
+    rc = nelix_cli.main(["wait", "--owner", OWNER, "--orchestration", ORCH])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "NELIX WAKE" in out
+    assert "no events" in out
+    assert "Re-arm:" in out
+
+
+def test_wait_handles_keyboard_interrupt_during_print(monkeypatch, capsys):
+    """KeyboardInterrupt during print() of a found event -> exits 0 with 'none' doorbell."""
+    monkeypatch.setattr(wait_cmd, "_poll",
+                        lambda owner, orch, cursor:
+                        {"event": {"session_id": "s-x", "seq": 1, "kind": "idle",
+                                   "requires_response": False, "hung": False},
+                         "cursor": "c-2"})
+    monkeypatch.setattr(wait_cmd.daemon_cmds, "_router_health", lambda timeout=2: {"ok": True})
+
+    print_calls = [0]
+    original_print = builtins.print
+
+    def interrupt_then_work(*args, **kwargs):
+        print_calls[0] += 1
+        if print_calls[0] == 1:
+            raise KeyboardInterrupt()
+        return original_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", interrupt_then_work)
+
+    rc = nelix_cli.main(["wait", "--owner", OWNER, "--orchestration", ORCH])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "NELIX WAKE" in out
+    assert "no events" in out
+    assert "Re-arm:" in out
