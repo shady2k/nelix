@@ -5,6 +5,7 @@ import argparse
 import sys
 
 from nelix_cli import daemon_cmds
+from nelix_cli import wait_cmd
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -14,6 +15,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     "the wake doorbell, and executor configuration.")
     top = parser.add_subparsers(dest="command", required=True)
     _add_daemon(top)
+    wait_cmd.add_parser(top)
     return parser
 
 
