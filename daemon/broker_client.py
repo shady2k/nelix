@@ -2,6 +2,7 @@
 before threads) and delegates PTY spawns to it. Serializes requests behind one lock and
 lazily respawns the broker once if it has died (existing sessions are unaffected — the
 daemon already owns their master fds)."""
+import logging
 import os
 import subprocess
 import sys
@@ -9,12 +10,26 @@ import threading
 
 from daemon.broker_proto import send_msg, recv_msg, make_socketpair
 
+# Process lifecycle was the one subsystem here that kept NO record of itself: nothing logged a
+# broker being spawned, killed or reaped. So when a child outlived its owner the only evidence was
+# a suite that would not finish and a CI runner terminating processes nobody could account for.
+# Spawn/reap are cheap and rare — one line each is affordable and is the difference between a
+# diagnosable leak and a mystery.
+_log = logging.getLogger("nelix.broker_client")
+
 
 class BrokerSpawnError(Exception):
     def __init__(self, stage, err_errno):
         super().__init__(f"broker spawn_failed at {stage} (errno={err_errno})")
         self.stage = stage
         self.err_errno = err_errno
+
+
+# Upper bound on how long the daemon waits for the broker's reply to one spawn. Generous, because
+# the broker forks, opens a PTY and execs a real CLI under whatever load the machine is under —
+# this is a deadlock backstop, not a latency budget. A spawn that genuinely needs longer than this
+# has already failed in a way the caller must hear about.
+_SPAWN_REPLY_TIMEOUT = 30.0
 
 
 class BrokerClient:
@@ -26,6 +41,14 @@ class BrokerClient:
 
     def _start(self):
         daemon_end, broker_end = make_socketpair()
+        # A recv deadline, because peer-close is NOT a portable liveness signal. Closing one end
+        # of an AF_UNIX/SOCK_DGRAM pair wakes the other end's recvmsg with ECONNRESET on macOS
+        # (broker_proto turns that into EOFError); Linux delivers no wakeup at all and the recv
+        # never returns. spawn() blocks in recv while holding self._lock, so on Linux one dead
+        # broker would wedge every later spawn behind it. The deadline needs no new handling:
+        # socket.timeout IS TimeoutError, an OSError, so spawn()'s existing
+        # `except (OSError, EOFError)` already routes it to restart-and-retry.
+        daemon_end.settimeout(_SPAWN_REPLY_TIMEOUT)
         os.set_inheritable(broker_end.fileno(), True)
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "daemon.pty_broker", str(broker_end.fileno())],
@@ -79,11 +102,20 @@ class BrokerClient:
             except OSError:
                 pass
             self._sock = None
-            if self._proc is not None and self._proc.poll() is None:
-                try:
-                    self._proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
+            proc = self._proc
+            if proc is not None:
+                if proc.poll() is None:
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        # kill() only SIGNALS. Without the wait() below the broker stays a zombie,
+                        # and a zombie is invisible: it holds a slot in the process table with
+                        # nothing recording who created it.
+                        proc.kill()
+                        proc.wait()
+                _log.info("broker reaped pid=%s rc=%s", getattr(proc, "pid", None),
+                          proc.returncode)
+                self._proc = None                 # idempotent: a second close() is a no-op
 
 
 _broker = None

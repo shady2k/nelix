@@ -61,6 +61,21 @@ include = ["daemon*", "router*", "nelix_cli*"]
 
 [tool.pytest.ini_options]
 addopts = "-n auto --dist=loadscope"
+
+# A WEDGED run is silent by construction, and that silence is the whole reason the 96% hang has
+# never been diagnosed. `-n auto` buffers each worker's output and prints it when the run ends; a
+# run that never ends prints nothing at all — no traceback, no summary, no name of the test that
+# stopped. Both venues that have hit this (the root container and a clean Linux runner) produced
+# an identical wall of dots and then nothing.
+#
+# faulthandler_timeout is the one instrument that speaks DURING a hang: pytest arms
+# faulthandler.dump_traceback_later, so a test still running after this many seconds dumps the
+# stacks of ALL its threads straight to stderr — unbuffered, before any hang can swallow it. It
+# only dumps; it does not kill the test, so a genuinely slow test costs noise rather than a
+# failure. 300s is chosen above the honestly-slow tests (`slow` builds a wheel and a venv with uv)
+# and far below the CI job cap, so the dump lands with minutes to spare.
+faulthandler_timeout = 300
+
 markers = [
     "slow: builds a wheel and a venv; seconds, not milliseconds (tests/test_real_wheel.py)",
 ]
