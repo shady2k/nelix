@@ -65,6 +65,19 @@ _FAKE_GEN_DAEMON = textwrap.dedent("""\
 """)
 
 
+# A fake daemon that serves health normally but publishes a start_fingerprint that does NOT match
+# the process it names. This reproduces the macOS readiness failure deterministically, on any
+# platform: the child is alive and answering, so _check_health passes, and _owns_lock can never be
+# satisfied. Derived from the real fake rather than copied, so the two cannot drift apart.
+_BAD_FINGERPRINT = '"start_fingerprint": "not-the-fingerprint-this-process-has"'
+_FAKE_BAD_FINGERPRINT_DAEMON = _FAKE_GEN_DAEMON.replace(
+    '"start_fingerprint": _insp.start_fingerprint(_pid)', _BAD_FINGERPRINT)
+# .replace() is silent when it matches nothing, which would leave this fixture identical to the
+# healthy daemon and turn the test below green for entirely the wrong reason.
+assert _BAD_FINGERPRINT in _FAKE_BAD_FINGERPRINT_DAEMON, \
+    "the start_fingerprint line in _FAKE_GEN_DAEMON moved; this fixture no longer patches anything"
+
+
 # A fake daemon that announces a WRONG generation_id on /health (for strict identity testing).
 _FAKE_MISMATCHED_DAEMON = textwrap.dedent("""\
     import json, os
@@ -248,6 +261,31 @@ def test_health_returns_expected_identity(monkeypatch, tmp_path):
     assert health["generation_epoch"] == epoch
 
     sup.teardown("test")
+
+
+def test_readiness_failure_names_the_half_that_failed(monkeypatch, tmp_path):
+    """A readiness timeout must say WHICH of the two conditions never held, and why.
+
+    Today it says only "did not become healthy; see <log>" — and on macOS that log is EMPTY,
+    because a fake daemon that is alive and serving writes nothing to it. An error that points at
+    a file a healthy process leaves blank cannot be acted on by anyone: not by us in CI, not by a
+    user on their own machine.
+
+    Here health succeeds and only lock ownership fails, so the message must distinguish the two
+    rather than blaming "healthy" for both.
+    """
+    monkeypatch.setattr(generation_supervisor, "_HEALTH_TIMEOUT", 2.0)
+    fake_path = _use_fake_daemon(monkeypatch, tmp_path, script=_FAKE_BAD_FINGERPRINT_DAEMON)
+    sup = _make_supervisor(monkeypatch, tmp_path)
+    sup._daemon_argv = lambda: [sys.executable, str(fake_path)]
+    sup._choose_transport = _tcp_transport
+
+    with pytest.raises(RuntimeError) as exc:
+        sup.ensure_running(generation_epoch=new_generation_id())
+
+    msg = str(exc.value)
+    assert "health=ok" in msg, msg
+    assert "fingerprint_mismatch" in msg, msg
 
 
 def test_adoption_rejects_mismatched_identity():

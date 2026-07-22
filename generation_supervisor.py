@@ -342,9 +342,36 @@ class GenerationSupervisor:
             return None
         return meta
 
+    def _lock_probe(self, pid: int) -> str:
+        """WHY `pid` does or does not hold the generation lock, as a short category.
+
+        ``_owns_lock`` is the boolean face of this, and every other caller keeps using
+        ``_live_lock_holder``. The category exists because a readiness failure that cannot name its
+        own cause is unactionable: it used to send the reader to a daemon log that a HEALTHY daemon
+        leaves completely empty, which is no answer at all — in CI or on a user's own machine.
+        """
+        meta = singleton.read_holder(self._lock_path)
+        if not meta:
+            return "no_record"
+        recorded = meta.get("pid")
+        if not recorded:
+            return "no_pid"
+        insp = reaper.ProcessInspector()
+        if not insp.is_alive(recorded):
+            return "dead"
+        observed = insp.start_fingerprint(recorded)
+        if observed != meta.get("start_fingerprint"):
+            # Both values are reported because the interesting case is not "they differ" but
+            # "one of them is None" — an unavailable fingerprint is not a mismatch, it is an
+            # absence, and the two demand different fixes.
+            return (f"fingerprint_mismatch(recorded={meta.get('start_fingerprint')!r}, "
+                    f"observed={observed!r})")
+        if recorded != pid:
+            return f"pid_mismatch(recorded={recorded}, expected={pid})"
+        return "ok"
+
     def _owns_lock(self, pid: int) -> bool:
-        holder = self._live_lock_holder()
-        return bool(holder) and holder.get("pid") == pid
+        return self._lock_probe(pid) == "ok"
 
     def _health_identity(self, transport) -> "dict | None":
         """Read the daemon's /health and return ``{generation_id, generation_epoch, build_id}``
@@ -529,10 +556,16 @@ class GenerationSupervisor:
 
         incarnation = self._capture_incarnation_from(proc.pid)
         deadline = time.time() + _HEALTH_TIMEOUT
+        # Retained so a timeout can say WHICH of the two conditions never held. The two are
+        # short-circuited, so "not_evaluated" is itself a real answer: reporting a lock failure
+        # that was never actually checked would send the next reader after the wrong half.
+        health_last = "not_probed"
+        lock_last = "not_evaluated"
         while time.time() < deadline:
             # Require BOTH a compatible /status AND proof that OUR spawned pid
             # holds the per-generation lock.
-            if self._check_health(transport) and self._owns_lock(proc.pid):
+            health_last = "ok" if self._check_health(transport) else "failed"
+            if health_last == "ok" and (lock_last := self._lock_probe(proc.pid)) == "ok":
                 self._write_state(proc.pid, transport)
                 _log.info("generation daemon started gen_id=%s epoch=%s pid=%s transport=%s log=%s",
                           self._generation_id, generation_epoch, proc.pid, transport.kind, log_path)
@@ -548,8 +581,9 @@ class GenerationSupervisor:
             time.sleep(0.1)
         proc.terminate()
         raise RuntimeError(
-            f"generation daemon gen_id={self._generation_id} did not become healthy; "
-            f"see {log_path}")
+            f"generation daemon gen_id={self._generation_id} did not become healthy "
+            f"in {_HEALTH_TIMEOUT}s: health={health_last} lock={lock_last} "
+            f"pid={proc.pid} exit={proc.poll()}; see {log_path}")
 
     # ---- reconciliation / adoption ------------------------------------------
 
