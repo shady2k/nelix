@@ -77,3 +77,44 @@ jobs:
         # ./.venv/bin/python, which does not exist on a runner. Parallelism comes from
         # pyproject.toml's addopts (-n auto --dist=loadscope).
         run: pytest -q
+
+      # The macOS failures name a daemon log — "generation daemon ... did not become healthy;
+      # see <path>" — and then the machine holding it evaporates. The PRODUCT's observability is
+      # fine: the daemon writes that log. What was missing is the VENUE's, and the gap only opened
+      # when the venue stopped being a machine someone could walk over to.
+      #
+      # This step cannot help with the 96% HANG. A job killed by timeout-minutes cancels its
+      # remaining steps, so nothing here would run. That case is covered by faulthandler_timeout
+      # in pyproject.toml, which writes to stderr while the run is still alive.
+      - name: Collect daemon logs from the pytest temp tree
+        if: failure()
+        run: |
+          set -u
+          dest="${{ runner.temp }}/test-artifacts"
+          mkdir -p "$dest"
+          # pytest's default basetemp is <system tmp>/pytest-of-<user>, and the system tmp differs
+          # per platform: /tmp on Linux, a long /private/var/folders/... path on macOS. Ask Python
+          # for it rather than hardcoding either and silently collecting nothing on the other.
+          base="$(python -c 'import getpass, os, tempfile; print(os.path.join(tempfile.gettempdir(), "pytest-of-" + getpass.getuser()))')"
+          echo "pytest basetemp: $base"
+          if [ ! -d "$base" ]; then
+            echo "no pytest temp tree there — nothing to collect"
+            exit 0
+          fi
+          ( cd "$base" && find . -name '*.log' -print > "$dest/loglist.txt" ) || true
+          echo "log files found: $(wc -l < "$dest/loglist.txt" | tr -d ' ')"
+          # Echo them inline as well as archiving them: a failure whose explanation requires
+          # downloading an artifact is one most readers will never actually look at.
+          while IFS= read -r f; do
+            echo "::group::$f"
+            tail -n 100 "$base/$f" || true
+            echo "::endgroup::"
+          done < "$dest/loglist.txt"
+          tar -czf "$dest/pytest-logs.tar.gz" -C "$base" -T "$dest/loglist.txt" || true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: failure()
+        with:
+          name: daemon-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/test-artifacts
+          if-no-files-found: warn
