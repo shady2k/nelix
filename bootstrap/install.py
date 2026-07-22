@@ -16,6 +16,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import time
@@ -26,6 +27,12 @@ from pathlib import Path
 import launcher
 import paths
 import runtime
+
+# The subscriber's pin file identifies WHAT release to fetch (version + manifest digest).
+# WHERE to fetch it from is a stable identity compiled into the bootstrap — a pin file
+# must never be able to redirect the installer at an arbitrary host.
+BASE_URL = "https://github.com/shady2k/nelix/releases/download"
+PIN_SCHEMA_VERSION = 1
 
 
 class BundleError(Exception):
@@ -46,14 +53,51 @@ def _hash_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def read_pin():
-    """Read the baked-in pin from bootstrap._pin (inside a release-built .pyz).
-    Returns None when the .pyz was hand-built without a release."""
+def read_pin_file(path):
+    """Read and strictly validate a pin JSON file.
+
+    A valid pin file has exactly this shape:
+        {"schema_version": 1, "version": "0.2.0", "manifest_sha256": "<64 lowercase hex>"}
+
+    There is NO base_url in the file — the repository identity is a stable constant (BASE_URL)
+    compiled into the bootstrap. Returns (version, manifest_sha256) on success.
+    Raises BundleError with a stable code on any validation failure."""
     try:
-        from bootstrap import _pin  # type: ignore
-        return _pin.VERSION, _pin.MANIFEST_SHA256, _pin.BASE_URL
-    except ImportError:
-        return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        raise BundleError("pin_file_missing", "pin file not found: " + str(path)) from e
+    except json.JSONDecodeError as e:
+        raise BundleError("pin_file_invalid", "pin file is not valid JSON: " + str(e)) from e
+
+    allowed_keys = {"schema_version", "version", "manifest_sha256"}
+    extra = set(data.keys()) - allowed_keys
+    if extra:
+        raise BundleError("pin_file_invalid",
+                          "unexpected keys in pin file: " + ", ".join(sorted(extra)))
+
+    if "schema_version" not in data:
+        raise BundleError("pin_file_invalid", "pin file missing 'schema_version'")
+    if data["schema_version"] != PIN_SCHEMA_VERSION:
+        raise BundleError("pin_file_invalid",
+                          "unknown schema_version " + repr(data["schema_version"])
+                          + ", expected " + str(PIN_SCHEMA_VERSION))
+
+    if "version" not in data:
+        raise BundleError("pin_file_invalid", "pin file missing 'version'")
+    version = data["version"]
+    if not isinstance(version, str) or not re.match(r"^\d+\.\d+\.\d+$", version):
+        raise BundleError("pin_file_invalid",
+                          "version must be X.Y.Z, got " + repr(version))
+
+    if "manifest_sha256" not in data:
+        raise BundleError("pin_file_invalid", "pin file missing 'manifest_sha256'")
+    digest = data["manifest_sha256"]
+    if not isinstance(digest, str) or not re.match(r"^[0-9a-f]{64}$", digest):
+        raise BundleError("pin_file_invalid",
+                          "manifest_sha256 must be 64 lowercase hex chars, got " + repr(digest))
+
+    return version, digest
 
 
 _DOWNLOAD_TIMEOUT = 30
@@ -210,9 +254,9 @@ def _download_to(dest_dir, base_url, name):
 def run_install(bundle_dir, manifest_sha256, home=None, base_url=None, pin_digest=None):
     """Verify -> build -> activate -> launcher. Returns an exit class; prints one JSON object.
 
-    When *bundle_dir* is None, reads the baked-in pin and fetches from *base_url* using
-    *pin_digest* as the trusted manifest digest. Fetching writes under NELIX_HOME, so it runs
-    INSIDE distribution_lock — unlike the offline path, where verification is a read-only check.
+    When *bundle_dir* is None, fetches from *base_url* using *pin_digest* as the trusted
+    manifest digest. Fetching writes under NELIX_HOME, so it runs INSIDE distribution_lock —
+    unlike the offline path, where verification is a read-only check.
     """
     from bootstrap.cli import EXIT_OK, EXIT_REJECTED, EXIT_UNAVAILABLE, EXIT_USAGE, emit, fail, require_prerequisites
 
@@ -260,19 +304,29 @@ def run_install(bundle_dir, manifest_sha256, home=None, base_url=None, pin_diges
 
 
 def run(args):
-    """Dispatch from the CLI. When --bundle is given, runs the offline path; otherwise reads the
-    baked-in pin and fetches."""
+    """Dispatch from the CLI.
+
+    Three modes:
+    1. --bundle + --manifest-sha256  → offline install from a local release bundle.
+    2. --pin-file <path>             → fetch the pinned release from BASE_URL/v<version>.
+    3. neither                       → usage error.
+    """
     if args.bundle is not None:
         return run_install(args.bundle, args.manifest_sha256, home=args.home)
-    pin = read_pin()
-    if pin is None:
-        from bootstrap.cli import EXIT_USAGE, fail
-        return fail("no_pin",
-                    "this .pyz was hand-built without a release pin; "
-                    "provide --bundle and --manifest-sha256",
-                    EXIT_USAGE)
-    _version, manifest_sha256, base_url = pin
-    if args.base_url is not None:
-        base_url = args.base_url  # override source, NOT the digest — trust model unchanged
-    return run_install(bundle_dir=None, manifest_sha256=manifest_sha256,
-                       home=args.home, base_url=base_url, pin_digest=manifest_sha256)
+
+    if args.pin_file is not None:
+        try:
+            version, digest = read_pin_file(args.pin_file)
+        except BundleError as e:
+            from bootstrap.cli import EXIT_USAGE, fail
+            return fail(e.code, str(e), EXIT_USAGE)
+        # The base URL for fetching is a stable constant; --base-url overrides the source
+        # but NEVER the digest — the pin file is the sole source of trust for what to install.
+        base_url = args.base_url or (BASE_URL + "/v" + version)
+        return run_install(bundle_dir=None, manifest_sha256=digest,
+                           home=args.home, base_url=base_url, pin_digest=digest)
+
+    from bootstrap.cli import EXIT_USAGE, fail
+    return fail("no_pin",
+                "a pin file is required; provide --pin-file <path> or --bundle + --manifest-sha256",
+                EXIT_USAGE)

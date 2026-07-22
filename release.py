@@ -11,6 +11,7 @@ bootstrapper that carries neither.
 """
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -21,20 +22,6 @@ MANIFEST_SCHEMA = 1
 CLI_API = 1
 REQUIRES_PYTHON = "==3.11.*"
 
-DEFAULT_BASE_URL = "https://github.com/shady2k/nelix/releases/download"
-
-_PIN_TEMPLATE = '''"""Baked at release time by release.py. Do not edit.
-
-This is what makes `nelix-bootstrap.pyz install` work with no arguments: the digest below is the
-one number a plugin's trust reduces to. The .pyz ships inside a plugin the user installed
-deliberately, so its bytes are trusted; everything else — the manifest, and through it every
-artifact — is verified against this.
-"""
-VERSION = {version!r}
-MANIFEST_SHA256 = {digest!r}
-BASE_URL = {base_url!r}
-'''
-
 REPO = Path(__file__).resolve().parent
 LOCK = REPO / "requirements-runtime.lock"
 PROJECTS = (REPO, REPO / "packages" / "nelix_store", REPO / "packages" / "nelix_contracts")
@@ -42,9 +29,13 @@ PROJECTS = (REPO, REPO / "packages" / "nelix_store", REPO / "packages" / "nelix_
 _PYZ_MODULES = ("runtime.py", "paths.py", "launcher.py")
 
 
-def build_pyz(dist_dir, *, pin=None) -> Path:
+_ZIP_EPOCH = 315532800  # 1980-01-01 00:00:00 UTC — the ZIP format minimum timestamp
+
+
+def build_pyz(dist_dir) -> Path:
     """Stage the bootstrapper and its three carried modules, and zip them into nelix-bootstrap.pyz.
-    When *pin* is given, writes bootstrap/_pin.py into the archive."""
+    File timestamps are normalised to a fixed epoch so that builds from identical source code
+    produce bit-for-bit identical .pyz archives."""
     dist_dir = Path(dist_dir)
     dist_dir.mkdir(parents=True, exist_ok=True)
     stage = dist_dir / "_pyz_stage"
@@ -55,9 +46,13 @@ def build_pyz(dist_dir, *, pin=None) -> Path:
         shutil.copy2(REPO / name, stage / name)
     for name in ("__init__.py", "__main__.py", "cli.py", "install.py"):
         shutil.copy2(REPO / "bootstrap" / name, stage / "bootstrap" / name)
-    if pin is not None:
-        (stage / "bootstrap" / "_pin.py").write_text(_PIN_TEMPLATE.format(**pin), encoding="utf-8")
     shutil.copy2(REPO / "bootstrap" / "__main__.py", stage / "__main__.py")
+
+    # Normalise every staged file's mtime to a fixed epoch so the zip archives are
+    # deterministic — two builds from the same source must produce the same sha256.
+    for f in sorted(stage.rglob("*")):
+        if f.is_file():
+            os.utime(f, (_ZIP_EPOCH, _ZIP_EPOCH))
 
     out = dist_dir / "nelix-bootstrap.pyz"
     zipapp.create_archive(stage, target=out, interpreter="/usr/bin/env python3")
@@ -89,13 +84,13 @@ def manifest_for(artifacts, *, version: str, lock_sha256: str) -> dict:
     }
 
 
-def build(dist_dir, *, version: str, base_url: str = None) -> Path:
+def build(dist_dir, *, version: str) -> Path:
     """Build every wheel into `dist_dir`, copy the lock beside them, and write release-manifest.json.
     Returns the manifest path.
 
-    Order: wheels + lock -> manifest -> pin -> .pyz. The manifest covers what gets INSTALLED
-    (wheels + the lock) — deliberately NOT the .pyz, which is built AFTERWARDS and carries
-    this manifest's digest, so listing it in the manifest would be circular."""
+    Order: wheels + lock -> manifest -> .pyz. The manifest covers what gets INSTALLED
+    (wheels + the lock) — deliberately NOT the .pyz, which is built AFTERWARDS and does
+    not carry a pin; the pin is the subscriber's responsibility to generate."""
     dist_dir = Path(dist_dir)
     dist_dir.mkdir(parents=True, exist_ok=True)
     for project in PROJECTS:
@@ -109,9 +104,7 @@ def build(dist_dir, *, version: str, base_url: str = None) -> Path:
     out = dist_dir / "release-manifest.json"
     out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    build_pyz(dist_dir, pin={"version": version,
-                             "digest": file_sha256(out),
-                             "base_url": (base_url or f"{DEFAULT_BASE_URL}/v{version}")})
+    build_pyz(dist_dir)
     return out
 
 
