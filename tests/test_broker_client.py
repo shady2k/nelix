@@ -1,9 +1,53 @@
 import os
+import subprocess
+import threading
 
 import pytest
 
 import daemon.broker_client as broker_client
 from daemon.broker_client import BrokerClient, BrokerSpawnError, set_broker, get_broker
+
+
+class _StubbornProc:
+    """A broker that ignores the socket close and has to be killed. Stands in for a real one so
+    the KILL path can be tested at all: a healthy broker exits on its own and never reaches it."""
+
+    def __init__(self):
+        self.returncode = None
+        self.killed = False
+        self.waits_after_kill = 0
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise subprocess.TimeoutExpired(cmd="broker", timeout=timeout)
+        self.waits_after_kill += 1
+        self.returncode = -9
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+
+def test_close_reaps_a_broker_it_had_to_kill():
+    """kill() only SIGNALs — without a following wait() the broker stays a zombie.
+
+    Every leaked child is invisible: nothing in this class logs a spawn or a reap, so a process
+    that outlives its owner leaves no trace except a suite that will not finish. The macOS job
+    wedged at 98% with the runner terminating leftover Python processes, and there was no record
+    anywhere of who had created them.
+    """
+    bc = BrokerClient.__new__(BrokerClient)          # no real broker: only close()'s discipline
+    bc._lock = threading.Lock()
+    bc._sock = None
+    bc._proc = _StubbornProc()
+
+    bc.close()
+
+    assert bc._proc is None or bc._proc.returncode is not None, \
+        "close() killed the broker but never reaped it — that is a zombie"
 
 
 def test_a_dead_broker_cannot_block_spawn_forever():

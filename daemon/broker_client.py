@@ -2,12 +2,20 @@
 before threads) and delegates PTY spawns to it. Serializes requests behind one lock and
 lazily respawns the broker once if it has died (existing sessions are unaffected — the
 daemon already owns their master fds)."""
+import logging
 import os
 import subprocess
 import sys
 import threading
 
 from daemon.broker_proto import send_msg, recv_msg, make_socketpair
+
+# Process lifecycle was the one subsystem here that kept NO record of itself: nothing logged a
+# broker being spawned, killed or reaped. So when a child outlived its owner the only evidence was
+# a suite that would not finish and a CI runner terminating processes nobody could account for.
+# Spawn/reap are cheap and rare — one line each is affordable and is the difference between a
+# diagnosable leak and a mystery.
+_log = logging.getLogger("nelix.broker_client")
 
 
 class BrokerSpawnError(Exception):
@@ -94,11 +102,20 @@ class BrokerClient:
             except OSError:
                 pass
             self._sock = None
-            if self._proc is not None and self._proc.poll() is None:
-                try:
-                    self._proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
+            proc = self._proc
+            if proc is not None:
+                if proc.poll() is None:
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        # kill() only SIGNALS. Without the wait() below the broker stays a zombie,
+                        # and a zombie is invisible: it holds a slot in the process table with
+                        # nothing recording who created it.
+                        proc.kill()
+                        proc.wait()
+                _log.info("broker reaped pid=%s rc=%s", getattr(proc, "pid", None),
+                          proc.returncode)
+                self._proc = None                 # idempotent: a second close() is a no-op
 
 
 _broker = None

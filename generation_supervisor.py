@@ -579,7 +579,18 @@ class GenerationSupervisor:
                     f"generation daemon gen_id={self._generation_id} exited early "
                     f"(code {proc.returncode}); see {log_path}")
             time.sleep(0.1)
+        # terminate() only SIGNALS. Returning without reaping leaves a child nobody owns, and
+        # under xdist a worker runs many tests in ONE process, so those accumulate: the CI runner
+        # allocates ~3 workers where this machine allocates 14, which is why leakage that is
+        # invisible locally is what the runner trips over.
         proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        _log.warning("generation daemon reaped after failed readiness gen_id=%s pid=%s rc=%s",
+                     self._generation_id, proc.pid, proc.returncode)
         raise RuntimeError(
             f"generation daemon gen_id={self._generation_id} did not become healthy "
             f"in {_HEALTH_TIMEOUT}s: health={health_last} lock={lock_last} "
