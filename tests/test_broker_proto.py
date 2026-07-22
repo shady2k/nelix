@@ -1,5 +1,6 @@
 import os
 import socket
+import time
 
 import pytest
 
@@ -34,14 +35,27 @@ def test_roundtrip_with_fd():
     a.close(); b.close()
 
 
-def test_eof_raises():
+def test_a_closed_peer_never_blocks_recv_forever():
+    """A closed peer must end the recv on EVERY supported platform — promptly, one way or another.
+
+    This test used to assert a bare EOFError, and that assertion is macOS-only: closing one end of
+    an AF_UNIX/SOCK_DGRAM pair wakes the other end's recvmsg with ECONNRESET there, which recv_msg
+    translates. Linux delivers NO wakeup, so the old test did not fail on Linux — it hung, forever,
+    and with --dist=loadscope it parked the entire suite at 96% until CI's cap killed the job. A
+    test that hangs is worse than one that fails: it reports nothing and costs the whole run.
+
+    So the portable contract is a deadline, not peer-close. What matters is that the wait ENDS and
+    the caller learns the peer is gone; whether that arrives as EOFError (macOS, via ECONNRESET) or
+    TimeoutError (Linux, via the deadline) is a platform detail, and both route to the same
+    restart-and-retry in broker_client.spawn(), since socket.timeout IS TimeoutError IS an OSError.
+    """
     a, b = _pair()
+    b.settimeout(0.5)
     a.close()
-    try:
+    started = time.monotonic()
+    with pytest.raises((EOFError, TimeoutError)):
         recv_msg(b)
-        assert False, "expected EOFError"
-    except EOFError:
-        pass
+    assert time.monotonic() - started < 5, "the recv did not honour its deadline"
     b.close()
 
 

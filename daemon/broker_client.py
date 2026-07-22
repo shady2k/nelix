@@ -17,6 +17,13 @@ class BrokerSpawnError(Exception):
         self.err_errno = err_errno
 
 
+# Upper bound on how long the daemon waits for the broker's reply to one spawn. Generous, because
+# the broker forks, opens a PTY and execs a real CLI under whatever load the machine is under —
+# this is a deadlock backstop, not a latency budget. A spawn that genuinely needs longer than this
+# has already failed in a way the caller must hear about.
+_SPAWN_REPLY_TIMEOUT = 30.0
+
+
 class BrokerClient:
     def __init__(self):
         self._lock = threading.Lock()
@@ -26,6 +33,14 @@ class BrokerClient:
 
     def _start(self):
         daemon_end, broker_end = make_socketpair()
+        # A recv deadline, because peer-close is NOT a portable liveness signal. Closing one end
+        # of an AF_UNIX/SOCK_DGRAM pair wakes the other end's recvmsg with ECONNRESET on macOS
+        # (broker_proto turns that into EOFError); Linux delivers no wakeup at all and the recv
+        # never returns. spawn() blocks in recv while holding self._lock, so on Linux one dead
+        # broker would wedge every later spawn behind it. The deadline needs no new handling:
+        # socket.timeout IS TimeoutError, an OSError, so spawn()'s existing
+        # `except (OSError, EOFError)` already routes it to restart-and-retry.
+        daemon_end.settimeout(_SPAWN_REPLY_TIMEOUT)
         os.set_inheritable(broker_end.fileno(), True)
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "daemon.pty_broker", str(broker_end.fileno())],
