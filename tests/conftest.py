@@ -11,6 +11,19 @@ import paths  # noqa: E402
 
 from daemon.config import ExecutorSpec  # noqa: E402  (after sys.path insert)
 
+# Hang watchdog: activates at import time only when NELIX_HANG_WATCHDOG_DIR is
+# set by the external wrapper.  When the env var is absent (direct pytest run),
+# the import is a zero-cost no-op.  Imported here so every xdist worker and the
+# controller process load it — a standalone conftest would not reach workers.
+#
+# NOT a relative import. pytest does not always give conftest a package context — with some
+# rootdir/import-mode combinations it loads this file as a top-level module, and `from .x import y`
+# then dies with "attempted relative import with no known parent package". That is not theoretical:
+# it failed exactly two tests in a full run while the other 2231 were fine, which is the worst
+# possible shape for a bug to have. The absolute form works in both contexts because the line above
+# has already put the repo root on sys.path, and tests/ is a package.
+from tests.hang_watchdog_plugin import heartbeat  # noqa: E402
+
 EXECUTOR = "demo"
 
 # The owner most tests drive as. `owner_id` is required on every caller-facing manager/RPC call
@@ -123,3 +136,25 @@ def reserve_start(ledger, owner_id=OWNER, idempotency_key=None):
                        orchestration_id=_OID, request_fingerprint="fp")
     ledger.assign_generation(r.session_id, _GID, _GEPOCH)
     return r.session_id
+
+
+# ---------------------------------------------------------------------------
+# Hang-watchdog heartbeat hooks.  Each writes a progress marker so the
+# external wrapper can distinguish "slow" from "stopped."  When the plugin is
+# inert (no NELIX_HANG_WATCHDOG_DIR), heartbeat() is a no-op.
+# ---------------------------------------------------------------------------
+
+def pytest_runtest_logstart(nodeid, location):
+    heartbeat(f"logstart:{nodeid}")
+
+
+def pytest_runtest_logfinish(nodeid, location):
+    heartbeat(f"logfinish:{nodeid}")
+
+
+def pytest_sessionstart(session):
+    heartbeat("sessionstart")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    heartbeat(f"sessionfinish:{exitstatus}")

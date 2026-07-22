@@ -73,10 +73,12 @@ jobs:
         run: ruff check --select F,E9 .
 
       - name: Test
-        # The WHOLE suite. `pytest -q` rather than `make test` because that target runs
+        # The WHOLE suite, run through the hang-watchdog wrapper so a wedged run is
+        # force-dumped and terminated rather than silently burning the full timeout-minutes.
+        # `python tools/hang_watchdog.py` rather than `make test` because that target runs
         # ./.venv/bin/python, which does not exist on a runner. Parallelism comes from
         # pyproject.toml's addopts (-n auto --dist=loadscope).
-        run: pytest -q
+        run: python tools/hang_watchdog.py
 
       # The macOS failures name a daemon log — "generation daemon ... did not become healthy;
       # see <path>" — and then the machine holding it evaporates. The PRODUCT's observability is
