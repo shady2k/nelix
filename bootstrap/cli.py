@@ -62,9 +62,11 @@ def build_parser():
     inst.add_argument("--bundle", default=None, help="directory holding the release artifacts")
     inst.add_argument("--manifest-sha256", dest="manifest_sha256", default=None,
                       help="the pinned digest of release-manifest.json")
+    inst.add_argument("--pin-file", dest="pin_file", default=None,
+                      help="path to a JSON pin file {schema_version, version, manifest_sha256}")
     inst.add_argument("--home", default=None, help="NELIX_HOME (default: $NELIX_HOME or ~/.nelix)")
     inst.add_argument("--base-url", dest="base_url", default=None,
-                      help="override the fetch source URL (the baked-in digest still protects)")
+                      help="override the fetch source URL (the pin's digest still protects)")
     inst.set_defaults(func=lambda a: __import__("bootstrap.install", fromlist=["run"]).run(a))
     return p
 
