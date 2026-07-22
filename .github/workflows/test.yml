@@ -1,0 +1,79 @@
+name: Test
+
+# The gate. TWO platforms, because the core forks on the OS at RUNTIME while shipping ONE artifact:
+# daemon/transport.py:49,54 picks SO_PEERCRED on linux and LOCAL_PEERCRED on darwin;
+# daemon/reaper.py:32,50,61 reads /proc on linux and shells out to `ps` everywhere else.
+# Our wheels are py3-none-any, so the BYTES are identical on both platforms — which is exactly the
+# trap: identical artifacts invite the conclusion that testing them once is enough. It isn't. On a
+# linux-only run the line `if sys.platform == "darwin"` never executes.
+#
+# And the darwin half degrades SILENTLY, not loudly: peer_uid() returning None makes peer_is_self()
+# return True (transport.py:70 — "platform can't report it, so allow"). A broken darwin branch
+# therefore OPENS the socket gate while a linux-only run stays green. That is the failure this
+# matrix exists to catch.
+#
+# Runners rather than the local container (Dockerfile.test, on another branch): that container runs
+# as root, which makes every permission-semantics test vacuous, and it cannot host darwin at all —
+# Docker on macOS is a Linux VM, so it would run the linux branch either way. A hosted runner is a
+# disposable machine with an ordinary user, which also satisfies the standing requirement that the
+# suite never touch the operator's own machine.
+#
+# Actions are pinned by commit SHA, each resolved with
+#   git ls-remote https://github.com/<repo> refs/tags/<tag> 'refs/tags/<tag>^{}'
+# taking the dereferenced commit where the tag is annotated (setup-uv v5 is; the other two are
+# lightweight tags pointing straight at commits).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      # Never let one platform's failure cancel the other's run: comparing the two IS the point,
+      # and a cancelled macOS job would leave the darwin branch unmeasured all over again.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # A wedged suite must FAIL rather than idle. The container run of this same suite reached 96%
+    # and then hung in the tail; without a cap that burns the job's full allowance and reports
+    # nothing useful.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          # The daemon's floor, enforced locally by `make check-python`. A newer interpreter can
+          # ship a 3.12+-only API green here and die on the 3.11 daemon (nelix-cb0).
+          python-version: '3.11'
+
+      # tests/test_real_runtime.py and tests/test_real_wheel.py build a real runtime, and
+      # runtime.py drives `uv python install` and `uv pip install --require-hashes`.
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Install dev + test dependencies
+        # requirements.txt, not `make install`: the Makefile targets drive ./.venv, and here the
+        # runner's own interpreter (pinned above) is the environment under test.
+        run: pip install -r requirements.txt
+
+      - name: Lint
+        # The same rule set the pre-commit gate blocks on — real-bug rules only (F = pyflakes,
+        # E9 = syntax/IO), not style.
+        run: ruff check --select F,E9 .
+
+      - name: Test
+        # The WHOLE suite. `pytest -q` rather than `make test` because that target runs
+        # ./.venv/bin/python, which does not exist on a runner. Parallelism comes from
+        # pyproject.toml's addopts (-n auto --dist=loadscope).
+        run: pytest -q
